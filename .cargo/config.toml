@@ -1,0 +1,8 @@
+[target.thumbv7em-none-eabihf]
+runner = "bash tools/build.sh"
+
+[build]
+target = "thumbv7em-none-eabihf"
+
+[env]
+DEFMT_LOG = "trace"

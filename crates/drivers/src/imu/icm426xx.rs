@@ -1,0 +1,364 @@
+//! ICM426xx-family IMU driver with async DMA SPI and async DRDY.
+//!
+//! Supports ICM42605, ICM42622P, ICM42688P, IIM42652, and IIM42653.
+//! Reads accelerometer + gyroscope data on DRDY interrupt and outputs physical units.
+
+use embedded_hal_async::spi::SpiDevice;
+use embedded_hal_async::{delay::DelayNs, digital::Wait};
+use nalgebra::Vector3;
+
+// ---------------------------------------------------------------------------
+// Register addresses
+// ---------------------------------------------------------------------------
+
+// Bank 0
+const REG_DEVICE_CONFIG: u8 = 0x11;
+const REG_INT_CONFIG: u8 = 0x14;
+const REG_TEMP_DATA1: u8 = 0x1D;
+const REG_INT_STATUS: u8 = 0x2D;
+const REG_INTF_CONFIG1: u8 = 0x4D;
+const REG_PWR_MGMT0: u8 = 0x4E;
+const REG_GYRO_CONFIG0: u8 = 0x4F;
+const REG_ACCEL_CONFIG0: u8 = 0x50;
+const REG_GYRO_ACCEL_CONFIG0: u8 = 0x52;
+const REG_INT_CONFIG0: u8 = 0x63;
+const REG_INT_CONFIG1: u8 = 0x64;
+const REG_INT_SOURCE0: u8 = 0x65;
+const REG_WHO_AM_I: u8 = 0x75;
+const REG_BANK_SEL: u8 = 0x76;
+
+// Bank 1 — gyro anti-alias filter
+const REG_GYRO_AAF_DELT: u8 = 0x0C;
+const REG_GYRO_AAF_DELTSQR_LO: u8 = 0x0D;
+const REG_GYRO_AAF_BITSHIFT: u8 = 0x0E;
+
+// Bank 2 — accel anti-alias filter
+const REG_ACCEL_AAF_DELT: u8 = 0x03;
+const REG_ACCEL_AAF_DELTSQR_LO: u8 = 0x04;
+const REG_ACCEL_AAF_BITSHIFT: u8 = 0x05;
+
+// SPI R/W bit
+const SPI_READ: u8 = 0x80;
+
+// ---------------------------------------------------------------------------
+// WHO_AM_I values
+// ---------------------------------------------------------------------------
+
+const WHOAMI_ICM42605: u8 = 0x42;
+const WHOAMI_ICM42622P: u8 = 0x46;
+const WHOAMI_ICM42688P: u8 = 0x47;
+const WHOAMI_IIM42652: u8 = 0x6F;
+const WHOAMI_IIM42653: u8 = 0x56;
+
+// ---------------------------------------------------------------------------
+// Scale factors (precomputed)
+// ---------------------------------------------------------------------------
+
+// Gyro: FSR / 32768 * PI / 180
+// All chips at FS_SEL=000: 2000 dps (ICM42688P/42605/42622P/IIM42652)
+const GYRO_SCALE_2000DPS: f32 = 2000.0 / 32768.0 * core::f32::consts::PI / 180.0;
+// IIM42653 only: FS_SEL=000 = 4000 dps
+const GYRO_SCALE_4000DPS: f32 = 4000.0 / 32768.0 * core::f32::consts::PI / 180.0;
+
+// Accel: FSR / 32768 * 9.80665
+// All chips at FS_SEL=000: 16g (ICM42688P/42605/42622P/IIM42652)
+const ACCEL_SCALE_16G: f32 = 16.0 / 32768.0 * 9.80665;
+// IIM42653 only: FS_SEL=000 = 32g
+const ACCEL_SCALE_32G: f32 = 32.0 / 32768.0 * 9.80665;
+
+// Temperature: raw / 132.48 + 25.0
+const TEMP_SCALE: f32 = 1.0 / 132.48;
+const TEMP_OFFSET: f32 = 25.0;
+
+// ---------------------------------------------------------------------------
+// Anti-alias filter (AAF) LUT
+//
+// The AAF is a hardware low-pass filter that runs before the ADC. It prevents
+// high-frequency vibration (e.g. from motors) from aliasing into the digital
+// samples — once aliased, no software filter can remove it.
+//
+// The delt/deltSqr/bitshift values come from a lookup table in the datasheet;
+// each row corresponds to a cutoff frequency. Current cutoffs (from Betaflight):
+//   Gyro  ~1 kHz  — passes all flight-relevant dynamics
+//   Accel ~250 Hz — aggressive, since accel is used for attitude/gravity only
+//
+// These cutoffs are also appropriate for VIO/state estimation (less demanding
+// on bandwidth than PID). Software filters (notch, PT1, etc.) are applied
+// downstream on the already-clean digital signal.
+// ---------------------------------------------------------------------------
+
+struct AafConfig {
+    delt: u8,
+    deltsqr: u16,
+    bitshift: u8,
+}
+
+// ICM42688P / ICM42622P family (datasheet section 5.3)
+const AAF_GYRO_42688: AafConfig = AafConfig { delt: 21, deltsqr: 440, bitshift: 6 };
+const AAF_ACCEL_42688: AafConfig = AafConfig { delt: 6, deltsqr: 36, bitshift: 10 };
+
+// ICM42605 / IIM42652 / IIM42653 family (datasheet section 5.3)
+const AAF_GYRO_42605: AafConfig = AafConfig { delt: 63, deltsqr: 3968, bitshift: 3 };
+const AAF_ACCEL_42605: AafConfig = AafConfig { delt: 21, deltsqr: 440, bitshift: 6 };
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// ICM426xx chip variant.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, defmt::Format)]
+pub enum Variant {
+    Icm42605,
+    Icm42622P,
+    Icm42688P,
+    Iim42652,
+    Iim42653,
+}
+
+/// A single IMU reading in physical units, chip-native axis order.
+#[derive(Clone, Debug)]
+pub struct ImuReading {
+    /// Acceleration in m/s^2.
+    pub accel: Vector3<f32>,
+    /// Angular rate in rad/s.
+    pub gyro: Vector3<f32>,
+    /// Die temperature in degrees Celsius.
+    pub temp_c: f32,
+}
+
+/// Driver error type, wrapping the SPI bus error.
+#[derive(Debug)]
+pub enum Error<E> {
+    Spi(E),
+    UnknownChip(u8),
+}
+
+impl<E: defmt::Format> defmt::Format for Error<E> {
+    fn format(&self, f: defmt::Formatter) {
+        match self {
+            Error::Spi(e) => defmt::write!(f, "Spi({})", e),
+            Error::UnknownChip(id) => defmt::write!(f, "UnknownChip({=u8:#x})", id),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Driver
+// ---------------------------------------------------------------------------
+
+/// ICM426xx driver with async DMA SPI and async DRDY.
+///
+/// Generic over any `embedded-hal-async` SPI device and an async DRDY wait pin.
+pub struct Icm426xx<SPI: SpiDevice, DRDY: Wait> {
+    spi: SPI,
+    drdy: DRDY,
+    variant: Variant,
+    gyro_scale: f32,
+    accel_scale: f32,
+}
+
+impl<SPI: SpiDevice, DRDY: Wait> Icm426xx<SPI, DRDY> {
+    /// Initialize the IMU. Performs soft reset, WHO_AM_I identification,
+    /// anti-alias filter configuration, and powers on gyro + accel at 8 kHz.
+    pub async fn new(
+        spi: SPI,
+        drdy: DRDY,
+        delay: &mut impl DelayNs,
+    ) -> Result<Self, Error<SPI::Error>> {
+        let mut drv = Self {
+            spi,
+            drdy,
+            variant: Variant::Icm42688P, // placeholder, overwritten below
+            gyro_scale: 0.0,
+            accel_scale: 0.0,
+        };
+
+        // 1. Ensure bank 0
+        drv.write_reg(REG_BANK_SEL, 0x00).await?;
+
+        // 2. Soft reset
+        drv.write_reg(REG_DEVICE_CONFIG, 0x01).await?;
+        delay.delay_ms(1).await;
+
+        // 3. Read WHO_AM_I with retries
+        let mut whoami = 0u8;
+        for _ in 0..5 {
+            whoami = drv.read_reg(REG_WHO_AM_I).await?;
+            if whoami != 0x00 && whoami != 0xFF {
+                break;
+            }
+            delay.delay_ms(1).await;
+        }
+
+        let variant = match whoami {
+            WHOAMI_ICM42605 => Variant::Icm42605,
+            WHOAMI_ICM42622P => Variant::Icm42622P,
+            WHOAMI_ICM42688P => Variant::Icm42688P,
+            WHOAMI_IIM42652 => Variant::Iim42652,
+            WHOAMI_IIM42653 => Variant::Iim42653,
+            _ => return Err(Error::UnknownChip(whoami)),
+        };
+
+        // FS_SEL=000 means ±2000dps/±16g for all chips except IIM42653 (±4000dps/±32g).
+        // IIM42652 max range is ±2000dps/±16g despite being in the IIM family.
+        let (gyro_scale, accel_scale) = match variant {
+            Variant::Iim42653 => (GYRO_SCALE_4000DPS, ACCEL_SCALE_32G),
+            _ => (GYRO_SCALE_2000DPS, ACCEL_SCALE_16G),
+        };
+
+        drv.variant = variant;
+        drv.gyro_scale = gyro_scale;
+        drv.accel_scale = accel_scale;
+
+        defmt::info!("ICM426xx: detected {:?} (WHO_AM_I={=u8:#x})", variant, whoami);
+
+        // 4. Power off sensors during configuration
+        drv.write_reg(REG_PWR_MGMT0, 0x00).await?;
+
+        // 5. Configure gyro anti-alias filter (bank 1)
+        let (gyro_aaf, accel_aaf) = match variant {
+            Variant::Icm42688P | Variant::Icm42622P => (AAF_GYRO_42688, AAF_ACCEL_42688),
+            _ => (AAF_GYRO_42605, AAF_ACCEL_42605),
+        };
+
+        // AAF register encoding (matching Betaflight):
+        //   DELT register: raw value (gyro) or raw << 1 (accel)
+        //   DELTSQR_LO: deltSqr[7:0]
+        //   BITSHIFT reg: [bitshift:4][deltSqr[11:8]:4]
+        drv.write_reg(REG_BANK_SEL, 0x01).await?;
+        drv.write_reg(REG_GYRO_AAF_DELT, gyro_aaf.delt).await?;
+        drv.write_reg(REG_GYRO_AAF_DELTSQR_LO, (gyro_aaf.deltsqr & 0xFF) as u8).await?;
+        drv.write_reg(REG_GYRO_AAF_BITSHIFT, (gyro_aaf.bitshift << 4) | (gyro_aaf.deltsqr >> 8) as u8).await?;
+
+        // 6. Configure accel anti-alias filter (bank 2)
+        // Note: accel delt register requires << 1 shift (Betaflight: aafConfig.delt << 1)
+        drv.write_reg(REG_BANK_SEL, 0x02).await?;
+        drv.write_reg(REG_ACCEL_AAF_DELT, accel_aaf.delt << 1).await?;
+        drv.write_reg(REG_ACCEL_AAF_DELTSQR_LO, (accel_aaf.deltsqr & 0xFF) as u8).await?;
+        drv.write_reg(REG_ACCEL_AAF_BITSHIFT, (accel_aaf.bitshift << 4) | (accel_aaf.deltsqr >> 8) as u8).await?;
+
+        // 7. Back to bank 0
+        drv.write_reg(REG_BANK_SEL, 0x00).await?;
+
+        // 8. UI filter bandwidth — low latency (Betaflight: accel=15<<4 | gyro=15 = 0xFF)
+        drv.write_reg(REG_GYRO_ACCEL_CONFIG0, 0xFF).await?;
+
+        // 9. Interrupt config: pulsed, push-pull, active-high
+        drv.write_reg(REG_INT_CONFIG, 0x03).await?;
+
+        // 10. DRDY status cleared on status bit read (Betaflight default)
+        drv.write_reg(REG_INT_CONFIG0, 0x00).await?;
+
+        // 11. Enable DRDY on INT1
+        drv.write_reg(REG_INT_SOURCE0, 0x08).await?;
+
+        // 12. INT_CONFIG1: clear async reset (bit 4), set 8us pulse (bit 6),
+        //     disable tdeassert (bit 5) — all per Betaflight
+        let int_config1 = drv.read_reg(REG_INT_CONFIG1).await?;
+        drv.write_reg(REG_INT_CONFIG1, (int_config1 & !(1 << 4)) | (1 << 6) | (1 << 5)).await?;
+
+        // 13. Disable AFSR — prevents gyro stalls (mask 0xC0 = bits [7:6])
+        let intf_config1 = drv.read_reg(REG_INTF_CONFIG1).await?;
+        drv.write_reg(REG_INTF_CONFIG1, (intf_config1 & 0x3F) | 0x40).await?;
+
+        // 14. Power on gyro + accel in low-noise mode
+        // Betaflight: "Turn on gyro and acc on again so ODR and FSR can be configured"
+        drv.write_reg(REG_PWR_MGMT0, 0x0F).await?;
+        delay.delay_ms(1).await;
+
+        // 15. Gyro: ODR=8kHz, FSR=max
+        drv.write_reg(REG_GYRO_CONFIG0, 0x03).await?;
+        delay.delay_ms(15).await;
+
+        // 16. Accel: ODR=8kHz, FSR=max
+        drv.write_reg(REG_ACCEL_CONFIG0, 0x03).await?;
+        delay.delay_ms(15).await;
+
+        // 17. Wait for gyro/accel startup (up to 200ms from standby per datasheet)
+        delay.delay_ms(200).await;
+
+        // Verify config readback
+        let gyro_cfg = drv.read_reg(REG_GYRO_CONFIG0).await?;
+        let accel_cfg = drv.read_reg(REG_ACCEL_CONFIG0).await?;
+        let pwr = drv.read_reg(REG_PWR_MGMT0).await?;
+        defmt::info!(
+            "ICM426xx readback: GYRO_CFG={=u8:#x} ACCEL_CFG={=u8:#x} PWR={=u8:#x}",
+            gyro_cfg, accel_cfg, pwr
+        );
+
+        // 18. Drain stale samples
+        for _ in 0..10 {
+            drv.drdy.wait_for_rising_edge().await.ok();
+            let _ = drv.read_reg(REG_INT_STATUS).await;
+            let mut buf = [0u8; 15];
+            buf[0] = SPI_READ | REG_TEMP_DATA1;
+            let _ = drv.spi.transfer_in_place(&mut buf).await;
+        }
+
+        Ok(drv)
+    }
+
+    /// Wait for DRDY, then burst-read accel + gyro + temperature.
+    ///
+    /// Returns an [`ImuReading`] with physical units in chip-native axis order.
+    pub async fn read(&mut self) -> Result<ImuReading, Error<SPI::Error>> {
+        // Wait for data-ready rising edge
+        self.drdy.wait_for_rising_edge().await.ok();
+
+        // Clear DRDY flag by reading INT_STATUS (INT_CONFIG0 = 0x00)
+        self.read_reg(REG_INT_STATUS).await?;
+
+        // Burst read: TEMP(2) + ACCEL(6) + GYRO(6) = 14 bytes
+        // Wire format: [addr | 0x80] + 14 data bytes = 15 bytes total
+        let mut buf = [0u8; 15];
+        buf[0] = SPI_READ | REG_TEMP_DATA1;
+        self.spi.transfer_in_place(&mut buf).await.map_err(Error::Spi)?;
+
+        // Parse big-endian i16 values from buf[1..]
+        let raw_temp = i16::from_be_bytes([buf[1], buf[2]]);
+        let raw_ax = i16::from_be_bytes([buf[3], buf[4]]);
+        let raw_ay = i16::from_be_bytes([buf[5], buf[6]]);
+        let raw_az = i16::from_be_bytes([buf[7], buf[8]]);
+        let raw_gx = i16::from_be_bytes([buf[9], buf[10]]);
+        let raw_gy = i16::from_be_bytes([buf[11], buf[12]]);
+        let raw_gz = i16::from_be_bytes([buf[13], buf[14]]);
+
+        let gs = self.gyro_scale;
+        let as_ = self.accel_scale;
+
+        Ok(ImuReading {
+            accel: Vector3::new(
+                raw_ax as f32 * as_,
+                raw_ay as f32 * as_,
+                raw_az as f32 * as_,
+            ),
+            gyro: Vector3::new(
+                raw_gx as f32 * gs,
+                raw_gy as f32 * gs,
+                raw_gz as f32 * gs,
+            ),
+            temp_c: raw_temp as f32 * TEMP_SCALE + TEMP_OFFSET,
+        })
+    }
+
+    /// Returns the detected chip variant.
+    pub fn variant(&self) -> Variant {
+        self.variant
+    }
+
+    // -----------------------------------------------------------------------
+    // Low-level SPI helpers (async)
+    // -----------------------------------------------------------------------
+
+    async fn read_reg(&mut self, reg: u8) -> Result<u8, Error<SPI::Error>> {
+        let mut buf = [SPI_READ | reg, 0x00];
+        self.spi.transfer_in_place(&mut buf).await.map_err(Error::Spi)?;
+        Ok(buf[1])
+    }
+
+    async fn write_reg(&mut self, reg: u8, val: u8) -> Result<(), Error<SPI::Error>> {
+        let buf = [reg, val];
+        self.spi.write(&buf).await.map_err(Error::Spi)?;
+        Ok(())
+    }
+}

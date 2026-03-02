@@ -1,0 +1,8 @@
+[package]
+name = "bsp-types"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+defmt = "1.0.1"

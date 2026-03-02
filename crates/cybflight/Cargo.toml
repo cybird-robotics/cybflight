@@ -1,0 +1,43 @@
+[package]
+name = "cybflight"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+# Pick one board by default
+default = ["board_sakurah743"]
+
+board_sakurah743 = ["dep:bsp-sakurah743"]
+
+[dependencies]
+bsp-sakurah743 = { path = "../bsp/sakurah743", optional = true }
+bsp-types = { path = "../bsp/types" }
+cybflight-drivers = { path = "../drivers" }
+
+# Embassy runtime pieces (board-agnostic)
+embassy-executor = { version = "0.9.1", features = ["arch-cortex-m", "executor-thread", "defmt"] }
+embassy-time     = { version = "0.5.0", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
+embassy-sync     = { version = "0.7.2", features = ["defmt"] }
+embassy-embedded-hal = { version = "0.5.0", features = ["defmt"] }
+embedded-hal = "1.0"
+embassy-futures = "0.1.2"
+embassy-usb = { version = "0.5", features = ["defmt"] }
+static_cell = "2"
+
+# cortex-m-rt needed by embassy_executor::main
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7.5"
+
+# Logging + panic
+defmt = "1.0.1"
+defmt-rtt = "1.1.0"
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+
+# Math (no_std)
+nalgebra = { version = "0.34.1", default-features = false, features = ["libm"] }
+
+[profile.release]
+debug = 2
+lto = "thin"
+codegen-units = 1

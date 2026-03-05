@@ -6,11 +6,12 @@ ELF="$1"
 # Output alongside the ELF, same name but .bin
 BIN="${ELF%.*}.bin"
 
-# Require rust-objcopy (cargo-binutils + llvm-tools-preview)
-command -v rust-objcopy >/dev/null 2>&1 || {
-  echo "rust-objcopy not found."
+# Find llvm-objcopy from the rustup toolchain (provided by llvm-tools-preview)
+OBJCOPY="$(rustc --print target-libdir)/../bin/llvm-objcopy"
+if [ ! -x "$OBJCOPY" ]; then
+  echo "llvm-objcopy not found. Run: rustup component add llvm-tools-preview"
   exit 1
-}
+fi
 
-rust-objcopy --output-target=binary "$ELF" "$BIN"
+"$OBJCOPY" --output-target=binary "$ELF" "$BIN"
 echo "Converted: $ELF -> $BIN"

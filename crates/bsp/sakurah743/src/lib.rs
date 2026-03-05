@@ -4,9 +4,11 @@ pub use embassy_stm32 as hal;
 
 use hal::exti;
 use hal::gpio::{Input, Level, Output, Pull, Speed};
-use hal::{bind_interrupts, Config, Peripherals};
+use hal::{Config, Peripherals, bind_interrupts};
 
-pub use bsp_types::{DmaHint, MotorMeta, SensorAlign, SerialPortId, SerialRole, TimerChannel, TimerId};
+pub use bsp_types::{
+    DmaHint, MotorMeta, SensorAlign, SerialPortId, SerialRole, TimerChannel, TimerId,
+};
 pub use cybflight_drivers::beeper::Beeper;
 
 /// Board name from Betaflight target.
@@ -53,43 +55,64 @@ pub const MOTOR_META: [MotorMeta; 8] = [
         timer: TimerId::Tim5,
         channel: TimerChannel::Ch3,
         af: 2,
-        dma: Some(DmaHint { stream: 0, request: 57 }),
+        dma: Some(DmaHint {
+            stream: 0,
+            request: 57,
+        }),
     },
     MotorMeta {
         timer: TimerId::Tim5,
         channel: TimerChannel::Ch4,
         af: 2,
-        dma: Some(DmaHint { stream: 1, request: 58 }),
+        dma: Some(DmaHint {
+            stream: 1,
+            request: 58,
+        }),
     },
     MotorMeta {
         timer: TimerId::Tim3,
         channel: TimerChannel::Ch4,
         af: 2,
-        dma: Some(DmaHint { stream: 3, request: 26 }),
+        dma: Some(DmaHint {
+            stream: 3,
+            request: 26,
+        }),
     },
     MotorMeta {
         timer: TimerId::Tim3,
         channel: TimerChannel::Ch3,
         af: 2,
-        dma: Some(DmaHint { stream: 2, request: 25 }),
+        dma: Some(DmaHint {
+            stream: 2,
+            request: 25,
+        }),
     },
     MotorMeta {
         timer: TimerId::Tim5,
         channel: TimerChannel::Ch2,
         af: 2,
-        dma: Some(DmaHint { stream: 5, request: 56 }),
+        dma: Some(DmaHint {
+            stream: 5,
+            request: 56,
+        }),
     },
     MotorMeta {
         timer: TimerId::Tim5,
         channel: TimerChannel::Ch1,
         af: 2,
-        dma: Some(DmaHint { stream: 4, request: 55 }),
+        dma: Some(DmaHint {
+            stream: 4,
+            request: 55,
+        }),
     },
     MotorMeta {
         timer: TimerId::Tim15,
         channel: TimerChannel::Ch1,
         af: 4,
-        dma: Some(DmaHint { stream: 6, request: 105 }),
+        dma: Some(DmaHint {
+            stream: 6,
+            request: 105,
+        }),
     },
     MotorMeta {
         timer: TimerId::Tim15,
@@ -108,8 +131,22 @@ pub const SERVO_META: &[(/*pin*/ &str, TimerId, TimerChannel, /*af*/ u8)] = &[
 ];
 
 /// LED strip pin mapping metadata.
-pub const LED_STRIP_META: (/*pin*/ &str, TimerId, TimerChannel, /*af*/ u8, DmaHint) =
-    ("PA8", TimerId::Tim1, TimerChannel::Ch1, 1, DmaHint { stream: 7, request: 11 });
+pub const LED_STRIP_META: (
+    /*pin*/ &str,
+    TimerId,
+    TimerChannel,
+    /*af*/ u8,
+    DmaHint,
+) = (
+    "PA8",
+    TimerId::Tim1,
+    TimerChannel::Ch1,
+    1,
+    DmaHint {
+        stream: 7,
+        request: 11,
+    },
+);
 
 // EXTI interrupts required by gyro DRDY pins:
 // - PB2 (EXTI2) for GYRO_1
@@ -318,7 +355,9 @@ fn board_config() -> Config {
     let mut config = Config::default();
     {
         use hal::rcc::*;
-        config.rcc.hsi48 = Some(Hsi48Config { sync_from_usb: true }); // 48 MHz for USB
+        config.rcc.hsi48 = Some(Hsi48Config {
+            sync_from_usb: true,
+        }); // 48 MHz for USB
         config.rcc.mux.usbsel = mux::Usbsel::HSI48;
         // SPI1/2/3 kernel clock defaults to PLL1_Q, which is off. Use PER clock (HSI 64 MHz).
         config.rcc.mux.spi123sel = mux::Saisel::PER;
@@ -342,7 +381,11 @@ pub fn init() -> Board {
     // Beeper (PD7), inverted => OFF should be High.
     let beeper_pin = Output::new(
         p.PD7,
-        if BEEPER_INVERTED { Level::High } else { Level::Low },
+        if BEEPER_INVERTED {
+            Level::High
+        } else {
+            Level::Low
+        },
         Speed::Low,
     );
     let beeper = Beeper::new(beeper_pin, BEEPER_INVERTED);

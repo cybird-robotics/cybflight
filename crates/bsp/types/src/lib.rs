@@ -1,8 +1,7 @@
 #![no_std]
 
 /// Sensor orientation tags from Betaflight — full set of alignment variants.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[derive(defmt::Format)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, defmt::Format)]
 pub enum SensorAlign {
     Default,
     Cw0Deg,
@@ -16,8 +15,7 @@ pub enum SensorAlign {
 }
 
 /// Default serial role mapping (Betaflight target header).
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[derive(defmt::Format)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, defmt::Format)]
 pub enum SerialRole {
     Msp,
     DisplayPort,
@@ -27,8 +25,7 @@ pub enum SerialRole {
 }
 
 /// A concrete serial port ID — full STM32H7 superset.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[derive(defmt::Format)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, defmt::Format)]
 pub enum SerialPortId {
     Usart1,
     Usart2,
@@ -42,8 +39,7 @@ pub enum SerialPortId {
 }
 
 /// Timer ID — full STM32H7 timer set.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[derive(defmt::Format)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, defmt::Format)]
 pub enum TimerId {
     Tim1,
     Tim2,
@@ -60,8 +56,7 @@ pub enum TimerId {
 }
 
 /// Timer channel identifier.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[derive(defmt::Format)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, defmt::Format)]
 pub enum TimerChannel {
     Ch1,
     Ch2,
@@ -70,8 +65,7 @@ pub enum TimerChannel {
 }
 
 /// DMA stream/request hint derived from Betaflight timer tables.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[derive(defmt::Format)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, defmt::Format)]
 pub struct DmaHint {
     /// Betaflight "DMA stream" number (0..7). Embassy typically exposes these as DMAx_CH0..CH7.
     pub stream: u8,
@@ -80,8 +74,7 @@ pub struct DmaHint {
 }
 
 /// Motor timer grouping metadata derived from `timer` output.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[derive(defmt::Format)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, defmt::Format)]
 pub struct MotorMeta {
     pub timer: TimerId,
     pub channel: TimerChannel,

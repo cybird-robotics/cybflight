@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
 
-use bsp_sakurah743 as bsp;
 use bsp::hal;
-use cybflight::{apply_alignment, ImuMessage, ImuSample, IMU_CHANNEL};
+use bsp_sakurah743 as bsp;
 use cybflight::status;
+use cybflight::{IMU_CHANNEL, ImuMessage, ImuSample, apply_alignment};
 use cybflight_drivers::imu::icm426xx::Icm426xx;
 use cybflight_drivers::led::Led;
 use defmt_rtt as _;
@@ -66,7 +66,9 @@ async fn main(spawner: Spawner) {
     match Icm426xx::new(dev4, p.sensors.gyro1_drdy, &mut delay).await {
         Ok(imu1) => {
             defmt::info!("IMU1 init OK");
-            spawner.spawn(imu_task(1, imu1, p.sensors.gyro1_align)).unwrap();
+            spawner
+                .spawn(imu_task(1, imu1, p.sensors.gyro1_align))
+                .unwrap();
         }
         Err(e) => defmt::error!("IMU1 init failed: {}", e),
     }
@@ -88,7 +90,9 @@ async fn main(spawner: Spawner) {
     match Icm426xx::new(dev1, p.sensors.gyro2_drdy, &mut delay).await {
         Ok(imu2) => {
             defmt::info!("IMU2 init OK");
-            spawner.spawn(imu_task(2, imu2, p.sensors.gyro2_align)).unwrap();
+            spawner
+                .spawn(imu_task(2, imu2, p.sensors.gyro2_align))
+                .unwrap();
         }
         Err(e) => defmt::error!("IMU2 init failed: {}", e),
     }

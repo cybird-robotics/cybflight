@@ -1,5 +1,5 @@
 use cybflight_drivers::led::Led;
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
 use embassy_time::Timer;
 use embedded_hal::digital::{OutputPin, StatefulOutputPin};
@@ -33,24 +33,20 @@ pub async fn run<P: OutputPin + StatefulOutputPin>(
         let phases = pattern(status);
         for &(on_ms, off_ms) in phases {
             led0.on();
-            if on_ms > 0 {
-                match select(Timer::after_millis(on_ms), receiver.changed()).await {
-                    Either::Second(new) => {
-                        status = new;
-                        continue 'outer;
-                    }
-                    _ => {}
-                }
+            if on_ms > 0
+                && let Either::Second(new) =
+                    select(Timer::after_millis(on_ms), receiver.changed()).await
+            {
+                status = new;
+                continue 'outer;
             }
             led0.off();
-            if off_ms > 0 {
-                match select(Timer::after_millis(off_ms), receiver.changed()).await {
-                    Either::Second(new) => {
-                        status = new;
-                        continue 'outer;
-                    }
-                    _ => {}
-                }
+            if off_ms > 0
+                && let Either::Second(new) =
+                    select(Timer::after_millis(off_ms), receiver.changed()).await
+            {
+                status = new;
+                continue 'outer;
             }
         }
     }

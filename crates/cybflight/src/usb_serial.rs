@@ -1,13 +1,13 @@
 use core::fmt::Write;
 
-use bsp_sakurah743 as bsp;
 use bsp::hal;
+use bsp_sakurah743 as bsp;
 use embassy_futures::join::join;
-use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::Builder;
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use hal::usb::Driver;
 
-use crate::{ImuMessage, IMU_CHANNEL};
+use crate::{IMU_CHANNEL, ImuMessage};
 
 /// Run the USB CDC serial task.
 pub async fn run(

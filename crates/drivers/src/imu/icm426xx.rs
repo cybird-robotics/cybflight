@@ -71,20 +71,26 @@ const TEMP_SCALE: f32 = 1.0 / 132.48;
 const TEMP_OFFSET: f32 = 25.0;
 
 // ---------------------------------------------------------------------------
-// Anti-alias filter (AAF) LUT
+// Anti-alias filter (AAF) configuration
 //
 // The AAF is a hardware low-pass filter that runs before the ADC. It prevents
 // high-frequency vibration (e.g. from motors) from aliasing into the digital
 // samples — once aliased, no software filter can remove it.
 //
-// The delt/deltSqr/bitshift values come from a lookup table in the datasheet;
-// each row corresponds to a cutoff frequency. Current cutoffs (from Betaflight):
-//   Gyro  ~1 kHz  — passes all flight-relevant dynamics
-//   Accel ~250 Hz — aggressive, since accel is used for attitude/gravity only
+// Register values come from the LUT in datasheet DS-000347 section 5.3.
+// Both chip families target the same real-world cutoffs:
 //
-// These cutoffs are also appropriate for VIO/state estimation (less demanding
-// on bandwidth than PID). Software filters (notch, PT1, etc.) are applied
-// downstream on the already-clean digital signal.
+//   Gyro  ~1 kHz  — passes all flight-relevant dynamics
+//   Accel ~250 Hz — accel is used for attitude/gravity correction only
+//
+// The ICM-42688P / ICM-42622P family runs the AAF on a 32 MHz internal clock.
+// The ICM-42605 / IIM-42652 / IIM-42653 family runs it on an 8 MHz clock.
+// Cutoff scales linearly with clock rate, so the 8 MHz family needs 4× larger
+// delt values to reach the same real-world frequencies:
+//
+//   42688P (32 MHz): delt=21 → 997 Hz gyro  | delt=6  → 258 Hz accel
+//   42605  (8 MHz):  delt=63 → 995 Hz gyro  | delt=21 → 249 Hz accel
+//          (table entry at 32 MHz)  (3979 Hz) |          (997 Hz)
 // ---------------------------------------------------------------------------
 
 struct AafConfig {
@@ -93,26 +99,28 @@ struct AafConfig {
     bitshift: u8,
 }
 
-// ICM42688P / ICM42622P family (datasheet section 5.3)
+// ICM-42688P / ICM-42622P — 32 MHz AAF clock (DS-000347 section 5.3)
 const AAF_GYRO_42688: AafConfig = AafConfig {
-    delt: 21,
+    delt: 21,       // table row: 997 Hz
     deltsqr: 440,
     bitshift: 6,
 };
 const AAF_ACCEL_42688: AafConfig = AafConfig {
-    delt: 6,
+    delt: 6,        // table row: 258 Hz
     deltsqr: 36,
     bitshift: 10,
 };
 
-// ICM42605 / IIM42652 / IIM42653 family (datasheet section 5.3)
+// ICM-42605 / IIM-42652 / IIM-42653 — 8 MHz AAF clock (4× slower than 42688P)
+// delt=63 at 8 MHz → 3979 × (8/32) ≈ 995 Hz gyro
+// delt=21 at 8 MHz →  997 × (8/32) ≈ 249 Hz accel
 const AAF_GYRO_42605: AafConfig = AafConfig {
-    delt: 63,
+    delt: 63,       // max table entry; effective cutoff ~995 Hz at 8 MHz clock
     deltsqr: 3968,
     bitshift: 3,
 };
 const AAF_ACCEL_42605: AafConfig = AafConfig {
-    delt: 21,
+    delt: 21,       // table row: 997 Hz at 32 MHz → ~249 Hz at 8 MHz clock
     deltsqr: 440,
     bitshift: 6,
 };

@@ -18,7 +18,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ## Build
 
 ```bash
-cargo run --release
+cargo run --release --no-default-features --features board_foxeerh743
 ```
 
 This compiles the firmware and runs `tools/build.sh` to produce a raw binary at

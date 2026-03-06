@@ -2,6 +2,12 @@
 
 Embedded flight controller firmware for Cybird autopilot.
 
+## Tooling
+
+The latest `rust-analyzer` will fail to analyzer nalgebra code.
+
+You must install versions earlier than 1.94.0. In vscode, go to the `rust-analyzer` extension page and select install specific version; `0.3.2449` was tested to work.
+
 ## Getting Started
 
 ### Install Rust

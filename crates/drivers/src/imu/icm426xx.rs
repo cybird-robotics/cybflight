@@ -5,7 +5,10 @@
 
 use embedded_hal_async::spi::SpiDevice;
 use embedded_hal_async::{delay::DelayNs, digital::Wait};
+
 use nalgebra::Vector3;
+
+use super::ImuReading;
 
 // ---------------------------------------------------------------------------
 // Register addresses
@@ -137,17 +140,6 @@ pub enum Variant {
     Icm42688P,
     Iim42652,
     Iim42653,
-}
-
-/// A single IMU reading in physical units, chip-native axis order.
-#[derive(Clone, Debug)]
-pub struct ImuReading {
-    /// Acceleration in m/s^2.
-    pub accel: Vector3<f32>,
-    /// Angular rate in rad/s.
-    pub gyro: Vector3<f32>,
-    /// Die temperature in degrees Celsius.
-    pub temp_c: f32,
 }
 
 /// Driver error type, wrapping the SPI bus error.

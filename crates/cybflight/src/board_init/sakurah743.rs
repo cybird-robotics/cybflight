@@ -8,7 +8,7 @@ use static_cell::StaticCell;
 
 use crate::bsp;
 use crate::hal;
-use crate::sensors::imu::{SpiBusMtx, imu_reader_task};
+use crate::sensors::imu::{SpiBusMtx, icm_reader_task};
 use crate::status;
 use crate::usb_serial;
 use hal::spi::{self, Spi};
@@ -58,7 +58,7 @@ pub async fn init(spawner: &Spawner, board: bsp::Board) {
         Ok(imu1) => {
             defmt::info!("IMU1 init OK");
             spawner
-                .spawn(imu_reader_task(imu1, board.sensors.gyro1_align))
+                .spawn(icm_reader_task(imu1, board.sensors.gyro1_align))
                 .unwrap();
         }
         Err(e) => defmt::error!("IMU1 init failed: {}", e),

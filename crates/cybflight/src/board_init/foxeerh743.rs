@@ -1,4 +1,6 @@
 use cybflight_drivers::imu::icm426xx::Icm426xx;
+use cybflight_drivers::imu::mpu6x00::Mpu6x00;
+use cybflight_drivers::imu::{DetectedImu, probe_imu_raw};
 use cybflight_drivers::led::Led;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::Spawner;
@@ -8,7 +10,7 @@ use static_cell::StaticCell;
 
 use crate::bsp;
 use crate::hal;
-use crate::sensors::imu::{SpiBusMtx, imu_reader_task};
+use crate::sensors::imu::{SpiBusMtx, icm_reader_task, mpu_reader_task};
 use crate::status;
 use crate::usb_serial;
 use hal::spi::{self, Spi};
@@ -35,9 +37,9 @@ pub async fn init(spawner: &Spawner, board: bsp::Board) {
     spi_config.frequency = Hertz(1_000_000);
     spi_config.mode = spi::MODE_3;
 
-    // --- IMU1: ICM42688P on SPI2 (PB13/14/15, CS=PB12, DRDY=PD0) ---
-    static SPI2_BUS: StaticCell<SpiBusMtx> = StaticCell::new();
-    let spi2 = Spi::new(
+    // --- IMU1 on SPI2 (PB13/14/15, CS=PB12, DRDY=PD0) ---
+    // Probe WHO_AM_I on raw bus before wrapping in Mutex/SpiDevice.
+    let mut spi2 = Spi::new(
         board.spi.spi2,
         board.spi.spi2_sck,
         board.spi.spi2_mosi,
@@ -46,17 +48,45 @@ pub async fn init(spawner: &Spawner, board: bsp::Board) {
         board.spi.spi2_rx_dma,
         spi_config,
     );
+    let mut cs = board.sensors.gyro1_cs;
+    let detected = probe_imu_raw(&mut spi2, &mut cs).await;
+    defmt::info!("IMU probe: {:?}", detected);
+
+    // Wrap bus in shared mutex now that probe is done.
+    static SPI2_BUS: StaticCell<SpiBusMtx> = StaticCell::new();
     let spi2_bus = SPI2_BUS.init(Mutex::new(spi2));
-    let dev2 = SpiDevice::new(spi2_bus, board.sensors.gyro1_cs);
+    let dev2 = SpiDevice::new(spi2_bus, cs);
 
     let mut delay = embassy_time::Delay;
-    match Icm426xx::new(dev2, board.sensors.gyro1_drdy, &mut delay).await {
-        Ok(imu1) => {
-            defmt::info!("IMU1 init OK");
-            spawner
-                .spawn(imu_reader_task(imu1, board.sensors.gyro1_align))
-                .unwrap();
+    match detected {
+        Ok(DetectedImu::Icm42605)
+        | Ok(DetectedImu::Icm42622P)
+        | Ok(DetectedImu::Icm42688P)
+        | Ok(DetectedImu::Iim42652)
+        | Ok(DetectedImu::Iim42653) => {
+            match Icm426xx::new(dev2, board.sensors.gyro1_drdy, &mut delay).await {
+                Ok(imu1) => {
+                    defmt::info!("IMU1 init OK (ICM)");
+                    spawner
+                        .spawn(icm_reader_task(imu1, board.sensors.gyro1_align))
+                        .unwrap();
+                }
+                Err(e) => defmt::error!("IMU1 ICM init failed: {}", e),
+            }
         }
-        Err(e) => defmt::error!("IMU1 init failed: {}", e),
+        Ok(DetectedImu::Mpu6000) | Ok(DetectedImu::Mpu6500) => {
+            match Mpu6x00::new(dev2, board.sensors.gyro1_drdy, &mut delay).await {
+                Ok(imu1) => {
+                    defmt::info!("IMU1 init OK (MPU)");
+                    spawner
+                        .spawn(mpu_reader_task(imu1, board.sensors.gyro1_align))
+                        .unwrap();
+                }
+                Err(e) => defmt::error!("IMU1 MPU init failed: {}", e),
+            }
+        }
+        Err(id) => {
+            defmt::error!("Unknown IMU: WHO_AM_I={:#x}", id);
+        }
     }
 }

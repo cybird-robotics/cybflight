@@ -28,7 +28,8 @@ this project MUST follow these patterns. Update this document when the design ch
        |           |                  |
 +------+--+ +------+------+ +--------+--------+
 |   BSP   | |   Drivers   | |  Sensor Tasks   |
-| (pins)  | | (Icm426xx,  | | (imu_reader,    |
+| (pins)  | | (Icm426xx,  | | (icm_reader,    |
+|         | |  Mpu6x00,   | |  mpu_reader,    |
 |         | |  Dps310,..) | |  imu_fusion,..) |
 +---------+ +-------------+ +-----------------+
 ```
@@ -62,7 +63,7 @@ crates/
       board_init/
         mod.rs            # cfg-dispatch: pub use {board}::init
         sakurah743.rs     # SPI4->IMU1, SPI1->IMU2, spawn fusion, no baro
-        foxeerh743.rs     # SPI2->IMU1, I2C1->baro, no fusion
+        foxeerh743.rs     # SPI2->IMU1 (probe: ICM or MPU), I2C1->baro, no fusion
       sensors/
         mod.rs            # Channel defs: FUSED_IMU, BARO, MAG
         imu.rs            # imu_reader_task, imu_fusion_task (reusable)
@@ -309,6 +310,58 @@ These rules ensure the final binary contains ONLY the code for the target board:
 4. **Add const flag** to `bsp-types` or BSP — e.g. `pub const HAS_GPS: bool`
 5. **Wire in board_init/** — only for boards that have the sensor
 6. **Consume in control/** — guarded by `if bsp::HAS_GPS { ... }`
+
+## Runtime Sensor Detection
+
+Some boards ship with different sensor variants across production runs. For example,
+FOXEERH743 may have an ICM42688P, MPU6000, or MPU6500 on the same SPI bus and pins.
+
+### Probe-before-construct pattern
+
+When a board has multiple possible sensors, `board_init` probes the WHO_AM_I register
+on the **raw SPI bus** before wrapping it in a `Mutex`/`SpiDevice`:
+
+```rust
+let mut spi = Spi::new(...);
+let mut cs = board.sensors.gyro1_cs;
+let detected = imu::probe_imu_raw(&mut spi, &mut cs).await;
+
+// Now wrap the bus and construct the correct driver
+let spi_bus = SPI_BUS.init(Mutex::new(spi));
+let dev = SpiDevice::new(spi_bus, cs);
+
+match detected {
+    Ok(DetectedImu::Icm42688P) => { /* Icm426xx::new(dev, ...) */ }
+    Ok(DetectedImu::Mpu6000)   => { /* Mpu6x00::new(dev, ...) */ }
+    // ...
+}
+```
+
+Probing on the raw bus avoids ownership issues — drivers consume the `SpiDevice`
+and DRDY pin in `new()`, so probing must happen before driver construction.
+
+### Separate tasks per driver type
+
+Embassy tasks cannot be generic (they need concrete types for static allocation).
+Each driver gets its own reader task: `icm_reader_task` for `Icm426xx` and
+`mpu_reader_task` for `Mpu6x00`. Both tasks have identical read-loop bodies but
+operate on different concrete types. This follows the architecture rule: no trait
+objects or dyn dispatch for sensors.
+
+### Which boards need probing
+
+| Board | Probing | Reason |
+|---|---|---|
+| SAKURAH743 | No | Fixed sensors: ICM42688P + IIM42652 |
+| FOXEERH743 | Yes | Production variants: ICM42688P, MPU6000, or MPU6500 |
+
+### Extending with new sensors
+
+1. Add the new WHO_AM_I value to `DetectedImu` enum in `crates/drivers/src/imu/mod.rs`
+2. Add the WHO_AM_I match arm to `probe_imu_raw()`
+3. Create a new driver in `crates/drivers/src/imu/`
+4. Add a new concrete task in `crates/cybflight/src/sensors/imu.rs`
+5. Add the dispatch arm in the relevant `board_init/` module
 
 ## Design Decisions & Rationale
 

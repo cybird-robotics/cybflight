@@ -5,6 +5,7 @@ just = { version = "1" }
 resolver = "3"
 members = [
   "crates/cybflight",
+  "crates/cybflight_core",
   "crates/bsp/sakurah743",
   "crates/bsp/types",
   "crates/drivers",

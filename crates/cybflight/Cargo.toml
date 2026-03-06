@@ -14,6 +14,7 @@ board_sakurah743 = ["dep:bsp-sakurah743"]
 bsp-sakurah743 = { path = "../bsp/sakurah743", optional = true }
 bsp-types = { path = "../bsp/types" }
 cybflight-drivers = { path = "../drivers" }
+cybflight-core = { path = "../cybflight_core/" }
 
 # Embassy runtime pieces (board-agnostic)
 embassy-executor = { version = "0.9.1", features = ["arch-cortex-m", "executor-thread", "defmt"] }

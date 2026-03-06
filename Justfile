@@ -1,7 +1,12 @@
 BIN := "target/thumbv7em-none-eabihf/release/cybflight.bin"
 
+HOST := `rustc -vV | sed -n 's/^host: //p'`
+
 build:
     cargo build --release
+
+test:
+    cargo test -p cybflight-core --target {{HOST}}
 
 flash: build
     #!/usr/bin/env bash

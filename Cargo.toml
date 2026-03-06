@@ -7,6 +7,7 @@ members = [
   "crates/cybflight",
   "crates/cybflight_core",
   "crates/bsp/sakurah743",
+  "crates/bsp/foxeerh743",
   "crates/bsp/types",
   "crates/drivers",
 ]

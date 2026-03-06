@@ -1,0 +1,18 @@
+[package]
+name = "bsp-foxeerh743"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+embassy-stm32 = { version = "0.5.0", features = [
+  "stm32h743vi",
+  "defmt",
+  "memory-x",
+  "time-driver-any",
+  "exti",
+] }
+
+defmt = "1.0.1"
+bsp-types = { path = "../types" }
+cybflight-drivers = { path = "../../drivers" }

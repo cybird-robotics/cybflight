@@ -1,22 +1,20 @@
 #![no_std]
 
+#[cfg(feature = "board_sakurah743")]
+pub use bsp_sakurah743 as bsp;
+#[cfg(feature = "board_foxeerh743")]
+pub use bsp_foxeerh743 as bsp;
+
+pub use bsp::hal;
+
+pub mod board_init;
+pub mod sensors;
 pub mod status;
 pub mod usb_serial;
 
 use bsp_types::SensorAlign;
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_time::Instant;
 use nalgebra::Vector3;
-
-/// A message carrying an IMU sample tagged with its source index.
-pub struct ImuMessage {
-    pub source: u8,
-    pub sample: ImuSample,
-}
-
-/// Static channel for IMU tasks to publish samples for USB streaming.
-/// Capacity 8: USB CDC is slower than IMU; oldest samples are dropped via `try_send`.
-pub static IMU_CHANNEL: Channel<CriticalSectionRawMutex, ImuMessage, 8> = Channel::new();
 
 /// A timestamped, board-aligned IMU sample ready for downstream processing.
 pub struct ImuSample {

@@ -1,13 +1,22 @@
 use core::fmt::Write;
 
-use bsp::hal;
-use bsp_sakurah743 as bsp;
+use crate::bsp;
+use crate::hal;
+use crate::sensors::FUSED_IMU;
+use crate::ImuSample;
 use embassy_futures::join::join;
 use embassy_usb::Builder;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use hal::usb::Driver;
 
-use crate::{IMU_CHANNEL, ImuMessage};
+#[embassy_executor::task]
+pub async fn task(
+    usb_otg: hal::Peri<'static, hal::peripherals::USB_OTG_FS>,
+    dp: hal::Peri<'static, hal::peripherals::PA12>,
+    dm: hal::Peri<'static, hal::peripherals::PA11>,
+) {
+    run(usb_otg, dp, dm).await
+}
 
 /// Run the USB CDC serial task.
 pub async fn run(
@@ -54,9 +63,9 @@ pub async fn run(
             class.wait_connection().await;
             defmt::info!("USB CDC connected");
             loop {
-                let msg = IMU_CHANNEL.receive().await;
+                let sample = FUSED_IMU.receive().await;
                 let mut buf = [0u8; 128];
-                let n = format_imu(&msg, &mut buf);
+                let n = format_imu(&sample, &mut buf);
                 if class.write_packet(&buf[..n]).await.is_err() {
                     break;
                 }
@@ -67,17 +76,16 @@ pub async fn run(
     .await;
 }
 
-/// Format an IMU message as CSV text into a fixed buffer.
-fn format_imu(msg: &ImuMessage, buf: &mut [u8; 128]) -> usize {
+/// Format an IMU sample as CSV text into a fixed buffer.
+fn format_imu(s: &ImuSample, buf: &mut [u8; 128]) -> usize {
     let mut w = WriteBuf {
         buf: buf.as_mut_slice(),
         pos: 0,
     };
-    let s = &msg.sample;
     let _ = write!(
         w,
-        "imu,{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1}\r\n",
-        msg.source, s.accel.x, s.accel.y, s.accel.z, s.gyro.x, s.gyro.y, s.gyro.z, s.temp_c,
+        "imu,{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1}\r\n",
+        s.accel.x, s.accel.y, s.accel.z, s.gyro.x, s.gyro.y, s.gyro.z, s.temp_c,
     );
     w.pos
 }

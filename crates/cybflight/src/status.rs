@@ -4,6 +4,8 @@ use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
 use embassy_time::Timer;
 use embedded_hal::digital::{OutputPin, StatefulOutputPin};
 
+use crate::hal;
+
 #[derive(Clone, Copy, PartialEq, Eq, defmt::Format)]
 pub enum SystemStatus {
     Alive,
@@ -18,35 +20,39 @@ fn pattern(status: SystemStatus) -> &'static [(u64, u64)] {
     }
 }
 
-pub async fn run<P: OutputPin + StatefulOutputPin>(
-    mut led0: Led<P>,
-    mut led1: Led<P>,
-    mut led2: Led<P>,
-) {
-    led1.off();
-    led2.off();
+type StatusLed = Led<hal::gpio::Output<'static>>;
 
+#[embassy_executor::task]
+pub async fn task(led: StatusLed) {
+    run(led).await
+}
+
+pub async fn run<P: OutputPin + StatefulOutputPin>(mut led: Led<P>) {
     let mut receiver = STATUS.receiver().unwrap();
     let mut status = receiver.changed().await;
 
     'outer: loop {
         let phases = pattern(status);
         for &(on_ms, off_ms) in phases {
-            led0.on();
-            if on_ms > 0
-                && let Either::Second(new) =
-                    select(Timer::after_millis(on_ms), receiver.changed()).await
-            {
-                status = new;
-                continue 'outer;
+            led.on();
+            if on_ms > 0 {
+                match select(Timer::after_millis(on_ms), receiver.changed()).await {
+                    Either::Second(new) => {
+                        status = new;
+                        continue 'outer;
+                    }
+                    _ => {}
+                }
             }
-            led0.off();
-            if off_ms > 0
-                && let Either::Second(new) =
-                    select(Timer::after_millis(off_ms), receiver.changed()).await
-            {
-                status = new;
-                continue 'outer;
+            led.off();
+            if off_ms > 0 {
+                match select(Timer::after_millis(off_ms), receiver.changed()).await {
+                    Either::Second(new) => {
+                        status = new;
+                        continue 'outer;
+                    }
+                    _ => {}
+                }
             }
         }
     }

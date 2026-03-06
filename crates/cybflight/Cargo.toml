@@ -9,9 +9,11 @@ publish = false
 default = ["board_sakurah743"]
 
 board_sakurah743 = ["dep:bsp-sakurah743"]
+board_foxeerh743 = ["dep:bsp-foxeerh743"]
 
 [dependencies]
 bsp-sakurah743 = { path = "../bsp/sakurah743", optional = true }
+bsp-foxeerh743 = { path = "../bsp/foxeerh743", optional = true }
 bsp-types = { path = "../bsp/types" }
 cybflight-drivers = { path = "../drivers" }
 cybflight-core = { path = "../cybflight_core/" }

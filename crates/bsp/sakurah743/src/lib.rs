@@ -19,6 +19,14 @@ pub const MANUFACTURER_ID: &str = "SSAK";
 /// Betaflight target: beeper is inverted (active-low).
 pub const BEEPER_INVERTED: bool = true;
 
+pub const IMU_COUNT: usize = 2;
+pub const HAS_BARO: bool = true;
+pub const HAS_MAG: bool = true;
+pub const HAS_OSD: bool = false;
+pub const HAS_FLASH: bool = false;
+pub const HAS_SDCARD: bool = true;
+pub const LED_COUNT: usize = 3;
+
 pub const DEFAULT_SERIAL_ROLE_MAP: &[(SerialRole, SerialPortId)] = &[
     (SerialRole::Msp, SerialPortId::Usart1),
     (SerialRole::DisplayPort, SerialPortId::Usart6),

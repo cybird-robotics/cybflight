@@ -7,4 +7,5 @@ components = [
   "llvm-tools-preview",
   "rustfmt",
   "clippy",
+  "rust-analyzer",
 ]

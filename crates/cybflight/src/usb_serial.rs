@@ -5,6 +5,8 @@ use crate::hal;
 use crate::msgs;
 use crate::platform;
 use crate::sensors::{RAW_IMU, VEHICLE_ATTITUDE};
+use crate::shell::format::ShellMsg;
+use crate::shell::WriteBuf;
 use embassy_futures::join::join;
 use embassy_futures::select::{select3, Either3};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -121,8 +123,17 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
     let mut rx_buf = [0u8; 64];
 
     let mut banner_buf = [0u8; 128];
-    let n = format_banner(&mut banner_buf);
-    if write_all(class, &banner_buf[..n]).await.is_err() {
+    let mut w = WriteBuf::new(&mut banner_buf);
+    let _ = write!(
+        w,
+        "cybflight v{} ({}) {} [{}]\r\ntype 'help' for commands\r\n\r\n> ",
+        crate::BUILD_VERSION,
+        crate::GIT_HASH,
+        crate::BUILD_TIMESTAMP,
+        crate::bsp::BOARD_NAME,
+    );
+
+    if write_all(class, w.as_slice()).await.is_err() {
         return;
     }
 
@@ -190,8 +201,9 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
             Either3::Second(WaitResult::Message(imu)) => {
                 if stream_imu {
                     let mut buf = [0u8; 128];
-                    let n = format_imu(&imu, &mut buf);
-                    if write_all(class, &buf[..n]).await.is_err() {
+                    let mut w = WriteBuf::new(buf.as_mut_slice());
+                    let _ = write!(w, "{}\r\n", ShellMsg(&imu));
+                    if write_all(class, w.as_slice()).await.is_err() {
                         return;
                     }
                 }
@@ -203,8 +215,9 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
             Either3::Third(WaitResult::Message(att)) => {
                 if stream_att {
                     let mut buf = [0u8; 64];
-                    let n = format_att(&att, &mut buf);
-                    if write_all(class, &buf[..n]).await.is_err() {
+                    let mut w = WriteBuf::new(buf.as_mut_slice());
+                    let _ = write!(w, "{}\r\n", ShellMsg(&att));
+                    if write_all(class, w.as_slice()).await.is_err() {
                         return;
                     }
                 }
@@ -235,15 +248,17 @@ async fn dispatch<'d>(
         }
         "imu" => {
             let msg = next_message(imu_sub).await;
-            let mut buf = [0u8; 128];
-            let n = format_imu(&msg, &mut buf);
-            write_all(class, &buf[..n]).await?;
+            let mut buf = [0u8; 256];
+            let mut w = WriteBuf::new(buf.as_mut_slice());
+            write!(w, "{}\r\n", ShellMsg(&msg)).ok();
+            write_all(class, w.as_slice()).await?;
         }
         "att" => {
             let msg = next_message(att_sub).await;
-            let mut buf = [0u8; 64];
-            let n = format_att(&msg, &mut buf);
-            write_all(class, &buf[..n]).await?;
+            let mut buf = [0u8; 256];
+            let mut w = WriteBuf::new(buf.as_mut_slice());
+            write!(w, "{}\r\n", ShellMsg(&msg)).ok();
+            write_all(class, w.as_slice()).await?;
         }
         "stream imu on" => {
             *stream_imu = true;
@@ -293,70 +308,6 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Formatting
-// ---------------------------------------------------------------------------
-
-/// Format the connection banner with firmware version, git hash, build timestamp, and board name.
-fn format_banner(buf: &mut [u8; 128]) -> usize {
-    let mut w = WriteBuf {
-        buf: buf.as_mut_slice(),
-        pos: 0,
-    };
-    let _ = write!(
-        w,
-        "cybflight v{} ({}) {} [{}]\r\ntype 'help' for commands\r\n\r\n> ",
-        crate::BUILD_VERSION,
-        crate::GIT_HASH,
-        crate::BUILD_TIMESTAMP,
-        crate::bsp::BOARD_NAME,
-    );
-    w.pos
-}
-
-/// Format an IMU sample as `imu:{ts_ms},{ax},{ay},{az},{gx},{gy},{gz},{temp}\r\n`.
-fn format_imu(s: &msgs::Imu, buf: &mut [u8; 128]) -> usize {
-    let mut w = WriteBuf {
-        buf: buf.as_mut_slice(),
-        pos: 0,
-    };
-    let _ = write!(
-        w,
-        "imu:{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1}\r\n",
-        s.timestamp.as_millis(),
-        s.accel_m_s2.x,
-        s.accel_m_s2.y,
-        s.accel_m_s2.z,
-        s.gyro_rad_s.x,
-        s.gyro_rad_s.y,
-        s.gyro_rad_s.z,
-        s.temp_c,
-    );
-    w.pos
-}
-
-/// Format an attitude sample as `att:{ts_ms},{roll_deg},{pitch_deg},{yaw_deg}\r\n`.
-///
-/// Euler angles are intrinsic XYZ (roll around body X, pitch around body Y,
-/// yaw around body Z) in degrees. Convention matches nalgebra `euler_angles()`.
-fn format_att(s: &msgs::VehicleAttitude, buf: &mut [u8; 64]) -> usize {
-    const RAD_TO_DEG: f32 = 180.0 / core::f32::consts::PI;
-    let (roll, pitch, yaw) = s.orientation.euler_angles();
-    let mut w = WriteBuf {
-        buf: buf.as_mut_slice(),
-        pos: 0,
-    };
-    let _ = write!(
-        w,
-        "att:{},{:.1},{:.1},{:.1}\r\n",
-        s.timestamp.as_millis(),
-        roll * RAD_TO_DEG,
-        pitch * RAD_TO_DEG,
-        yaw * RAD_TO_DEG,
-    );
-    w.pos
-}
-
-// ---------------------------------------------------------------------------
 // USB write helper
 // ---------------------------------------------------------------------------
 
@@ -375,26 +326,4 @@ async fn write_all<'d>(
         class.write_packet(&[]).await?;
     }
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// WriteBuf — core::fmt::Write adapter for fixed byte slices
-// ---------------------------------------------------------------------------
-
-struct WriteBuf<'a> {
-    buf: &'a mut [u8],
-    pos: usize,
-}
-
-impl Write for WriteBuf<'_> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let remaining = &mut self.buf[self.pos..];
-        if bytes.len() > remaining.len() {
-            return Err(core::fmt::Error);
-        }
-        remaining[..bytes.len()].copy_from_slice(bytes);
-        self.pos += bytes.len();
-        Ok(())
-    }
 }

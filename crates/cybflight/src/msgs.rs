@@ -27,11 +27,15 @@ pub struct Pose {
     pub orientation: UnitQuaternion<f32>,
 }
 
+impl Message for Pose {}
+
 #[derive(Clone, defmt::Format)]
 pub struct Twist {
     pub linear: Vector3<f32>,
     pub angular: Vector3<f32>,
 }
+
+impl Message for Twist {}
 
 #[derive(Clone, defmt::Format)]
 pub struct VehicleOdometry {

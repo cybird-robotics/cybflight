@@ -11,6 +11,7 @@ pub mod board_init;
 pub mod msgs;
 pub mod platform;
 pub mod sensors;
+pub mod shell;
 pub mod status;
 pub mod usb_serial;
 

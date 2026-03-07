@@ -358,17 +358,32 @@ bind_interrupts!(pub struct UsbIrqs {
 
 /// Board clock/power configuration.
 ///
-/// Step 1 debug: defaults + HSI48 only. PLL1 (400 MHz) commented out until basic boot works.
+/// PLL1: HSI (64 MHz) / M=4 * N=50 / P=2 = 400 MHz SYSCLK.
+/// VCO = 800 MHz, which is within the wide VCO range (192–960 MHz) for H743.
+/// AHB at 200 MHz (SYSCLK/2), APBx at 100 MHz (AHB/2).
+/// USB uses HSI48 (independent of PLL1).
 fn board_config() -> Config {
     let mut config = Config::default();
     {
         use hal::rcc::*;
-        config.rcc.hsi48 = Some(Hsi48Config {
-            sync_from_usb: true,
-        }); // 48 MHz for USB
-        config.rcc.mux.usbsel = mux::Usbsel::HSI48;
-        // SPI1/2/3 kernel clock defaults to PLL1_Q, which is off. Use PER clock (HSI 64 MHz).
-        config.rcc.mux.spi123sel = mux::Saisel::PER;
+        config.rcc.pll1 = Some(Pll {
+            source: PllSource::HSI,
+            prediv: PllPreDiv::DIV4,   // 64 / 4 = 16 MHz ref
+            mul:    PllMul::MUL50,     // 16 * 50 = 800 MHz VCO
+            fracn:  None,
+            divp:   Some(PllDiv::DIV2), // 400 MHz SYSCLK
+            divq:   Some(PllDiv::DIV4), // 200 MHz spare
+            divr:   None,
+        });
+        config.rcc.sys      = Sysclk::PLL1_P;
+        config.rcc.ahb_pre  = AHBPrescaler::DIV2;  // 200 MHz AHB
+        config.rcc.apb1_pre = APBPrescaler::DIV2;  // 100 MHz
+        config.rcc.apb2_pre = APBPrescaler::DIV2;
+        config.rcc.apb3_pre = APBPrescaler::DIV2;
+        config.rcc.apb4_pre = APBPrescaler::DIV2;
+        config.rcc.hsi48 = Some(Hsi48Config { sync_from_usb: true }); // USB clock
+        config.rcc.mux.usbsel    = mux::Usbsel::HSI48;
+        config.rcc.mux.spi123sel = mux::Saisel::PER; // PER = HSI 64 MHz
     }
     config
 }

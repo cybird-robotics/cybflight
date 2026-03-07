@@ -10,7 +10,7 @@ use static_cell::StaticCell;
 
 use crate::bsp;
 use crate::hal;
-use crate::sensors::imu::{SpiBusMtx, icm_reader_task, mpu_reader_task};
+use crate::sensors::imu::{ImuReader, SpiBusMtx, icm_reader_task, mpu_reader_task};
 use crate::status;
 use crate::usb_serial;
 use hal::spi::{self, Spi};
@@ -58,6 +58,9 @@ pub async fn init(spawner: &Spawner, board: bsp::Board) {
     let dev2 = SpiDevice::new(spi2_bus, cs);
 
     let mut delay = embassy_time::Delay;
+    const ACCEL_CUTOFF_HZ: f32 = 20.0;
+    const GYRO_CUTOFF_HZ: f32 = 150.0;
+
     match detected {
         Ok(DetectedImu::Icm42605)
         | Ok(DetectedImu::Icm42622P)
@@ -68,7 +71,12 @@ pub async fn init(spawner: &Spawner, board: bsp::Board) {
                 Ok(imu1) => {
                     defmt::info!("IMU1 init OK (ICM)");
                     spawner
-                        .spawn(icm_reader_task(imu1, board.sensors.gyro1_align))
+                        .spawn(icm_reader_task(ImuReader::new(
+                            imu1,
+                            board.sensors.gyro1_align,
+                            ACCEL_CUTOFF_HZ,
+                            GYRO_CUTOFF_HZ,
+                        )))
                         .unwrap();
                 }
                 Err(e) => defmt::error!("IMU1 ICM init failed: {}", e),
@@ -79,7 +87,12 @@ pub async fn init(spawner: &Spawner, board: bsp::Board) {
                 Ok(imu1) => {
                     defmt::info!("IMU1 init OK (MPU)");
                     spawner
-                        .spawn(mpu_reader_task(imu1, board.sensors.gyro1_align))
+                        .spawn(mpu_reader_task(ImuReader::new(
+                            imu1,
+                            board.sensors.gyro1_align,
+                            ACCEL_CUTOFF_HZ,
+                            GYRO_CUTOFF_HZ,
+                        )))
                         .unwrap();
                 }
                 Err(e) => defmt::error!("IMU1 MPU init failed: {}", e),

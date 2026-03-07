@@ -3,8 +3,9 @@ use core::fmt::Write;
 use crate::bsp;
 use crate::hal;
 use crate::msgs;
-use crate::sensors::FUSED_IMU;
+use crate::sensors::RAW_IMU;
 use embassy_futures::join::join;
+use embassy_sync::pubsub::WaitResult;
 use embassy_usb::Builder;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use hal::usb::Driver;
@@ -58,12 +59,20 @@ pub async fn run(
     let mut class = CdcAcmClass::new(&mut builder, &mut state, 64);
     let mut usb = builder.build();
 
+    let mut sub = RAW_IMU.subscriber().unwrap();
+
     join(usb.run(), async {
         loop {
             class.wait_connection().await;
             defmt::info!("USB CDC connected");
             loop {
-                let sample = FUSED_IMU.receive().await;
+                let sample = match sub.next_message().await {
+                    WaitResult::Message(m) => m,
+                    WaitResult::Lagged(n) => {
+                        defmt::warn!("USB serial dropped {} IMU samples", n);
+                        continue;
+                    }
+                };
                 let mut buf = [0u8; 128];
                 let n = format_imu(&sample, &mut buf);
                 if class.write_packet(&buf[..n]).await.is_err() {
@@ -84,8 +93,15 @@ fn format_imu(s: &msgs::Imu, buf: &mut [u8; 128]) -> usize {
     };
     let _ = write!(
         w,
-        "imu,{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1}\r\n",
-        s.accel_m_s2.x, s.accel_m_s2.y, s.accel_m_s2.z, s.gyro_rad_s.x, s.gyro_rad_s.y, s.gyro_rad_s.z, s.temp_c,
+        "imu:{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1}\r\n",
+        s.timestamp.as_millis(),
+        s.accel_m_s2.x,
+        s.accel_m_s2.y,
+        s.accel_m_s2.z,
+        s.gyro_rad_s.x,
+        s.gyro_rad_s.y,
+        s.gyro_rad_s.z,
+        s.temp_c,
     );
     w.pos
 }

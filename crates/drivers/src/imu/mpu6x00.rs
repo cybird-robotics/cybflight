@@ -7,7 +7,7 @@ use embedded_hal_async::spi::SpiDevice;
 use embedded_hal_async::{delay::DelayNs, digital::Wait};
 use nalgebra::Vector3;
 
-use super::ImuReading;
+use super::{ImuReading, ReadImu};
 
 // ---------------------------------------------------------------------------
 // Register addresses
@@ -127,7 +127,11 @@ impl<SPI: SpiDevice, DRDY: Wait> Mpu6x00<SPI, DRDY> {
 
         drv.variant = variant;
 
-        defmt::info!("MPU6x00: detected {:?} (WHO_AM_I={=u8:#x})", variant, whoami);
+        defmt::info!(
+            "MPU6x00: detected {:?} (WHO_AM_I={=u8:#x})",
+            variant,
+            whoami
+        );
 
         // 4. Variant-specific configuration (matches Betaflight register order)
         match variant {
@@ -229,42 +233,6 @@ impl<SPI: SpiDevice, DRDY: Wait> Mpu6x00<SPI, DRDY> {
         Ok(drv)
     }
 
-    /// Wait for DRDY, then burst-read accel + temp + gyro.
-    ///
-    /// Returns an [`ImuReading`] with physical units in chip-native axis order.
-    pub async fn read(&mut self) -> Result<ImuReading, Error<SPI::Error>> {
-        // Wait for data-ready rising edge
-        self.drdy.wait_for_rising_edge().await.ok();
-
-        // Burst read: ACCEL(6) + TEMP(2) + GYRO(6) = 14 bytes from 0x3B
-        let mut buf = [0u8; 15];
-        buf[0] = SPI_READ | REG_ACCEL_XOUT_H;
-        self.spi.transfer_in_place(&mut buf).await.map_err(Error::Spi)?;
-
-        // Parse big-endian i16 values from buf[1..]
-        let raw_ax = i16::from_be_bytes([buf[1], buf[2]]);
-        let raw_ay = i16::from_be_bytes([buf[3], buf[4]]);
-        let raw_az = i16::from_be_bytes([buf[5], buf[6]]);
-        let raw_temp = i16::from_be_bytes([buf[7], buf[8]]);
-        let raw_gx = i16::from_be_bytes([buf[9], buf[10]]);
-        let raw_gy = i16::from_be_bytes([buf[11], buf[12]]);
-        let raw_gz = i16::from_be_bytes([buf[13], buf[14]]);
-
-        Ok(ImuReading {
-            accel: Vector3::new(
-                raw_ax as f32 * ACCEL_SCALE_16G,
-                raw_ay as f32 * ACCEL_SCALE_16G,
-                raw_az as f32 * ACCEL_SCALE_16G,
-            ),
-            gyro: Vector3::new(
-                raw_gx as f32 * GYRO_SCALE_2000DPS,
-                raw_gy as f32 * GYRO_SCALE_2000DPS,
-                raw_gz as f32 * GYRO_SCALE_2000DPS,
-            ),
-            temp_c: raw_temp as f32 * self.temp_scale + self.temp_offset,
-        })
-    }
-
     /// Returns the detected chip variant.
     pub fn variant(&self) -> Variant {
         self.variant
@@ -276,7 +244,10 @@ impl<SPI: SpiDevice, DRDY: Wait> Mpu6x00<SPI, DRDY> {
 
     async fn read_reg(&mut self, reg: u8) -> Result<u8, Error<SPI::Error>> {
         let mut buf = [SPI_READ | reg, 0x00];
-        self.spi.transfer_in_place(&mut buf).await.map_err(Error::Spi)?;
+        self.spi
+            .transfer_in_place(&mut buf)
+            .await
+            .map_err(Error::Spi)?;
         Ok(buf[1])
     }
 
@@ -284,5 +255,55 @@ impl<SPI: SpiDevice, DRDY: Wait> Mpu6x00<SPI, DRDY> {
         let buf = [reg, val];
         self.spi.write(&buf).await.map_err(Error::Spi)?;
         Ok(())
+    }
+}
+
+impl<SPI: SpiDevice, DRDY: Wait> ReadImu for Mpu6x00<SPI, DRDY>
+where
+    SPI::Error: defmt::Format,
+{
+    type Error = Error<SPI::Error>;
+
+    /// REG_SMPLRT_DIV = 0x00, REG_CONFIG DLPF_CFG = 0 (disabled) → gyro rate = 8 kHz.
+    fn sample_rate_hz(&self) -> f32 {
+        8000.0
+    }
+
+    /// Wait for DRDY, then burst-read accel + temp + gyro.
+    ///
+    /// Returns an [`ImuReading`] with physical units in chip-native axis order.
+    async fn read(&mut self) -> Result<ImuReading, Self::Error> {
+        // Wait for data-ready rising edge
+        self.drdy.wait_for_rising_edge().await.ok();
+
+        // Burst read: ACCEL(6) + TEMP(2) + GYRO(6) = 14 bytes from 0x3B
+        let mut buf = [0u8; 15];
+        buf[0] = SPI_READ | REG_ACCEL_XOUT_H;
+        self.spi
+            .transfer_in_place(&mut buf)
+            .await
+            .map_err(Error::Spi)?;
+        // Parse big-endian i16 values from buf[1..]
+        let raw_ax = i16::from_be_bytes([buf[1], buf[2]]);
+        let raw_ay = i16::from_be_bytes([buf[3], buf[4]]);
+        let raw_az = i16::from_be_bytes([buf[5], buf[6]]);
+        let raw_temp = i16::from_be_bytes([buf[7], buf[8]]);
+        let raw_gx = i16::from_be_bytes([buf[9], buf[10]]);
+        let raw_gy = i16::from_be_bytes([buf[11], buf[12]]);
+        let raw_gz = i16::from_be_bytes([buf[13], buf[14]]);
+
+        Ok(ImuReading {
+            accel_m_s2: Vector3::new(
+                raw_ax as f32 * ACCEL_SCALE_16G,
+                raw_ay as f32 * ACCEL_SCALE_16G,
+                raw_az as f32 * ACCEL_SCALE_16G,
+            ),
+            gyro_rad_s: Vector3::new(
+                raw_gx as f32 * GYRO_SCALE_2000DPS,
+                raw_gy as f32 * GYRO_SCALE_2000DPS,
+                raw_gz as f32 * GYRO_SCALE_2000DPS,
+            ),
+            temp_c: raw_temp as f32 * self.temp_scale + self.temp_offset,
+        })
     }
 }

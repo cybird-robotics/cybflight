@@ -8,7 +8,7 @@ use embedded_hal_async::{delay::DelayNs, digital::Wait};
 
 use nalgebra::Vector3;
 
-use super::ImuReading;
+use super::{ImuReading, ReadImu};
 
 // ---------------------------------------------------------------------------
 // Register addresses
@@ -102,28 +102,26 @@ struct AafConfig {
     bitshift: u8,
 }
 
-// ICM-42688P / ICM-42622P — 32 MHz AAF clock (DS-000347 section 5.3)
+// ICM42688P / ICM42622P family (datasheet section 5.3)
 const AAF_GYRO_42688: AafConfig = AafConfig {
-    delt: 21,       // table row: 997 Hz
+    delt: 21,
     deltsqr: 440,
     bitshift: 6,
 };
 const AAF_ACCEL_42688: AafConfig = AafConfig {
-    delt: 6,        // table row: 258 Hz
+    delt: 6,
     deltsqr: 36,
     bitshift: 10,
 };
 
-// ICM-42605 / IIM-42652 / IIM-42653 — 8 MHz AAF clock (4× slower than 42688P)
-// delt=63 at 8 MHz → 3979 × (8/32) ≈ 995 Hz gyro
-// delt=21 at 8 MHz →  997 × (8/32) ≈ 249 Hz accel
+// ICM42605 / IIM42652 / IIM42653 family (datasheet section 5.3)
 const AAF_GYRO_42605: AafConfig = AafConfig {
-    delt: 63,       // max table entry; effective cutoff ~995 Hz at 8 MHz clock
+    delt: 63,
     deltsqr: 3968,
     bitshift: 3,
 };
 const AAF_ACCEL_42605: AafConfig = AafConfig {
-    delt: 21,       // table row: 997 Hz at 32 MHz → ~249 Hz at 8 MHz clock
+    delt: 21,
     deltsqr: 440,
     bitshift: 6,
 };
@@ -335,11 +333,46 @@ impl<SPI: SpiDevice, DRDY: Wait> Icm426xx<SPI, DRDY> {
 
         Ok(drv)
     }
+    /// Returns the detected chip variant.
+    pub fn variant(&self) -> Variant {
+        self.variant
+    }
+
+    // -----------------------------------------------------------------------
+    // Low-level SPI helpers (async)
+    // -----------------------------------------------------------------------
+
+    async fn read_reg(&mut self, reg: u8) -> Result<u8, Error<SPI::Error>> {
+        let mut buf = [SPI_READ | reg, 0x00];
+        self.spi
+            .transfer_in_place(&mut buf)
+            .await
+            .map_err(Error::Spi)?;
+        Ok(buf[1])
+    }
+
+    async fn write_reg(&mut self, reg: u8, val: u8) -> Result<(), Error<SPI::Error>> {
+        let buf = [reg, val];
+        self.spi.write(&buf).await.map_err(Error::Spi)?;
+        Ok(())
+    }
+}
+
+impl<SPI: SpiDevice, DRDY: Wait> ReadImu for Icm426xx<SPI, DRDY>
+where
+    SPI::Error: defmt::Format,
+{
+    type Error = Error<SPI::Error>;
+
+    /// REG_GYRO_CONFIG0 / REG_ACCEL_CONFIG0 = 0x03 → ODR = 8 kHz.
+    fn sample_rate_hz(&self) -> f32 {
+        8000.0
+    }
 
     /// Wait for DRDY, then burst-read accel + gyro + temperature.
     ///
     /// Returns an [`ImuReading`] with physical units in chip-native axis order.
-    pub async fn read(&mut self) -> Result<ImuReading, Error<SPI::Error>> {
+    async fn read(&mut self) -> Result<ImuReading, Self::Error> {
         // Wait for data-ready rising edge
         self.drdy.wait_for_rising_edge().await.ok();
 
@@ -368,37 +401,13 @@ impl<SPI: SpiDevice, DRDY: Wait> Icm426xx<SPI, DRDY> {
         let as_ = self.accel_scale;
 
         Ok(ImuReading {
-            accel: Vector3::new(
+            accel_m_s2: Vector3::new(
                 raw_ax as f32 * as_,
                 raw_ay as f32 * as_,
                 raw_az as f32 * as_,
             ),
-            gyro: Vector3::new(raw_gx as f32 * gs, raw_gy as f32 * gs, raw_gz as f32 * gs),
+            gyro_rad_s: Vector3::new(raw_gx as f32 * gs, raw_gy as f32 * gs, raw_gz as f32 * gs),
             temp_c: raw_temp as f32 * TEMP_SCALE + TEMP_OFFSET,
         })
-    }
-
-    /// Returns the detected chip variant.
-    pub fn variant(&self) -> Variant {
-        self.variant
-    }
-
-    // -----------------------------------------------------------------------
-    // Low-level SPI helpers (async)
-    // -----------------------------------------------------------------------
-
-    async fn read_reg(&mut self, reg: u8) -> Result<u8, Error<SPI::Error>> {
-        let mut buf = [SPI_READ | reg, 0x00];
-        self.spi
-            .transfer_in_place(&mut buf)
-            .await
-            .map_err(Error::Spi)?;
-        Ok(buf[1])
-    }
-
-    async fn write_reg(&mut self, reg: u8, val: u8) -> Result<(), Error<SPI::Error>> {
-        let buf = [reg, val];
-        self.spi.write(&buf).await.map_err(Error::Spi)?;
-        Ok(())
     }
 }

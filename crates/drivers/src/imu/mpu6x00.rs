@@ -212,10 +212,8 @@ impl<SPI: SpiDevice, DRDY: Wait> Mpu6x00<SPI, DRDY> {
                 drv.write_reg(REG_USER_CTRL, 0x10).await?;
                 delay.delay_ms(100).await;
 
-                // NOTE: Betaflight uses 1/340 and 36.53 for MPU6500 temperature
-                // conversion. The MPU6500 datasheet specifies 1/333.87 and 21.0.
-                drv.temp_scale = 1.0 / 340.0;
-                drv.temp_offset = 36.53;
+                drv.temp_scale = 1.0 / 333.87;
+                drv.temp_offset = 21.0;
             }
         }
 

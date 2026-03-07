@@ -3,21 +3,21 @@ use core::fmt::Write;
 use crate::bsp;
 use crate::hal;
 use crate::msgs;
+use crate::platform;
 use crate::sensors::{RAW_IMU, VEHICLE_ATTITUDE};
 use embassy_futures::join::join;
-use embassy_futures::select::{Either3, select3};
+use embassy_futures::select::{select3, Either3};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::pubsub::{Subscriber, WaitResult};
-use embassy_usb::Builder;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
+use embassy_usb::Builder;
 use hal::usb::Driver;
 
 type UsbDriver<'d> = Driver<'d, hal::peripherals::USB_OTG_FS>;
 type ImuSub = Subscriber<'static, CriticalSectionRawMutex, msgs::Imu, 4, 4, 2>;
 type AttSub = Subscriber<'static, CriticalSectionRawMutex, msgs::VehicleAttitude, 4, 4, 1>;
 
-const BANNER: &[u8] = b"cybflight shell\r\ntype 'help' for commands\r\n\r\n> ";
 const PROMPT: &[u8] = b"> ";
 const HELP_TEXT: &[u8] = b"\
   imu              one-shot IMU snapshot\r\n\
@@ -26,6 +26,8 @@ const HELP_TEXT: &[u8] = b"\
   stream imu off   stop IMU stream\r\n\
   stream att on    stream vehicle attitude\r\n\
   stream att off   stop attitude stream\r\n\
+  reboot           software reset\r\n\
+  reboot --dfu     reset into USB DFU bootloader\r\n\
   help             show this message\r\n\
 ";
 
@@ -118,7 +120,9 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
     let mut stream_att = false;
     let mut rx_buf = [0u8; 64];
 
-    if write_all(class, BANNER).await.is_err() {
+    let mut banner_buf = [0u8; 128];
+    let n = format_banner(&mut banner_buf);
+    if write_all(class, &banner_buf[..n]).await.is_err() {
         return;
     }
 
@@ -257,6 +261,14 @@ async fn dispatch<'d>(
             *stream_att = false;
             write_all(class, b"attitude stream off\r\n").await?;
         }
+        "reboot" => {
+            write_all(class, b"rebooting...\r\n").await?;
+            platform::sys_reboot();
+        }
+        "reboot --dfu" => {
+            write_all(class, b"entering DFU mode...\r\n").await?;
+            platform::enter_dfu();
+        }
         _ => {
             write_all(class, b"unknown command (try 'help')\r\n").await?;
         }
@@ -283,6 +295,23 @@ where
 // ---------------------------------------------------------------------------
 // Formatting
 // ---------------------------------------------------------------------------
+
+/// Format the connection banner with firmware version, git hash, build timestamp, and board name.
+fn format_banner(buf: &mut [u8; 128]) -> usize {
+    let mut w = WriteBuf {
+        buf: buf.as_mut_slice(),
+        pos: 0,
+    };
+    let _ = write!(
+        w,
+        "cybflight v{} ({}) {} [{}]\r\ntype 'help' for commands\r\n\r\n> ",
+        crate::BUILD_VERSION,
+        crate::GIT_HASH,
+        crate::BUILD_TIMESTAMP,
+        crate::bsp::BOARD_NAME,
+    );
+    w.pos
+}
 
 /// Format an IMU sample as `imu:{ts_ms},{ax},{ay},{az},{gx},{gy},{gz},{temp}\r\n`.
 fn format_imu(s: &msgs::Imu, buf: &mut [u8; 128]) -> usize {

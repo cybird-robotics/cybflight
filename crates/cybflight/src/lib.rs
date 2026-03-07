@@ -9,9 +9,23 @@ pub use bsp::hal;
 
 pub mod board_init;
 pub mod msgs;
+pub mod platform;
 pub mod sensors;
 pub mod status;
 pub mod usb_serial;
+
+/// Firmware version from `Cargo.toml`.
+pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// UTC build timestamp set by `build.rs`, e.g. `"2026-03-07 14:30Z"`.
+pub const BUILD_TIMESTAMP: &str = match option_env!("BUILD_TIMESTAMP") {
+    Some(s) => s,
+    None => "unknown",
+};
+/// Short git commit hash set by `build.rs`, e.g. `"abc1234"`.
+pub const GIT_HASH: &str = match option_env!("GIT_HASH") {
+    Some(s) => s,
+    None => "unknown",
+};
 
 use bsp_types::SensorAlign;
 use embassy_time::Instant;

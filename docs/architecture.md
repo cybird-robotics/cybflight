@@ -363,6 +363,17 @@ objects or dyn dispatch for sensors.
 4. Add a new concrete task in `crates/cybflight/src/sensors/imu.rs`
 5. Add the dispatch arm in the relevant `board_init/` module
 
+## Future Improvements
+
+- **D-Cache**: The Cortex-M7 data cache is currently disabled to avoid DMA
+  coherency issues (DMA buffers must be cache-line aligned and manually
+  invalidated/cleaned around transfers). Enabling it requires placing DMA
+  buffers in a non-cacheable MPU region or using cache maintenance operations
+  in every DMA path. This is worth revisiting once the DMA usage patterns
+  stabilize.
+- **ITCM/DTCM linker sections**: Hot-path code and data could be placed in
+  tightly-coupled memory for deterministic zero-wait-state access.
+
 ## Design Decisions & Rationale
 
 ### Why channels, not traits?

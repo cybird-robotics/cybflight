@@ -6,6 +6,7 @@ use panic_probe as _;
 
 #[embassy_executor::main]
 async fn main(spawner: embassy_executor::Spawner) {
+    cybflight::platform::enable_icache();
     let board = cybflight::bsp::init();
     defmt::info!("cybflight: {} starting", cybflight::bsp::BOARD_NAME);
     cybflight::status::STATUS.sender().send(cybflight::status::SystemStatus::Alive);

@@ -1,4 +1,14 @@
 // ---------------------------------------------------------------------------
+// Platform init helpers
+// ---------------------------------------------------------------------------
+
+/// Enable Cortex-M7 instruction cache for flash acceleration.
+pub fn enable_icache() {
+    let mut cp = cortex_m::Peripherals::take().unwrap();
+    cp.SCB.enable_icache();
+}
+
+// ---------------------------------------------------------------------------
 // Platform reset helpers
 // ---------------------------------------------------------------------------
 

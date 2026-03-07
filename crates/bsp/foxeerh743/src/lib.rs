@@ -267,14 +267,34 @@ pub struct Board {
 }
 
 /// Board clock/power configuration.
+///
+/// PLL1: HSI (64 MHz) / M=4 * N=60 / P=2 = 480 MHz SYSCLK (VOS0).
+/// VCO = 960 MHz, which is within the wide VCO range (192–960 MHz) for H743.
+/// AHB at 240 MHz (SYSCLK/2), APBx at 120 MHz (AHB/2).
+/// SPI123 kernel clock = PLL1_Q = 240 MHz.
+/// USB uses HSI48 (independent of PLL1).
 fn board_config() -> Config {
     let mut config = Config::default();
     {
         use hal::rcc::*;
+        config.rcc.pll1 = Some(Pll {
+            source: PllSource::HSI,
+            prediv: PllPreDiv::DIV4,   // 64 / 4 = 16 MHz ref
+            mul:    PllMul::MUL60,     // 16 * 60 = 960 MHz VCO
+            fracn:  None,
+            divp:   Some(PllDiv::DIV2), // 480 MHz SYSCLK
+            divq:   Some(PllDiv::DIV4), // 240 MHz for SPI123
+            divr:   None,
+        });
+        config.rcc.sys      = Sysclk::PLL1_P;
+        config.rcc.ahb_pre  = AHBPrescaler::DIV2;  // 240 MHz AHB
+        config.rcc.apb1_pre = APBPrescaler::DIV2;  // 120 MHz
+        config.rcc.apb2_pre = APBPrescaler::DIV2;
+        config.rcc.apb3_pre = APBPrescaler::DIV2;
+        config.rcc.apb4_pre = APBPrescaler::DIV2;
         config.rcc.hsi48 = Some(Hsi48Config { sync_from_usb: true }); // 48 MHz for USB
         config.rcc.mux.usbsel = mux::Usbsel::HSI48;
-        // SPI1/2/3 kernel clock defaults to PLL1_Q, which is off. Use PER clock (HSI 64 MHz).
-        config.rcc.mux.spi123sel = mux::Saisel::PER;
+        config.rcc.mux.spi123sel = mux::Saisel::PLL1_Q;
     }
     config
 }

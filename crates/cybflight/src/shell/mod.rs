@@ -1,5 +1,10 @@
 use core::fmt::Write;
 
+use embassy_usb::{
+    class::cdc_acm::CdcAcmClass,
+    driver::{Driver, EndpointError},
+};
+
 pub mod format;
 
 // ---------------------------------------------------------------------------
@@ -31,4 +36,21 @@ impl Write for WriteBuf<'_> {
         self.pos += bytes.len();
         Ok(())
     }
+}
+
+/// Write `data` to the CDC class in ≤64-byte packets.
+///
+/// A zero-length packet (ZLP) is appended when `data` is an exact multiple of
+/// 64 bytes, signalling end-of-transfer to the USB host.
+pub async fn write_all<'d>(
+    class: &mut CdcAcmClass<'d, impl Driver<'d>>,
+    data: &[u8],
+) -> Result<(), EndpointError> {
+    for chunk in data.chunks(64) {
+        class.write_packet(chunk).await?;
+    }
+    if !data.is_empty() && data.len() % 64 == 0 {
+        class.write_packet(&[]).await?;
+    }
+    Ok(())
 }

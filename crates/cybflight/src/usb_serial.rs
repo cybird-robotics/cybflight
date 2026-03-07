@@ -6,6 +6,7 @@ use crate::msgs;
 use crate::platform;
 use crate::sensors::{RAW_IMU, VEHICLE_ATTITUDE};
 use crate::shell::format::ShellMsg;
+use crate::shell::write_all;
 use crate::shell::WriteBuf;
 use embassy_futures::join::join;
 use embassy_futures::select::{select3, Either3};
@@ -305,25 +306,4 @@ where
             WaitResult::Lagged(_) => continue,
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// USB write helper
-// ---------------------------------------------------------------------------
-
-/// Write `data` to the CDC class in ≤64-byte packets.
-///
-/// A zero-length packet (ZLP) is appended when `data` is an exact multiple of
-/// 64 bytes, signalling end-of-transfer to the USB host.
-async fn write_all<'d>(
-    class: &mut CdcAcmClass<'d, UsbDriver<'d>>,
-    data: &[u8],
-) -> Result<(), EndpointError> {
-    for chunk in data.chunks(64) {
-        class.write_packet(chunk).await?;
-    }
-    if !data.is_empty() && data.len() % 64 == 0 {
-        class.write_packet(&[]).await?;
-    }
-    Ok(())
 }

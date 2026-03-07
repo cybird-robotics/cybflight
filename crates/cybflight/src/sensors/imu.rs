@@ -7,7 +7,7 @@ use embassy_sync::mutex::Mutex;
 use embassy_time::{Instant, Timer};
 
 use crate::hal;
-use crate::{apply_alignment, ImuSample};
+use crate::{apply_alignment, msgs};
 use hal::gpio::Output;
 use hal::spi::{self, Spi};
 
@@ -29,9 +29,9 @@ pub async fn icm_reader_task(mut imu: IcmDev, align: SensorAlign) {
     loop {
         match imu.read().await {
             Ok(reading) => {
-                let sample = ImuSample {
-                    accel: apply_alignment(align, reading.accel),
-                    gyro: apply_alignment(align, reading.gyro),
+                let sample = msgs::Imu {
+                    accel_m_s2: apply_alignment(align, reading.accel),
+                    gyro_rad_s: apply_alignment(align, reading.gyro),
                     temp_c: reading.temp_c,
                     timestamp: Instant::now(),
                 };
@@ -50,9 +50,9 @@ pub async fn mpu_reader_task(mut imu: MpuDev, align: SensorAlign) {
     loop {
         match imu.read().await {
             Ok(reading) => {
-                let sample = ImuSample {
-                    accel: apply_alignment(align, reading.accel),
-                    gyro: apply_alignment(align, reading.gyro),
+                let sample = msgs::Imu {
+                    accel_m_s2: apply_alignment(align, reading.accel),
+                    gyro_rad_s: apply_alignment(align, reading.gyro),
                     temp_c: reading.temp_c,
                     timestamp: Instant::now(),
                 };

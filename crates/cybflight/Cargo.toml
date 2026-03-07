@@ -38,7 +38,7 @@ defmt-rtt = "1.1.0"
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 
 # Math (no_std)
-nalgebra = { version = "0.34.1", default-features = false, features = ["libm"] }
+nalgebra = { version = "0.34.1", default-features = false, features = ["libm", "defmt"] }
 
 [profile.release]
 debug = 2

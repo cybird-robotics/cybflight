@@ -8,6 +8,7 @@ pub use bsp_foxeerh743 as bsp;
 pub use bsp::hal;
 
 pub mod board_init;
+pub mod msgs;
 pub mod sensors;
 pub mod status;
 pub mod usb_serial;
@@ -15,18 +16,6 @@ pub mod usb_serial;
 use bsp_types::SensorAlign;
 use embassy_time::Instant;
 use nalgebra::Vector3;
-
-/// A timestamped, board-aligned IMU sample ready for downstream processing.
-pub struct ImuSample {
-    /// Acceleration in m/s^2, rotated into the board reference frame.
-    pub accel: Vector3<f32>,
-    /// Angular rate in rad/s, rotated into the board reference frame.
-    pub gyro: Vector3<f32>,
-    /// Die temperature in degrees Celsius.
-    pub temp_c: f32,
-    /// Timestamp captured immediately after the burst read completes.
-    pub timestamp: Instant,
-}
 
 /// Rotate a 3-axis sensor vector according to the board-defined alignment.
 ///

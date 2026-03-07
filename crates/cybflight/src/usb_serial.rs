@@ -2,8 +2,8 @@ use core::fmt::Write;
 
 use crate::bsp;
 use crate::hal;
+use crate::msgs;
 use crate::sensors::FUSED_IMU;
-use crate::ImuSample;
 use embassy_futures::join::join;
 use embassy_usb::Builder;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
@@ -77,7 +77,7 @@ pub async fn run(
 }
 
 /// Format an IMU sample as CSV text into a fixed buffer.
-fn format_imu(s: &ImuSample, buf: &mut [u8; 128]) -> usize {
+fn format_imu(s: &msgs::Imu, buf: &mut [u8; 128]) -> usize {
     let mut w = WriteBuf {
         buf: buf.as_mut_slice(),
         pos: 0,
@@ -85,7 +85,7 @@ fn format_imu(s: &ImuSample, buf: &mut [u8; 128]) -> usize {
     let _ = write!(
         w,
         "imu,{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1}\r\n",
-        s.accel.x, s.accel.y, s.accel.z, s.gyro.x, s.gyro.y, s.gyro.z, s.temp_c,
+        s.accel_m_s2.x, s.accel_m_s2.y, s.accel_m_s2.z, s.gyro_rad_s.x, s.gyro_rad_s.y, s.gyro_rad_s.z, s.temp_c,
     );
     w.pos
 }

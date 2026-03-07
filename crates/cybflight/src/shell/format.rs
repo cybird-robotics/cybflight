@@ -78,6 +78,21 @@ impl fmt::Display for ShellMsg<'_, msgs::VehicleOdometry> {
     }
 }
 
+impl fmt::Display for ShellMsg<'_, msgs::OcpSolverOutput> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.0;
+        write!(
+            f,
+            "OcpSolverOutput(timestamp={:.4}, command={:?}, iterations={}, converged={}, solve_time_ms={})",
+            s.timestamp.as_millis(),
+            s.command.as_slice(),
+            s.iterations,
+            s.converged,
+            s.solve_time_us as f64 / 1000.0
+        )
+    }
+}
+
 pub trait Printable {
     fn should_print(&self, ctx: &ShellState) -> bool;
     fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result;
@@ -114,6 +129,16 @@ impl Printable for msgs::VehicleAttitude {
 impl Printable for msgs::VehicleOdometry {
     fn should_print(&self, ctx: &ShellState) -> bool {
         ctx.stream_odom
+    }
+
+    fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        write!(w, "{}", ShellMsg(self))
+    }
+}
+
+impl Printable for msgs::OcpSolverOutput {
+    fn should_print(&self, _ctx: &ShellState) -> bool {
+        true
     }
 
     fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {

@@ -1,5 +1,5 @@
 use embassy_time::Instant;
-use nalgebra::{UnitQuaternion, Vector3};
+use nalgebra::{SVector, UnitQuaternion, Vector3};
 
 trait Message: defmt::Format + Clone + Sync + 'static {}
 
@@ -45,3 +45,13 @@ pub struct VehicleOdometry {
 }
 
 impl Message for VehicleOdometry {}
+
+const OCP_OUTPUT_SIZE: usize = 4;
+#[derive(Clone, defmt::Format)]
+pub struct OcpSolverOutput {
+    pub timestamp: Instant,
+    pub command: SVector<f32, OCP_OUTPUT_SIZE>,
+    pub iterations: i32,
+    pub converged: bool,
+    pub solve_time_us: u64,
+}

@@ -13,5 +13,9 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::sensors::attitude::mahony_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude task"));
+
+    spawner
+        .spawn(cybflight::control::nmpc_driver::nmpc_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn NMPC driver task"));
     defmt::info!("all init done");
 }

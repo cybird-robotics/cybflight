@@ -1,6 +1,7 @@
 use core::fmt::Write;
 
 use crate::bsp;
+use crate::control::OCP_SOLVER_OUTPUT;
 use crate::hal;
 use crate::msgs;
 use crate::platform;
@@ -9,7 +10,7 @@ use crate::shell::format::ShellMsg;
 use crate::shell::write_all;
 use crate::shell::WriteBuf;
 use embassy_futures::join::join;
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::select::{select4, Either4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::pubsub::{Subscriber, WaitResult};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
@@ -20,6 +21,7 @@ use hal::usb::Driver;
 type UsbDriver<'d> = Driver<'d, hal::peripherals::USB_OTG_FS>;
 type ImuSub = Subscriber<'static, CriticalSectionRawMutex, msgs::Imu, 4, 4, 2>;
 type AttSub = Subscriber<'static, CriticalSectionRawMutex, msgs::VehicleAttitude, 4, 4, 1>;
+type OcpSub = Subscriber<'static, CriticalSectionRawMutex, msgs::OcpSolverOutput, 4, 4, 1>;
 
 const PROMPT: &[u8] = b"> ";
 const HELP_TEXT: &[u8] = b"\
@@ -117,10 +119,19 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
         }
     };
 
+    let mut ocp_sub = match OCP_SOLVER_OUTPUT.subscriber() {
+        Ok(s) => s,
+        Err(_) => {
+            defmt::error!("USB shell: OCP_SOLVER_OUTPUT subscriber slots exhausted");
+            return;
+        }
+    };
+
     let mut line_buf = [0u8; 64];
     let mut line_len = 0usize;
     let mut stream_imu = false;
     let mut stream_att = false;
+    let mut stream_ocp = false;
     let mut rx_buf = [0u8; 64];
 
     let mut banner_buf = [0u8; 128];
@@ -139,16 +150,17 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
     }
 
     loop {
-        match select3(
+        match select4(
             class.read_packet(&mut rx_buf),
             imu_sub.next_message(),
             att_sub.next_message(),
+            ocp_sub.next_message(),
         )
         .await
         {
-            Either3::First(Err(_)) => return,
+            Either4::First(Err(_)) => return,
 
-            Either3::First(Ok(n)) => {
+            Either4::First(Ok(n)) => {
                 for &b in &rx_buf[..n] {
                     match b {
                         b'\r' | b'\n' => {
@@ -163,8 +175,10 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
                                 line,
                                 &mut stream_imu,
                                 &mut stream_att,
+                                &mut stream_ocp,
                                 &mut imu_sub,
                                 &mut att_sub,
+                                &mut ocp_sub,
                             )
                             .await
                             .is_err()
@@ -199,7 +213,7 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
                 }
             }
 
-            Either3::Second(WaitResult::Message(imu)) => {
+            Either4::Second(WaitResult::Message(imu)) => {
                 if stream_imu {
                     let mut buf = [0u8; 128];
                     let mut w = WriteBuf::new(buf.as_mut_slice());
@@ -209,11 +223,11 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
                     }
                 }
             }
-            Either3::Second(WaitResult::Lagged(n)) => {
+            Either4::Second(WaitResult::Lagged(n)) => {
                 defmt::warn!("USB shell: dropped {} IMU samples", n);
             }
 
-            Either3::Third(WaitResult::Message(att)) => {
+            Either4::Third(WaitResult::Message(att)) => {
                 if stream_att {
                     let mut buf = [0u8; 64];
                     let mut w = WriteBuf::new(buf.as_mut_slice());
@@ -223,8 +237,23 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
                     }
                 }
             }
-            Either3::Third(WaitResult::Lagged(n)) => {
+            Either4::Third(WaitResult::Lagged(n)) => {
                 defmt::warn!("USB shell: dropped {} attitude samples", n);
+            }
+
+            Either4::Fourth(WaitResult::Message(ocp)) => {
+                if stream_ocp {
+                    let mut buf = [0u8; 256];
+                    let mut w = WriteBuf::new(buf.as_mut_slice());
+                    let _ = write!(w, "{}\r\n", ShellMsg(&ocp));
+                    if write_all(class, w.as_slice()).await.is_err() {
+                        return;
+                    }
+                }
+            }
+
+            Either4::Fourth(WaitResult::Lagged(n)) => {
+                defmt::warn!("USB shell: dropped {} OCP solver outputs", n);
             }
         }
     }
@@ -239,8 +268,10 @@ async fn dispatch<'d>(
     line: &str,
     stream_imu: &mut bool,
     stream_att: &mut bool,
+    stream_ocp: &mut bool,
     imu_sub: &mut ImuSub,
     att_sub: &mut AttSub,
+    ocp_sub: &mut OcpSub,
 ) -> Result<(), EndpointError> {
     match line {
         "" => {}
@@ -261,6 +292,13 @@ async fn dispatch<'d>(
             write!(w, "{}\r\n", ShellMsg(&msg)).ok();
             write_all(class, w.as_slice()).await?;
         }
+        "ocp" => {
+            let msg = next_message(ocp_sub).await;
+            let mut buf = [0u8; 256];
+            let mut w = WriteBuf::new(buf.as_mut_slice());
+            write!(w, "{}\r\n", ShellMsg(&msg)).ok();
+            write_all(class, w.as_slice()).await?;
+        }
         "stream imu on" => {
             *stream_imu = true;
             write_all(class, b"IMU stream on\r\n").await?;
@@ -276,6 +314,14 @@ async fn dispatch<'d>(
         "stream att off" => {
             *stream_att = false;
             write_all(class, b"attitude stream off\r\n").await?;
+        }
+        "stream ocp on" => {
+            *stream_ocp = true;
+            write_all(class, b"OCP solver output stream on\r\n").await?;
+        }
+        "stream ocp off" => {
+            *stream_ocp = false;
+            write_all(class, b"OCP solver output stream off\r\n").await?;
         }
         "reboot" => {
             write_all(class, b"rebooting...\r\n").await?;

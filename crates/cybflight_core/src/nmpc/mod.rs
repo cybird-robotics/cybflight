@@ -3,6 +3,7 @@
 
 mod lbfgs;
 mod model;
+mod qp;
 mod solver;
 
 /// Xorshift32 PRNG — returns a uniform value in [-1, 1].
@@ -38,7 +39,7 @@ pub struct NmpcResult {
 /// Reference:     hover at z=1.0 m, level attitude, zero velocity.
 /// u_ref:         [mass*g, 0, 0, 0]  — hover thrust.
 ///
-/// This non-trivial offset exercises the full L-BFGS loop so convergence
+/// This non-trivial offset exercises the full SQP loop so convergence
 /// and solve time are meaningful. After the first call the solver warmstarts
 /// from the previous solution.
 pub fn run_once(solver: &mut NmpcSolver) -> NmpcResult {

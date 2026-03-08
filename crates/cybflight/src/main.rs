@@ -18,5 +18,22 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::control::nmpc_driver::nmpc_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn NMPC driver task"));
+
+    spawner
+        .spawn(cybflight::usb_serial::imu_stream_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn IMU stream task"));
+    spawner
+        .spawn(cybflight::usb_serial::att_stream_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude stream task"));
+    spawner
+        .spawn(cybflight::usb_serial::ocp_stream_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn OCP stream task"));
+    spawner
+        .spawn(cybflight::usb_serial::rc_stream_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn RC stream task"));
+    spawner
+        .spawn(cybflight::usb_serial::rc_link_stream_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn RC link stream task"));
+
     defmt::info!("all init done");
 }

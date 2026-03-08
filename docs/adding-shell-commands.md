@@ -2,8 +2,24 @@
 
 The USB serial shell lives in `crates/cybflight/src/usb_serial.rs`. Commands are
 dispatched by an exhaustive `match` on the trimmed input line inside `dispatch()`.
-Adding a command always requires the same two or three edits; extra steps are only
-needed when the command displays a new message type or subscribes to a new channel.
+
+## Architecture overview
+
+```
+publisher tasks ──► PubSubChannel ──► msg_stream_task ──► SHELL_OUT ──► shell_loop
+                                            ▲                               │
+                                     AtomicBool flag                  writes USB CDC
+                                     (toggled by dispatch)
+```
+
+- **`shell_loop`** selects over two futures only: USB keyboard input and
+  `SHELL_OUT.receive()`. It has no topic-specific code and never changes.
+- **`msg_stream_task`** is a generic async fn. One concrete
+  `#[embassy_executor::task]` wrapper runs permanently per topic.
+- **`STREAM_*: AtomicBool`** statics gate each stream. The shell sets them;
+  the stream tasks read them.
+- **One-shot commands** create a temporary subscriber on demand inside `dispatch`,
+  use it once, then drop it.
 
 ---
 
@@ -12,8 +28,11 @@ needed when the command displays a new message type or subscribes to a new chann
 1. Add a help line to `HELP_TEXT` in `usb_serial.rs`
 2. Add a match arm in `dispatch()` in `usb_serial.rs`
 3. *(If the command prints a `msgs::*` type)* Add a `ShellMsg` impl in `shell/format.rs`
-4. *(If the command needs a new streaming channel)* Add a subscriber in `shell_loop()`
-   and a `Printable` impl in `shell/format.rs`
+4. *(If the command needs a new streaming topic)* Also:
+   - Add a `pub static STREAM_FOO: AtomicBool` in `usb_serial.rs`
+   - Add a concrete task wrapper calling `msg_stream_task`
+   - Spawn it from `main.rs`
+   - Ensure the channel has a free subscriber slot
 
 ---
 
@@ -26,7 +45,7 @@ needed when the command displays a new message type or subscribes to a new chann
 ```rust
 const HELP_TEXT: &[u8] = b"\
   ...
-  version          print firmware version and build info\r\n\   // ← add
+  version            print firmware version and build info\r\n\
   ...
 ";
 ```
@@ -57,12 +76,9 @@ in no_std. A `[u8; 128]` stack buffer is large enough for most single-line respo
 
 **Example: `odom` — print one VehicleOdometry snapshot**
 
-The channel and subscriber type must already exist. If they don't, follow Case 4.
-
 ### Step 1 — Add a `ShellMsg` impl (`shell/format.rs`)
 
 `ShellMsg<'_, T>` is the newtype that implements `fmt::Display` for shell output.
-`VehicleOdometry` already has one (see `shell/format.rs:68`), so this step is done.
 For a new message type `msgs::Foo`:
 
 ```rust
@@ -75,29 +91,40 @@ impl fmt::Display for ShellMsg<'_, msgs::Foo> {
 }
 ```
 
+Also implement `msgs::Message` for the type in `msgs.rs` if not already done:
+
+```rust
+impl Message for msgs::Foo {}
+```
+
 ### Step 2 — Add the help line and match arm (`usb_serial.rs`)
 
 ```rust
 // HELP_TEXT
-  odom             one-shot odometry snapshot\r\n\
+  odom               one-shot odometry snapshot\r\n\
 
 // dispatch()
 "odom" => {
-    let msg = next_message(odom_sub).await;   // see Case 4 for odom_sub
-    let mut buf = [0u8; 256];
-    let mut w = WriteBuf::new(buf.as_mut_slice());
-    write!(w, "{}\r\n", ShellMsg(&msg)).ok();
-    write_all(class, w.as_slice()).await?;
+    let mut sub = match crate::sensors::VEHICLE_ODOMETRY.subscriber() {
+        Ok(s) => s,
+        Err(_) => return write_all(class, b"error: no subscriber slot\r\n").await,
+    };
+    oneshot(class, &mut sub, 256).await?;
 }
 ```
+
+`oneshot` waits up to 150 ms for a message, formats it via `ShellMsg`, and writes
+it to the CDC class. It prints `"no data (timeout)\r\n"` if nothing arrives.
+
+The subscriber is created on-demand and dropped at the end of the match arm, so it
+does not consume a slot permanently. Verify the channel's `SUBS` const is at least
+`(number of permanent stream tasks) + 1`.
 
 ---
 
 ## Case 3 — Side-effect command (no output / platform action)
 
 **Example: `reboot` — already implemented**
-
-These commands write a brief confirmation, then call a function that does not return.
 
 ```rust
 // dispatch()
@@ -107,113 +134,75 @@ These commands write a brief confirmation, then call a function that does not re
 }
 ```
 
-If the function returns normally, `dispatch` continues and the prompt is reprinted.
-If it is `-> !` (like `sys_reboot`), `write_all` must complete before calling it
-because the compiler will not reorder them across an `.await`.
+If the function is `-> !` (like `sys_reboot`), `write_all` must complete before
+calling it — the compiler will not reorder them across an `.await`.
 
 Platform-level functions (`sys_reboot`, `enter_dfu`, etc.) belong in
 `crates/cybflight/src/platform.rs`, not in `usb_serial.rs`.
 
 ---
 
-## Case 4 — New streaming command
-
-Adding streaming for a new message type requires changes in both `shell_loop` and
-`dispatch`, plus a `Printable` impl.
+## Case 4 — New streaming topic
 
 **Example: `stream odom on/off`**
 
+`shell_loop` never changes. Adding a new topic means adding a flag, a task, and
+two match arms.
+
 ### Step 1 — `ShellMsg` impl (`shell/format.rs`)
 
-Already present for `VehicleOdometry` at line 68. Add one if your type is new.
+As in Case 2, Step 1.
 
-### Step 2 — `Printable` impl (`shell/format.rs`)
-
-`Printable` ties a message type to a field in `ShellState`:
+### Step 2 — Publish channel (`sensors/mod.rs` or wherever appropriate)
 
 ```rust
-// shell/format.rs
-impl Printable for msgs::VehicleOdometry {
-    fn should_print(&self, ctx: &ShellState) -> bool { ctx.stream_odom }
-    fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {
-        write!(w, "{}", ShellMsg(self))
-    }
-}
-```
-
-Already present. If your type is new, add the field to `ShellState`:
-
-```rust
-pub struct ShellState {
-    pub stream_imu: bool,
-    pub stream_att: bool,
-    pub stream_odom: bool,
-    pub stream_foo: bool,    // ← add
-}
-```
-
-### Step 3 — Publish channel and subscriber type (`sensors/mod.rs`)
-
-A `PubSubChannel` for the message type must exist as a `pub static`. If it doesn't:
-
-```rust
-// sensors/mod.rs
 pub static VEHICLE_ODOMETRY: PubSubChannel<
     CriticalSectionRawMutex, msgs::VehicleOdometry, 4, 4, 1,
 > = PubSubChannel::new();
 ```
 
-Increment the `SUBS` const if you are adding a subscriber beyond the current count.
+Set `SUBS` to at least `(number of stream tasks for this channel) + 1` to leave
+room for one-shot commands.
 
-### Step 4 — Add the subscriber to `shell_loop` (`usb_serial.rs`)
-
-```rust
-// Type alias at top of file
-type OdomSub = Subscriber<'static, CriticalSectionRawMutex, msgs::VehicleOdometry, 4, 4, 1>;
-
-// Inside shell_loop():
-let mut odom_sub: OdomSub = match crate::sensors::VEHICLE_ODOMETRY.subscriber() {
-    Ok(s) => s,
-    Err(_) => {
-        defmt::error!("USB shell: VEHICLE_ODOMETRY subscriber slots exhausted");
-        return;
-    }
-};
-```
-
-Then extend the `select3(...)` call to `select4(...)` (or `select` + `join` if you
-need more) and add the corresponding match arm:
+### Step 3 — Stream flag and task wrapper (`usb_serial.rs`)
 
 ```rust
-Either4::Fourth(WaitResult::Message(odom)) => {
-    if stream_odom {
-        let mut buf = [0u8; 256];
-        let mut w = WriteBuf::new(buf.as_mut_slice());
-        let _ = write!(w, "{}\r\n", ShellMsg(&odom));
-        if write_all(class, w.as_slice()).await.is_err() {
-            return;
-        }
-    }
-}
-Either4::Fourth(WaitResult::Lagged(n)) => {
-    defmt::warn!("USB shell: dropped {} odometry samples", n);
+// At module level, alongside STREAM_IMU etc.:
+pub static STREAM_ODOM: AtomicBool = AtomicBool::new(false);
+
+// Concrete task wrapper:
+#[embassy_executor::task]
+pub async fn odom_stream_task() {
+    msg_stream_task(&crate::sensors::VEHICLE_ODOMETRY, &STREAM_ODOM).await
 }
 ```
 
-### Step 5 — Help text and match arms (`usb_serial.rs`)
+### Step 4 — Spawn the task (`main.rs`)
+
+```rust
+spawner
+    .spawn(cybflight::usb_serial::odom_stream_task())
+    .unwrap_or_else(|_| defmt::panic!("failed to spawn odometry stream task"));
+```
+
+### Step 5 — Reset the flag on connection (`shell_loop`, `usb_serial.rs`)
+
+```rust
+// Inside shell_loop(), alongside the other resets:
+STREAM_ODOM.store(false, Ordering::Relaxed);
+```
+
+### Step 6 — Help text and match arms (`usb_serial.rs`)
 
 ```rust
 // HELP_TEXT
-  stream odom on   stream vehicle odometry\r\n\
-  stream odom off  stop odometry stream\r\n\
+  stream odom on     stream vehicle odometry\r\n\
+  stream odom off    stop odometry stream\r\n\
 
-// dispatch() — stream_odom must be threaded in via &mut bool parameter
-"stream odom on"  => { *stream_odom = true;  write_all(class, b"odometry stream on\r\n").await?; }
-"stream odom off" => { *stream_odom = false; write_all(class, b"odometry stream off\r\n").await?; }
+// dispatch()
+"stream odom on"  => { STREAM_ODOM.store(true,  Ordering::Relaxed); write_all(class, b"odometry stream on\r\n").await?; }
+"stream odom off" => { STREAM_ODOM.store(false, Ordering::Relaxed); write_all(class, b"odometry stream off\r\n").await?; }
 ```
-
-Add `stream_odom: &mut bool` to the `dispatch` signature and thread it through from
-`shell_loop`.
 
 ---
 
@@ -226,18 +215,18 @@ Add `stream_odom: &mut bool` to the `dispatch` signature and thread it through f
 | Multi-field nested message | `[u8; 256]` |
 | Help text / multi-line | use `write_all(class, CONST_BYTES)` directly |
 
-`WriteBuf` silently truncates if the buffer is too small (returns `fmt::Error` which
-is ignored by `let _ = write!(...)`). If output is being silently cut off, increase
-the buffer size.
+Pass the buffer size to `oneshot` as the second argument. It is capped at 256
+internally. `WriteBuf` silently truncates on overflow — if output is cut off,
+increase the buffer.
 
 ---
 
 ## What not to put in `usb_serial.rs`
 
 - **Platform actions** (`reboot`, DFU entry, watchdog kick): `platform.rs`
-- **Message formatting** (`ShellMsg` impls, `Printable` impls): `shell/format.rs`
-- **New pub/sub channels**: `sensors/mod.rs`
+- **Message formatting** (`ShellMsg` impls): `shell/format.rs`
+- **New pub/sub channels**: `sensors/mod.rs` (or the appropriate module)
 - **New message types**: `msgs.rs`
 
-`usb_serial.rs` owns only the USB transport, the shell loop, and the command
-dispatch table. Keep it that way.
+`usb_serial.rs` owns the USB transport, the stream flags, the stream task wrappers,
+the shell loop, and the command dispatch table. Keep it that way.

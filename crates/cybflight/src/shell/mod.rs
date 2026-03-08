@@ -1,5 +1,6 @@
 use core::fmt::Write;
 
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_usb::{
     class::cdc_acm::CdcAcmClass,
     driver::{Driver, EndpointError},
@@ -49,8 +50,48 @@ pub async fn write_all<'d>(
     for chunk in data.chunks(64) {
         class.write_packet(chunk).await?;
     }
-    if !data.is_empty() && data.len() % 64 == 0 {
+    if !data.is_empty() && data.len().is_multiple_of(64) {
         class.write_packet(&[]).await?;
     }
     Ok(())
 }
+
+pub struct ShellLine {
+    buf: [u8; 256],
+    len: usize,
+}
+
+impl ShellLine {
+    pub fn new() -> Self {
+        Self {
+            buf: [0; 256],
+            len: 0,
+        }
+    }
+    pub fn writer(&mut self) -> WriteBuf<'_> {
+        WriteBuf::new(&mut self.buf)
+    }
+
+    pub fn finish(&mut self, w: &WriteBuf<'_>) {
+        self.len = w.as_slice().len();
+    }
+
+    /// Write into the line via a closure, then seal it in one borrow.
+    pub fn format<F: FnOnce(&mut WriteBuf<'_>)>(&mut self, f: F) {
+        let mut w = WriteBuf::new(&mut self.buf);
+        f(&mut w);
+        self.len = w.as_slice().len();
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl Default for ShellLine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub static SHELL_OUT: Channel<CriticalSectionRawMutex, ShellLine, 8> = Channel::new();

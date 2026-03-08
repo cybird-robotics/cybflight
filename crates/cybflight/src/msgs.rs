@@ -1,7 +1,7 @@
 use embassy_time::Instant;
 use nalgebra::{SVector, UnitQuaternion, Vector3};
 
-trait Message: defmt::Format + Clone + Sync + 'static {}
+pub trait Message: defmt::Format + Clone + Sync + 'static {}
 
 #[derive(Clone, defmt::Format)]
 pub struct Imu {
@@ -81,3 +81,4 @@ pub struct OcpSolverOutput {
     pub converged: bool,
     pub solve_time_us: u64,
 }
+impl Message for OcpSolverOutput {}

@@ -11,9 +11,9 @@ use crate::shell::write_all;
 use crate::shell::WriteBuf;
 use embassy_futures::join::join;
 use embassy_futures::select::{select6, Either6};
-use embassy_time::{Duration, with_timeout};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::pubsub::{Subscriber, WaitResult};
+use embassy_time::{with_timeout, Duration};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::Builder;
@@ -28,17 +28,13 @@ type RcLinkSub = Subscriber<'static, CriticalSectionRawMutex, msgs::RcLinkStatus
 
 const PROMPT: &[u8] = b"> ";
 const HELP_TEXT: &[u8] = b"\
-  imu                  one-shot IMU snapshot\r\n\
-  att                  one-shot attitude snapshot\r\n\
-  rc                   one-shot RC channel values\r\n\
-  rcstats              one-shot RC link status\r\n\
-  stream imu on/off    stream IMU at sensor rate\r\n\
-  stream att on/off    stream vehicle attitude\r\n\
-  stream rc on/off     stream RC channel values\r\n\
-  stream rcstats on/off  stream RC link status\r\n\
-  reboot               software reset\r\n\
-  reboot --dfu         reset into USB DFU bootloader\r\n\
-  help                 show this message\r\n\
+  imu                one-shot IMU snapshot\r\n\
+  att                one-shot attitude snapshot\r\n\
+  stream <topic> on  stream data on <topic>\r\n\
+  stream <topic> off stop data stream on <topic>\r\n\
+  reboot             software reset\r\n\
+  reboot --dfu       reset into USB DFU bootloader\r\n\
+  help               show this message\r\n\
 ";
 
 // ---------------------------------------------------------------------------
@@ -104,6 +100,15 @@ pub async fn run(
     .await;
 }
 
+#[derive(Default)]
+struct StreamState {
+    pub stream_imu: bool,
+    pub stream_att: bool,
+    pub stream_ocp: bool,
+    pub stream_rc: bool,
+    pub stream_rcstats: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Shell loop
 // ---------------------------------------------------------------------------
@@ -150,11 +155,8 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
 
     let mut line_buf = [0u8; 64];
     let mut line_len = 0usize;
-    let mut stream_imu = false;
-    let mut stream_att = false;
-    let mut stream_ocp = false;
-    let mut stream_rc = false;
-    let mut stream_rcstats = false;
+
+    let mut state = StreamState::default();
     let mut rx_buf = [0u8; 64];
 
     let mut banner_buf = [0u8; 128];
@@ -198,11 +200,7 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
                             if dispatch(
                                 class,
                                 line,
-                                &mut stream_imu,
-                                &mut stream_att,
-                                &mut stream_ocp,
-                                &mut stream_rc,
-                                &mut stream_rcstats,
+                                &mut state,
                                 &mut imu_sub,
                                 &mut att_sub,
                                 &mut ocp_sub,
@@ -243,7 +241,7 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
             }
 
             Either6::Second(WaitResult::Message(imu)) => {
-                if stream_imu {
+                if state.stream_imu {
                     let mut buf = [0u8; 128];
                     let mut w = WriteBuf::new(buf.as_mut_slice());
                     let _ = write!(w, "{}\r\n", ShellMsg(&imu));
@@ -257,7 +255,7 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
             }
 
             Either6::Third(WaitResult::Message(att)) => {
-                if stream_att {
+                if state.stream_att {
                     let mut buf = [0u8; 64];
                     let mut w = WriteBuf::new(buf.as_mut_slice());
                     let _ = write!(w, "{}\r\n", ShellMsg(&att));
@@ -271,7 +269,7 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
             }
 
             Either6::Fourth(WaitResult::Message(ocp)) => {
-                if stream_ocp {
+                if state.stream_ocp {
                     let mut buf = [0u8; 256];
                     let mut w = WriteBuf::new(buf.as_mut_slice());
                     let _ = write!(w, "{}\r\n", ShellMsg(&ocp));
@@ -285,7 +283,7 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
             }
 
             Either6::Fifth(WaitResult::Message(rc)) => {
-                if stream_rc {
+                if state.stream_rc {
                     let mut buf = [0u8; 256];
                     let mut w = WriteBuf::new(buf.as_mut_slice());
                     let _ = write!(w, "{}\r\n", ShellMsg(&rc));
@@ -299,7 +297,7 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
             }
 
             Either6::Sixth(WaitResult::Message(link)) => {
-                if stream_rcstats {
+                if state.stream_rcstats {
                     let mut buf = [0u8; 128];
                     let mut w = WriteBuf::new(buf.as_mut_slice());
                     let _ = write!(w, "{}\r\n", ShellMsg(&link));
@@ -322,11 +320,7 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
 async fn dispatch<'d>(
     class: &mut CdcAcmClass<'d, UsbDriver<'d>>,
     line: &str,
-    stream_imu: &mut bool,
-    stream_att: &mut bool,
-    stream_ocp: &mut bool,
-    stream_rc: &mut bool,
-    stream_rcstats: &mut bool,
+    state: &mut StreamState,
     imu_sub: &mut ImuSub,
     att_sub: &mut AttSub,
     ocp_sub: &mut OcpSub,
@@ -389,43 +383,43 @@ async fn dispatch<'d>(
             }
         }
         "stream imu on" => {
-            *stream_imu = true;
+            state.stream_imu = true;
             write_all(class, b"IMU stream on\r\n").await?;
         }
         "stream imu off" => {
-            *stream_imu = false;
+            state.stream_imu = false;
             write_all(class, b"IMU stream off\r\n").await?;
         }
         "stream att on" => {
-            *stream_att = true;
+            state.stream_att = true;
             write_all(class, b"attitude stream on\r\n").await?;
         }
         "stream att off" => {
-            *stream_att = false;
+            state.stream_att = false;
             write_all(class, b"attitude stream off\r\n").await?;
         }
         "stream ocp on" => {
-            *stream_ocp = true;
+            state.stream_ocp = true;
             write_all(class, b"OCP solver output stream on\r\n").await?;
         }
         "stream ocp off" => {
-            *stream_ocp = false;
+            state.stream_ocp = false;
             write_all(class, b"OCP solver output stream off\r\n").await?;
         }
         "stream rc on" => {
-            *stream_rc = true;
+            state.stream_rc = true;
             write_all(class, b"RC stream on\r\n").await?;
         }
         "stream rc off" => {
-            *stream_rc = false;
+            state.stream_rc = false;
             write_all(class, b"RC stream off\r\n").await?;
         }
         "stream rcstats on" => {
-            *stream_rcstats = true;
+            state.stream_rcstats = true;
             write_all(class, b"RC link status stream on\r\n").await?;
         }
         "stream rcstats off" => {
-            *stream_rcstats = false;
+            state.stream_rcstats = false;
             write_all(class, b"RC link status stream off\r\n").await?;
         }
         "reboot" => {

@@ -3,3 +3,4 @@
 pub mod beeper;
 pub mod imu;
 pub mod led;
+pub mod rc;

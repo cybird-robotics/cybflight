@@ -5,11 +5,13 @@ edition = "2024"
 publish = false
 
 [features]
-# Pick one board by default
-default = ["board_sakurah743"]
+# Pick one board by default; enable CRSF RC by default
+default = ["board_sakurah743", "rx_crsf"]
 
 board_sakurah743 = ["dep:bsp-sakurah743"]
 board_foxeerh743 = ["dep:bsp-foxeerh743"]
+rx_crsf = []
+rx_ghst = []
 
 [dependencies]
 bsp-sakurah743 = { path = "../bsp/sakurah743", optional = true }
@@ -26,6 +28,7 @@ embassy-embedded-hal = { version = "0.5.0", features = ["defmt"] }
 embedded-hal = "1.0"
 embassy-futures = "0.1.2"
 embassy-usb = { version = "0.5", features = ["defmt"] }
+embedded-io-async = "0.7"
 static_cell = "2"
 
 # cortex-m-rt needed by embassy_executor::main

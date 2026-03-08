@@ -16,6 +16,11 @@ use crate::usb_serial;
 use hal::spi::{self, Spi};
 use hal::time::Hertz;
 
+// Bind USART1 interrupt for SerialRx (CRSF/GHST) — BF default: SERIALRX_UART = USART1
+hal::bind_interrupts!(struct Usart1Irqs {
+    USART1 => hal::usart::BufferedInterruptHandler<hal::peripherals::USART1>;
+});
+
 pub async fn init(spawner: &Spawner, board: bsp::Board) {
     // --- LED: only 1 LED, use it for status ---
     let led0 = Led::new(board.leds.led0, false);
@@ -100,6 +105,67 @@ pub async fn init(spawner: &Spawner, board: bsp::Board) {
         }
         Err(id) => {
             defmt::error!("Unknown IMU: WHO_AM_I={:#x}", id);
+        }
+    }
+
+    // --- SerialRx: USART1 on PA10 (RX) / PA9 (TX) — BF default ---
+    // CRSF: full-duplex (separate TX/RX pins), standard Betaflight behavior.
+    // GHST: single-wire half-duplex on TX pin (T1 pad = PA9), per BF SERIAL_BIDIR.
+    #[cfg(feature = "rx_crsf")]
+    {
+        static TX_BUF: StaticCell<[u8; 128]> = StaticCell::new();
+        static RX_BUF: StaticCell<[u8; 128]> = StaticCell::new();
+        let tx_buf = &mut TX_BUF.init([0u8; 128])[..];
+        let rx_buf = &mut RX_BUF.init([0u8; 128])[..];
+
+        let mut uart_config = hal::usart::Config::default();
+        uart_config.baudrate = 420_000;
+
+        match hal::usart::BufferedUart::new(
+            board.serial.usart1,
+            board.serial.usart1_rx,
+            board.serial.usart1_tx,
+            tx_buf,
+            rx_buf,
+            Usart1Irqs,
+            uart_config,
+        ) {
+            Ok(uart) => {
+                defmt::info!("CRSF USART1 init OK");
+                spawner
+                    .spawn(crate::sensors::rc::crsf_runner::crsf_task(uart))
+                    .unwrap_or_else(|e| defmt::error!("Failed to spawn CRSF task: {}", e));
+            }
+            Err(e) => defmt::error!("CRSF USART1 init failed: {}", e),
+        }
+    }
+
+    #[cfg(feature = "rx_ghst")]
+    {
+        static TX_BUF: StaticCell<[u8; 128]> = StaticCell::new();
+        static RX_BUF: StaticCell<[u8; 128]> = StaticCell::new();
+        let tx_buf = &mut TX_BUF.init([0u8; 128])[..];
+        let rx_buf = &mut RX_BUF.init([0u8; 128])[..];
+
+        let mut uart_config = hal::usart::Config::default();
+        uart_config.baudrate = 420_000;
+
+        match hal::usart::BufferedUart::new_half_duplex(
+            board.serial.usart1,
+            board.serial.usart1_tx,
+            Usart1Irqs,
+            tx_buf,
+            rx_buf,
+            uart_config,
+            hal::usart::HalfDuplexReadback::NoReadback,
+        ) {
+            Ok(uart) => {
+                defmt::info!("GHST USART1 half-duplex init OK");
+                spawner
+                    .spawn(crate::sensors::rc::ghst_runner::ghst_task(uart))
+                    .unwrap_or_else(|e| defmt::error!("Failed to spawn GHST task: {}", e));
+            }
+            Err(e) => defmt::error!("GHST USART1 init failed: {}", e),
         }
     }
 }

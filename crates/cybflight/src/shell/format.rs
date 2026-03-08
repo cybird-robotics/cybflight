@@ -93,6 +93,35 @@ impl fmt::Display for ShellMsg<'_, msgs::OcpSolverOutput> {
     }
 }
 
+impl fmt::Display for ShellMsg<'_, msgs::RcInput> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.0;
+        write!(f, "RcInput(timestamp={}, channels=[", s.timestamp.as_millis())?;
+        for i in 0..s.channel_count as usize {
+            if i > 0 {
+                write!(f, ",")?;
+            }
+            write!(f, "{}", s.channels[i])?;
+        }
+        write!(f, "], count={})", s.channel_count)
+    }
+}
+
+impl fmt::Display for ShellMsg<'_, msgs::RcLinkStatus> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.0;
+        write!(
+            f,
+            "RcLinkStatus(timestamp={}, rssi={}dBm, lq={}%, snr={}dB, rf_mode={})",
+            s.timestamp.as_millis(),
+            s.rssi_dbm,
+            s.link_quality,
+            s.snr,
+            s.rf_mode
+        )
+    }
+}
+
 pub trait Printable {
     fn should_print(&self, ctx: &ShellState) -> bool;
     fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result;
@@ -104,6 +133,8 @@ pub struct ShellState {
     pub stream_imu: bool,
     pub stream_att: bool,
     pub stream_odom: bool,
+    pub stream_rc: bool,
+    pub stream_rcstats: bool,
 }
 
 impl Printable for msgs::Imu {
@@ -129,6 +160,26 @@ impl Printable for msgs::VehicleAttitude {
 impl Printable for msgs::VehicleOdometry {
     fn should_print(&self, ctx: &ShellState) -> bool {
         ctx.stream_odom
+    }
+
+    fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        write!(w, "{}", ShellMsg(self))
+    }
+}
+
+impl Printable for msgs::RcInput {
+    fn should_print(&self, ctx: &ShellState) -> bool {
+        ctx.stream_rc
+    }
+
+    fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        write!(w, "{}", ShellMsg(self))
+    }
+}
+
+impl Printable for msgs::RcLinkStatus {
+    fn should_print(&self, ctx: &ShellState) -> bool {
+        ctx.stream_rcstats
     }
 
     fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {

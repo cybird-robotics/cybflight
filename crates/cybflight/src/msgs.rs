@@ -46,6 +46,32 @@ pub struct VehicleOdometry {
 
 impl Message for VehicleOdometry {}
 
+#[derive(Clone, defmt::Format)]
+pub struct RcInput {
+    pub timestamp: Instant,
+    /// Channel values in PWM microseconds [988..2012].
+    pub channels: [u16; 16],
+    /// Number of valid channels.
+    pub channel_count: u8,
+}
+
+impl Message for RcInput {}
+
+#[derive(Clone, defmt::Format)]
+pub struct RcLinkStatus {
+    pub timestamp: Instant,
+    /// RSSI in dBm (negative value).
+    pub rssi_dbm: i16,
+    /// Link quality percentage [0..100].
+    pub link_quality: u8,
+    /// Signal-to-noise ratio in dB.
+    pub snr: i8,
+    /// RF mode index (protocol-specific).
+    pub rf_mode: u8,
+}
+
+impl Message for RcLinkStatus {}
+
 const OCP_OUTPUT_SIZE: usize = 4;
 #[derive(Clone, defmt::Format)]
 pub struct OcpSolverOutput {

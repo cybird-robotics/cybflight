@@ -5,12 +5,13 @@ use crate::control::OCP_SOLVER_OUTPUT;
 use crate::hal;
 use crate::msgs;
 use crate::platform;
-use crate::sensors::{RAW_IMU, VEHICLE_ATTITUDE};
+use crate::sensors::{RAW_IMU, RC_INPUT, RC_LINK_STATUS, VEHICLE_ATTITUDE};
 use crate::shell::format::ShellMsg;
 use crate::shell::write_all;
 use crate::shell::WriteBuf;
 use embassy_futures::join::join;
-use embassy_futures::select::{select4, Either4};
+use embassy_futures::select::{select6, Either6};
+use embassy_time::{Duration, with_timeout};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::pubsub::{Subscriber, WaitResult};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
@@ -22,18 +23,22 @@ type UsbDriver<'d> = Driver<'d, hal::peripherals::USB_OTG_FS>;
 type ImuSub = Subscriber<'static, CriticalSectionRawMutex, msgs::Imu, 4, 4, 2>;
 type AttSub = Subscriber<'static, CriticalSectionRawMutex, msgs::VehicleAttitude, 4, 4, 1>;
 type OcpSub = Subscriber<'static, CriticalSectionRawMutex, msgs::OcpSolverOutput, 4, 4, 1>;
+type RcSub = Subscriber<'static, CriticalSectionRawMutex, msgs::RcInput, 4, 4, 1>;
+type RcLinkSub = Subscriber<'static, CriticalSectionRawMutex, msgs::RcLinkStatus, 2, 3, 1>;
 
 const PROMPT: &[u8] = b"> ";
 const HELP_TEXT: &[u8] = b"\
-  imu              one-shot IMU snapshot\r\n\
-  att              one-shot attitude snapshot\r\n\
-  stream imu on    stream IMU at sensor rate\r\n\
-  stream imu off   stop IMU stream\r\n\
-  stream att on    stream vehicle attitude\r\n\
-  stream att off   stop attitude stream\r\n\
-  reboot           software reset\r\n\
-  reboot --dfu     reset into USB DFU bootloader\r\n\
-  help             show this message\r\n\
+  imu                  one-shot IMU snapshot\r\n\
+  att                  one-shot attitude snapshot\r\n\
+  rc                   one-shot RC channel values\r\n\
+  rcstats              one-shot RC link status\r\n\
+  stream imu on/off    stream IMU at sensor rate\r\n\
+  stream att on/off    stream vehicle attitude\r\n\
+  stream rc on/off     stream RC channel values\r\n\
+  stream rcstats on/off  stream RC link status\r\n\
+  reboot               software reset\r\n\
+  reboot --dfu         reset into USB DFU bootloader\r\n\
+  help                 show this message\r\n\
 ";
 
 // ---------------------------------------------------------------------------
@@ -127,11 +132,29 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
         }
     };
 
+    let mut rc_sub: RcSub = match RC_INPUT.subscriber() {
+        Ok(s) => s,
+        Err(_) => {
+            defmt::error!("USB shell: RC_INPUT subscriber slots exhausted");
+            return;
+        }
+    };
+
+    let mut rc_link_sub: RcLinkSub = match RC_LINK_STATUS.subscriber() {
+        Ok(s) => s,
+        Err(_) => {
+            defmt::error!("USB shell: RC_LINK_STATUS subscriber slots exhausted");
+            return;
+        }
+    };
+
     let mut line_buf = [0u8; 64];
     let mut line_len = 0usize;
     let mut stream_imu = false;
     let mut stream_att = false;
     let mut stream_ocp = false;
+    let mut stream_rc = false;
+    let mut stream_rcstats = false;
     let mut rx_buf = [0u8; 64];
 
     let mut banner_buf = [0u8; 128];
@@ -150,17 +173,19 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
     }
 
     loop {
-        match select4(
+        match select6(
             class.read_packet(&mut rx_buf),
             imu_sub.next_message(),
             att_sub.next_message(),
             ocp_sub.next_message(),
+            rc_sub.next_message(),
+            rc_link_sub.next_message(),
         )
         .await
         {
-            Either4::First(Err(_)) => return,
+            Either6::First(Err(_)) => return,
 
-            Either4::First(Ok(n)) => {
+            Either6::First(Ok(n)) => {
                 for &b in &rx_buf[..n] {
                     match b {
                         b'\r' | b'\n' => {
@@ -176,9 +201,13 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
                                 &mut stream_imu,
                                 &mut stream_att,
                                 &mut stream_ocp,
+                                &mut stream_rc,
+                                &mut stream_rcstats,
                                 &mut imu_sub,
                                 &mut att_sub,
                                 &mut ocp_sub,
+                                &mut rc_sub,
+                                &mut rc_link_sub,
                             )
                             .await
                             .is_err()
@@ -213,7 +242,7 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
                 }
             }
 
-            Either4::Second(WaitResult::Message(imu)) => {
+            Either6::Second(WaitResult::Message(imu)) => {
                 if stream_imu {
                     let mut buf = [0u8; 128];
                     let mut w = WriteBuf::new(buf.as_mut_slice());
@@ -223,11 +252,11 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
                     }
                 }
             }
-            Either4::Second(WaitResult::Lagged(n)) => {
+            Either6::Second(WaitResult::Lagged(n)) => {
                 defmt::warn!("USB shell: dropped {} IMU samples", n);
             }
 
-            Either4::Third(WaitResult::Message(att)) => {
+            Either6::Third(WaitResult::Message(att)) => {
                 if stream_att {
                     let mut buf = [0u8; 64];
                     let mut w = WriteBuf::new(buf.as_mut_slice());
@@ -237,11 +266,11 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
                     }
                 }
             }
-            Either4::Third(WaitResult::Lagged(n)) => {
+            Either6::Third(WaitResult::Lagged(n)) => {
                 defmt::warn!("USB shell: dropped {} attitude samples", n);
             }
 
-            Either4::Fourth(WaitResult::Message(ocp)) => {
+            Either6::Fourth(WaitResult::Message(ocp)) => {
                 if stream_ocp {
                     let mut buf = [0u8; 256];
                     let mut w = WriteBuf::new(buf.as_mut_slice());
@@ -251,9 +280,36 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
                     }
                 }
             }
-
-            Either4::Fourth(WaitResult::Lagged(n)) => {
+            Either6::Fourth(WaitResult::Lagged(n)) => {
                 defmt::warn!("USB shell: dropped {} OCP solver outputs", n);
+            }
+
+            Either6::Fifth(WaitResult::Message(rc)) => {
+                if stream_rc {
+                    let mut buf = [0u8; 256];
+                    let mut w = WriteBuf::new(buf.as_mut_slice());
+                    let _ = write!(w, "{}\r\n", ShellMsg(&rc));
+                    if write_all(class, w.as_slice()).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            Either6::Fifth(WaitResult::Lagged(n)) => {
+                defmt::warn!("USB shell: dropped {} RC input samples", n);
+            }
+
+            Either6::Sixth(WaitResult::Message(link)) => {
+                if stream_rcstats {
+                    let mut buf = [0u8; 128];
+                    let mut w = WriteBuf::new(buf.as_mut_slice());
+                    let _ = write!(w, "{}\r\n", ShellMsg(&link));
+                    if write_all(class, w.as_slice()).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            Either6::Sixth(WaitResult::Lagged(n)) => {
+                defmt::warn!("USB shell: dropped {} RC link status samples", n);
             }
         }
     }
@@ -269,9 +325,13 @@ async fn dispatch<'d>(
     stream_imu: &mut bool,
     stream_att: &mut bool,
     stream_ocp: &mut bool,
+    stream_rc: &mut bool,
+    stream_rcstats: &mut bool,
     imu_sub: &mut ImuSub,
     att_sub: &mut AttSub,
     ocp_sub: &mut OcpSub,
+    rc_sub: &mut RcSub,
+    rc_link_sub: &mut RcLinkSub,
 ) -> Result<(), EndpointError> {
     match line {
         "" => {}
@@ -279,25 +339,54 @@ async fn dispatch<'d>(
             write_all(class, HELP_TEXT).await?;
         }
         "imu" => {
-            let msg = next_message(imu_sub).await;
-            let mut buf = [0u8; 256];
-            let mut w = WriteBuf::new(buf.as_mut_slice());
-            write!(w, "{}\r\n", ShellMsg(&msg)).ok();
-            write_all(class, w.as_slice()).await?;
+            if let Some(msg) = next_message(imu_sub).await {
+                let mut buf = [0u8; 256];
+                let mut w = WriteBuf::new(buf.as_mut_slice());
+                write!(w, "{}\r\n", ShellMsg(&msg)).ok();
+                write_all(class, w.as_slice()).await?;
+            } else {
+                write_all(class, b"no data (timeout)\r\n").await?;
+            }
         }
         "att" => {
-            let msg = next_message(att_sub).await;
-            let mut buf = [0u8; 256];
-            let mut w = WriteBuf::new(buf.as_mut_slice());
-            write!(w, "{}\r\n", ShellMsg(&msg)).ok();
-            write_all(class, w.as_slice()).await?;
+            if let Some(msg) = next_message(att_sub).await {
+                let mut buf = [0u8; 256];
+                let mut w = WriteBuf::new(buf.as_mut_slice());
+                write!(w, "{}\r\n", ShellMsg(&msg)).ok();
+                write_all(class, w.as_slice()).await?;
+            } else {
+                write_all(class, b"no data (timeout)\r\n").await?;
+            }
         }
         "ocp" => {
-            let msg = next_message(ocp_sub).await;
-            let mut buf = [0u8; 256];
-            let mut w = WriteBuf::new(buf.as_mut_slice());
-            write!(w, "{}\r\n", ShellMsg(&msg)).ok();
-            write_all(class, w.as_slice()).await?;
+            if let Some(msg) = next_message(ocp_sub).await {
+                let mut buf = [0u8; 256];
+                let mut w = WriteBuf::new(buf.as_mut_slice());
+                write!(w, "{}\r\n", ShellMsg(&msg)).ok();
+                write_all(class, w.as_slice()).await?;
+            } else {
+                write_all(class, b"no data (timeout)\r\n").await?;
+            }
+        }
+        "rc" => {
+            if let Some(msg) = next_message(rc_sub).await {
+                let mut buf = [0u8; 256];
+                let mut w = WriteBuf::new(buf.as_mut_slice());
+                write!(w, "{}\r\n", ShellMsg(&msg)).ok();
+                write_all(class, w.as_slice()).await?;
+            } else {
+                write_all(class, b"no data (timeout)\r\n").await?;
+            }
+        }
+        "rcstats" => {
+            if let Some(msg) = next_message(rc_link_sub).await {
+                let mut buf = [0u8; 128];
+                let mut w = WriteBuf::new(buf.as_mut_slice());
+                write!(w, "{}\r\n", ShellMsg(&msg)).ok();
+                write_all(class, w.as_slice()).await?;
+            } else {
+                write_all(class, b"no data (timeout)\r\n").await?;
+            }
         }
         "stream imu on" => {
             *stream_imu = true;
@@ -323,6 +412,22 @@ async fn dispatch<'d>(
             *stream_ocp = false;
             write_all(class, b"OCP solver output stream off\r\n").await?;
         }
+        "stream rc on" => {
+            *stream_rc = true;
+            write_all(class, b"RC stream on\r\n").await?;
+        }
+        "stream rc off" => {
+            *stream_rc = false;
+            write_all(class, b"RC stream off\r\n").await?;
+        }
+        "stream rcstats on" => {
+            *stream_rcstats = true;
+            write_all(class, b"RC link status stream on\r\n").await?;
+        }
+        "stream rcstats off" => {
+            *stream_rcstats = false;
+            write_all(class, b"RC link status stream off\r\n").await?;
+        }
         "reboot" => {
             write_all(class, b"rebooting...\r\n").await?;
             platform::sys_reboot();
@@ -338,18 +443,26 @@ async fn dispatch<'d>(
     Ok(())
 }
 
-/// Drain lagged subscriber messages until a fresh one arrives.
+/// Timeout for one-shot shell commands waiting on a channel message.
+/// Matches Betaflight's RXLOSS_TRIGGER_INTERVAL (150ms).
+const ONESHOT_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// Drain lagged subscriber messages until a fresh one arrives, with timeout.
 async fn next_message<M, T, const CAP: usize, const SUBS: usize, const PUBS: usize>(
     sub: &mut Subscriber<'_, M, T, CAP, SUBS, PUBS>,
-) -> T
+) -> Option<T>
 where
     M: embassy_sync::blocking_mutex::raw::RawMutex,
     T: Clone,
 {
-    loop {
-        match sub.next_message().await {
-            WaitResult::Message(m) => return m,
-            WaitResult::Lagged(_) => continue,
+    with_timeout(ONESHOT_TIMEOUT, async {
+        loop {
+            match sub.next_message().await {
+                WaitResult::Message(m) => return m,
+                WaitResult::Lagged(_) => continue,
+            }
         }
-    }
+    })
+    .await
+    .ok()
 }

@@ -27,11 +27,12 @@ Key rules:
 ## Building
 
 ```sh
-# Default board (sakurah743):
+# Default board (sakurah743) + default RC protocol (CRSF):
 cargo build -p cybflight
 
-# Specific board:
-cargo build -p cybflight --no-default-features --features board_foxeerh743
+# Specific board + RC protocol:
+cargo build -p cybflight --no-default-features --features board_foxeerh743,rx_crsf
+cargo build -p cybflight --no-default-features --features board_sakurah743,rx_ghst
 ```
 
 ## Crate Map

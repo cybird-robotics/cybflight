@@ -1,5 +1,6 @@
 pub mod attitude;
 pub mod imu;
+pub mod rc;
 use crate::msgs;
 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, pubsub::PubSubChannel};
@@ -18,3 +19,11 @@ pub static VEHICLE_ATTITUDE: PubSubChannel<
     4,
     1,
 > = PubSubChannel::new();
+
+// RC input: CAP=4, SUBS=4 (control + telemetry + 2 spare), PUBS=1 (single RC task).
+pub static RC_INPUT: PubSubChannel<CriticalSectionRawMutex, msgs::RcInput, 4, 4, 1> =
+    PubSubChannel::new();
+
+// RC link status: CAP=2, SUBS=3 (telemetry + shell + spare), PUBS=1 (single RC task).
+pub static RC_LINK_STATUS: PubSubChannel<CriticalSectionRawMutex, msgs::RcLinkStatus, 2, 3, 1> =
+    PubSubChannel::new();

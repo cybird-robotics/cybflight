@@ -276,6 +276,73 @@ impl QuadModel {
         xout
     }
 
+    /// Single-stage Euler sensitivity — ~10× cheaper than `propagate_rk4_grad`.
+    ///
+    /// Computes F_x = I + dt·∂f/∂x(xk) and F_u = dt·∂f/∂u(xk) using one
+    /// `dynamics_jac_impl` call and explicit sparse index writes (no dense mat-muls).
+    /// The state trajectory is NOT advanced here; use `propagate_rk4` for that.
+    pub fn propagate_euler_grad(
+        &mut self,
+        xk: &State,
+        uk: &Control,
+        grad_fx: &mut StateJac,
+        grad_fu: &mut CtrlJac,
+    ) {
+        let mass = self.mass;
+        let grav = self.grav;
+        let dt = self.dt;
+        dynamics_jac_impl(xk, uk, mass, grav, &mut self.df_x0, &mut self.df_u0);
+
+        // F_x = I + dt·J_x — identity diagonal + sparse nonzeros of df_x0
+        *grad_fx = StateJac::zeros();
+        for i in 0..10 {
+            grad_fx[(i, i)] = 1.0;
+        }
+        grad_fx[(0, 7)] += self.df_x0[(0, 7)] * dt;
+        grad_fx[(1, 8)] += self.df_x0[(1, 8)] * dt;
+        grad_fx[(2, 9)] += self.df_x0[(2, 9)] * dt;
+        grad_fx[(3, 4)] += self.df_x0[(3, 4)] * dt;
+        grad_fx[(3, 5)] += self.df_x0[(3, 5)] * dt;
+        grad_fx[(3, 6)] += self.df_x0[(3, 6)] * dt;
+        grad_fx[(4, 3)] += self.df_x0[(4, 3)] * dt;
+        grad_fx[(4, 5)] += self.df_x0[(4, 5)] * dt;
+        grad_fx[(4, 6)] += self.df_x0[(4, 6)] * dt;
+        grad_fx[(5, 3)] += self.df_x0[(5, 3)] * dt;
+        grad_fx[(5, 4)] += self.df_x0[(5, 4)] * dt;
+        grad_fx[(5, 6)] += self.df_x0[(5, 6)] * dt;
+        grad_fx[(6, 3)] += self.df_x0[(6, 3)] * dt;
+        grad_fx[(6, 4)] += self.df_x0[(6, 4)] * dt;
+        grad_fx[(6, 5)] += self.df_x0[(6, 5)] * dt;
+        grad_fx[(7, 3)] += self.df_x0[(7, 3)] * dt;
+        grad_fx[(7, 4)] += self.df_x0[(7, 4)] * dt;
+        grad_fx[(7, 5)] += self.df_x0[(7, 5)] * dt;
+        grad_fx[(7, 6)] += self.df_x0[(7, 6)] * dt;
+        grad_fx[(8, 3)] += self.df_x0[(8, 3)] * dt;
+        grad_fx[(8, 4)] += self.df_x0[(8, 4)] * dt;
+        grad_fx[(8, 5)] += self.df_x0[(8, 5)] * dt;
+        grad_fx[(8, 6)] += self.df_x0[(8, 6)] * dt;
+        grad_fx[(9, 3)] += self.df_x0[(9, 3)] * dt;
+        grad_fx[(9, 4)] += self.df_x0[(9, 4)] * dt;
+
+        // F_u = dt·J_u — sparse nonzeros of df_u0
+        *grad_fu = CtrlJac::zeros();
+        grad_fu[(3, 1)] = self.df_u0[(3, 1)] * dt;
+        grad_fu[(3, 2)] = self.df_u0[(3, 2)] * dt;
+        grad_fu[(3, 3)] = self.df_u0[(3, 3)] * dt;
+        grad_fu[(4, 1)] = self.df_u0[(4, 1)] * dt;
+        grad_fu[(4, 2)] = self.df_u0[(4, 2)] * dt;
+        grad_fu[(4, 3)] = self.df_u0[(4, 3)] * dt;
+        grad_fu[(5, 1)] = self.df_u0[(5, 1)] * dt;
+        grad_fu[(5, 2)] = self.df_u0[(5, 2)] * dt;
+        grad_fu[(5, 3)] = self.df_u0[(5, 3)] * dt;
+        grad_fu[(6, 1)] = self.df_u0[(6, 1)] * dt;
+        grad_fu[(6, 2)] = self.df_u0[(6, 2)] * dt;
+        grad_fu[(6, 3)] = self.df_u0[(6, 3)] * dt;
+        grad_fu[(7, 0)] = self.df_u0[(7, 0)] * dt;
+        grad_fu[(8, 0)] = self.df_u0[(8, 0)] * dt;
+        grad_fu[(9, 0)] = self.df_u0[(9, 0)] * dt;
+    }
+
     // State cost + gradient wrt x. Matches NMPCModel.h:StateCostGrad.
     pub fn state_cost_grad(&self, x: &State, xref: &State, grad_x: &mut State) -> f32 {
         let wp = [50.0_f32, 50.0, 100.0];

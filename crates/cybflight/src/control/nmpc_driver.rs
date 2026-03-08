@@ -10,19 +10,20 @@ pub struct NmpcDriver {
 impl NmpcDriver {
     pub fn new() -> Self {
         Self {
-            solver: nmpc::NmpcSolver::new(),
+            solver: nmpc::NmpcSolver::new().with_timer(|| Instant::now().as_micros()),
         }
     }
 
     pub async fn run(&mut self) -> ! {
         let publisher = super::OCP_SOLVER_OUTPUT.immediate_publisher();
         loop {
-            let t0 = Instant::now();
             let res = nmpc::run_once(&mut self.solver);
-            let solve_us = t0.elapsed().as_micros();
-
+            let solve_us = res.timing.us_fwd
+                + res.timing.us_bwd_jac
+                + res.timing.us_bwd_cost
+                + res.timing.us_bwd_mat;
             publisher.publish_immediate(msgs::OcpSolverOutput {
-                timestamp: t0,
+                timestamp: Instant::now(),
                 command: res.u_opt.into(),
                 converged: res.converged,
                 iterations: res.iterations,

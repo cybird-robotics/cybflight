@@ -1,0 +1,12 @@
+{
+  "rust-analyzer": {
+    "cargo": {
+      "target": "thumbv7em-none-eabihf",
+      "allTargets": true
+    },
+    "check": {
+      "allTargets": true,
+      "extraArgs": ["--target", "thumbv7em-none-eabihf"]
+    }
+  }
+}

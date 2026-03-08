@@ -7,8 +7,8 @@
 
 use nalgebra::ComplexField as _;
 
-pub const DIM: usize = 40; // must equal N * NU (10 * 4); see assert in solver.rs
-pub const M: usize = 10;
+pub const DIM: usize = 80; // must equal N * NU (10 * 4); see assert in solver.rs
+pub const M: usize = 5;
 pub const PAST: usize = 3;
 
 // L-BFGS return codes (matches C++ enum)
@@ -36,11 +36,11 @@ pub struct LbfgsParams {
 impl LbfgsParams {
     pub fn default_nmpc() -> Self {
         Self {
-            max_iterations: 1,
+            max_iterations: 5,
             max_linesearch: 20,
-            past: 3,
-            delta: 1e-5,
-            g_epsilon: 1e-3,
+            past: 0,
+            delta: 0.0,
+            g_epsilon: 1e-4,
             min_step: 1e-20,
             max_step: 1e20,
             f_dec_coeff: 1e-4,

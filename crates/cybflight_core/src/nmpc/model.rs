@@ -499,6 +499,218 @@ impl QuadModel {
         self.state_cost_grad(x, xref, grad_x)
     }
 
+    /// State cost Gauss-Newton Hessian + gradient in a single pass.
+    ///
+    /// Returns (Q_k, q_k) where Q_k is the 10×10 GN Hessian of the state cost
+    /// and q_k is the gradient (same as `state_cost_grad`).
+    pub fn state_cost_hess_grad(
+        &self,
+        x: &State,
+        xref: &State,
+        grad_x: &mut State,
+        hess_xx: &mut StateJac,
+    ) -> f32 {
+        let wp = [50.0_f32, 50.0, 100.0];
+        let wa = [5.0_f32, 5.0, 200.0];
+        let wv = [1.0_f32, 1.0, 1.0];
+        let dt = self.dt;
+
+        let ep = [x[0] - xref[0], x[1] - xref[1], x[2] - xref[2]];
+        let ev = [x[7] - xref[7], x[8] - xref[8], x[9] - xref[9]];
+
+        // q_aux = q ⊗ q_ref⁻¹
+        let (qx, qy, qz, qw) = (x[3], x[4], x[5], x[6]);
+        let (rx, ry, rz, rw) = (xref[3], xref[4], xref[5], xref[6]);
+        let mut qa = [
+            -qx * rw + qw * rx + qz * ry - qy * rz,
+            -qy * rw - qz * rx + qw * ry + qx * rz,
+            -qz * rw + qy * rx - qx * ry + qw * rz,
+            qw * rw + qx * rx + qy * ry + qz * rz,
+        ];
+        let sign_flip = if qa[3] < 0.0 {
+            qa[0] = -qa[0];
+            qa[1] = -qa[1];
+            qa[2] = -qa[2];
+            qa[3] = -qa[3];
+            -1.0_f32
+        } else {
+            1.0_f32
+        };
+
+        const EPS: f32 = 1e-3;
+        let denom = (qa[3] * qa[3] + qa[2] * qa[2] + EPS).sqrt();
+        let inv_d = 1.0 / denom;
+        let nr = qa[3] * qa[0] - qa[1] * qa[2];
+        let np = qa[3] * qa[1] + qa[0] * qa[2];
+        let ny = qa[2];
+        let ea = [2.0 * nr * inv_d, 2.0 * np * inv_d, 2.0 * ny * inv_d];
+
+        let cost = dt * (ep[0] * ep[0] * wp[0] + ep[1] * ep[1] * wp[1] + ep[2] * ep[2] * wp[2])
+            + dt * (ev[0] * ev[0] * wv[0] + ev[1] * ev[1] * wv[1] + ev[2] * ev[2] * wv[2])
+            + dt * (ea[0] * ea[0] * wa[0] + ea[1] * ea[1] * wa[1] + ea[2] * ea[2] * wa[2]);
+
+        // Gradient wrt position and velocity
+        grad_x[0] = 2.0 * ep[0] * wp[0] * dt;
+        grad_x[1] = 2.0 * ep[1] * wp[1] * dt;
+        grad_x[2] = 2.0 * ep[2] * wp[2] * dt;
+        grad_x[7] = 2.0 * ev[0] * wv[0] * dt;
+        grad_x[8] = 2.0 * ev[1] * wv[1] * dt;
+        grad_x[9] = 2.0 * ev[2] * wv[2] * dt;
+
+        // Gradient wrt quaternion (chain rule) — same as state_cost_grad
+        let inv_d2 = inv_d * inv_d;
+        let dd2 = qa[2] * inv_d;
+        let dd3 = qa[3] * inv_d;
+
+        // de_att/dq_aux (3×4)
+        let de = [
+            [
+                2.0 * qa[3] * inv_d,
+                2.0 * (-qa[2]) * inv_d,
+                2.0 * (-qa[1] * inv_d - nr * dd2 * inv_d2),
+                2.0 * (qa[0] * inv_d - nr * dd3 * inv_d2),
+            ],
+            [
+                2.0 * qa[2] * inv_d,
+                2.0 * qa[3] * inv_d,
+                2.0 * (qa[0] * inv_d - np * dd2 * inv_d2),
+                2.0 * (qa[1] * inv_d - np * dd3 * inv_d2),
+            ],
+            [
+                0.0,
+                0.0,
+                2.0 * (inv_d - ny * dd2 * inv_d2),
+                2.0 * (-ny * dd3 * inv_d2),
+            ],
+        ];
+        // dq_aux/dq (4×4)
+        let dqadq = [
+            [
+                -rw * sign_flip,
+                -rz * sign_flip,
+                ry * sign_flip,
+                rx * sign_flip,
+            ],
+            [
+                rz * sign_flip,
+                -rw * sign_flip,
+                -rx * sign_flip,
+                ry * sign_flip,
+            ],
+            [
+                -ry * sign_flip,
+                rx * sign_flip,
+                -rw * sign_flip,
+                rz * sign_flip,
+            ],
+            [
+                rx * sign_flip,
+                ry * sign_flip,
+                rz * sign_flip,
+                rw * sign_flip,
+            ],
+        ];
+        let wea = [ea[0] * wa[0], ea[1] * wa[1], ea[2] * wa[2]];
+
+        // grad_qaux = de^T * wea  (length 4)
+        let mut gqa = [0.0_f32; 4];
+        for col in 0..4 {
+            for row in 0..3 {
+                gqa[col] += de[row][col] * wea[row];
+            }
+        }
+
+        // grad_q = 2*dt * dqadq^T * gqa
+        for qi in 0..4 {
+            let mut v = 0.0_f32;
+            for j in 0..4 {
+                v += dqadq[j][qi] * gqa[j];
+            }
+            grad_x[3 + qi] = 2.0 * dt * v;
+        }
+
+        // ── Gauss-Newton Hessian ──
+        *hess_xx = StateJac::zeros();
+
+        // Position block (3×3 diagonal, rows/cols 0-2)
+        hess_xx[(0, 0)] = 2.0 * dt * wp[0];
+        hess_xx[(1, 1)] = 2.0 * dt * wp[1];
+        hess_xx[(2, 2)] = 2.0 * dt * wp[2];
+
+        // Velocity block (3×3 diagonal, rows/cols 7-9)
+        hess_xx[(7, 7)] = 2.0 * dt * wv[0];
+        hess_xx[(8, 8)] = 2.0 * dt * wv[1];
+        hess_xx[(9, 9)] = 2.0 * dt * wv[2];
+
+        // Quaternion block (4×4, rows/cols 3-6): 2*dt * J_att^T diag(wa) J_att
+        // where J_att (3×4) = de * dqadq composed: J[i][qi] = Σ_j de[i][j] * dqadq[j][qi]
+        let mut j_att = [[0.0_f32; 4]; 3]; // 3×4
+        for i in 0..3 {
+            for qi in 0..4 {
+                let mut v = 0.0_f32;
+                for j in 0..4 {
+                    v += de[i][j] * dqadq[j][qi];
+                }
+                j_att[i][qi] = v;
+            }
+        }
+        // H_q = 2*dt * J_att^T * diag(wa) * J_att (4×4)
+        for qi in 0..4 {
+            for qj in qi..4 {
+                let mut v = 0.0_f32;
+                for i in 0..3 {
+                    v += j_att[i][qi] * wa[i] * j_att[i][qj];
+                }
+                let h = 2.0 * dt * v;
+                hess_xx[(3 + qi, 3 + qj)] = h;
+                if qi != qj {
+                    hess_xx[(3 + qj, 3 + qi)] = h;
+                }
+            }
+        }
+
+        cost
+    }
+
+    /// Combined stage cost Hessian + gradient.
+    ///
+    /// Returns (Q_k, R_k_diag, q_k, r_k, cost) where:
+    /// - Q_k: 10×10 state cost GN Hessian
+    /// - R_k_diag: 4-element diagonal of input cost Hessian (includes constraint Hessian)
+    /// - q_k: 10-element state cost gradient
+    /// - r_k: 4-element input cost gradient (includes constraint gradient)
+    pub fn stage_cost_hess_grad(
+        &self,
+        x: &State,
+        u: &Control,
+        xref: &State,
+        uref: &Control,
+        hess_xx: &mut StateJac,
+        r_diag: &mut Control,
+        grad_x: &mut State,
+        grad_u: &mut Control,
+    ) -> f32 {
+        let dt = self.dt;
+        let wu = [1.0_f32; 4];
+
+        // State cost Hessian + gradient
+        let cost_x = self.state_cost_hess_grad(x, xref, grad_x, hess_xx);
+
+        // Input cost gradient + Hessian diagonal
+        let mut cost_u = 0.0_f32;
+        for i in 0..4 {
+            let e = u[i] - uref[i];
+            cost_u += e * e * wu[i] * dt;
+            grad_u[i] = 2.0 * e * wu[i] * dt;
+            r_diag[i] = 2.0 * dt * wu[i];
+        }
+
+        // Constraint penalty gradient + Hessian contribution
+        let cost_con = Self::constraint_hess_grad(u, grad_u, r_diag);
+
+        cost_x + cost_u + cost_con
+    }
+
     // Cubic box constraint penalty for one scalar value.
     fn box_constraint(val: f32, lb: f32, ub: f32, grad: &mut f32) -> f32 {
         const RHO: f32 = 1e4;
@@ -516,6 +728,37 @@ impl QuadModel {
         }
         *grad = 0.0;
         0.0
+    }
+
+    /// Box constraint penalty + gradient + Hessian diagonal contribution.
+    /// Adds to existing grad_u and r_diag (does not zero them).
+    fn constraint_hess_grad(u: &Control, grad_u: &mut Control, r_diag: &mut Control) -> f32 {
+        const RHO: f32 = 1e4;
+        let bounds: [(f32, f32); 4] = [
+            (0.98, 29.4),
+            (-10.47, 10.47),
+            (-10.47, 10.47),
+            (-8.73, 8.73),
+        ];
+        let mut penalty = 0.0_f32;
+        for i in 0..4 {
+            let lpen = bounds[i].0 - u[i];
+            if lpen > 0.0 {
+                let lpen2 = lpen * lpen;
+                penalty += RHO * lpen2 * lpen;
+                grad_u[i] += -RHO * 3.0 * lpen2;
+                r_diag[i] += RHO * 6.0 * lpen;
+                continue;
+            }
+            let upen = u[i] - bounds[i].1;
+            if upen > 0.0 {
+                let upen2 = upen * upen;
+                penalty += RHO * upen2 * upen;
+                grad_u[i] += RHO * 3.0 * upen2;
+                r_diag[i] += RHO * 6.0 * upen;
+            }
+        }
+        penalty
     }
 
     // Control box constraints + gradients. Matches NMPCModel.h:AddGeneralConstraintGrad.
@@ -539,4 +782,12 @@ impl QuadModel {
         }
         penalty
     }
+
+    /// Control box constraint bounds (used by QP solver for clamping).
+    pub const U_BOUNDS: [(f32, f32); 4] = [
+        (0.98, 29.4),
+        (-10.47, 10.47),
+        (-10.47, 10.47),
+        (-8.73, 8.73),
+    ];
 }

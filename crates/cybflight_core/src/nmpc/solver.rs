@@ -1,42 +1,43 @@
-// NMPC solver: adjoint backward pass + L-BFGS orchestration.
-// Ported from NMPCSolver.h (FSC Lab / cyblib).
+// NMPC solver: supports both multiple-shooting SQP (Gauss-Newton) and
+// single-shooting L-BFGS via the USE_SQP flag.
 
-use super::lbfgs::{self, LbfgsParams, LbfgsWorkspace, DIM};
-use super::model::{Control, CtrlJac, QuadModel, State, StateJac, NU};
-use core::assert;
-use core::default::Default;
-use core::option::{
-    Option,
-    Option::{None, Some},
-};
+use super::lbfgs::{self, DIM, LbfgsParams, LbfgsWorkspace};
+use super::model::{Control, CtrlJac, NU, QuadModel, State, StateJac};
+use super::qp::QpWorkspace;
 
-/// Per-phase timing from one `solve()` call (cumulative across all eval invocations).
+/// Per-phase timing from one `solve()` call.
 pub struct NmpcTiming {
-    /// µs spent in forward pass (propagate_rk4 × N, all eval calls combined).
+    /// µs spent in forward simulation (propagate_rk4 × N).
     pub us_fwd: u64,
-    /// µs spent in propagate_rk4_grad (adjoint Jacobians) in the backward pass.
+    /// µs spent computing linearizations (Euler sensitivities).
     pub us_bwd_jac: u64,
-    /// µs spent in path_cost_grad + constraint_grad + terminal_cost_grad.
+    /// µs spent computing cost Hessians and gradients.
     pub us_bwd_cost: u64,
-    /// µs spent in matrix multiplies inside the backward pass.
+    /// µs spent in QP backward/forward sweeps (SQP) or matrix multiplies (L-BFGS).
     pub us_bwd_mat: u64,
-    /// Total number of eval() invocations (1 initial + line-search count).
+    /// Number of SQP iterations or eval() invocations.
     pub eval_count: u32,
 }
 
 pub const N: usize = 20; // prediction horizon
 
-/// If true, use the fast single-stage Euler sensitivity in the backward pass
-/// (~10× cheaper than RK4 sensitivity, slight gradient approximation error).
-/// If false, use the full 4-stage RK4 sensitivity (accurate but slow).
+/// If true, use multiple-shooting SQP with Gauss-Newton Hessian.
+/// If false, use single-shooting L-BFGS (original solver).
+const USE_SQP: bool = true;
+
+/// If true, use the fast single-stage Euler sensitivity in the L-BFGS backward pass.
 const USE_EULER_GRAD: bool = true;
 
-const _: () = assert!(lbfgs::DIM == N * NU, "lbfgs::DIM must equal N * NU");
+const MAX_SQP_ITERS: usize = 2;
+const KKT_TOL: f32 = 1e-3;
+
+const _: () = assert!(DIM == N * NU, "lbfgs::DIM must equal N * NU");
 
 // ── Persistent solver state ───────────────────────────────────────────────────
 
 pub struct NmpcSolver {
     pub model: QuadModel,
+    pub qp: QpWorkspace,
     pub ws: LbfgsWorkspace,
     warmstart: bool,
     prev_u: [f32; DIM],
@@ -52,12 +53,18 @@ impl NmpcSolver {
     pub fn new() -> Self {
         let mass = 1.0_f32;
         let grav = 9.81_f32;
+        let model = QuadModel::new(mass, grav, 0.05);
+        let mut qp = QpWorkspace::new();
+        for k in 0..N {
+            qp.u_bar[k] = Control::from([mass * grav, 0.0, 0.0, 0.0]);
+        }
         let mut prev_u = [0.0_f32; DIM];
         for i in 0..N {
-            prev_u[i * NU] = mass * grav; // hover thrust for every step
+            prev_u[i * NU] = mass * grav;
         }
         Self {
-            model: QuadModel::new(mass, grav, 0.05),
+            model,
+            qp,
             ws: LbfgsWorkspace::zeroed(),
             warmstart: true,
             prev_u,
@@ -73,8 +80,206 @@ impl NmpcSolver {
     }
 
     // Solve the NMPC problem.
-    // Returns (u_opt_first, final_cost, lbfgs_iterations, converged, timing).
+    // Returns (u_opt_first, final_cost, iterations, converged, timing).
     pub fn solve(
+        &mut self,
+        x_init: &State,
+        x_refs: &[State; N + 1],
+        u_refs: &[Control; N],
+    ) -> (Control, f32, i32, bool, NmpcTiming) {
+        if USE_SQP {
+            self.solve_sqp(x_init, x_refs, u_refs)
+        } else {
+            self.solve_lbfgs(x_init, x_refs, u_refs)
+        }
+    }
+
+    // ── SQP solver ──────────────────────────────────────────────────────────
+
+    /// Compute total cost for current trajectory in qp workspace.
+    fn eval_cost(&self, x_refs: &[State; N + 1], u_refs: &[Control; N]) -> f32 {
+        let mut cost = 0.0_f32;
+        let mut gx = State::zeros();
+        let mut gu = Control::zeros();
+        for k in 0..N {
+            cost += self
+                .model
+                .state_cost_grad(&self.qp.x_bar[k], &x_refs[k], &mut gx);
+            cost += self
+                .model
+                .input_cost_grad(&self.qp.u_bar[k], &u_refs[k], &mut gu);
+            let mut gx_con = State::zeros();
+            let mut gu_con = Control::zeros();
+            cost += self
+                .model
+                .constraint_grad(&self.qp.u_bar[k], &mut gx_con, &mut gu_con);
+        }
+        cost += self
+            .model
+            .state_cost_grad(&self.qp.x_bar[N], &x_refs[N], &mut gx);
+        cost
+    }
+
+    fn solve_sqp(
+        &mut self,
+        x_init: &State,
+        x_refs: &[State; N + 1],
+        u_refs: &[Control; N],
+    ) -> (Control, f32, i32, bool, NmpcTiming) {
+        if self.warmstart {
+            let mut shifted = [Control::zeros(); N];
+            for k in 0..(N - 1) {
+                shifted[k] = self.qp.u_bar[k + 1];
+            }
+            shifted[N - 1] = self.qp.u_bar[N - 1];
+            self.qp.u_bar = shifted;
+            self.warmstart = false;
+        }
+
+        let mut us_fwd = 0u64;
+        let mut us_bwd_jac = 0u64;
+        let mut us_bwd_cost = 0u64;
+        let mut us_bwd_mat = 0u64;
+        let mut converged = false;
+        let mut sqp_iter = 0i32;
+        let mut final_cost = 0.0_f32;
+
+        let mut grad_fx = StateJac::zeros();
+        let mut grad_fu = CtrlJac::zeros();
+
+        for iter in 0..MAX_SQP_ITERS {
+            sqp_iter = (iter + 1) as i32;
+
+            // Step 1: Forward simulate trajectory
+            let t = self.timer_us.map_or(0, |f| f());
+            self.qp.x_bar[0] = *x_init;
+            for k in 0..N {
+                self.qp.x_bar[k + 1] = self
+                    .model
+                    .propagate_rk4(&self.qp.x_bar[k], &self.qp.u_bar[k]);
+            }
+            us_fwd += self.timer_us.map_or(0, |f| f()) - t;
+
+            // Step 2: Linearize dynamics + compute cost Hessians/gradients
+            let t = self.timer_us.map_or(0, |f| f());
+            for k in 0..N {
+                self.model.propagate_euler_grad(
+                    &self.qp.x_bar[k],
+                    &self.qp.u_bar[k],
+                    &mut grad_fx,
+                    &mut grad_fu,
+                );
+                self.qp.a[k] = grad_fx;
+                self.qp.b[k] = grad_fu;
+                self.qp.d[k] = State::zeros(); // consistent trajectory → zero defect
+            }
+            us_bwd_jac += self.timer_us.map_or(0, |f| f()) - t;
+
+            let t = self.timer_us.map_or(0, |f| f());
+            for k in 0..N {
+                self.model.stage_cost_hess_grad(
+                    &self.qp.x_bar[k],
+                    &self.qp.u_bar[k],
+                    &x_refs[k],
+                    &u_refs[k],
+                    &mut self.qp.qm[k],
+                    &mut self.qp.rm[k],
+                    &mut self.qp.q[k],
+                    &mut self.qp.r[k],
+                );
+            }
+            self.model.state_cost_hess_grad(
+                &self.qp.x_bar[N],
+                &x_refs[N],
+                &mut self.qp.q[N],
+                &mut self.qp.qm[N],
+            );
+            us_bwd_cost += self.timer_us.map_or(0, |f| f()) - t;
+
+            // Step 3: Backward sweep (Riccati block elimination)
+            let t = self.timer_us.map_or(0, |f| f());
+            self.qp.backward_sweep();
+            us_bwd_mat += self.timer_us.map_or(0, |f| f()) - t;
+
+            // Step 4: Check convergence via feedforward norm
+            let mut kkt_norm = 0.0_f32;
+            for k in 0..N {
+                for j in 0..4 {
+                    let v = self.qp.gain_kk[k][j].abs();
+                    if v > kkt_norm {
+                        kkt_norm = v;
+                    }
+                }
+            }
+
+            // Step 5: Forward sweep with line search
+            let t_fwd = self.timer_us.map_or(0, |f| f());
+            let u_bar_prev = self.qp.u_bar;
+            let cost_before = self.eval_cost(x_refs, u_refs);
+
+            let mut alpha = 1.0_f32;
+            self.qp.forward_sweep(x_init, alpha);
+
+            self.qp.x_bar[0] = *x_init;
+            for k in 0..N {
+                self.qp.x_bar[k + 1] = self
+                    .model
+                    .propagate_rk4(&self.qp.x_bar[k], &self.qp.u_bar[k]);
+            }
+            let mut cost_after = self.eval_cost(x_refs, u_refs);
+
+            for _ in 0..4 {
+                if cost_after <= cost_before {
+                    break;
+                }
+                alpha *= 0.5;
+                self.qp.u_bar = u_bar_prev;
+                self.qp.forward_sweep(x_init, alpha);
+                self.qp.x_bar[0] = *x_init;
+                for k in 0..N {
+                    self.qp.x_bar[k + 1] = self
+                        .model
+                        .propagate_rk4(&self.qp.x_bar[k], &self.qp.u_bar[k]);
+                }
+                cost_after = self.eval_cost(x_refs, u_refs);
+            }
+
+            if cost_after > cost_before {
+                self.qp.u_bar = u_bar_prev;
+                self.qp.x_bar[0] = *x_init;
+                for k in 0..N {
+                    self.qp.x_bar[k + 1] = self
+                        .model
+                        .propagate_rk4(&self.qp.x_bar[k], &self.qp.u_bar[k]);
+                }
+                final_cost = cost_before;
+            } else {
+                final_cost = cost_after;
+            }
+            us_fwd += self.timer_us.map_or(0, |f| f()) - t_fwd;
+
+            if kkt_norm < KKT_TOL {
+                converged = true;
+                break;
+            }
+        }
+
+        self.warmstart = true;
+
+        let u_first = self.qp.u_bar[0];
+        let timing = NmpcTiming {
+            us_fwd,
+            us_bwd_jac,
+            us_bwd_cost,
+            us_bwd_mat,
+            eval_count: sqp_iter as u32,
+        };
+        (u_first, final_cost, sqp_iter, converged, timing)
+    }
+
+    // ── L-BFGS solver ───────────────────────────────────────────────────────
+
+    fn solve_lbfgs(
         &mut self,
         x_init: &State,
         x_refs: &[State; N + 1],
@@ -82,7 +287,6 @@ impl NmpcSolver {
     ) -> (Control, f32, i32, bool, NmpcTiming) {
         let mut u_flat = [0.0_f32; DIM];
         if self.warmstart {
-            // Receding-horizon shift: u[i] = prev_u[i+1], repeat last step
             for i in 0..(N - 1) {
                 for j in 0..NU {
                     u_flat[i * NU + j] = self.prev_u[(i + 1) * NU + j];
@@ -103,12 +307,9 @@ impl NmpcSolver {
         let params = LbfgsParams::default_nmpc();
         let mut f_opt = 0.0_f32;
 
-        // Borrow disjoint fields before creating the closure so the
-        // borrow checker can see they don't overlap with self.ws.
         let model = &mut self.model;
         let ws = &mut self.ws;
 
-        // Stack-allocated trajectory scratch (1680 bytes — acceptable)
         let mut traj_x: [State; N + 1] = [State::zeros(); N + 1];
         let mut grad_fx = StateJac::zeros();
         let mut grad_fu = CtrlJac::zeros();

@@ -154,10 +154,6 @@ pub struct SerialPins {
     pub usart1_tx: hal::Peri<'static, hal::peripherals::PA9>,
     pub usart1_rx: hal::Peri<'static, hal::peripherals::PA10>,
 
-    pub usart3: hal::Peri<'static, hal::peripherals::USART3>,
-    pub usart3_tx: hal::Peri<'static, hal::peripherals::PB10>,
-    pub usart3_rx: hal::Peri<'static, hal::peripherals::PB11>,
-
     pub uart4: hal::Peri<'static, hal::peripherals::UART4>,
     pub uart4_tx: hal::Peri<'static, hal::peripherals::PA0>,
     pub uart4_rx: hal::Peri<'static, hal::peripherals::PA1>,
@@ -357,10 +353,6 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
         usart1_tx: p.PA9,
         usart1_rx: p.PA10,
 
-        usart3: p.USART3,
-        usart3_tx: p.PB10,
-        usart3_rx: p.PB11,
-
         uart4: p.UART4,
         uart4_tx: p.PA0,
         uart4_rx: p.PA1,
@@ -423,10 +415,10 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
         mag_align: SensorAlign::Cw180Deg,
     };
 
-    // USART2 TX (PA2) for defmt serial logging at 921600 baud.
+    // USART3 TX (PB10) for defmt serial logging at 921600 baud.
     let mut defmt_uart_config = hal::usart::Config::default();
     defmt_uart_config.baudrate = 921_600;
-    let defmt_uart = hal::usart::UartTx::new_blocking(p.USART2, p.PA2, defmt_uart_config)
+    let defmt_uart = hal::usart::UartTx::new_blocking(p.USART3, p.PB10, defmt_uart_config)
         .expect("defmt UART init failed");
 
     (

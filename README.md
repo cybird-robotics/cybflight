@@ -38,7 +38,7 @@ cargo build -p cybflight --release --no-default-features --features board_sakura
 | `board_foxeerh743` | no | Select the FOXEERH743 BSP |
 | `rx_crsf` | yes | CRSF (ELRS/TBS) RC protocol |
 | `rx_ghst` | no | GHST (ImmersionRC) RC protocol |
-| `defmt_uart` | yes | UART-based defmt logging on USART2 |
+| `defmt_uart` | yes | UART-based defmt logging on USART3 (SAKURAH743: PD8, FOXEERH743: PB10) |
 
 ### Flash via USB DFU
 

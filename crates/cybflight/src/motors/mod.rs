@@ -1,7 +1,19 @@
 pub mod dshot;
 
+use core::sync::atomic::AtomicU16;
+
 use crate::hal::pac::gpio::Gpio;
 use crate::hal::pac::timer::TimGp16;
+use cybflight_drivers::dshot::DSHOT_MIN_THROTTLE;
+
+/// Per-motor throttle commands. Written by the shell, read by dshot_task every loop.
+/// Default: DSHOT_MIN_THROTTLE (arm/idle). 0 = MOTOR_STOP command.
+pub static MOTOR_THROTTLE: [AtomicU16; 4] = [
+    AtomicU16::new(DSHOT_MIN_THROTTLE),
+    AtomicU16::new(DSHOT_MIN_THROTTLE),
+    AtomicU16::new(DSHOT_MIN_THROTTLE),
+    AtomicU16::new(DSHOT_MIN_THROTTLE),
+];
 
 // DShot600 bit timing (at 12 MHz effective timer clock, 20 ticks/bit)
 pub const DSHOT600_BIT_0: u32 = 7; // 35% duty

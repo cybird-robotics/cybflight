@@ -1,8 +1,10 @@
+use core::sync::atomic::Ordering;
+
 use crate::hal::dma::{Transfer, TransferOptions};
 use crate::hal::pac::timer::vals;
 use crate::hal::peripherals::{DMA1_CH0, DMA1_CH1, DMA1_CH2, DMA1_CH3};
 use crate::hal::Peri;
-use cybflight_drivers::dshot::{DSHOT_DMA_BUFFER_SIZE, DSHOT_MIN_THROTTLE};
+use cybflight_drivers::dshot::DSHOT_DMA_BUFFER_SIZE;
 use embassy_futures::join::join4;
 
 use super::{DshotQuadConfig, DSHOT600_ARR, DSHOT600_BIT_0, DSHOT600_BIT_1, DSHOT600_PSC};
@@ -69,11 +71,14 @@ pub async fn dshot_task(
 
     // --- Frame output loop ---
     loop {
-        // 1. Encode frame (throttle=0 for Phase 2)
-        let frame =
-            cybflight_drivers::dshot::frame::encode_packet(DSHOT_MIN_THROTTLE, false, true);
+        // 1. Encode per-motor frames from shared throttle state
+        // NOTE: bidirectional=false (unidirectional CRC). Switch to true when
+        // Phase 4 pin-switching + input-capture telemetry is implemented.
         let mut bufs = [[0u32; DSHOT_DMA_BUFFER_SIZE]; 4];
-        for buf in bufs.iter_mut() {
+        for (i, buf) in bufs.iter_mut().enumerate() {
+            let throttle = super::MOTOR_THROTTLE[i].load(Ordering::Relaxed);
+            let frame =
+                cybflight_drivers::dshot::frame::encode_packet(throttle, false, false);
             cybflight_drivers::dshot::frame::packet_to_dma_buffer(
                 frame,
                 buf,
@@ -167,18 +172,7 @@ pub async fn dshot_task(
             config.timers[i].cr1().modify(|w| w.set_cen(false));
         }
 
-        // // 8. Log
-        // if frame_count < 10 || frame_count % 1000 == 0 {
-        //     defmt::debug!(
-        //         "DShot #{}: frame={:#06x} buf[0..4]={:?}",
-        //         frame_count,
-        //         frame,
-        //         &bufs[0][0..4]
-        //     );
-        // }
-        // frame_count += 1;
-
-        // 9. Wait for next frame period (~8 kHz = 125us)
+        // 8. Wait for next frame period (~8 kHz = 125us)
         embassy_time::Timer::after_micros(95).await;
     }
 }

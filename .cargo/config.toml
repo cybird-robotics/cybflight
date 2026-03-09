@@ -6,5 +6,5 @@ runner = "bash tools/build.sh"
 target = "thumbv7em-none-eabihf"
 
 [env]
-# DEFMT_LOG = "info"
-DEFMT_LOG = "trace"
+DEFMT_LOG = "debug"
+# DEFMT_LOG = "trace"

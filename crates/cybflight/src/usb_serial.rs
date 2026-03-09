@@ -1,10 +1,10 @@
 use core::fmt::Write;
-use core::sync::atomic::AtomicBool;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bsp;
 use crate::control::OCP_SOLVER_OUTPUT;
 use crate::hal;
+use crate::motors::MOTOR_THROTTLE;
 use crate::msgs;
 use crate::platform;
 use crate::sensors::{RAW_IMU, RC_INPUT, RC_LINK_STATUS, VEHICLE_ATTITUDE};
@@ -34,6 +34,7 @@ const HELP_TEXT: &[u8] = b"\
   rcstats              one-shot RC link status\r\n\
   stream <topic> on    stream data on <topic>\r\n\
   stream <topic> off   stop data stream on <topic>\r\n\
+  motor <1-4> <0-100>  set motor throttle (test mode)\r\n\
   reboot               software reset\r\n\
   reboot --dfu         reset into USB DFU bootloader\r\n\
   help                 show this message\r\n\
@@ -357,11 +358,55 @@ async fn dispatch<'d>(
             write_all(class, b"entering DFU mode...\r\n").await?;
             platform::enter_dfu();
         }
+        line if line.starts_with("motor ") => {
+            dispatch_motor(class, line).await?;
+        }
         _ => {
             write_all(class, b"unknown command (try 'help')\r\n").await?;
         }
     }
     Ok(())
+}
+
+async fn dispatch_motor<'d>(
+    class: &mut CdcAcmClass<'d, UsbDriver<'d>>,
+    line: &str,
+) -> Result<(), EndpointError> {
+    use cybflight_drivers::dshot::{DSHOT_CMD_MOTOR_STOP, DSHOT_MAX_THROTTLE, DSHOT_MIN_THROTTLE};
+
+    let mut parts = line.split_ascii_whitespace();
+    parts.next(); // skip "motor"
+    let idx_str = parts.next();
+    let pct_str = parts.next();
+
+    let (idx_str, pct_str) = match (idx_str, pct_str) {
+        (Some(i), Some(p)) => (i, p),
+        _ => return write_all(class, b"usage: motor <1-4> <0-100>\r\n").await,
+    };
+
+    let idx: u8 = match idx_str.parse() {
+        Ok(v) if (1..=4).contains(&v) => v,
+        _ => return write_all(class, b"motor index must be 1-4\r\n").await,
+    };
+
+    let pct: u8 = match pct_str.parse() {
+        Ok(v) if v <= 100 => v,
+        _ => return write_all(class, b"throttle must be 0-100\r\n").await,
+    };
+
+    let dshot_val: u16 = if pct == 0 {
+        DSHOT_CMD_MOTOR_STOP
+    } else {
+        let range = (DSHOT_MAX_THROTTLE - DSHOT_MIN_THROTTLE) as u32;
+        (DSHOT_MIN_THROTTLE as u32 + (pct as u32 - 1) * range / 99) as u16
+    };
+
+    MOTOR_THROTTLE[(idx - 1) as usize].store(dshot_val, Ordering::Relaxed);
+
+    let mut buf = [0u8; 64];
+    let mut w = WriteBuf::new(&mut buf);
+    write!(w, "motor {} = {}% (dshot {})\r\n", idx, pct, dshot_val).ok();
+    write_all(class, w.as_slice()).await
 }
 
 // ---------------------------------------------------------------------------

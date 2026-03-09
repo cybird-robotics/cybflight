@@ -10,6 +10,7 @@ pub use bsp::hal;
 pub mod board_init;
 pub mod serial_logger;
 pub mod control;
+pub mod motors;
 pub mod msgs;
 pub mod platform;
 pub mod sensors;

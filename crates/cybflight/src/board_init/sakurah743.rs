@@ -8,11 +8,14 @@ use static_cell::StaticCell;
 
 use crate::bsp;
 use crate::hal;
+use crate::motors::{DshotQuadConfig, MotorTimerConfig};
 use crate::sensors::imu::{ImuReader, SpiBusMtx, icm_reader_task};
 use crate::status;
 use crate::usb_serial;
+use hal::gpio::{AfType, Flex, OutputType, Speed};
 use hal::spi::{self, Spi};
 use hal::time::Hertz;
+use hal::timer::low_level::Timer as LLTimer;
 
 // Bind UART4 interrupt for SerialRx (CRSF/GHST)
 hal::bind_interrupts!(struct Uart4Irqs {
@@ -137,4 +140,74 @@ pub async fn init(spawner: &Spawner, board: bsp::Board) {
             Err(e) => defmt::error!("GHST UART4 init failed: {}", e),
         }
     }
+
+    // --- DShot motor output ---
+
+    // Enable RCC for motor timers (Timer::new enables clock + reset)
+    let timer5 = LLTimer::new(board.motors.tim5);
+    let timer3 = LLTimer::new(board.motors.tim3);
+    let tim5_regs = timer5.regs_gp16();
+    let tim3_regs = timer3.regs_gp16();
+    // Prevent drop from disabling RCC clocks
+    core::mem::forget(timer5);
+    core::mem::forget(timer3);
+
+    // Configure GPIO as timer AF (board-specific pins + AF numbers)
+    let af = AfType::output(OutputType::PushPull, Speed::VeryHigh);
+    macro_rules! pin_af {
+        ($pin:expr, $af_num:expr) => {{
+            let mut flex = Flex::new($pin);
+            flex.set_as_af_unchecked($af_num, af);
+            core::mem::forget(flex);
+        }};
+    }
+    pin_af!(board.motors.m1, 2); // PA2 AF2 = TIM5_CH3
+    pin_af!(board.motors.m2, 2); // PA3 AF2 = TIM5_CH4
+    pin_af!(board.motors.m3, 2); // PB1 AF2 = TIM3_CH4
+    pin_af!(board.motors.m4, 2); // PB0 AF2 = TIM3_CH3
+
+    let dshot_config = DshotQuadConfig {
+        motors: [
+            MotorTimerConfig {
+                timer_regs: tim5_regs,
+                channel_index: 2,
+                dma_request: 57,
+                gpio_port: hal::pac::GPIOA,
+                gpio_pin: 2,
+            }, // M1: PA2 TIM5_CH3
+            MotorTimerConfig {
+                timer_regs: tim5_regs,
+                channel_index: 3,
+                dma_request: 58,
+                gpio_port: hal::pac::GPIOA,
+                gpio_pin: 3,
+            }, // M2: PA3 TIM5_CH4
+            MotorTimerConfig {
+                timer_regs: tim3_regs,
+                channel_index: 3,
+                dma_request: 26,
+                gpio_port: hal::pac::GPIOB,
+                gpio_pin: 1,
+            }, // M3: PB1 TIM3_CH4
+            MotorTimerConfig {
+                timer_regs: tim3_regs,
+                channel_index: 2,
+                dma_request: 25,
+                gpio_port: hal::pac::GPIOB,
+                gpio_pin: 0,
+            }, // M4: PB0 TIM3_CH3
+        ],
+        timers: [tim5_regs, tim3_regs],
+        timer_count: 2,
+    };
+
+    spawner
+        .spawn(crate::motors::dshot::dshot_task(
+            dshot_config,
+            board.motors.dma1_ch0,
+            board.motors.dma1_ch1,
+            board.motors.dma1_ch2,
+            board.motors.dma1_ch3,
+        ))
+        .unwrap_or_else(|_| defmt::error!("Failed to spawn DShot task"));
 }

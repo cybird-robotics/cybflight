@@ -25,7 +25,7 @@ cybflight-drivers = { path = "../drivers" }
 cybflight-core = { path = "../cybflight_core/" }
 
 # Embassy runtime pieces (board-agnostic)
-embassy-executor = { version = "0.9.1", features = ["arch-cortex-m", "executor-thread", "defmt"] }
+embassy-executor = { version = "0.9.1", features = ["arch-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
 embassy-time     = { version = "0.5.0", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
 embassy-sync     = { version = "0.7.2", features = ["defmt"] }
 embassy-embedded-hal = { version = "0.5.0", features = ["defmt"] }

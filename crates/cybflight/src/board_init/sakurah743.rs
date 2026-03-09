@@ -1,7 +1,7 @@
 use cybflight_drivers::imu::icm426xx::Icm426xx;
 use cybflight_drivers::led::Led;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
-use embassy_executor::Spawner;
+use embassy_executor::{SendSpawner, Spawner};
 use embassy_sync::mutex::Mutex;
 use embassy_time::Timer;
 use static_cell::StaticCell;
@@ -22,7 +22,7 @@ hal::bind_interrupts!(struct Uart4Irqs {
     UART4 => hal::usart::BufferedInterruptHandler<hal::peripherals::UART4>;
 });
 
-pub async fn init(spawner: &Spawner, board: bsp::Board) {
+pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Board) {
     // --- LEDs: turn off led1 & led2, use led0 for status ---
     let mut led1 = Led::new(board.leds.led1, false);
     let mut led2 = Led::new(board.leds.led2, false);
@@ -201,7 +201,7 @@ pub async fn init(spawner: &Spawner, board: bsp::Board) {
         timer_count: 2,
     };
 
-    spawner
+    high_spawner
         .spawn(crate::motors::dshot::dshot_task(
             dshot_config,
             board.motors.dma1_ch0,

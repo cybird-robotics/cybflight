@@ -17,6 +17,7 @@ pub mod sensors;
 pub mod shell;
 pub mod status;
 pub mod usb_serial;
+pub mod watchdog;
 
 /// Firmware version from `Cargo.toml`.
 pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -3,7 +3,7 @@ use cybflight_drivers::imu::mpu6x00::Mpu6x00;
 use cybflight_drivers::imu::{DetectedImu, probe_imu_raw};
 use cybflight_drivers::led::Led;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
-use embassy_executor::Spawner;
+use embassy_executor::{SendSpawner, Spawner};
 use embassy_sync::mutex::Mutex;
 use embassy_time::Timer;
 use static_cell::StaticCell;
@@ -24,7 +24,7 @@ hal::bind_interrupts!(struct Usart1Irqs {
     USART1 => hal::usart::BufferedInterruptHandler<hal::peripherals::USART1>;
 });
 
-pub async fn init(spawner: &Spawner, board: bsp::Board) {
+pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Board) {
     // --- LED: only 1 LED, use it for status ---
     let led0 = Led::new(board.leds.led0, false);
     spawner.spawn(status::task(led0)).unwrap();
@@ -229,7 +229,7 @@ pub async fn init(spawner: &Spawner, board: bsp::Board) {
         timer_count: 1,
     };
 
-    spawner
+    high_spawner
         .spawn(crate::motors::dshot::dshot_task(
             dshot_config,
             board.motors.dma1_ch0,

@@ -1,7 +1,24 @@
 #![no_std]
 #![no_main]
 
+use cybflight::hal::interrupt;
+use embassy_executor::InterruptExecutor;
 use panic_probe as _;
+
+/// High-priority interrupt executor for safety-critical motor output.
+///
+/// DShot runs here so it preempts the thread executor (IMU, CRSF, USB, LED)
+/// and maintains its ~8 kHz frame rate regardless of other task load.
+static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
+
+/// CRS interrupt handler — drives the high-priority executor.
+///
+/// CRS (Clock Recovery System) is unused by this firmware, so we repurpose
+/// its NVIC slot as the executor's wake interrupt.
+#[interrupt]
+unsafe fn CRS() {
+    unsafe { EXECUTOR_HIGH.on_interrupt() }
+}
 
 #[embassy_executor::main]
 async fn main(spawner: embassy_executor::Spawner) {
@@ -10,7 +27,29 @@ async fn main(spawner: embassy_executor::Spawner) {
     cybflight::serial_logger::init(defmt_uart);
     defmt::info!("cybflight: {} starting", cybflight::bsp::BOARD_NAME);
     cybflight::status::STATUS.sender().send(cybflight::status::SystemStatus::Alive);
-    cybflight::board_init::init(&spawner, board).await;
+
+    // --- Start high-priority interrupt executor for DShot ---
+    //
+    // Priority P6 (of P0..P15, lower = higher priority):
+    //   P0–P5 : DMA completion, SPI, I2C, EXTI (HAL-managed)
+    //   P6    : DShot executor — preempts thread mode, yields to DMA
+    //   Thread: Main executor (IMU readers, CRSF, USB, LED)
+    {
+        use cybflight::hal::interrupt::{self, InterruptExt, Priority};
+        let irq = interrupt::CRS;
+        irq.set_priority(Priority::P6);
+    }
+    let high_spawner = EXECUTOR_HIGH.start(cybflight::hal::interrupt::CRS);
+
+    // --- Board-specific init (spawns DShot on high_spawner, rest on spawner) ---
+    cybflight::board_init::init(&spawner, &high_spawner, board).await;
+
+    // --- IWDG: system-level safety net ---
+    cybflight::watchdog::init();
+    spawner
+        .spawn(cybflight::watchdog::iwdg_feed_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn IWDG feed task"));
+
     spawner
         .spawn(cybflight::sensors::attitude::mahony_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude task"));

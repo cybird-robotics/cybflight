@@ -49,9 +49,17 @@ dfu-util -l
 dfu-util -a 0 -s 0x08000000:leave -D target/thumbv7em-none-eabihf/release/cybflight.bin
 ```
 
-### Debug via USB Serial
+### Connect to USB Shell
 ```bash
 minicom -D /dev/ttyACM0 -b 115200
+```
+
+### View `defmt` Serial Log
+```bash
+cargo install defmt-print
+
+stty -F /dev/ttyTHS0 921600 raw -echo
+defmt-print -e target/thumbv7em-none-eabihf/release/cybflight < /dev/ttyTHS0
 ```
 
 ## References

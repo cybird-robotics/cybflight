@@ -7,7 +7,7 @@ use crate::hal;
 use crate::motors::MOTOR_THROTTLE;
 use crate::msgs;
 use crate::platform;
-use crate::sensors::{RAW_IMU, RC_INPUT, RC_LINK_STATUS, VEHICLE_ATTITUDE};
+use crate::sensors::{DSHOT_TELEMETRY, RAW_IMU, RC_INPUT, RC_LINK_STATUS, VEHICLE_ATTITUDE};
 use crate::shell::format::ShellMsg;
 use crate::shell::write_all;
 use crate::shell::ShellLine;
@@ -34,6 +34,7 @@ const HELP_TEXT: &[u8] = b"\
   rcstats              one-shot RC link status\r\n\
   stream <topic> on    stream data on <topic>\r\n\
   stream <topic> off   stop data stream on <topic>\r\n\
+  dshot                one-shot DShot telemetry\r\n\
   motor <1-4> <0-100>  set motor throttle (test mode)\r\n\
   reboot               software reset\r\n\
   reboot --dfu         reset into USB DFU bootloader\r\n\
@@ -49,6 +50,7 @@ pub static STREAM_ATT: AtomicBool = AtomicBool::new(false);
 pub static STREAM_OCP: AtomicBool = AtomicBool::new(false);
 pub static STREAM_RC: AtomicBool = AtomicBool::new(false);
 pub static STREAM_RC_LINK: AtomicBool = AtomicBool::new(false);
+pub static STREAM_DSHOT: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Generic stream bridge + concrete embassy task wrappers
@@ -112,6 +114,11 @@ pub async fn rc_stream_task() {
 #[embassy_executor::task]
 pub async fn rc_link_stream_task() {
     msg_stream_task(&RC_LINK_STATUS, &STREAM_RC_LINK).await
+}
+
+#[embassy_executor::task]
+pub async fn dshot_stream_task() {
+    msg_stream_task(&DSHOT_TELEMETRY, &STREAM_DSHOT).await
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +195,7 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
     STREAM_OCP.store(false, Ordering::Relaxed);
     STREAM_RC.store(false, Ordering::Relaxed);
     STREAM_RC_LINK.store(false, Ordering::Relaxed);
+    STREAM_DSHOT.store(false, Ordering::Relaxed);
 
     let mut line_buf = [0u8; 64];
     let mut line_len = 0usize;
@@ -349,6 +357,21 @@ async fn dispatch<'d>(
         "stream rcstats off" => {
             STREAM_RC_LINK.store(false, Ordering::Relaxed);
             write_all(class, b"RC link status stream off\r\n").await?;
+        }
+        "dshot" => {
+            let mut sub = match DSHOT_TELEMETRY.subscriber() {
+                Ok(s) => s,
+                Err(_) => return write_all(class, b"error: no subscriber slot\r\n").await,
+            };
+            oneshot(class, &mut sub, 256).await?;
+        }
+        "stream dshot on" => {
+            STREAM_DSHOT.store(true, Ordering::Relaxed);
+            write_all(class, b"DShot telemetry stream on\r\n").await?;
+        }
+        "stream dshot off" => {
+            STREAM_DSHOT.store(false, Ordering::Relaxed);
+            write_all(class, b"DShot telemetry stream off\r\n").await?;
         }
         "reboot" => {
             write_all(class, b"rebooting...\r\n").await?;

@@ -122,6 +122,26 @@ impl fmt::Display for ShellMsg<'_, msgs::RcLinkStatus> {
     }
 }
 
+impl fmt::Display for ShellMsg<'_, msgs::DshotTelemetry> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use cybflight_drivers::dshot::telemetry::TelemetryValue;
+        write!(f, "DshotTelem(t={}", self.0.timestamp.as_millis())?;
+        for (i, m) in self.0.motors.iter().enumerate() {
+            match m.value {
+                TelemetryValue::Erpm(e) => {
+                    write!(f, " M{}={}erpm", i + 1, e as u32 * 100)?
+                }
+                TelemetryValue::Stopped => write!(f, " M{}=stopped", i + 1)?,
+                TelemetryValue::Edt(edt) => {
+                    write!(f, " M{}=edt:{:?}={}", i + 1, edt.edt_type, edt.data)?
+                }
+                TelemetryValue::Invalid => write!(f, " M{}=invalid", i + 1)?,
+            }
+        }
+        write!(f, ")")
+    }
+}
+
 pub trait Printable {
     fn should_print(&self, ctx: &ShellState) -> bool;
     fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result;
@@ -135,6 +155,7 @@ pub struct ShellState {
     pub stream_odom: bool,
     pub stream_rc: bool,
     pub stream_rcstats: bool,
+    pub stream_dshot: bool,
 }
 
 impl Printable for msgs::Imu {
@@ -190,6 +211,16 @@ impl Printable for msgs::RcLinkStatus {
 impl Printable for msgs::OcpSolverOutput {
     fn should_print(&self, _ctx: &ShellState) -> bool {
         true
+    }
+
+    fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        write!(w, "{}", ShellMsg(self))
+    }
+}
+
+impl Printable for msgs::DshotTelemetry {
+    fn should_print(&self, ctx: &ShellState) -> bool {
+        ctx.stream_dshot
     }
 
     fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {

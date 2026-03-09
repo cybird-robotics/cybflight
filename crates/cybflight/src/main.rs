@@ -73,6 +73,9 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::usb_serial::rc_link_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn RC link stream task"));
+    spawner
+        .spawn(cybflight::usb_serial::dshot_stream_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn DShot stream task"));
 
     defmt::info!("all init done");
 }

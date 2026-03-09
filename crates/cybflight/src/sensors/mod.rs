@@ -37,3 +37,8 @@ pub static RC_INPUT: PubSubChannel<CriticalSectionRawMutex, msgs::RcInput, 4, 4,
 // RC link status: CAP=2, SUBS=3 (telemetry + shell + spare), PUBS=1 (single RC task).
 pub static RC_LINK_STATUS: PubSubChannel<CriticalSectionRawMutex, msgs::RcLinkStatus, 2, 3, 1> =
     PubSubChannel::new();
+
+// DShot telemetry: CAP=2 (high publish rate, only latest matters),
+// SUBS=3 (oneshot + stream + spare), PUBS=1 (dshot_task).
+pub static DSHOT_TELEMETRY: PubSubChannel<CriticalSectionRawMutex, msgs::DshotTelemetry, 2, 3, 1> =
+    PubSubChannel::new();

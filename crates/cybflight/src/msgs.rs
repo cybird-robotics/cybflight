@@ -84,6 +84,19 @@ pub struct NmpcSetpoint {
 
 impl Message for NmpcSetpoint {}
 
+#[derive(Clone, defmt::Format)]
+pub struct DshotMotorTelemetry {
+    pub value: cybflight_drivers::dshot::telemetry::TelemetryValue,
+    pub raw: Option<u16>,
+}
+
+#[derive(Clone, defmt::Format)]
+pub struct DshotTelemetry {
+    pub timestamp: Instant,
+    pub motors: [DshotMotorTelemetry; 4],
+}
+impl Message for DshotTelemetry {}
+
 const OCP_OUTPUT_SIZE: usize = 4;
 #[derive(Clone, defmt::Format)]
 pub struct OcpSolverOutput {

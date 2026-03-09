@@ -62,3 +62,7 @@ pub const MAX_GCR_EDGES: usize = 22;
 
 /// Sentinel for invalid telemetry.
 pub const DSHOT_TELEMETRY_INVALID: u32 = 0xFFFF;
+
+/// GCR ticks per bit at DShot600 (12 MHz clock, 750 kbit/s = 5/4 × 600 kbit/s).
+/// 12_000_000 / 750_000 = 16 ticks.
+pub const DSHOT600_GCR_TICKS_PER_BIT: u32 = 16;

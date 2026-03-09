@@ -202,6 +202,7 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                 dma_request: 23,
                 gpio_port: hal::pac::GPIOB,
                 gpio_pin: 4,
+                af_number: 2,
             }, // M1: PB4 TIM3_CH1
             MotorTimerConfig {
                 timer_regs: tim3_regs,
@@ -209,6 +210,7 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                 dma_request: 24,
                 gpio_port: hal::pac::GPIOB,
                 gpio_pin: 5,
+                af_number: 2,
             }, // M2: PB5 TIM3_CH2
             MotorTimerConfig {
                 timer_regs: tim3_regs,
@@ -216,6 +218,7 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                 dma_request: 25,
                 gpio_port: hal::pac::GPIOB,
                 gpio_pin: 0,
+                af_number: 2,
             }, // M3: PB0 TIM3_CH3
             MotorTimerConfig {
                 timer_regs: tim3_regs,
@@ -223,6 +226,7 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                 dma_request: 26,
                 gpio_port: hal::pac::GPIOB,
                 gpio_pin: 1,
+                af_number: 2,
             }, // M4: PB1 TIM3_CH4
         ],
         timers: [tim3_regs, tim3_regs], // Only 1 unique timer; timers[1] unused padding

@@ -84,9 +84,7 @@ where
                     SHELL_OUT.try_send(line).ok();
                 }
             }
-            WaitResult::Lagged(n) => {
-                defmt::warn!("{}: dropped {} messages", core::any::type_name::<M>(), n);
-            }
+            WaitResult::Lagged(_) => {} // subscriber behind publisher — expected for high-rate topics
         }
     }
 }

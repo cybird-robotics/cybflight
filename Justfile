@@ -8,6 +8,9 @@ build:
 test:
     cargo test -p cybflight-core --target {{HOST}}
 
+test-drivers:
+    cargo test -p cybflight-drivers --target {{HOST}}
+
 flash: build
     #!/usr/bin/env bash
     set -euo pipefail

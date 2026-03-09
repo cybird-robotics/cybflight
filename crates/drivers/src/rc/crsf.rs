@@ -133,114 +133,11 @@ fn map_read_err<E>(e: embedded_io_async::ReadExactError<E>) -> Error<E> {
     }
 }
 
-impl<RW> Crsf<RW>
-where
-    RW: Read + Write,
-{
-    pub fn new(rw: RW) -> Self {
-        Self {
-            rw,
-            new_baudrate: None,
-        }
-    }
+// -----------------------------------------------------------------------
+// Pure parsing helpers (no trait bounds needed — they never touch self.rw)
+// -----------------------------------------------------------------------
 
-    /// Returns and clears the pending baudrate hint (set after V3 negotiation).
-    pub fn take_baudrate_hint(&mut self) -> Option<u32> {
-        self.new_baudrate.take()
-    }
-
-    /// Read one complete CRSF frame, validate CRC, and parse the payload.
-    ///
-    /// Blocks until a valid frame is received. Invalid frames (bad CRC,
-    /// wrong address, too long) are silently discarded and the next frame
-    /// is attempted.
-    pub async fn read_frame(&mut self) -> Result<CrsfEvent, Error<RW::Error>> {
-        let mut buf = [0u8; CRSF_FRAME_SIZE_MAX];
-        loop {
-            // 1. Sync: read bytes until we see a valid address byte
-            let addr = loop {
-                let mut b = [0u8; 1];
-                self.rw.read_exact(&mut b).await.map_err(map_read_err)?;
-                if b[0] == CRSF_ADDRESS_FLIGHT_CONTROLLER || b[0] == CRSF_ADDRESS_BROADCAST {
-                    break b[0];
-                }
-            };
-
-            // 2. Read frame length byte
-            let mut len_byte = [0u8; 1];
-            self.rw
-                .read_exact(&mut len_byte)
-                .await
-                .map_err(map_read_err)?;
-            let frame_len = len_byte[0] as usize;
-
-            // Validate length: must be at least 2 (type + CRC), at most 62
-            if frame_len < 2 || frame_len > CRSF_FRAME_SIZE_MAX - 2 {
-                continue;
-            }
-
-            // 3. Read the rest: type + payload + CRC
-            self.rw
-                .read_exact(&mut buf[..frame_len])
-                .await
-                .map_err(map_read_err)?;
-
-            // 4. CRC check: CRC covers type + payload (NOT addr, NOT len)
-            let crc_idx = frame_len - 1;
-            let expected_crc = buf[crc_idx];
-            let computed_crc = crc8_dvb_s2_buf(&buf[..crc_idx]);
-            if computed_crc != expected_crc {
-                continue;
-            }
-
-            let frame_type = buf[0];
-            let payload = &buf[1..crc_idx];
-
-            // 5. Parse by frame type
-            match frame_type {
-                CRSF_FRAMETYPE_RC_CHANNELS_PACKED => {
-                    if payload.len() < CRSF_FRAME_RC_CHANNELS_PAYLOAD_SIZE {
-                        continue;
-                    }
-                    return Ok(CrsfEvent::RcChannelsPacked(
-                        Self::unpack_rc_channels_packed(payload),
-                    ));
-                }
-                CRSF_FRAMETYPE_SUBSET_RC_CHANNELS_PACKED => {
-                    if payload.is_empty() {
-                        continue;
-                    }
-                    return Ok(CrsfEvent::SubsetRcChannels(
-                        Self::unpack_subset_rc_channels(payload, frame_len),
-                    ));
-                }
-                CRSF_FRAMETYPE_LINK_STATISTICS => {
-                    if payload.len() < CRSF_FRAME_LINK_STATISTICS_PAYLOAD_SIZE {
-                        continue;
-                    }
-                    return Ok(CrsfEvent::LinkStatistics(Self::parse_link_stats(payload)));
-                }
-                CRSF_FRAMETYPE_LINK_STATISTICS_TX => {
-                    if payload.len() < CRSF_FRAME_LINK_STATISTICS_TX_PAYLOAD_SIZE {
-                        continue;
-                    }
-                    return Ok(CrsfEvent::LinkStatisticsTx(
-                        Self::parse_link_stats_tx(payload),
-                    ));
-                }
-                CRSF_FRAMETYPE_COMMAND => {
-                    if let Some(evt) = self.parse_command(&buf, frame_len, addr) {
-                        return Ok(evt);
-                    }
-                    continue;
-                }
-                _ => {
-                    return Ok(CrsfEvent::Other { frame_type });
-                }
-            }
-        }
-    }
-
+impl<RW> Crsf<RW> {
     // -----------------------------------------------------------------------
     // RC channel unpacking
     // -----------------------------------------------------------------------
@@ -387,6 +284,119 @@ where
             snr,
             rf_mode: 0,
             tx_power_dbm: dl_power as i8,
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// Driver methods requiring Read + Write
+// -----------------------------------------------------------------------
+
+impl<RW> Crsf<RW>
+where
+    RW: Read + Write,
+{
+    pub fn new(rw: RW) -> Self {
+        Self {
+            rw,
+            new_baudrate: None,
+        }
+    }
+
+    /// Returns and clears the pending baudrate hint (set after V3 negotiation).
+    pub fn take_baudrate_hint(&mut self) -> Option<u32> {
+        self.new_baudrate.take()
+    }
+
+    /// Read one complete CRSF frame, validate CRC, and parse the payload.
+    ///
+    /// Blocks until a valid frame is received. Invalid frames (bad CRC,
+    /// wrong address, too long) are silently discarded and the next frame
+    /// is attempted.
+    pub async fn read_frame(&mut self) -> Result<CrsfEvent, Error<RW::Error>> {
+        let mut buf = [0u8; CRSF_FRAME_SIZE_MAX];
+        loop {
+            // 1. Sync: read bytes until we see a valid address byte
+            let addr = loop {
+                let mut b = [0u8; 1];
+                self.rw.read_exact(&mut b).await.map_err(map_read_err)?;
+                if b[0] == CRSF_ADDRESS_FLIGHT_CONTROLLER || b[0] == CRSF_ADDRESS_BROADCAST {
+                    break b[0];
+                }
+            };
+
+            // 2. Read frame length byte
+            let mut len_byte = [0u8; 1];
+            self.rw
+                .read_exact(&mut len_byte)
+                .await
+                .map_err(map_read_err)?;
+            let frame_len = len_byte[0] as usize;
+
+            // Validate length: must be at least 2 (type + CRC), at most 62
+            if frame_len < 2 || frame_len > CRSF_FRAME_SIZE_MAX - 2 {
+                continue;
+            }
+
+            // 3. Read the rest: type + payload + CRC
+            self.rw
+                .read_exact(&mut buf[..frame_len])
+                .await
+                .map_err(map_read_err)?;
+
+            // 4. CRC check: CRC covers type + payload (NOT addr, NOT len)
+            let crc_idx = frame_len - 1;
+            let expected_crc = buf[crc_idx];
+            let computed_crc = crc8_dvb_s2_buf(&buf[..crc_idx]);
+            if computed_crc != expected_crc {
+                continue;
+            }
+
+            let frame_type = buf[0];
+            let payload = &buf[1..crc_idx];
+
+            // 5. Parse by frame type
+            match frame_type {
+                CRSF_FRAMETYPE_RC_CHANNELS_PACKED => {
+                    if payload.len() < CRSF_FRAME_RC_CHANNELS_PAYLOAD_SIZE {
+                        continue;
+                    }
+                    return Ok(CrsfEvent::RcChannelsPacked(
+                        Self::unpack_rc_channels_packed(payload),
+                    ));
+                }
+                CRSF_FRAMETYPE_SUBSET_RC_CHANNELS_PACKED => {
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    return Ok(CrsfEvent::SubsetRcChannels(
+                        Self::unpack_subset_rc_channels(payload, frame_len),
+                    ));
+                }
+                CRSF_FRAMETYPE_LINK_STATISTICS => {
+                    if payload.len() < CRSF_FRAME_LINK_STATISTICS_PAYLOAD_SIZE {
+                        continue;
+                    }
+                    return Ok(CrsfEvent::LinkStatistics(Self::parse_link_stats(payload)));
+                }
+                CRSF_FRAMETYPE_LINK_STATISTICS_TX => {
+                    if payload.len() < CRSF_FRAME_LINK_STATISTICS_TX_PAYLOAD_SIZE {
+                        continue;
+                    }
+                    return Ok(CrsfEvent::LinkStatisticsTx(
+                        Self::parse_link_stats_tx(payload),
+                    ));
+                }
+                CRSF_FRAMETYPE_COMMAND => {
+                    if let Some(evt) = self.parse_command(&buf, frame_len, addr) {
+                        return Ok(evt);
+                    }
+                    continue;
+                }
+                _ => {
+                    return Ok(CrsfEvent::Other { frame_type });
+                }
+            }
         }
     }
 

@@ -150,6 +150,7 @@ impl Message for OcpSolverOutput {}
 #[derive(Clone, defmt::Format)]
 pub struct AttitudeControlSetpoint {
     pub timestamp: Instant,
+    pub collective_thrust_n: f32,
     pub attitude_quaternion: UnitQuaternion<f32>,
     pub body_rate_rad_s: Vector3<f32>,
     pub torque_n_m: Vector3<f32>,

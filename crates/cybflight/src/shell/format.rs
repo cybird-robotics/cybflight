@@ -96,7 +96,11 @@ impl fmt::Display for ShellMsg<'_, msgs::OcpSolverOutput> {
 impl fmt::Display for ShellMsg<'_, msgs::RcInput> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = self.0;
-        write!(f, "RcInput(timestamp={}, channels=[", s.timestamp.as_millis())?;
+        write!(
+            f,
+            "RcInput(timestamp={}, channels=[",
+            s.timestamp.as_millis()
+        )?;
         for i in 0..s.channel_count as usize {
             if i > 0 {
                 write!(f, ",")?;
@@ -176,9 +180,7 @@ impl fmt::Display for ShellMsg<'_, msgs::DshotTelemetry> {
         write!(f, "DshotTelem(t={}", self.0.timestamp.as_millis())?;
         for (i, m) in self.0.motors.iter().enumerate() {
             match m.value {
-                TelemetryValue::Erpm(e) => {
-                    write!(f, " M{}={}erpm", i + 1, e as u32 * 100)?
-                }
+                TelemetryValue::Erpm(e) => write!(f, " M{}={}erpm", i + 1, e as u32 * 100)?,
                 TelemetryValue::Stopped => write!(f, " M{}=stopped", i + 1)?,
                 TelemetryValue::Edt(edt) => {
                     write!(f, " M{}=edt:{:?}={}", i + 1, edt.edt_type, edt.data)?
@@ -187,6 +189,28 @@ impl fmt::Display for ShellMsg<'_, msgs::DshotTelemetry> {
             }
         }
         write!(f, ")")
+    }
+}
+
+impl fmt::Display for ShellMsg<'_, msgs::AttitudeControlSetpoint> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.0;
+        write!(
+            f,
+            "AttitudeControlSetpoint(timestamp={:.4}, collective_thrust_n={:.4},attitude_quaternion=Quaternion(x={:.4},y={:.4},z={:.4},w={:.4}), body_rate_rad_s=[{:.4},{:.4},{:.4}], torque_n_m=[{:.4},{:.4},{:.4}])",
+            s.timestamp.as_millis(),
+            s.collective_thrust_n,
+            s.attitude_quaternion.i,
+            s.attitude_quaternion.j,
+            s.attitude_quaternion.k,
+            s.attitude_quaternion.w,
+            s.body_rate_rad_s.x,
+            s.body_rate_rad_s.y,
+            s.body_rate_rad_s.z,
+            s.torque_n_m.x,
+            s.torque_n_m.y,
+            s.torque_n_m.z
+        )
     }
 }
 
@@ -209,6 +233,7 @@ pub struct ShellState {
     pub stream_magint: bool,
     pub stream_baro1: bool,
     pub stream_baro2: bool,
+    pub stream_attcontrol: bool,
 }
 
 impl Printable for msgs::Imu {
@@ -304,6 +329,16 @@ impl Printable for msgs::MagSample {
 impl Printable for msgs::BaroSample {
     fn should_print(&self, _ctx: &ShellState) -> bool {
         true
+    }
+
+    fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        write!(w, "{}", ShellMsg(self))
+    }
+}
+
+impl Printable for msgs::AttitudeControlSetpoint {
+    fn should_print(&self, ctx: &ShellState) -> bool {
+        ctx.stream_attcontrol
     }
 
     fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {

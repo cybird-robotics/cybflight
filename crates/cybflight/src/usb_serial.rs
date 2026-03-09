@@ -2,12 +2,16 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bsp;
+use crate::control::ATTITUDE_CONTROL_SETPOINT;
 use crate::control::OCP_SOLVER_OUTPUT;
 use crate::hal;
 use crate::motors::ACTUATOR_MOTORS;
 use crate::msgs;
 use crate::platform;
-use crate::sensors::{BARO_1, BARO_2, DSHOT_TELEMETRY, GPS_FIX, IMU_1, IMU_2, MAG_EXT, MAG_INT, RC_INPUT, RC_LINK_STATUS, VEHICLE_ATTITUDE};
+use crate::sensors::{
+    BARO_1, BARO_2, DSHOT_TELEMETRY, GPS_FIX, IMU_1, IMU_2, MAG_EXT, MAG_INT, RC_INPUT,
+    RC_LINK_STATUS, VEHICLE_ATTITUDE,
+};
 use crate::shell::format::ShellMsg;
 use crate::shell::write_all;
 use crate::shell::ShellLine;
@@ -63,6 +67,7 @@ pub static STREAM_MAGEXT: AtomicBool = AtomicBool::new(false);
 pub static STREAM_MAGINT: AtomicBool = AtomicBool::new(false);
 pub static STREAM_BARO1: AtomicBool = AtomicBool::new(false);
 pub static STREAM_BARO2: AtomicBool = AtomicBool::new(false);
+pub static STREAM_ATTITUDE_CONTROL: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Generic stream bridge + concrete embassy task wrappers
@@ -161,6 +166,11 @@ pub async fn baro2_stream_task() {
     msg_stream_task(&BARO_2, &STREAM_BARO2).await
 }
 
+#[embassy_executor::task]
+pub async fn attitude_control_stream_task() {
+    msg_stream_task(&ATTITUDE_CONTROL_SETPOINT, &STREAM_ATTITUDE_CONTROL).await
+}
+
 // ---------------------------------------------------------------------------
 // Task entry points
 // ---------------------------------------------------------------------------
@@ -242,6 +252,7 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
     STREAM_MAGINT.store(false, Ordering::Relaxed);
     STREAM_BARO1.store(false, Ordering::Relaxed);
     STREAM_BARO2.store(false, Ordering::Relaxed);
+    STREAM_ATTITUDE_CONTROL.store(false, Ordering::Relaxed);
 
     let mut line_buf = [0u8; 64];
     let mut line_len = 0usize;
@@ -370,6 +381,13 @@ async fn dispatch<'d>(
                 Err(_) => return write_all(class, b"error: no subscriber slot\r\n").await,
             };
             oneshot(class, &mut sub, 128).await?;
+        }
+        "attcontrol" => {
+            let mut sub = match ATTITUDE_CONTROL_SETPOINT.subscriber() {
+                Ok(s) => s,
+                Err(_) => return write_all(class, b"error: no subscriber slot\r\n").await,
+            };
+            oneshot(class, &mut sub, 256).await?;
         }
         "stream imu1 on" => {
             STREAM_IMU1.store(true, Ordering::Relaxed);
@@ -508,6 +526,14 @@ async fn dispatch<'d>(
         "stream baro2 off" => {
             STREAM_BARO2.store(false, Ordering::Relaxed);
             write_all(class, b"baro2 stream off\r\n").await?;
+        }
+        "stream attcontrol on" => {
+            STREAM_ATTITUDE_CONTROL.store(true, Ordering::Relaxed);
+            write_all(class, b"attitude control setpoint stream on\r\n").await?;
+        }
+        "stream attcontrol off" => {
+            STREAM_ATTITUDE_CONTROL.store(false, Ordering::Relaxed);
+            write_all(class, b"attitude control setpoint stream off\r\n").await?;
         }
         "reboot" => {
             write_all(class, b"rebooting...\r\n").await?;

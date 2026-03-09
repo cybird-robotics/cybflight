@@ -26,7 +26,9 @@ async fn main(spawner: embassy_executor::Spawner) {
     let (board, defmt_uart) = cybflight::bsp::init();
     cybflight::serial_logger::init(defmt_uart);
     defmt::info!("cybflight: {} starting", cybflight::bsp::BOARD_NAME);
-    cybflight::status::STATUS.sender().send(cybflight::status::SystemStatus::Alive);
+    cybflight::status::STATUS
+        .sender()
+        .send(cybflight::status::SystemStatus::Alive);
 
     // --- Start high-priority interrupt executor for DShot ---
     //
@@ -49,7 +51,6 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::watchdog::iwdg_feed_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn IWDG feed task"));
-
     spawner
         .spawn(cybflight::sensors::attitude::mahony_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude task"));
@@ -68,6 +69,9 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::usb_serial::imu2_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn IMU2 stream task"));
+    spawner
+        .spawn(cybflight::control::attitude_control::attitude_control_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude control task"));
     spawner
         .spawn(cybflight::usb_serial::att_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude stream task"));
@@ -98,6 +102,9 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::usb_serial::baro2_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn baro2 stream task"));
+    spawner
+        .spawn(cybflight::usb_serial::attitude_control_stream_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude control stream task"));
 
     defmt::info!("all init done");
 }

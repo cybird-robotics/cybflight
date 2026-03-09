@@ -1,3 +1,4 @@
+pub mod attitude_control;
 pub mod nmpc_driver;
 pub mod rc_interpreter;
 
@@ -17,3 +18,11 @@ pub static OCP_SOLVER_OUTPUT: PubSubChannel<
 // PUBS=1 (single RC-to-setpoint converter, not yet implemented).
 pub static NMPC_SETPOINT: PubSubChannel<CriticalSectionRawMutex, msgs::NmpcSetpoint, 2, 2, 1> =
     PubSubChannel::new();
+
+pub static ATTITUDE_CONTROL_SETPOINT: PubSubChannel<
+    CriticalSectionRawMutex,
+    msgs::AttitudeControlSetpoint,
+    2,
+    2,
+    1,
+> = PubSubChannel::new();

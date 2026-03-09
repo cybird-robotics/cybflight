@@ -72,6 +72,18 @@ pub struct RcLinkStatus {
 
 impl Message for RcLinkStatus {}
 
+/// NMPC position setpoint.  Published by the RC-input-to-setpoint converter
+/// (not yet implemented); the NMPC driver falls back to a hardcoded hover
+/// target until a publisher exists.
+#[derive(Clone, defmt::Format)]
+pub struct NmpcSetpoint {
+    pub timestamp: Instant,
+    /// Target position in world frame [m].
+    pub position: Vector3<f32>,
+}
+
+impl Message for NmpcSetpoint {}
+
 const OCP_OUTPUT_SIZE: usize = 4;
 #[derive(Clone, defmt::Format)]
 pub struct OcpSolverOutput {

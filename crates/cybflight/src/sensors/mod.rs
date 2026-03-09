@@ -20,6 +20,16 @@ pub static VEHICLE_ATTITUDE: PubSubChannel<
     1,
 > = PubSubChannel::new();
 
+// Vehicle odometry (position + velocity): PUBS=1 (single odometry source, e.g. VIO/GPS-EKF),
+// SUBS=4 (control + telemetry + 2 spare).
+pub static VEHICLE_ODOMETRY: PubSubChannel<
+    CriticalSectionRawMutex,
+    msgs::VehicleOdometry,
+    4,
+    4,
+    1,
+> = PubSubChannel::new();
+
 // RC input: CAP=4, SUBS=4 (control + telemetry + 2 spare), PUBS=1 (single RC task).
 pub static RC_INPUT: PubSubChannel<CriticalSectionRawMutex, msgs::RcInput, 4, 4, 1> =
     PubSubChannel::new();

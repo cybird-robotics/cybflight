@@ -6,11 +6,74 @@ use crate::nmpc::lbfgs::ValueAndGrad;
 use super::lbfgs::{self, LbfgsParams, LbfgsWorkspace, DIM};
 use super::model::{Control, CtrlJac, QuadModel, State, StateJac, NU};
 use super::qp::QpWorkspace;
+use core::convert::From;
 use core::option::{
     Option,
     Option::{None, Some},
 };
 use nalgebra as na;
+
+#[derive(Clone)]
+pub struct NmpcState {
+    pub position: na::Vector3<f32>,
+    pub orientation: na::UnitQuaternion<f32>,
+    pub velocity: na::Vector3<f32>,
+}
+
+impl From<State> for NmpcState {
+    fn from(state: State) -> Self {
+        Self {
+            position: state.fixed_rows::<3>(0).into(),
+            orientation: na::UnitQuaternion::from_quaternion(na::Quaternion::from_vector(
+                state.fixed_rows::<4>(3).into(),
+            )),
+            velocity: state.fixed_rows::<3>(7).into(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct NmpcCommand {
+    pub thrust: f32,
+    pub omega: na::Vector3<f32>,
+}
+
+impl From<Control> for NmpcCommand {
+    fn from(control: Control) -> Self {
+        Self {
+            thrust: control[0],
+            omega: control.fixed_rows::<3>(1).into(),
+        }
+    }
+}
+
+impl From<NmpcState> for State {
+    fn from(s: NmpcState) -> Self {
+        let mut out = State::zeros();
+        out.fixed_rows_mut::<3>(0).copy_from(&s.position);
+        out.fixed_rows_mut::<4>(3).copy_from(&s.orientation.coords);
+        out.fixed_rows_mut::<3>(7).copy_from(&s.velocity);
+        out
+    }
+}
+
+impl From<&NmpcState> for State {
+    fn from(s: &NmpcState) -> Self {
+        State::from(s.clone())
+    }
+}
+
+impl From<NmpcCommand> for Control {
+    fn from(c: NmpcCommand) -> Self {
+        Control::from([c.thrust, c.omega[0], c.omega[1], c.omega[2]])
+    }
+}
+
+impl From<&NmpcCommand> for Control {
+    fn from(c: &NmpcCommand) -> Self {
+        Control::from(c.clone())
+    }
+}
 
 /// Per-phase timing from one `solve()` call.
 pub struct NmpcTiming {
@@ -86,9 +149,31 @@ impl NmpcSolver {
         self
     }
 
+    pub fn solve(
+        &mut self,
+        x_init: &NmpcState,
+        x_refs: &[NmpcState; N + 1],
+        u_refs: &[NmpcCommand; N],
+    ) -> (NmpcCommand, f32, i32, bool, NmpcTiming) {
+        // 1. Convert the initial state and bind it to a local variable
+        let x0: State = x_init.into();
+
+        // 2. Use core::array::from_fn to map over the reference arrays cleanly
+        let x_refs_arr: [State; N + 1] = core::array::from_fn(|i| (&x_refs[i]).into());
+        let u_refs_arr: [Control; N] = core::array::from_fn(|i| (&u_refs[i]).into());
+
+        // 3. Pass references to the newly created local arrays/variables
+        let (u, v, i, b, t) = self.solve_with_array(&x0, &x_refs_arr, &u_refs_arr);
+
+        // 4. Convert the output back to the wrapper
+        let u_cmd = NmpcCommand::from(u);
+
+        (u_cmd, v, i, b, t)
+    }
+
     // Solve the NMPC problem.
     // Returns (u_opt_first, final_cost, iterations, converged, timing).
-    pub fn solve(
+    pub fn solve_with_array(
         &mut self,
         x_init: &State,
         x_refs: &[State; N + 1],

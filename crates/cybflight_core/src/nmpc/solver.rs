@@ -1,9 +1,16 @@
 // NMPC solver: supports both multiple-shooting SQP (Gauss-Newton) and
 // single-shooting L-BFGS via the USE_SQP flag.
 
-use super::lbfgs::{self, DIM, LbfgsParams, LbfgsWorkspace};
-use super::model::{Control, CtrlJac, NU, QuadModel, State, StateJac};
+use crate::nmpc::lbfgs::ValueAndGrad;
+
+use super::lbfgs::{self, LbfgsParams, LbfgsWorkspace, DIM};
+use super::model::{Control, CtrlJac, QuadModel, State, StateJac, NU};
 use super::qp::QpWorkspace;
+use core::option::{
+    Option,
+    Option::{None, Some},
+};
+use nalgebra as na;
 
 /// Per-phase timing from one `solve()` call.
 pub struct NmpcTiming {
@@ -38,9 +45,9 @@ const _: () = assert!(DIM == N * NU, "lbfgs::DIM must equal N * NU");
 pub struct NmpcSolver {
     pub model: QuadModel,
     pub qp: QpWorkspace,
-    pub ws: LbfgsWorkspace,
+    pub ws: LbfgsWorkspace<f32, DIM>,
     warmstart: bool,
-    prev_u: [f32; DIM],
+    prev_u: na::SVector<f32, DIM>,
     /// Persistent simulated state — propagated forward after each solve so the
     /// next call sees a different x0 (closed-loop simulation).
     pub sim_x0: Option<State>,
@@ -58,14 +65,14 @@ impl NmpcSolver {
         for k in 0..N {
             qp.u_bar[k] = Control::from([mass * grav, 0.0, 0.0, 0.0]);
         }
-        let mut prev_u = [0.0_f32; DIM];
+        let mut prev_u = na::SVector::<f32, DIM>::zeros();
         for i in 0..N {
             prev_u[i * NU] = mass * grav;
         }
         Self {
             model,
             qp,
-            ws: LbfgsWorkspace::zeroed(),
+            ws: LbfgsWorkspace::default(),
             warmstart: true,
             prev_u,
             sim_x0: None,
@@ -102,21 +109,13 @@ impl NmpcSolver {
         let mut gx = State::zeros();
         let mut gu = Control::zeros();
         for k in 0..N {
-            cost += self
-                .model
-                .state_cost_grad(&self.qp.x_bar[k], &x_refs[k], &mut gx);
-            cost += self
-                .model
-                .input_cost_grad(&self.qp.u_bar[k], &u_refs[k], &mut gu);
+            cost += self.model.state_cost_grad(&self.qp.x_bar[k], &x_refs[k], &mut gx);
+            cost += self.model.input_cost_grad(&self.qp.u_bar[k], &u_refs[k], &mut gu);
             let mut gx_con = State::zeros();
             let mut gu_con = Control::zeros();
-            cost += self
-                .model
-                .constraint_grad(&self.qp.u_bar[k], &mut gx_con, &mut gu_con);
+            cost += self.model.constraint_grad(&self.qp.u_bar[k], &mut gx_con, &mut gu_con);
         }
-        cost += self
-            .model
-            .state_cost_grad(&self.qp.x_bar[N], &x_refs[N], &mut gx);
+        cost += self.model.state_cost_grad(&self.qp.x_bar[N], &x_refs[N], &mut gx);
         cost
     }
 
@@ -154,9 +153,8 @@ impl NmpcSolver {
             let t = self.timer_us.map_or(0, |f| f());
             self.qp.x_bar[0] = *x_init;
             for k in 0..N {
-                self.qp.x_bar[k + 1] = self
-                    .model
-                    .propagate_rk4(&self.qp.x_bar[k], &self.qp.u_bar[k]);
+                self.qp.x_bar[k + 1] =
+                    self.model.propagate_rk4(&self.qp.x_bar[k], &self.qp.u_bar[k]);
             }
             us_fwd += self.timer_us.map_or(0, |f| f()) - t;
 
@@ -222,9 +220,8 @@ impl NmpcSolver {
 
             self.qp.x_bar[0] = *x_init;
             for k in 0..N {
-                self.qp.x_bar[k + 1] = self
-                    .model
-                    .propagate_rk4(&self.qp.x_bar[k], &self.qp.u_bar[k]);
+                self.qp.x_bar[k + 1] =
+                    self.model.propagate_rk4(&self.qp.x_bar[k], &self.qp.u_bar[k]);
             }
             let mut cost_after = self.eval_cost(x_refs, u_refs);
 
@@ -237,9 +234,8 @@ impl NmpcSolver {
                 self.qp.forward_sweep(x_init, alpha);
                 self.qp.x_bar[0] = *x_init;
                 for k in 0..N {
-                    self.qp.x_bar[k + 1] = self
-                        .model
-                        .propagate_rk4(&self.qp.x_bar[k], &self.qp.u_bar[k]);
+                    self.qp.x_bar[k + 1] =
+                        self.model.propagate_rk4(&self.qp.x_bar[k], &self.qp.u_bar[k]);
                 }
                 cost_after = self.eval_cost(x_refs, u_refs);
             }
@@ -248,9 +244,8 @@ impl NmpcSolver {
                 self.qp.u_bar = u_bar_prev;
                 self.qp.x_bar[0] = *x_init;
                 for k in 0..N {
-                    self.qp.x_bar[k + 1] = self
-                        .model
-                        .propagate_rk4(&self.qp.x_bar[k], &self.qp.u_bar[k]);
+                    self.qp.x_bar[k + 1] =
+                        self.model.propagate_rk4(&self.qp.x_bar[k], &self.qp.u_bar[k]);
                 }
                 final_cost = cost_before;
             } else {
@@ -285,7 +280,7 @@ impl NmpcSolver {
         x_refs: &[State; N + 1],
         u_refs: &[Control; N],
     ) -> (Control, f32, i32, bool, NmpcTiming) {
-        let mut u_flat = [0.0_f32; DIM];
+        let mut u_flat = na::SVector::<f32, DIM>::zeros();
         if self.warmstart {
             for i in 0..(N - 1) {
                 for j in 0..NU {
@@ -304,8 +299,7 @@ impl NmpcSolver {
             }
         }
 
-        let params = LbfgsParams::default_nmpc();
-        let mut f_opt = 0.0_f32;
+        let params = LbfgsParams::default();
 
         let model = &mut self.model;
         let ws = &mut self.ws;
@@ -324,7 +318,7 @@ impl NmpcSolver {
         let mut us_bwd_mat = 0u64;
         let mut eval_count = 0u32;
 
-        let mut eval = |u_flat: &[f32; DIM], grad_u_flat: &mut [f32; DIM]| -> f32 {
+        let mut eval = |u_flat: &na::SVector<f32, DIM>| -> lbfgs::ValueAndGrad<f32, DIM> {
             eval_count += 1;
 
             // Forward pass
@@ -342,6 +336,7 @@ impl NmpcSolver {
             let mut total_cost = model.terminal_cost_grad(&traj_x[N], &xr[N], &mut lambda);
             us_bwd_cost += self.timer_us.map_or(0, |f| f()) - t;
 
+            let mut grad_u_flat = na::SVector::<f32, DIM>::zeros();
             for i in (0..N).rev() {
                 let uk = Control::from_fn(|j, _| u_flat[i * NU + j]);
                 let mut gx_cost = State::zeros();
@@ -378,17 +373,22 @@ impl NmpcSolver {
                 us_bwd_mat += self.timer_us.map_or(0, |f| f()) - t;
             }
 
-            total_cost
+            ValueAndGrad(total_cost, grad_u_flat)
         };
 
-        let ret = lbfgs::lbfgs_optimize(&mut u_flat, &mut f_opt, &params, ws, &mut eval);
+        let ret = lbfgs::lbfgs_optimize(&u_flat, &params, ws, &mut eval);
 
-        self.prev_u.copy_from_slice(&u_flat);
+        let (u_first, f_opt, converged) = if let Ok(lbfgs::Solution { x, f, .. }) = ret {
+            (x, f, true)
+        } else {
+            (u_flat, f32::INFINITY, false)
+        };
+        let u_first = Control::from_fn(|j, _| u_first[j]);
+
+        self.prev_u = u_flat;
         self.warmstart = true;
 
-        let u_first = Control::from_fn(|j, _| u_flat[j]);
         let iters = self.ws.last_k;
-        let converged = ret == lbfgs::LBFGS_CONVERGENCE || ret == lbfgs::LBFGS_STOP;
         let timing = NmpcTiming {
             us_fwd,
             us_bwd_jac,

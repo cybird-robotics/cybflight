@@ -5,13 +5,17 @@ edition = "2024"
 publish = false
 
 [features]
-# Pick one board by default; enable CRSF RC by default
-default = ["board_sakurah743", "rx_crsf"]
+# Pick one board by default; enable CRSF RC and UART logging by default
+default = ["board_sakurah743", "rx_crsf", "defmt_uart"]
 
 board_sakurah743 = ["dep:bsp-sakurah743"]
 board_foxeerh743 = ["dep:bsp-foxeerh743"]
 rx_crsf = []
 rx_ghst = []
+# Enable UART-based defmt logging. Disable for production to eliminate all
+# blocking UART overhead and free USART2 (the peripheral is still consumed
+# and dropped at init, but no bytes are ever transmitted).
+defmt_uart = []
 
 [dependencies]
 bsp-sakurah743 = { path = "../bsp/sakurah743", optional = true }
@@ -37,7 +41,8 @@ cortex-m-rt = "0.7.5"
 
 # Logging + panic
 defmt = "1.0.1"
-defmt-rtt = "1.1.0"
+critical-section = "1"
+embedded-io = "0.7"
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 
 # Math (no_std)

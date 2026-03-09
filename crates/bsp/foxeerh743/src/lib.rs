@@ -154,10 +154,6 @@ pub struct SerialPins {
     pub usart1_tx: hal::Peri<'static, hal::peripherals::PA9>,
     pub usart1_rx: hal::Peri<'static, hal::peripherals::PA10>,
 
-    pub usart2: hal::Peri<'static, hal::peripherals::USART2>,
-    pub usart2_tx: hal::Peri<'static, hal::peripherals::PA2>,
-    pub usart2_rx: hal::Peri<'static, hal::peripherals::PA3>,
-
     pub usart3: hal::Peri<'static, hal::peripherals::USART3>,
     pub usart3_tx: hal::Peri<'static, hal::peripherals::PB10>,
     pub usart3_rx: hal::Peri<'static, hal::peripherals::PB11>,
@@ -300,7 +296,7 @@ fn board_config() -> Config {
 }
 
 /// Initialize the HAL and return all board resources.
-pub fn init() -> Board {
+pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
     let p: Peripherals = hal::init(board_config());
 
     // LED (PC13). Start low.
@@ -360,10 +356,6 @@ pub fn init() -> Board {
         usart1: p.USART1,
         usart1_tx: p.PA9,
         usart1_rx: p.PA10,
-
-        usart2: p.USART2,
-        usart2_tx: p.PA2,
-        usart2_rx: p.PA3,
 
         usart3: p.USART3,
         usart3_tx: p.PB10,
@@ -431,17 +423,26 @@ pub fn init() -> Board {
         mag_align: SensorAlign::Cw180Deg,
     };
 
-    Board {
-        leds,
-        beeper,
-        spi,
-        i2c,
-        serial,
-        adc,
-        motors,
-        sensors,
-        flash: FlashPins { flash_cs },
-        osd: OsdPins { osd_cs },
-        usb,
-    }
+    // USART2 TX (PA2) for defmt serial logging at 921600 baud.
+    let mut defmt_uart_config = hal::usart::Config::default();
+    defmt_uart_config.baudrate = 921_600;
+    let defmt_uart = hal::usart::UartTx::new_blocking(p.USART2, p.PA2, defmt_uart_config)
+        .expect("defmt UART init failed");
+
+    (
+        Board {
+            leds,
+            beeper,
+            spi,
+            i2c,
+            serial,
+            adc,
+            motors,
+            sensors,
+            flash: FlashPins { flash_cs },
+            osd: OsdPins { osd_cs },
+            usb,
+        },
+        defmt_uart,
+    )
 }

@@ -8,6 +8,7 @@ pub use bsp_foxeerh743 as bsp;
 pub use bsp::hal;
 
 pub mod board_init;
+pub mod serial_logger;
 pub mod control;
 pub mod msgs;
 pub mod platform;

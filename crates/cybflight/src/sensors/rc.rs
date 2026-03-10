@@ -6,7 +6,7 @@
 use embassy_time::{Instant, Timer};
 
 use crate::hal;
-use crate::msgs;
+use cybflight_msgs as msgs;
 
 pub type RcUart = hal::usart::BufferedUart<'static>;
 

@@ -6,7 +6,7 @@ use crate::hal::pac::timer::regs::{CcerGp16, CcmrInput2ch, CcmrOutputGp16};
 use crate::hal::pac::timer::vals;
 use crate::hal::peripherals::{DMA1_CH0, DMA1_CH1, DMA1_CH2, DMA1_CH3};
 use crate::hal::Peri;
-use crate::msgs::{DshotMotorTelemetry, DshotTelemetry};
+use cybflight_msgs::{DshotMotorTelemetry, DshotTelemetry};
 use crate::sensors::DSHOT_TELEMETRY;
 use cybflight_drivers::dshot::{
     gcr, telemetry, DSHOT600_GCR_TICKS_PER_BIT, DSHOT_DMA_BUFFER_SIZE, MAX_GCR_EDGES,

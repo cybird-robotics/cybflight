@@ -1,3 +1,7 @@
+#![no_std]
+
+pub mod dshot;
+
 use embassy_time::Instant;
 use nalgebra::{SVector, UnitQuaternion, Vector3};
 
@@ -86,7 +90,7 @@ impl Message for NmpcSetpoint {}
 
 #[derive(Clone, defmt::Format)]
 pub struct DshotMotorTelemetry {
-    pub value: cybflight_drivers::dshot::telemetry::TelemetryValue,
+    pub value: dshot::TelemetryValue,
     pub raw: Option<u16>,
 }
 

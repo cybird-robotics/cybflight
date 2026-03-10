@@ -11,7 +11,7 @@ pub mod board_init;
 pub mod serial_logger;
 pub mod control;
 pub mod motors;
-pub mod msgs;
+pub use cybflight_msgs as msgs;
 pub mod platform;
 pub mod sensors;
 pub mod shell;
@@ -33,7 +33,6 @@ pub const GIT_HASH: &str = match option_env!("GIT_HASH") {
 };
 
 use bsp_types::SensorAlign;
-use embassy_time::Instant;
 use nalgebra::Vector3;
 
 /// Rotate a 3-axis sensor vector according to the board-defined alignment.

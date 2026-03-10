@@ -5,7 +5,7 @@ use embassy_sync::pubsub::WaitResult;
 use embassy_time::Instant;
 
 use super::{RAW_IMU, VEHICLE_ATTITUDE};
-use crate::msgs;
+use cybflight_msgs as msgs;
 
 #[embassy_executor::task]
 pub async fn mahony_task() {

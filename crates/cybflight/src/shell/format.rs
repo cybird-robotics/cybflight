@@ -1,4 +1,4 @@
-use crate::msgs;
+use cybflight_msgs as msgs;
 
 use core::fmt;
 
@@ -124,7 +124,7 @@ impl fmt::Display for ShellMsg<'_, msgs::RcLinkStatus> {
 
 impl fmt::Display for ShellMsg<'_, msgs::DshotTelemetry> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use cybflight_drivers::dshot::telemetry::TelemetryValue;
+        use cybflight_msgs::dshot::TelemetryValue;
         write!(f, "DshotTelem(t={}", self.0.timestamp.as_millis())?;
         for (i, m) in self.0.motors.iter().enumerate() {
             match m.value {

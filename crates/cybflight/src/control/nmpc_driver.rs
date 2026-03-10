@@ -3,7 +3,8 @@ use embassy_sync::pubsub::WaitResult;
 use embassy_time::Instant;
 use nalgebra::{SVector, UnitQuaternion, Vector3};
 
-use crate::{msgs, sensors};
+use cybflight_msgs as msgs;
+use crate::sensors;
 
 pub struct NmpcDriver {
     solver: nmpc::NmpcSolver,

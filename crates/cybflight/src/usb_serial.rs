@@ -5,7 +5,7 @@ use crate::bsp;
 use crate::control::OCP_SOLVER_OUTPUT;
 use crate::hal;
 use crate::motors::MOTOR_THROTTLE;
-use crate::msgs;
+use cybflight_msgs as msgs;
 use crate::platform;
 use crate::sensors::{DSHOT_TELEMETRY, RAW_IMU, RC_INPUT, RC_LINK_STATUS, VEHICLE_ATTITUDE};
 use crate::shell::format::ShellMsg;

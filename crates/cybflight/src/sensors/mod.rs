@@ -1,7 +1,7 @@
 pub mod attitude;
 pub mod imu;
 pub mod rc;
-use crate::msgs;
+use cybflight_msgs as msgs;
 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, pubsub::PubSubChannel};
 

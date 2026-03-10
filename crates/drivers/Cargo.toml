@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+cybflight-msgs = { path = "../msgs" }
 embedded-hal = "1.0"
 embedded-hal-async = "1.0"
 defmt = "1.0.1"

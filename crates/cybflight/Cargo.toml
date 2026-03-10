@@ -22,6 +22,7 @@ bsp-sakurah743 = { path = "../bsp/sakurah743", optional = true }
 bsp-foxeerh743 = { path = "../bsp/foxeerh743", optional = true }
 bsp-types = { path = "../bsp/types" }
 cybflight-drivers = { path = "../drivers" }
+cybflight-msgs = { path = "../msgs" }
 cybflight-core = { path = "../cybflight_core/" }
 
 # Embassy runtime pieces (board-agnostic)

@@ -2,41 +2,12 @@
 //!
 //! Implements eRPM decode (`dshot_decode_eRPM_telemetry_value`, BF `dshot.c:198-213`)
 //! and EDT (Extended DShot Telemetry) type dispatch (`dshot.c:215-242`).
+//!
+//! The pure data types (`TelemetryValue`, `EdtType`, `EdtValue`) live in
+//! `cybflight-msgs` so they can be shared with non-HAL crates. Re-exported here
+//! for backwards compatibility.
 
-/// Decoded telemetry value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), derive(defmt::Format))]
-pub enum TelemetryValue {
-    /// Motor eRPM × 100.
-    Erpm(u32),
-    /// Motor stopped (raw 0x0FFF).
-    Stopped,
-    /// Extended DShot Telemetry value.
-    Edt(EdtValue),
-    /// Invalid telemetry (period == 0).
-    Invalid,
-}
-
-/// Extended DShot Telemetry type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), derive(defmt::Format))]
-pub enum EdtType {
-    Temperature,
-    Voltage,
-    Current,
-    Debug1,
-    Debug2,
-    Debug3,
-    StateEvents,
-}
-
-/// Extended DShot Telemetry value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), derive(defmt::Format))]
-pub struct EdtValue {
-    pub edt_type: EdtType,
-    pub data: u8,
-}
+pub use cybflight_msgs::dshot::{EdtType, EdtValue, TelemetryValue};
 
 /// Decode eRPM from a 12-bit raw telemetry value.
 ///

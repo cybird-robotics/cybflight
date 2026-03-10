@@ -1,6 +1,6 @@
 pub mod nmpc_driver;
 
-use crate::msgs;
+use cybflight_msgs as msgs;
 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, pubsub::PubSubChannel};
 

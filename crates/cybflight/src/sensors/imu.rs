@@ -8,7 +8,8 @@ use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Instant, Timer};
 use crate::hal;
-use crate::{apply_alignment, msgs};
+use cybflight_msgs as msgs;
+use crate::apply_alignment;
 use hal::gpio::Output;
 use hal::spi::{self, Spi};
 

@@ -67,3 +67,13 @@ pub static BARO_1: PubSubChannel<CriticalSectionRawMutex, msgs::BaroSample, 2, 4
 // Baro 2: same sizing for dual-baro boards.
 pub static BARO_2: PubSubChannel<CriticalSectionRawMutex, msgs::BaroSample, 2, 4, 1> =
     PubSubChannel::new();
+
+// Manual control setpoint (thrust + rates from RC sticks): CAP=2 (fresh only),
+// SUBS=4 (control + telemetry + shell + spare), PUBS=1 (rc_interpreter).
+pub static MANUAL_CONTROL: PubSubChannel<
+    CriticalSectionRawMutex,
+    msgs::ManualControlSetpoint,
+    2,
+    4,
+    1,
+> = PubSubChannel::new();

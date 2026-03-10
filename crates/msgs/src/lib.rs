@@ -189,3 +189,19 @@ pub struct ArmDisarm {
     pub timestamp: Instant,
     pub armed: bool,
 }
+
+/// Manual control setpoint: thrust + body rates from RC sticks.
+#[derive(Clone, defmt::Format)]
+pub struct ManualControlSetpoint {
+    pub timestamp: Instant,
+    /// Normalized thrust [0, 1].
+    pub thrust: f32,
+    /// Roll rate command (rad/s).
+    pub roll_rate: f32,
+    /// Pitch rate command (rad/s).
+    pub pitch_rate: f32,
+    /// Yaw rate command (rad/s).
+    pub yaw_rate: f32,
+}
+
+impl Message for ManualControlSetpoint {}

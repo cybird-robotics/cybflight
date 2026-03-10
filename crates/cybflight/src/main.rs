@@ -59,6 +59,10 @@ async fn main(spawner: embassy_executor::Spawner) {
         .unwrap_or_else(|_| defmt::panic!("failed to spawn NMPC driver task"));
 
     spawner
+        .spawn(cybflight::control::rc_interpreter::rc_interpreter_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn RC interpreter task"));
+
+    spawner
         .spawn(cybflight::usb_serial::imu1_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn IMU1 stream task"));
     spawner

@@ -1,4 +1,5 @@
 pub mod nmpc_driver;
+pub mod rc_interpreter;
 
 use cybflight_msgs as msgs;
 

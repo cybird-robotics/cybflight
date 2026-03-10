@@ -19,15 +19,15 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ```bash
 # Default board (sakurah743) + default RC protocol (CRSF) + UART logging:
-cargo build -p cybflight
+cargo run --release -p cybflight
 
 # Specific board + RC protocol:
-cargo build -p cybflight --no-default-features --features board_foxeerh743,rx_crsf,defmt_uart
-cargo build -p cybflight --no-default-features --features board_sakurah743,rx_ghst,defmt_uart
+cargo run --release -p cybflight --no-default-features --features board_foxeerh743,rx_ghst,defmt_uart
+cargo run --release -p cybflight --no-default-features --features board_sakurah743,rx_ghst,defmt_uart
 
 # Production build (no UART logging overhead):
 # Set `DEFMT_LOG=off` in '.cargo/config.toml`
-cargo build -p cybflight --release --no-default-features --features board_sakurah743,rx_crsf
+cargo run --release -p cybflight --release --no-default-features --features board_sakurah743,rx_crsf
 ```
 
 ### Cargo Features

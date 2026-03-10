@@ -71,14 +71,18 @@ pub async fn dshot_task(
         config.timers[i].egr().write(|w| w.set_ug(true));
     }
 
-    // Save OC register values for restore after IC mode.
-    let saved_ccmr1 = config.timers[0].ccmr_output(0).read();
-    let saved_ccmr2 = config.timers[0].ccmr_output(1).read();
-    let saved_ccer = config.timers[0].ccer().read();
-
-    // CCMR values with OCPE disabled — for writing CCR directly to shadow register
-    let ccmr1_no_preload = CcmrOutputGp16(saved_ccmr1.0 & !0x0808);
-    let ccmr2_no_preload = CcmrOutputGp16(saved_ccmr2.0 & !0x0808);
+    // Save OC register values (per-timer) for restore after IC mode.
+    let mut saved_ccmr = [[CcmrOutputGp16(0); 2]; 2];
+    let mut saved_ccer = [CcerGp16(0); 2];
+    let mut ccmr_no_preload = [[CcmrOutputGp16(0); 2]; 2];
+    for i in 0..config.timer_count as usize {
+        saved_ccmr[i][0] = config.timers[i].ccmr_output(0).read();
+        saved_ccmr[i][1] = config.timers[i].ccmr_output(1).read();
+        saved_ccer[i] = config.timers[i].ccer().read();
+        // CCMR values with OCPE disabled — for writing CCR directly to shadow register
+        ccmr_no_preload[i][0] = CcmrOutputGp16(saved_ccmr[i][0].0 & !0x0808);
+        ccmr_no_preload[i][1] = CcmrOutputGp16(saved_ccmr[i][1].0 & !0x0808);
+    }
 
     let mut telem_motor: usize = 0;
 
@@ -190,10 +194,12 @@ pub async fn dshot_task(
                 .modify(|w| w.set_moder(pin, gpio_vals::Moder::OUTPUT));
         }
 
-        config.timers[0].ccer().write_value(CcerGp16(0));
-        config.timers[0].ccmr_input(0).write_value(CcmrInput2ch(CCMR_IC));
-        config.timers[0].ccmr_input(1).write_value(CcmrInput2ch(CCMR_IC));
-        config.timers[0].ccer().write_value(CcerGp16(CCER_IC));
+        for i in 0..config.timer_count as usize {
+            config.timers[i].ccer().write_value(CcerGp16(0));
+            config.timers[i].ccmr_input(0).write_value(CcmrInput2ch(CCMR_IC));
+            config.timers[i].ccmr_input(1).write_value(CcmrInput2ch(CCMR_IC));
+            config.timers[i].ccer().write_value(CcerGp16(CCER_IC));
+        }
 
         // Reconfigure timer for free-running IC timestamps
         for i in 0..config.timer_count as usize {
@@ -313,21 +319,30 @@ pub async fn dshot_task(
         }
 
         // Restore OC CCMR (channels must be off for CC1S write)
-        config.timers[0].ccer().write_value(CcerGp16(0));
-        config.timers[0].ccmr_output(0).write_value(saved_ccmr1);
-        config.timers[0].ccmr_output(1).write_value(saved_ccmr2);
+        for i in 0..config.timer_count as usize {
+            config.timers[i].ccer().write_value(CcerGp16(0));
+            config.timers[i].ccmr_output(0).write_value(saved_ccmr[i][0]);
+            config.timers[i].ccmr_output(1).write_value(saved_ccmr[i][1]);
+        }
 
         // IC captures corrupt CCR shadow registers. Fix: temporarily disable
         // output preload (OCPE=0) so CCR writes go directly to shadow, then
         // re-enable preload and restore CCER.
-        config.timers[0].ccmr_output(0).write_value(ccmr1_no_preload);
-        config.timers[0].ccmr_output(1).write_value(ccmr2_no_preload);
-        for ch in 0..4usize {
-            config.timers[0].ccr(ch).write(|w| w.set_ccr(0));
+        for i in 0..config.timer_count as usize {
+            config.timers[i].ccmr_output(0).write_value(ccmr_no_preload[i][0]);
+            config.timers[i].ccmr_output(1).write_value(ccmr_no_preload[i][1]);
         }
-        config.timers[0].ccmr_output(0).write_value(saved_ccmr1);
-        config.timers[0].ccmr_output(1).write_value(saved_ccmr2);
-        config.timers[0].ccer().write_value(saved_ccer);
+        for m in 0..4 {
+            config.motors[m]
+                .timer_regs
+                .ccr(config.motors[m].channel_index as usize)
+                .write(|w| w.set_ccr(0));
+        }
+        for i in 0..config.timer_count as usize {
+            config.timers[i].ccmr_output(0).write_value(saved_ccmr[i][0]);
+            config.timers[i].ccmr_output(1).write_value(saved_ccmr[i][1]);
+            config.timers[i].ccer().write_value(saved_ccer[i]);
+        }
 
         // Restore DShot600 ARR
         for i in 0..config.timer_count as usize {

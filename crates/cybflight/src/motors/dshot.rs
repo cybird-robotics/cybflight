@@ -2,6 +2,7 @@ use core::sync::atomic::Ordering;
 
 use crate::hal::dma::{Transfer, TransferOptions};
 use crate::hal::pac::gpio::vals as gpio_vals;
+use crate::hal::pac::timer::regs::{CcerGp16, CcmrInput2ch, CcmrOutputGp16};
 use crate::hal::pac::timer::vals;
 use crate::hal::peripherals::{DMA1_CH0, DMA1_CH1, DMA1_CH2, DMA1_CH3};
 use crate::hal::Peri;
@@ -70,19 +71,14 @@ pub async fn dshot_task(
         config.timers[i].egr().write(|w| w.set_ug(true));
     }
 
-    // Save raw OC register values for restore after IC mode.
-    // Raw pointer writes bypass PAC dual OC/IC interpretation issues.
-    let ccmr1_ptr = config.timers[0].ccmr_output(0).as_ptr() as *mut u32;
-    let ccmr2_ptr = unsafe { ccmr1_ptr.add(1) }; // CCMR2 = CCMR1 + 4 bytes
-    let ccer_ptr = config.timers[0].ccer().as_ptr() as *mut u32;
-
-    let saved_ccmr1 = unsafe { core::ptr::read_volatile(ccmr1_ptr) };
-    let saved_ccmr2 = unsafe { core::ptr::read_volatile(ccmr2_ptr) };
-    let saved_ccer = unsafe { core::ptr::read_volatile(ccer_ptr) };
+    // Save OC register values for restore after IC mode.
+    let saved_ccmr1 = config.timers[0].ccmr_output(0).read();
+    let saved_ccmr2 = config.timers[0].ccmr_output(1).read();
+    let saved_ccer = config.timers[0].ccer().read();
 
     // CCMR values with OCPE disabled — for writing CCR directly to shadow register
-    let ccmr1_no_preload = saved_ccmr1 & !0x0808;
-    let ccmr2_no_preload = saved_ccmr2 & !0x0808;
+    let ccmr1_no_preload = CcmrOutputGp16(saved_ccmr1.0 & !0x0808);
+    let ccmr2_no_preload = CcmrOutputGp16(saved_ccmr2.0 & !0x0808);
 
     let mut telem_motor: usize = 0;
 
@@ -194,12 +190,10 @@ pub async fn dshot_task(
                 .modify(|w| w.set_moder(pin, gpio_vals::Moder::OUTPUT));
         }
 
-        unsafe {
-            core::ptr::write_volatile(ccer_ptr, 0);
-            core::ptr::write_volatile(ccmr1_ptr, CCMR_IC);
-            core::ptr::write_volatile(ccmr2_ptr, CCMR_IC);
-            core::ptr::write_volatile(ccer_ptr, CCER_IC);
-        }
+        config.timers[0].ccer().write_value(CcerGp16(0));
+        config.timers[0].ccmr_input(0).write_value(CcmrInput2ch(CCMR_IC));
+        config.timers[0].ccmr_input(1).write_value(CcmrInput2ch(CCMR_IC));
+        config.timers[0].ccer().write_value(CcerGp16(CCER_IC));
 
         // Reconfigure timer for free-running IC timestamps
         for i in 0..config.timer_count as usize {
@@ -319,27 +313,21 @@ pub async fn dshot_task(
         }
 
         // Restore OC CCMR (channels must be off for CC1S write)
-        unsafe {
-            core::ptr::write_volatile(ccer_ptr, 0);
-            core::ptr::write_volatile(ccmr1_ptr, saved_ccmr1);
-            core::ptr::write_volatile(ccmr2_ptr, saved_ccmr2);
-        }
+        config.timers[0].ccer().write_value(CcerGp16(0));
+        config.timers[0].ccmr_output(0).write_value(saved_ccmr1);
+        config.timers[0].ccmr_output(1).write_value(saved_ccmr2);
 
         // IC captures corrupt CCR shadow registers. Fix: temporarily disable
         // output preload (OCPE=0) so CCR writes go directly to shadow, then
         // re-enable preload and restore CCER.
-        unsafe {
-            core::ptr::write_volatile(ccmr1_ptr, ccmr1_no_preload);
-            core::ptr::write_volatile(ccmr2_ptr, ccmr2_no_preload);
-        }
+        config.timers[0].ccmr_output(0).write_value(ccmr1_no_preload);
+        config.timers[0].ccmr_output(1).write_value(ccmr2_no_preload);
         for ch in 0..4usize {
             config.timers[0].ccr(ch).write(|w| w.set_ccr(0));
         }
-        unsafe {
-            core::ptr::write_volatile(ccmr1_ptr, saved_ccmr1);
-            core::ptr::write_volatile(ccmr2_ptr, saved_ccmr2);
-            core::ptr::write_volatile(ccer_ptr, saved_ccer);
-        }
+        config.timers[0].ccmr_output(0).write_value(saved_ccmr1);
+        config.timers[0].ccmr_output(1).write_value(saved_ccmr2);
+        config.timers[0].ccer().write_value(saved_ccer);
 
         // Restore DShot600 ARR
         for i in 0..config.timer_count as usize {

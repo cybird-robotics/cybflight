@@ -5,6 +5,7 @@ use crate::bsp;
 use crate::control::OCP_SOLVER_OUTPUT;
 use crate::hal;
 use crate::motors::ACTUATOR_MOTORS;
+use crate::msgs;
 use crate::platform;
 use crate::sensors::{BARO_1, BARO_2, DSHOT_TELEMETRY, GPS_FIX, IMU_1, IMU_2, MAG_EXT, MAG_INT, RC_INPUT, RC_LINK_STATUS, VEHICLE_ATTITUDE};
 use crate::shell::format::ShellMsg;

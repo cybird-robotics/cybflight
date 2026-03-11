@@ -1,19 +1,19 @@
-use core::sync::atomic::Ordering;
-
 use crate::hal::dma::{Transfer, TransferOptions};
 use crate::hal::pac::gpio::vals as gpio_vals;
 use crate::hal::pac::timer::regs::{CcerGp16, CcmrInput2ch, CcmrOutputGp16};
 use crate::hal::pac::timer::vals;
 use crate::hal::peripherals::{DMA1_CH0, DMA1_CH1, DMA1_CH2, DMA1_CH3};
 use crate::hal::Peri;
-use cybflight_msgs::{DshotMotorTelemetry, DshotTelemetry};
+use crate::motors::ACTUATOR_MOTORS;
 use crate::sensors::DSHOT_TELEMETRY;
 use cybflight_drivers::dshot::{
-    gcr, telemetry, DSHOT600_GCR_TICKS_PER_BIT, DSHOT_DMA_BUFFER_SIZE, MAX_GCR_EDGES,
-    MIN_GCR_EDGES,
+    gcr, telemetry, DSHOT600_GCR_TICKS_PER_BIT, DSHOT_CMD_MOTOR_STOP, DSHOT_DMA_BUFFER_SIZE,
+    DSHOT_MAX_THROTTLE, DSHOT_MIN_THROTTLE, MAX_GCR_EDGES, MIN_GCR_EDGES,
 };
+use cybflight_msgs::{ActuatorMotors, DshotMotorTelemetry, DshotTelemetry};
 use embassy_futures::join::join4;
-use embassy_time::Instant;
+use embassy_futures::select::{select, Either};
+use embassy_time::{Instant, Timer};
 
 use super::{DshotQuadConfig, DSHOT600_ARR, DSHOT600_BIT_0, DSHOT600_BIT_1, DSHOT600_PSC};
 
@@ -85,16 +85,28 @@ pub async fn dshot_task(
     }
 
     let mut telem_motor: usize = 0;
-
+    let mut dshot_throttle: [u16; 4] = [0; 4];
     // --- Bidirectional DShot frame loop ---
     loop {
+        if let Either::First(ActuatorMotors { motor_commands, .. }) =
+            select(ACTUATOR_MOTORS.wait(), Timer::after_micros(1)).await
+        {
+            dshot_throttle = motor_commands.map(|nrm| {
+                let nrm = nrm.value();
+                if nrm < 1e-6 {
+                    DSHOT_CMD_MOTOR_STOP
+                } else {
+                    let range = (DSHOT_MAX_THROTTLE - DSHOT_MIN_THROTTLE) as f32;
+                    (nrm * range) as u16 + DSHOT_MIN_THROTTLE
+                }
+            });
+        }
+
         // ======================== A: Output DShot frame ========================
         let mut bufs = [[0u32; DSHOT_DMA_BUFFER_SIZE]; 4];
-        for (i, buf) in bufs.iter_mut().enumerate() {
-            let throttle = super::MOTOR_THROTTLE[i].load(Ordering::Relaxed);
+        for (i, (buf, throttle)) in bufs.iter_mut().zip(dshot_throttle).enumerate() {
             let telem_req = i == telem_motor;
-            let frame =
-                cybflight_drivers::dshot::frame::encode_packet(throttle, telem_req, true);
+            let frame = cybflight_drivers::dshot::frame::encode_packet(throttle, telem_req, true);
             cybflight_drivers::dshot::frame::packet_to_dma_buffer(
                 frame,
                 buf,
@@ -196,8 +208,12 @@ pub async fn dshot_task(
 
         for i in 0..config.timer_count as usize {
             config.timers[i].ccer().write_value(CcerGp16(0));
-            config.timers[i].ccmr_input(0).write_value(CcmrInput2ch(CCMR_IC));
-            config.timers[i].ccmr_input(1).write_value(CcmrInput2ch(CCMR_IC));
+            config.timers[i]
+                .ccmr_input(0)
+                .write_value(CcmrInput2ch(CCMR_IC));
+            config.timers[i]
+                .ccmr_input(1)
+                .write_value(CcmrInput2ch(CCMR_IC));
             config.timers[i].ccer().write_value(CcerGp16(CCER_IC));
         }
 
@@ -321,16 +337,24 @@ pub async fn dshot_task(
         // Restore OC CCMR (channels must be off for CC1S write)
         for i in 0..config.timer_count as usize {
             config.timers[i].ccer().write_value(CcerGp16(0));
-            config.timers[i].ccmr_output(0).write_value(saved_ccmr[i][0]);
-            config.timers[i].ccmr_output(1).write_value(saved_ccmr[i][1]);
+            config.timers[i]
+                .ccmr_output(0)
+                .write_value(saved_ccmr[i][0]);
+            config.timers[i]
+                .ccmr_output(1)
+                .write_value(saved_ccmr[i][1]);
         }
 
         // IC captures corrupt CCR shadow registers. Fix: temporarily disable
         // output preload (OCPE=0) so CCR writes go directly to shadow, then
         // re-enable preload and restore CCER.
         for i in 0..config.timer_count as usize {
-            config.timers[i].ccmr_output(0).write_value(ccmr_no_preload[i][0]);
-            config.timers[i].ccmr_output(1).write_value(ccmr_no_preload[i][1]);
+            config.timers[i]
+                .ccmr_output(0)
+                .write_value(ccmr_no_preload[i][0]);
+            config.timers[i]
+                .ccmr_output(1)
+                .write_value(ccmr_no_preload[i][1]);
         }
         for m in 0..4 {
             config.motors[m]
@@ -339,8 +363,12 @@ pub async fn dshot_task(
                 .write(|w| w.set_ccr(0));
         }
         for i in 0..config.timer_count as usize {
-            config.timers[i].ccmr_output(0).write_value(saved_ccmr[i][0]);
-            config.timers[i].ccmr_output(1).write_value(saved_ccmr[i][1]);
+            config.timers[i]
+                .ccmr_output(0)
+                .write_value(saved_ccmr[i][0]);
+            config.timers[i]
+                .ccmr_output(1)
+                .write_value(saved_ccmr[i][1]);
             config.timers[i].ccer().write_value(saved_ccer[i]);
         }
 
@@ -375,7 +403,12 @@ pub async fn dshot_task(
             ],
         };
 
-        let edge_bufs = [&edge_buf0[..], &edge_buf1[..], &edge_buf2[..], &edge_buf3[..]];
+        let edge_bufs = [
+            &edge_buf0[..],
+            &edge_buf1[..],
+            &edge_buf2[..],
+            &edge_buf3[..],
+        ];
         for m in 0..4 {
             if edge_counts[m] >= MIN_GCR_EDGES {
                 // Skip leading glitch edge(s) from GPIO→AF transition.

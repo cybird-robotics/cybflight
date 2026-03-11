@@ -146,3 +146,40 @@ pub struct OcpSolverOutput {
     pub solve_time_us: u64,
 }
 impl Message for OcpSolverOutput {}
+
+#[derive(Clone, defmt::Format)]
+pub struct AttitudeControlSetpoint {
+    pub timestamp: Instant,
+    pub attitude_quaternion: UnitQuaternion<f32>,
+    pub body_rate_rad_s: Vector3<f32>,
+    pub torque_n_m: Vector3<f32>,
+}
+
+impl Message for AttitudeControlSetpoint {}
+
+#[derive(Debug, Copy, Clone, defmt::Format)]
+pub struct NormalizedThrottle(f32);
+
+impl NormalizedThrottle {
+    pub fn new(value: f32) -> Option<Self> {
+        if (0.0..=1.0).contains(&value) {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    pub fn new_saturating(value: f32) -> Self {
+        Self(value.clamp(0.0, 1.0))
+    }
+
+    pub fn value(&self) -> f32 {
+        self.0
+    }
+}
+
+#[derive(Clone, defmt::Format)]
+pub struct ActuatorMotors {
+    pub timestamp: Instant,
+    pub motor_commands: [NormalizedThrottle; 4],
+}

@@ -4,8 +4,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::bsp;
 use crate::control::OCP_SOLVER_OUTPUT;
 use crate::hal;
-use crate::motors::MOTOR_THROTTLE;
-use cybflight_msgs as msgs;
+use crate::motors::ACTUATOR_MOTORS;
 use crate::platform;
 use crate::sensors::{BARO_1, BARO_2, DSHOT_TELEMETRY, GPS_FIX, IMU_1, IMU_2, MAG_EXT, MAG_INT, RC_INPUT, RC_LINK_STATUS, VEHICLE_ATTITUDE};
 use crate::shell::format::ShellMsg;
@@ -17,7 +16,7 @@ use embassy_futures::join::join;
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::pubsub::{PubSubChannel, Subscriber, WaitResult};
-use embassy_time::{with_timeout, Duration};
+use embassy_time::{with_timeout, Duration, Instant};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::Builder;
@@ -531,8 +530,6 @@ async fn dispatch_motor<'d>(
     class: &mut CdcAcmClass<'d, UsbDriver<'d>>,
     line: &str,
 ) -> Result<(), EndpointError> {
-    use cybflight_drivers::dshot::{DSHOT_CMD_MOTOR_STOP, DSHOT_MAX_THROTTLE, DSHOT_MIN_THROTTLE};
-
     let mut parts = line.split_ascii_whitespace();
     parts.next(); // skip "motor"
     let idx_str = parts.next();
@@ -553,18 +550,19 @@ async fn dispatch_motor<'d>(
         _ => return write_all(class, b"throttle must be 0-100\r\n").await,
     };
 
-    let dshot_val: u16 = if pct == 0 {
-        DSHOT_CMD_MOTOR_STOP
-    } else {
-        let range = (DSHOT_MAX_THROTTLE - DSHOT_MIN_THROTTLE) as u32;
-        (DSHOT_MIN_THROTTLE as u32 + (pct as u32 - 1) * range / 99) as u16
-    };
+    let mut motor_commands: [msgs::NormalizedThrottle; 4] =
+        [msgs::NormalizedThrottle::new_saturating(0.0); 4];
 
-    MOTOR_THROTTLE[(idx - 1) as usize].store(dshot_val, Ordering::Relaxed);
+    motor_commands[(idx - 1) as usize] =
+        msgs::NormalizedThrottle::new_saturating(pct as f32 / 100.0);
+    ACTUATOR_MOTORS.signal(msgs::ActuatorMotors {
+        timestamp: Instant::now(),
+        motor_commands,
+    });
 
     let mut buf = [0u8; 64];
     let mut w = WriteBuf::new(&mut buf);
-    write!(w, "motor {} = {}% (dshot {})\r\n", idx, pct, dshot_val).ok();
+    write!(w, "motor {} = {}%\r\n", idx, pct).ok();
     write_all(class, w.as_slice()).await
 }
 

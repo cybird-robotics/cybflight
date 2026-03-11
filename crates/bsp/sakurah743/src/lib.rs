@@ -20,7 +20,7 @@ pub const MANUFACTURER_ID: &str = "SSAK";
 pub const BEEPER_INVERTED: bool = true;
 
 pub const IMU_COUNT: usize = 2;
-pub const HAS_BARO: bool = true;
+pub const BARO_COUNT: usize = 2;
 pub const HAS_MAG: bool = true;
 pub const HAS_OSD: bool = false;
 pub const HAS_FLASH: bool = false;
@@ -42,8 +42,11 @@ pub mod sensors {
     pub const GYRO_1: &str = "ICM42688P";
     /// Betaflight: IIM42652 on SPI1 (GYRO_2).
     pub const GYRO_2: &str = "IIM42652";
+    /// Betaflight: ICP20100 barometer on I2C1 addr 0x63.
+    pub const BARO_1: &str = "ICP20100";
+    pub const BARO_1_I2C_ADDR: u8 = 0x63;
     /// Betaflight: DPS310 barometer on SPI1.
-    pub const BARO: &str = "DPS310";
+    pub const BARO_2: &str = "DPS310";
     /// Betaflight: IST8310 magnetometer on I2C1 addr 0x0E (14).
     pub const MAG: &str = "IST8310";
     pub const MAG_I2C_ADDR: u8 = 0x0E;
@@ -306,8 +309,8 @@ pub struct SensorPins {
     pub gyro2_drdy: exti::ExtiInput<'static>,
     pub gyro2_align: SensorAlign,
 
-    // Baro: DPS310 on SPI1, CS=PC5
-    pub baro_cs: Output<'static>,
+    // Baro 2: DPS310 on SPI1, CS=PC5
+    pub baro2_cs: Output<'static>,
 
     // Mag: IST8310 on I2C1 addr 0x0E, align CW180
     pub mag_i2c_addr: u8,
@@ -411,7 +414,7 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
     // Sensor CS pins: deasserted high.
     let gyro1_cs = Output::new(p.PE11, Level::High, Speed::VeryHigh);
     let gyro2_cs = Output::new(p.PA4, Level::High, Speed::VeryHigh);
-    let baro_cs = Output::new(p.PC5, Level::High, Speed::VeryHigh);
+    let baro2_cs = Output::new(p.PC5, Level::High, Speed::VeryHigh);
 
     // Gyro DRDY pins as EXTI inputs.
     // Pull::None is usually correct for push-pull DRDY lines. Change if your board needs it.
@@ -551,7 +554,7 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
         gyro2_drdy,
         gyro2_align: SensorAlign::Cw0DegFlip,
 
-        baro_cs,
+        baro2_cs,
 
         mag_i2c_addr: sensors::MAG_I2C_ADDR,
         mag_align: SensorAlign::Cw180Deg,

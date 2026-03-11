@@ -18,7 +18,7 @@ pub const MANUFACTURER_ID: &str = "FOXE";
 pub const BEEPER_INVERTED: bool = true;
 
 pub const IMU_COUNT: usize = 1;
-pub const HAS_BARO: bool = true;
+pub const BARO_COUNT: usize = 1;
 pub const HAS_MAG: bool = false;
 pub const HAS_OSD: bool = true;
 pub const HAS_FLASH: bool = true;
@@ -35,7 +35,8 @@ pub mod sensors {
     /// Betaflight: ICM42688P (also supports MPU6000/MPU6500) on SPI2 (GYRO_1).
     pub const GYRO_1: &str = "ICM42688P";
     /// Betaflight: DPS310 barometer on I2C1.
-    pub const BARO: &str = "DPS310";
+    pub const BARO_1: &str = "DPS310";
+    pub const BARO_1_I2C_ADDR: u8 = 0x76;
     /// Betaflight: magnetometer on I2C1, align CW180.
     pub const MAG: &str = "MAG";
 }

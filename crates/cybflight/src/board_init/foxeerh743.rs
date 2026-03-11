@@ -9,7 +9,7 @@ use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::{SendSpawner, Spawner};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::Timer;
+use embassy_time::{Duration, Timer, with_timeout};
 use static_cell::StaticCell;
 
 use crate::bsp;
@@ -212,14 +212,15 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
             Ok(uart) => {
                 defmt::info!("GPS: UART4 OK, sending CFG-VALSET...");
                 let mut delay = embassy_time::Delay;
-                match UbloxM10::new(uart, &mut delay).await {
-                    Ok(gps) => {
+                match with_timeout(Duration::from_secs(3), UbloxM10::new(uart, &mut delay)).await {
+                    Ok(Ok(gps)) => {
                         defmt::info!("GPS u-blox M10 init OK");
                         spawner
                             .spawn(crate::sensors::gps::ublox_gps_task(GpsRunner::new(gps)))
                             .unwrap_or_else(|e| defmt::error!("Failed to spawn GPS task: {}", e));
                     }
-                    Err(e) => defmt::warn!("GPS init failed: {}", e),
+                    Ok(Err(e)) => defmt::warn!("GPS init failed: {}", e),
+                    Err(_) => defmt::warn!("GPS init timed out (no module?)"),
                 }
             }
             Err(e) => defmt::error!("GPS UART4 init failed: {}", e),

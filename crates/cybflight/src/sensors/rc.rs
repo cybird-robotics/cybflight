@@ -149,12 +149,18 @@ pub mod crsf_runner {
 pub mod ghst_runner {
     use super::*;
     use cybflight_drivers::rc::ghst::{Ghst, GhstEvent};
+    use embassy_time::{with_timeout, Duration};
 
     /// GHST runner: reads frames, publishes channels/link stats, sends telemetry.
     pub struct GhstRunner {
         ghst: Ghst<RcUart>,
         telemetry_idx: u8,
     }
+
+    /// Time to wait for the first GHST frame before warning about pin assignment.
+    const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+    /// Time to wait for subsequent frames before warning about signal loss.
+    const FRAME_TIMEOUT: Duration = Duration::from_secs(1);
 
     impl GhstRunner {
         pub fn new(uart: RcUart) -> Self {
@@ -168,12 +174,70 @@ pub mod ghst_runner {
             let rc_pub = super::super::RC_INPUT.immediate_publisher();
             let link_pub = super::super::RC_LINK_STATUS.immediate_publisher();
 
+            let mut frame_count: u32 = 0;
+            let mut err_count: u32 = 0;
+            let mut timeout_count: u32 = 0;
+            let mut got_first_frame = false;
+
+            defmt::info!("GHST: waiting for first frame (timeout {}s)...",
+                FIRST_FRAME_TIMEOUT.as_secs());
+
             loop {
-                match self.ghst.read_frame().await {
-                    Ok(event) => {
+                let timeout = if got_first_frame {
+                    FRAME_TIMEOUT
+                } else {
+                    FIRST_FRAME_TIMEOUT
+                };
+
+                match with_timeout(timeout, self.ghst.read_frame()).await {
+                    Err(_elapsed) => {
+                        timeout_count = timeout_count.wrapping_add(1);
+                        if !got_first_frame {
+                            defmt::error!(
+                                "GHST: NO DATA after {}s — check wiring! \
+                                 Verify RC receiver is connected to the correct UART TX pin \
+                                 (half-duplex). (timeouts={})",
+                                FIRST_FRAME_TIMEOUT.as_secs(),
+                                timeout_count,
+                            );
+                        } else {
+                            defmt::warn!(
+                                "GHST: frame timeout ({}s no data, timeouts={}, frames={}, errs={})",
+                                FRAME_TIMEOUT.as_secs(),
+                                timeout_count,
+                                frame_count,
+                                err_count,
+                            );
+                        }
+                        continue;
+                    }
+                    Ok(Err(e)) => {
+                        err_count = err_count.wrapping_add(1);
+                        defmt::warn!("GHST read error: {} (total errs={})", e, err_count);
+                        continue;
+                    }
+                    Ok(Ok(event)) => {
+                        if !got_first_frame {
+                            got_first_frame = true;
+                            defmt::info!("GHST: first frame received OK");
+                        }
+                        frame_count = frame_count.wrapping_add(1);
                         let now = Instant::now();
                         match event {
                             GhstEvent::RcChannels(rc) => {
+                                if frame_count % 500 == 1 {
+                                    defmt::info!(
+                                        "GHST ch[0..4]=[{},{},{},{}] frames={} errs={} timeouts={}",
+                                        rc.channels[0],
+                                        rc.channels[1],
+                                        rc.channels[2],
+                                        rc.channels[3],
+                                        frame_count,
+                                        err_count,
+                                        timeout_count,
+                                    );
+                                }
+
                                 rc_pub.publish_immediate(msgs::RcInput {
                                     timestamp: now,
                                     channels: rc.channels,
@@ -187,6 +251,12 @@ pub mod ghst_runner {
                                 self.send_telemetry().await;
                             }
                             GhstEvent::RssiFrame(stats) => {
+                                defmt::debug!(
+                                    "GHST link: rssi={}dBm lq={}% rf_mode={}",
+                                    stats.rssi_dbm,
+                                    stats.link_quality,
+                                    stats.rf_mode,
+                                );
                                 link_pub.publish_immediate(msgs::RcLinkStatus {
                                     timestamp: now,
                                     rssi_dbm: stats.rssi_dbm,
@@ -195,11 +265,10 @@ pub mod ghst_runner {
                                     rf_mode: stats.rf_mode,
                                 });
                             }
-                            GhstEvent::Other { .. } => {}
+                            GhstEvent::Other { frame_type } => {
+                                defmt::debug!("GHST unknown frame type={:#x}", frame_type);
+                            }
                         }
-                    }
-                    Err(e) => {
-                        defmt::warn!("GHST read error: {}", e);
                     }
                 }
             }

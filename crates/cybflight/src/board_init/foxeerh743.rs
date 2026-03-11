@@ -2,7 +2,7 @@ use cybflight_drivers::baro::dps310::Dps310;
 use cybflight_drivers::gps::UbloxM10;
 use cybflight_drivers::imu::icm426xx::Icm426xx;
 use cybflight_drivers::imu::mpu6x00::Mpu6x00;
-use cybflight_drivers::imu::{DetectedImu, probe_imu_raw};
+use cybflight_drivers::imu::{probe_imu_raw, DetectedImu};
 use cybflight_drivers::led::Led;
 use cybflight_drivers::mag::Qmc5883l;
 use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
@@ -10,7 +10,7 @@ use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::{SendSpawner, Spawner};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::{Duration, Timer, with_timeout};
+use embassy_time::{with_timeout, Duration, Timer};
 use static_cell::StaticCell;
 
 use crate::bsp;
@@ -18,7 +18,7 @@ use crate::hal;
 use crate::motors::{DshotQuadConfig, MotorTimerConfig};
 use crate::sensors::baro::BaroReader;
 use crate::sensors::gps::GpsRunner;
-use crate::sensors::imu::{ImuReader, SpiBusMtx, icm_reader_task, mpu_reader_task};
+use crate::sensors::imu::{icm_reader_task, mpu_reader_task, ImuReader, SpiBusMtx};
 use crate::sensors::mag::{I2cBusMtx, MagReader};
 use crate::status;
 use crate::usb_serial;
@@ -27,9 +27,14 @@ use hal::spi::{self, Spi};
 use hal::time::Hertz;
 use hal::timer::low_level::Timer as LLTimer;
 
-// Bind USART1 interrupt for SerialRx (CRSF/GHST) — BF default: SERIALRX_UART = USART1
+// Bind USART1 interrupt for SerialRx (CRSF) — BF default: SERIALRX_UART = USART1
 hal::bind_interrupts!(struct Usart1Irqs {
     USART1 => hal::usart::BufferedInterruptHandler<hal::peripherals::USART1>;
+});
+
+// Bind USART2 interrupt for SerialRx (GHST half-duplex on T2 pad = PA2)
+hal::bind_interrupts!(struct Usart2Irqs {
+    USART2 => hal::usart::BufferedInterruptHandler<hal::peripherals::USART2>;
 });
 
 // Bind UART4 interrupt for GPS
@@ -130,9 +135,9 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
         }
     }
 
-    // --- SerialRx: USART1 on PA10 (RX) / PA9 (TX) — BF default ---
-    // CRSF: full-duplex (separate TX/RX pins), standard Betaflight behavior.
-    // GHST: single-wire half-duplex on TX pin (T1 pad = PA9), per BF SERIAL_BIDIR.
+    // --- SerialRx ---
+    // CRSF: full-duplex on USART1 (T1=PA9, R1=PA10)
+    // GHST: half-duplex on USART2 TX pin (T2 pad = PA2)
     #[cfg(feature = "rx_crsf")]
     {
         static TX_BUF: StaticCell<[u8; 128]> = StaticCell::new();
@@ -173,21 +178,21 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
         uart_config.baudrate = 420_000;
 
         match hal::usart::BufferedUart::new_half_duplex(
-            board.serial.usart1,
-            board.serial.usart1_tx,
-            Usart1Irqs,
+            board.serial.usart2,
+            board.serial.usart2_tx,
+            Usart2Irqs,
             tx_buf,
             rx_buf,
             uart_config,
             hal::usart::HalfDuplexReadback::NoReadback,
         ) {
             Ok(uart) => {
-                defmt::info!("GHST USART1 half-duplex init OK");
+                defmt::info!("GHST USART2 half-duplex init OK (T2 pad = PA2)");
                 spawner
                     .spawn(crate::sensors::rc::ghst_runner::ghst_task(uart))
                     .unwrap_or_else(|e| defmt::error!("Failed to spawn GHST task: {}", e));
             }
-            Err(e) => defmt::error!("GHST USART1 init failed: {}", e),
+            Err(e) => defmt::error!("GHST USART2 init failed: {}", e),
         }
     }
 
@@ -262,9 +267,7 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                             mag,
                             bsp_types::SensorAlign::Cw180Deg,
                         )))
-                        .unwrap_or_else(|e| {
-                            defmt::error!("Failed to spawn QMC5883L task: {}", e)
-                        });
+                        .unwrap_or_else(|e| defmt::error!("Failed to spawn QMC5883L task: {}", e));
                 }
                 Err(e) => defmt::warn!("QMC5883L init failed: {}", e),
             }

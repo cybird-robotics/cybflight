@@ -101,9 +101,6 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
         Err(e) => defmt::error!("IMU1 init failed: {}", e),
     }
 
-    // TODO: spawn IMU2 when fusion task exists
-    // IMU2: IIM42652 on SPI1 (PA5/6/7, CS=PA4, DRDY=PC4)
-
     // --- SerialRx: UART4 ---
     // CRSF: full-duplex (separate TX/RX pins), standard Betaflight behavior.
     // GHST: single-wire half-duplex on TX pin (T4 pad = PB9), per BF SERIAL_BIDIR.
@@ -340,8 +337,8 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
         }
     }
 
-    // --- SPI1 shared bus (PA5/6/7) for BARO_2 (DPS310, CS=PC5) ---
-    defmt::info!("SPI1: starting init for DPS310 baro2");
+    // --- SPI1 shared bus (PA5/6/7) for BARO_2 (DPS310, CS=PC5) + IMU2 (IIM42652, CS=PA4) ---
+    defmt::info!("SPI1: starting init for DPS310 baro2 + IIM42652 IMU2");
     {
         use crate::sensors::imu::SpiBusMtx;
         static SPI1_BUS: StaticCell<SpiBusMtx> = StaticCell::new();
@@ -356,6 +353,7 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
         );
         let spi1_bus = SPI1_BUS.init(Mutex::new(spi1));
 
+        // DPS310 barometer (CS=PC5)
         let mut probe_dev = SpiDevice::new(spi1_bus, board.sensors.baro2_cs);
         if Dps310::probe_spi(&mut probe_dev).await {
             defmt::info!("SPI1: DPS310 found, initializing...");
@@ -376,6 +374,22 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
             }
         } else {
             defmt::warn!("DPS310 not detected on SPI1");
+        }
+
+        // IMU2: IIM42652 (CS=PA4, DRDY=PC4) — same Icm426xx driver as IMU1
+        let dev_imu2 = SpiDevice::new(spi1_bus, board.sensors.gyro2_cs);
+        let mut delay = embassy_time::Delay;
+        match Icm426xx::new(dev_imu2, board.sensors.gyro2_drdy, &mut delay).await {
+            Ok(imu2) => {
+                defmt::info!("IMU2 (IIM42652) init OK");
+                spawner
+                    .spawn(icm_reader_task(
+                        ImuReader::new(imu2, board.sensors.gyro2_align, 80.0, 200.0),
+                        &crate::sensors::IMU_2,
+                    ))
+                    .unwrap_or_else(|e| defmt::error!("Failed to spawn IMU2 reader task: {}", e));
+            }
+            Err(e) => defmt::warn!("IMU2 (IIM42652) init failed: {}", e),
         }
     }
 

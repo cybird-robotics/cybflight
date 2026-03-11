@@ -103,12 +103,15 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                 Ok(imu1) => {
                     defmt::info!("IMU1 init OK (ICM)");
                     spawner
-                        .spawn(icm_reader_task(ImuReader::new(
-                            imu1,
-                            board.sensors.gyro1_align,
-                            ACCEL_CUTOFF_HZ,
-                            GYRO_CUTOFF_HZ,
-                        )))
+                        .spawn(icm_reader_task(
+                            ImuReader::new(
+                                imu1,
+                                board.sensors.gyro1_align,
+                                ACCEL_CUTOFF_HZ,
+                                GYRO_CUTOFF_HZ,
+                            ),
+                            &crate::sensors::IMU_1,
+                        ))
                         .unwrap();
                 }
                 Err(e) => defmt::error!("IMU1 ICM init failed: {}", e),
@@ -119,12 +122,15 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                 Ok(imu1) => {
                     defmt::info!("IMU1 init OK (MPU)");
                     spawner
-                        .spawn(mpu_reader_task(ImuReader::new(
-                            imu1,
-                            board.sensors.gyro1_align,
-                            ACCEL_CUTOFF_HZ,
-                            GYRO_CUTOFF_HZ,
-                        )))
+                        .spawn(mpu_reader_task(
+                            ImuReader::new(
+                                imu1,
+                                board.sensors.gyro1_align,
+                                ACCEL_CUTOFF_HZ,
+                                GYRO_CUTOFF_HZ,
+                            ),
+                            &crate::sensors::IMU_1,
+                        ))
                         .unwrap();
                 }
                 Err(e) => defmt::error!("IMU1 MPU init failed: {}", e),

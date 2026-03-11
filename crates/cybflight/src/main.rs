@@ -59,8 +59,11 @@ async fn main(spawner: embassy_executor::Spawner) {
         .unwrap_or_else(|_| defmt::panic!("failed to spawn NMPC driver task"));
 
     spawner
-        .spawn(cybflight::usb_serial::imu_stream_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn IMU stream task"));
+        .spawn(cybflight::usb_serial::imu1_stream_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn IMU1 stream task"));
+    spawner
+        .spawn(cybflight::usb_serial::imu2_stream_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn IMU2 stream task"));
     spawner
         .spawn(cybflight::usb_serial::att_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude stream task"));

@@ -4,8 +4,9 @@ use cybflight_drivers::imu::ReadImu;
 use cybflight_drivers::imu::icm426xx::Icm426xx;
 use cybflight_drivers::imu::mpu6x00::Mpu6x00;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::mutex::Mutex;
+use embassy_sync::pubsub::PubSubChannel;
 use embassy_time::{Instant, Timer};
 use crate::hal;
 use cybflight_msgs as msgs;
@@ -42,8 +43,11 @@ impl<D: ReadImu> ImuReader<D> {
         }
     }
 
-    pub async fn run(&mut self) -> ! {
-        let publisher = super::RAW_IMU.immediate_publisher();
+    pub async fn run(
+        &mut self,
+        channel: &'static PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 4, 1>,
+    ) -> ! {
+        let publisher = channel.immediate_publisher();
         loop {
             match self.imu.read().await {
                 Ok(reading) => {
@@ -75,11 +79,17 @@ impl<D: ReadImu> ImuReader<D> {
 }
 
 #[embassy_executor::task(pool_size = 2)]
-pub async fn icm_reader_task(mut reader: ImuReader<IcmDev>) {
-    reader.run().await;
+pub async fn icm_reader_task(
+    mut reader: ImuReader<IcmDev>,
+    channel: &'static PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 4, 1>,
+) {
+    reader.run(channel).await;
 }
 
 #[embassy_executor::task(pool_size = 2)]
-pub async fn mpu_reader_task(mut reader: ImuReader<MpuDev>) {
-    reader.run().await;
+pub async fn mpu_reader_task(
+    mut reader: ImuReader<MpuDev>,
+    channel: &'static PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 4, 1>,
+) {
+    reader.run(channel).await;
 }

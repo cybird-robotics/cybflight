@@ -92,12 +92,10 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
         Ok(imu1) => {
             defmt::info!("IMU1 init OK");
             spawner
-                .spawn(icm_reader_task(ImuReader::new(
-                    imu1,
-                    board.sensors.gyro1_align,
-                    80.0,
-                    200.0,
-                )))
+                .spawn(icm_reader_task(
+                    ImuReader::new(imu1, board.sensors.gyro1_align, 80.0, 200.0),
+                    &crate::sensors::IMU_1,
+                ))
                 .unwrap_or_else(|e| defmt::error!("Failed to spawn IMU1 reader task: {}", e));
         }
         Err(e) => defmt::error!("IMU1 init failed: {}", e),

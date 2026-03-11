@@ -14,7 +14,7 @@ this project MUST follow these patterns. Update this document when the design ch
                               | static channels (the boundary)
 +-----------------------------+-----------------------------+
 |                 Sensor Channels                            |
-|  FUSED_IMU, BARO_1, BARO_2, MAG_EXT, MAG_INT, etc.        |
+|  IMU_1, IMU_2, BARO_1, BARO_2, MAG_EXT, MAG_INT, etc.     |
 |  Defined in sensors/mod.rs. Always the same type/shape.   |
 +-----------------------------+-----------------------------+
                               |
@@ -66,7 +66,7 @@ crates/
         sakurah743.rs     # SPI4->IMU1, SPI1->DPS310, I2C1->ICP20100+IST8310, I2C2->QMC5883L
         foxeerh743.rs     # SPI2->IMU1 (probe: ICM or MPU), I2C1->DPS310+QMC5883L
       sensors/
-        mod.rs            # Channel defs: FUSED_IMU, BARO_1, BARO_2, MAG_EXT, MAG_INT
+        mod.rs            # Channel defs: IMU_1, IMU_2, BARO_1, BARO_2, MAG_EXT, MAG_INT
         imu.rs            # imu_reader_task, imu_fusion_task (reusable)
         baro.rs           # baro_reader_task (DPS310 SPI/I2C, ICP20100)
         mag.rs            # mag_reader_task (QMC5883L, IST8310)
@@ -142,8 +142,8 @@ pub async fn init(spawner: &Spawner, board: bsp::Board) {
 
 | Scenario | Board init does |
 |---|---|
-| 1 IMU | Spawns 1 `imu_reader_task` -> writes directly to `FUSED_IMU` |
-| 2 IMUs | Spawns 2 `imu_reader_task` -> `RAW_IMU` -> `imu_fusion_task` -> `FUSED_IMU` |
+| 1 IMU | Spawns 1 `imu_reader_task` -> `IMU_1` channel. `IMU_2` stays empty. |
+| 2 IMUs | Spawns 2 `imu_reader_task` -> `IMU_1` + `IMU_2` channels |
 | Has baro | Inits baro driver, spawns `baro_reader_task` -> `BARO_1`/`BARO_2` channel |
 | No baro | Does nothing. `BARO_1`/`BARO_2` channels stay empty. |
 | Has mag | Inits mag driver, spawns `mag_reader_task` -> `MAG_EXT`/`MAG_INT` channel |
@@ -206,7 +206,9 @@ Defined in `sensors/mod.rs`. These are the ONLY interface between hardware and
 control logic.
 
 ```rust
-pub static FUSED_IMU: PubSubChannel<CriticalSectionRawMutex, ImuSample, ...>;
+pub static IMU_1: PubSubChannel<CriticalSectionRawMutex, Imu, ...>;
+pub static IMU_2: PubSubChannel<CriticalSectionRawMutex, Imu, ...>;
+pub static VEHICLE_ATTITUDE: PubSubChannel<CriticalSectionRawMutex, VehicleAttitude, ...>;
 pub static BARO_1: PubSubChannel<CriticalSectionRawMutex, BaroSample, ...>;
 pub static BARO_2: PubSubChannel<CriticalSectionRawMutex, BaroSample, ...>;
 pub static MAG_EXT: PubSubChannel<CriticalSectionRawMutex, MagSample, ...>;
@@ -219,12 +221,14 @@ Downstream code uses const flags for zero-cost optional sensor handling:
 
 ```rust
 // In flight controller:
-let imu = sensors::FUSED_IMU.receive().await;  // always present
+// Attitude estimator subscribes to IMU_1 and publishes VEHICLE_ATTITUDE.
+// Control logic reads VEHICLE_ATTITUDE — never touches IMU directly.
+let att = sensors::VEHICLE_ATTITUDE.receive().await;
 
 if bsp::HAS_BARO {
     // Entire block eliminated at compile time when HAS_BARO=false.
     // No runtime branch, no dead code in flash.
-    if let Ok(baro) = sensors::BARO.try_receive() {
+    if let Ok(baro) = sensors::BARO_1.try_receive() {
         // use altitude data
     }
 }
@@ -240,13 +244,13 @@ which to spawn and how to wire them.
 
 // pool_size=2 supports up to dual-gyro. Single-gyro boards spawn 1 instance;
 // the unused slot costs one task-struct of static RAM (~200 bytes), acceptable.
+// Each reader publishes to its own channel (IMU_1 or IMU_2).
 #[embassy_executor::task(pool_size = 2)]
-async fn imu_reader_task(source: u8, mut imu: ImuDev, align: SensorAlign, ...) { }
+async fn icm_reader_task(reader: ImuReader<IcmDev>, channel: &'static ImuChannel) { }
 
-// Only spawned on dual-gyro boards. On single-gyro boards, this function is
-// never referenced and stripped by the linker.
+// Attitude estimator (Mahony) subscribes to IMU_1.
 #[embassy_executor::task]
-async fn imu_fusion_task(...) { }
+async fn mahony_task() { }
 ```
 
 ## Compile-Time Optimization Rules

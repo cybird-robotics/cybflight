@@ -4,12 +4,12 @@ use cybflight_core::mahony::{Mahony, MahonyError};
 use embassy_sync::pubsub::WaitResult;
 use embassy_time::Instant;
 
-use super::{RAW_IMU, VEHICLE_ATTITUDE};
+use super::{IMU_1, VEHICLE_ATTITUDE};
 use cybflight_msgs as msgs;
 
 #[embassy_executor::task]
 pub async fn mahony_task() {
-    let mut sub = RAW_IMU.subscriber().unwrap();
+    let mut sub = IMU_1.subscriber().unwrap();
     let publisher = VEHICLE_ATTITUDE.immediate_publisher();
     let mut mahony = Mahony::<f32>::new();
     let mut prev_timestamp: Option<Instant> = None;

@@ -7,7 +7,7 @@ use crate::hal;
 use crate::motors::MOTOR_THROTTLE;
 use cybflight_msgs as msgs;
 use crate::platform;
-use crate::sensors::{BARO_1, BARO_2, DSHOT_TELEMETRY, GPS_FIX, MAG_EXT, MAG_INT, RAW_IMU, RC_INPUT, RC_LINK_STATUS, VEHICLE_ATTITUDE};
+use crate::sensors::{BARO_1, BARO_2, DSHOT_TELEMETRY, GPS_FIX, IMU_1, IMU_2, MAG_EXT, MAG_INT, RC_INPUT, RC_LINK_STATUS, VEHICLE_ATTITUDE};
 use crate::shell::format::ShellMsg;
 use crate::shell::write_all;
 use crate::shell::ShellLine;
@@ -27,7 +27,8 @@ type UsbDriver<'d> = Driver<'d, hal::peripherals::USB_OTG_FS>;
 
 const PROMPT: &[u8] = b"> ";
 const HELP_TEXT: &[u8] = b"\
-  imu                  one-shot IMU snapshot\r\n\
+  imu1                 one-shot IMU 1 snapshot\r\n\
+  imu2                 one-shot IMU 2 snapshot\r\n\
   att                  one-shot attitude snapshot\r\n\
   ocp                  one-shot OCP solver output\r\n\
   rc                   one-shot RC channel values\r\n\
@@ -50,7 +51,8 @@ const HELP_TEXT: &[u8] = b"\
 // Stream enable flags — written by the shell, read by the stream tasks
 // ---------------------------------------------------------------------------
 
-pub static STREAM_IMU: AtomicBool = AtomicBool::new(false);
+pub static STREAM_IMU1: AtomicBool = AtomicBool::new(false);
+pub static STREAM_IMU2: AtomicBool = AtomicBool::new(false);
 pub static STREAM_ATT: AtomicBool = AtomicBool::new(false);
 pub static STREAM_OCP: AtomicBool = AtomicBool::new(false);
 pub static STREAM_RC: AtomicBool = AtomicBool::new(false);
@@ -100,8 +102,13 @@ where
 }
 
 #[embassy_executor::task]
-pub async fn imu_stream_task() {
-    msg_stream_task(&RAW_IMU, &STREAM_IMU).await
+pub async fn imu1_stream_task() {
+    msg_stream_task(&IMU_1, &STREAM_IMU1).await
+}
+
+#[embassy_executor::task]
+pub async fn imu2_stream_task() {
+    msg_stream_task(&IMU_2, &STREAM_IMU2).await
 }
 
 #[embassy_executor::task]
@@ -223,7 +230,8 @@ pub async fn run(
 
 async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
     // Reset stream flags so a fresh connection starts silent.
-    STREAM_IMU.store(false, Ordering::Relaxed);
+    STREAM_IMU1.store(false, Ordering::Relaxed);
+    STREAM_IMU2.store(false, Ordering::Relaxed);
     STREAM_ATT.store(false, Ordering::Relaxed);
     STREAM_OCP.store(false, Ordering::Relaxed);
     STREAM_RC.store(false, Ordering::Relaxed);
@@ -321,8 +329,15 @@ async fn dispatch<'d>(
         "help" => {
             write_all(class, HELP_TEXT).await?;
         }
-        "imu" => {
-            let mut sub = match RAW_IMU.subscriber() {
+        "imu1" => {
+            let mut sub = match IMU_1.subscriber() {
+                Ok(s) => s,
+                Err(_) => return write_all(class, b"error: no subscriber slot\r\n").await,
+            };
+            oneshot(class, &mut sub, 256).await?;
+        }
+        "imu2" => {
+            let mut sub = match IMU_2.subscriber() {
                 Ok(s) => s,
                 Err(_) => return write_all(class, b"error: no subscriber slot\r\n").await,
             };
@@ -356,13 +371,21 @@ async fn dispatch<'d>(
             };
             oneshot(class, &mut sub, 128).await?;
         }
-        "stream imu on" => {
-            STREAM_IMU.store(true, Ordering::Relaxed);
-            write_all(class, b"IMU stream on\r\n").await?;
+        "stream imu1 on" => {
+            STREAM_IMU1.store(true, Ordering::Relaxed);
+            write_all(class, b"IMU1 stream on\r\n").await?;
         }
-        "stream imu off" => {
-            STREAM_IMU.store(false, Ordering::Relaxed);
-            write_all(class, b"IMU stream off\r\n").await?;
+        "stream imu1 off" => {
+            STREAM_IMU1.store(false, Ordering::Relaxed);
+            write_all(class, b"IMU1 stream off\r\n").await?;
+        }
+        "stream imu2 on" => {
+            STREAM_IMU2.store(true, Ordering::Relaxed);
+            write_all(class, b"IMU2 stream on\r\n").await?;
+        }
+        "stream imu2 off" => {
+            STREAM_IMU2.store(false, Ordering::Relaxed);
+            write_all(class, b"IMU2 stream off\r\n").await?;
         }
         "stream att on" => {
             STREAM_ATT.store(true, Ordering::Relaxed);

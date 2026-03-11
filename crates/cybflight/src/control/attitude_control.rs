@@ -1,22 +1,29 @@
-use cybflight_core::attitude_control::{self, geometric_controller};
+use cybflight_core::{
+    attitude_control::{self, geometric_controller, AttitudeControlOutput},
+    vehicle_model::{motor_thrust_to_throttle, thrust_torque_to_motor_thrusts, ThrustTorque, VehicleModel},
+};
 use embassy_futures::select::{select3, Either3};
 use embassy_sync::pubsub::WaitResult;
 use embassy_time::Instant;
 use nalgebra::UnitQuaternion;
 
 use crate::{
+    motors::ACTUATOR_MOTORS,
     msgs,
     sensors::{self, MANUAL_CONTROL},
+    vehicle::QUADROTOR,
 };
 
-pub struct AttitudeControl {
+pub struct AttitudeControl<'a, Mdl: VehicleModel<Scalar = f32>> {
     ac: geometric_controller::GeometricAttitudeController<f32>,
+    mdl: &'a Mdl,
 }
 
-impl AttitudeControl {
-    pub fn new() -> Self {
+impl<'a, Mdl: VehicleModel<Scalar = f32>> AttitudeControl<'a, Mdl> {
+    pub fn new(mdl: &'a Mdl) -> Self {
         Self {
             ac: geometric_controller::GeometricAttitudeController::default(),
+            mdl,
         }
     }
 
@@ -25,6 +32,7 @@ impl AttitudeControl {
         let mut att_sub = sensors::VEHICLE_ATTITUDE.subscriber().unwrap();
         let mut rc_sub = MANUAL_CONTROL.subscriber().unwrap();
         let publisher = super::ATTITUDE_CONTROL_SETPOINT.immediate_publisher();
+        let max_thrust = self.mdl.max_thrust_per_motor();
 
         // Stub reference: hover at z = 1 m, level attitude, zero velocity.
         // TODO: subscribe to super::ATTITUDE_SETPOINT for a live target.
@@ -80,7 +88,32 @@ impl AttitudeControl {
                 }
             };
 
-            let output = self.ac.compute(&state, &att_ref);
+            let AttitudeControlOutput {
+                body_rate_rad_s,
+                torque_n_m,
+            } = self.ac.compute(&state, &att_ref);
+
+            // Convert RC normalized thrust [0,1] to total force (N), then allocate.
+            let total_thrust_n = collective_thrust_n * 4.0 * max_thrust;
+            let thrusts_n = thrust_torque_to_motor_thrusts(
+                &ThrustTorque {
+                    collective_thrust_n: total_thrust_n,
+                    torque_n_m,
+                },
+                self.mdl,
+            );
+
+            // Per-motor thrust (N) → normalized throttle [0,1] via linear thrust curve.
+            let motor_commands = [
+                msgs::NormalizedThrottle::new_saturating(motor_thrust_to_throttle(thrusts_n[0], max_thrust)),
+                msgs::NormalizedThrottle::new_saturating(motor_thrust_to_throttle(thrusts_n[1], max_thrust)),
+                msgs::NormalizedThrottle::new_saturating(motor_thrust_to_throttle(thrusts_n[2], max_thrust)),
+                msgs::NormalizedThrottle::new_saturating(motor_thrust_to_throttle(thrusts_n[3], max_thrust)),
+            ];
+            ACTUATOR_MOTORS.signal(msgs::ActuatorMotors {
+                timestamp: Instant::now(),
+                motor_commands,
+            });
 
             publisher.publish_immediate(msgs::AttitudeControlSetpoint {
                 timestamp: Instant::now(),
@@ -88,8 +121,8 @@ impl AttitudeControl {
                 attitude_quaternion: att_ref
                     .attitude_quaternion
                     .unwrap_or(UnitQuaternion::identity()),
-                body_rate_rad_s: output.body_rate_rad_s,
-                torque_n_m: output.torque_n_m,
+                body_rate_rad_s,
+                torque_n_m,
             });
 
             embassy_futures::yield_now().await;
@@ -97,14 +130,8 @@ impl AttitudeControl {
     }
 }
 
-impl Default for AttitudeControl {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[embassy_executor::task(pool_size = 2)]
 pub async fn attitude_control_task() {
-    let mut driver = AttitudeControl::new();
+    let mut driver = AttitudeControl::new(&QUADROTOR);
     driver.run().await;
 }

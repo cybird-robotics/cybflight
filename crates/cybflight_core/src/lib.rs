@@ -6,3 +6,4 @@ pub mod mahony;
 pub mod nmpc;
 pub mod rc;
 pub mod rotation;
+pub mod vehicle_model;

@@ -17,6 +17,7 @@ pub mod sensors;
 pub mod shell;
 pub mod status;
 pub mod usb_serial;
+pub mod vehicle;
 pub mod watchdog;
 
 /// Firmware version from `Cargo.toml`.

@@ -5,6 +5,7 @@ use crate::bsp;
 use crate::comm;
 use crate::control::ATTITUDE_CONTROL_SETPOINT;
 use crate::control::OCP_SOLVER_OUTPUT;
+use crate::estimation::{EstimatorPhase, ESTIMATOR_STATUS};
 use crate::hal;
 use crate::motors::ACTUATOR_MOTORS;
 use crate::msgs;
@@ -45,6 +46,7 @@ const HELP_TEXT: &[u8] = b"\
   baro1                one-shot barometer 1\r\n\
   baro2                one-shot barometer 2\r\n\
   vicon                one-shot Vicon pose\r\n\
+  eskf                 one-shot estimator status\r\n\
   stream <topic> on    stream data on <topic>\r\n\
   stream <topic> off   stop data stream on <topic>\r\n\
   motor <1-4> <0-100>  set motor throttle (test mode)\r\n\
@@ -77,6 +79,7 @@ pub static STREAM_BARO2: AtomicBool = AtomicBool::new(false);
 pub static STREAM_ATTITUDE_CONTROL: AtomicBool = AtomicBool::new(false);
 pub static STREAM_VICON: AtomicBool = AtomicBool::new(false);
 pub static STREAM_TIMESYNC: AtomicBool = AtomicBool::new(false);
+pub static STREAM_ESKF: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Generic stream bridge + concrete embassy task wrappers
@@ -205,6 +208,75 @@ pub async fn timesync_stream_task() {
     }
 }
 
+/// Periodically writes the estimator status to `SHELL_OUT` at 2 Hz while
+/// `STREAM_ESKF` is set.  Runs permanently; cheap when stream is off.
+#[embassy_executor::task]
+pub async fn estimator_stream_task() {
+    use embassy_time::Timer;
+    loop {
+        Timer::after(embassy_time::Duration::from_millis(500)).await;
+        if STREAM_ESKF.load(Ordering::Relaxed) {
+            let phase = ESTIMATOR_STATUS.lock(|c| c.get());
+            let mut line = ShellLine::new();
+            line.format(|w| {
+                write_eskf_phase(w, &phase).ok();
+                write!(w, "\r\n").ok();
+            });
+            SHELL_OUT.try_send(line).ok();
+        }
+    }
+}
+
+/// Format the estimator phase into `w`.
+fn write_eskf_phase(w: &mut WriteBuf<'_>, phase: &EstimatorPhase) -> core::fmt::Result {
+    match phase {
+        EstimatorPhase::AwaitingBaro => write!(w, "ESKF[Phase1] baro=WAIT gps=WAIT imu=WAIT"),
+        EstimatorPhase::AwaitingGps {
+            imu_ready,
+            roll_deg,
+            pitch_deg,
+        } => {
+            let imu_str = if *imu_ready { "OK  " } else { "WAIT" };
+            write!(w, "ESKF[Phase1] baro=OK   gps=WAIT imu={imu_str}")?;
+            if let (Some(r), Some(p)) = (roll_deg, pitch_deg) {
+                write!(w, "  orientation: roll={r:.1} pitch={p:.1}")?;
+            }
+            Ok(())
+        }
+        EstimatorPhase::CalibImu => write!(w, "ESKF[Phase1] baro=OK   gps=OK   imu=WAIT"),
+        EstimatorPhase::Running {
+            roll_deg,
+            pitch_deg,
+            yaw_deg,
+            pos,
+            vel,
+            gyro_bias,
+            accel_bias,
+        } => write!(
+            w,
+            "ESKF[Phase2] roll={:.1} pitch={:.1} yaw={:.1}  \
+             pos=[{:.2},{:.2},{:.2}]m  vel=[{:.2},{:.2},{:.2}]m/s  \
+             gyro_bias=[{:.4},{:.4},{:.4}]rad/s  accel_bias=[{:.3},{:.3},{:.3}]m/s2",
+            roll_deg,
+            pitch_deg,
+            yaw_deg,
+            pos[0],
+            pos[1],
+            pos[2],
+            vel[0],
+            vel[1],
+            vel[2],
+            gyro_bias[0],
+            gyro_bias[1],
+            gyro_bias[2],
+            accel_bias[0],
+            accel_bias[1],
+            accel_bias[2],
+        ),
+    }
+}
+
+
 // ---------------------------------------------------------------------------
 // Task entry points
 // ---------------------------------------------------------------------------
@@ -289,6 +361,7 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
     STREAM_ATTITUDE_CONTROL.store(false, Ordering::Relaxed);
     STREAM_VICON.store(false, Ordering::Relaxed);
     STREAM_TIMESYNC.store(false, Ordering::Relaxed);
+    STREAM_ESKF.store(false, Ordering::Relaxed);
 
     let mut line_buf = [0u8; 64];
     let mut line_len = 0usize;
@@ -606,6 +679,22 @@ async fn dispatch<'d>(
         "stream timesync off" => {
             STREAM_TIMESYNC.store(false, Ordering::Relaxed);
             write_all(class, b"Time sync stream off\r\n").await?;
+        }
+        "eskf" => {
+            let phase = ESTIMATOR_STATUS.lock(|c| c.get());
+            let mut buf = [0u8; 256];
+            let mut w = WriteBuf::new(&mut buf);
+            write_eskf_phase(&mut w, &phase).ok();
+            write!(w, "\r\n").ok();
+            write_all(class, w.as_slice()).await?;
+        }
+        "stream eskf on" => {
+            STREAM_ESKF.store(true, Ordering::Relaxed);
+            write_all(class, b"ESKF status stream on\r\n").await?;
+        }
+        "stream eskf off" => {
+            STREAM_ESKF.store(false, Ordering::Relaxed);
+            write_all(class, b"ESKF status stream off\r\n").await?;
         }
         "reboot" => {
             write_all(class, b"rebooting...\r\n").await?;

@@ -52,8 +52,14 @@ pub struct NavPvt {
     pub alt_msl_mm: i32,
     pub h_acc_mm: u32,
     pub v_acc_mm: u32,
+    /// NED velocity components [mm/s].
+    pub vel_north_mm_s: i32,
+    pub vel_east_mm_s: i32,
+    pub vel_down_mm_s: i32,
     pub ground_speed_mm_s: u32,
     pub heading_mot_1e5: i32,
+    /// Speed accuracy estimate [mm/s].
+    pub s_acc_mm_s: u32,
     pub pdop: u16,
 }
 
@@ -319,8 +325,12 @@ fn parse_nav_pvt(p: &[u8; 92]) -> NavPvt {
         alt_msl_mm: i32::from_le_bytes([p[36], p[37], p[38], p[39]]),
         h_acc_mm: u32::from_le_bytes([p[40], p[41], p[42], p[43]]),
         v_acc_mm: u32::from_le_bytes([p[44], p[45], p[46], p[47]]),
+        vel_north_mm_s: i32::from_le_bytes([p[48], p[49], p[50], p[51]]),
+        vel_east_mm_s: i32::from_le_bytes([p[52], p[53], p[54], p[55]]),
+        vel_down_mm_s: i32::from_le_bytes([p[56], p[57], p[58], p[59]]),
         ground_speed_mm_s: i32::from_le_bytes([p[60], p[61], p[62], p[63]]).unsigned_abs(),
         heading_mot_1e5: i32::from_le_bytes([p[64], p[65], p[66], p[67]]),
+        s_acc_mm_s: u32::from_le_bytes([p[68], p[69], p[70], p[71]]),
         pdop: u16::from_le_bytes([p[76], p[77]]),
     }
 }

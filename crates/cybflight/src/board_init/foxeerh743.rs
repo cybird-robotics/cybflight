@@ -316,6 +316,7 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                         .spawn(crate::sensors::mag::qmc5883l_mag_task(MagReader::new(
                             mag,
                             bsp_types::SensorAlign::Cw180Deg,
+                            nalgebra::Vector3::zeros(),
                         )))
                         .unwrap_or_else(|e| defmt::error!("Failed to spawn QMC5883L task: {}", e));
                 }

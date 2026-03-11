@@ -233,10 +233,9 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                         .spawn(crate::sensors::mag::qmc5883l_mag_task(MagReader::new(
                             mag,
                             bsp_types::SensorAlign::Cw180Deg,
+                            nalgebra::Vector3::zeros(),
                         )))
-                        .unwrap_or_else(|e| {
-                            defmt::error!("Failed to spawn QMC5883L task: {}", e)
-                        });
+                        .unwrap_or_else(|e| defmt::error!("Failed to spawn QMC5883L task: {}", e));
                 }
                 Err(e) => defmt::warn!("QMC5883L init failed: {}", e),
             }
@@ -279,7 +278,10 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
         let mut mag_int_driver = None;
 
         // ICP20100 barometer (addr 0x63) — init directly, no separate probe
-        defmt::info!("I2C1: initializing ICP20100 at {:#x}...", bsp::sensors::BARO_1_I2C_ADDR);
+        defmt::info!(
+            "I2C1: initializing ICP20100 at {:#x}...",
+            bsp::sensors::BARO_1_I2C_ADDR
+        );
         {
             let dev = I2cDevice::new(i2c1_bus);
             let mut delay = embassy_time::Delay;
@@ -293,7 +295,10 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
         }
 
         // IST8310 internal magnetometer (addr 0x0E)
-        defmt::info!("I2C1: probing IST8310 at {:#x}...", bsp::sensors::MAG_I2C_ADDR);
+        defmt::info!(
+            "I2C1: probing IST8310 at {:#x}...",
+            bsp::sensors::MAG_I2C_ADDR
+        );
         {
             let mut probe_dev = I2cDevice::new(i2c1_bus);
             let mut delay = embassy_time::Delay;
@@ -309,7 +314,10 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                     Err(e) => defmt::warn!("IST8310 init failed: {}", e),
                 }
             } else {
-                defmt::warn!("IST8310 not detected on I2C1 (addr {:#x})", bsp::sensors::MAG_I2C_ADDR);
+                defmt::warn!(
+                    "IST8310 not detected on I2C1 (addr {:#x})",
+                    bsp::sensors::MAG_I2C_ADDR
+                );
             }
         }
 
@@ -321,20 +329,17 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                     BaroReader::new(baro),
                     &crate::sensors::BARO_1,
                 ))
-                .unwrap_or_else(|e| {
-                    defmt::error!("Failed to spawn ICP20100 baro1 task: {}", e)
-                });
+                .unwrap_or_else(|e| defmt::error!("Failed to spawn ICP20100 baro1 task: {}", e));
         }
         if let Some(mag) = mag_int_driver {
             defmt::info!("Spawning mag int task");
             spawner
                 .spawn(crate::sensors::mag::ist8310_mag_task(MagReader::new(
                     mag,
-                    board.sensors.mag_align,
+                    bsp_types::SensorAlign::Cw180Deg,
+                    nalgebra::Vector3::zeros(),
                 )))
-                .unwrap_or_else(|e| {
-                    defmt::error!("Failed to spawn IST8310 task: {}", e)
-                });
+                .unwrap_or_else(|e| defmt::error!("Failed to spawn IST8310 task: {}", e));
         }
     }
 

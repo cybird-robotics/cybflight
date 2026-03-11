@@ -53,6 +53,7 @@ cobs = { version = "0.5", default-features = false }
 nalgebra = { version = "0.34.1", default-features = false, features = ["libm", "defmt"] }
 air-filters = { version = "0.0.3", default-features = false, features = ["libm"] }
 discrete_pid = { version = "0.1.0", default-features = false }
+libm = "0.2"
 
 [profile.release]
 debug = 2

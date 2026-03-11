@@ -546,11 +546,11 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
     let sensors = SensorPins {
         gyro1_cs,
         gyro1_drdy,
-        gyro1_align: SensorAlign::Cw0DegFlip,
+        gyro1_align: SensorAlign::Cw0Deg,
 
         gyro2_cs,
         gyro2_drdy,
-        gyro2_align: SensorAlign::Cw0DegFlip,
+        gyro2_align: SensorAlign::Cw0Deg,
 
         baro2_cs,
 

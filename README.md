@@ -83,8 +83,8 @@ minicom -D /dev/ttyACM0 -b 115200
 ```bash
 cargo install defmt-print
 
-stty -F /dev/ttyTHS0 921600 raw -echo
-defmt-print -e target/thumbv7em-none-eabihf/release/cybflight < /dev/ttyTHS0
+stty -F /dev/ttyUSB0 921600 raw -echo
+defmt-print -e target/thumbv7em-none-eabihf/release/cybflight < /dev/ttyUSB0
 ```
 
 ## References

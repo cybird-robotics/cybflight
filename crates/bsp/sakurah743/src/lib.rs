@@ -24,6 +24,7 @@ pub const HAS_BARO: bool = true;
 pub const HAS_MAG: bool = true;
 pub const HAS_OSD: bool = false;
 pub const HAS_FLASH: bool = false;
+pub const HAS_GPS: bool = true;
 pub const HAS_SDCARD: bool = true;
 pub const LED_COUNT: usize = 3;
 
@@ -202,10 +203,14 @@ pub struct I2cPins {
     pub i2c1: hal::Peri<'static, hal::peripherals::I2C1>,
     pub i2c1_scl: hal::Peri<'static, hal::peripherals::PB6>,
     pub i2c1_sda: hal::Peri<'static, hal::peripherals::PB7>,
+    pub i2c1_tx_dma: hal::Peri<'static, hal::peripherals::DMA2_CH4>,
+    pub i2c1_rx_dma: hal::Peri<'static, hal::peripherals::DMA2_CH5>,
 
     pub i2c2: hal::Peri<'static, hal::peripherals::I2C2>,
     pub i2c2_scl: hal::Peri<'static, hal::peripherals::PB10>,
     pub i2c2_sda: hal::Peri<'static, hal::peripherals::PB11>,
+    pub i2c2_tx_dma: hal::Peri<'static, hal::peripherals::DMA2_CH6>,
+    pub i2c2_rx_dma: hal::Peri<'static, hal::peripherals::DMA2_CH7>,
 }
 
 pub struct SerialPins {
@@ -227,9 +232,6 @@ pub struct SerialPins {
     pub uart7_cts: hal::Peri<'static, hal::peripherals::PE10>,
     pub uart7_rts: hal::Peri<'static, hal::peripherals::PE9>,
 
-    pub uart8: hal::Peri<'static, hal::peripherals::UART8>,
-    pub uart8_tx: hal::Peri<'static, hal::peripherals::PE1>,
-    pub uart8_rx: hal::Peri<'static, hal::peripherals::PE0>,
 }
 
 pub struct AdcPins {
@@ -459,10 +461,14 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
         i2c1: p.I2C1,
         i2c1_scl: p.PB6,
         i2c1_sda: p.PB7,
+        i2c1_tx_dma: p.DMA2_CH4,
+        i2c1_rx_dma: p.DMA2_CH5,
 
         i2c2: p.I2C2,
         i2c2_scl: p.PB10,
         i2c2_sda: p.PB11,
+        i2c2_tx_dma: p.DMA2_CH6,
+        i2c2_rx_dma: p.DMA2_CH7,
     };
 
     let serial = SerialPins {
@@ -484,9 +490,6 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
         uart7_cts: p.PE10,
         uart7_rts: p.PE9,
 
-        uart8: p.UART8,
-        uart8_tx: p.PE1,
-        uart8_rx: p.PE0,
     };
 
     let adc = AdcPins {
@@ -561,10 +564,10 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
         can1_silent: Output::new(p.PD3, Level::Low, Speed::Low), // LOW = normal mode
     };
 
-    // USART3 TX (PD8) for defmt serial logging at 921600 baud.
+    // UART8 TX (PE1) for defmt serial logging at 921600 baud.
     let mut defmt_uart_config = hal::usart::Config::default();
     defmt_uart_config.baudrate = 921_600;
-    let defmt_uart = hal::usart::UartTx::new_blocking(p.USART3, p.PD8, defmt_uart_config)
+    let defmt_uart = hal::usart::UartTx::new_blocking(p.UART8, p.PE1, defmt_uart_config)
         .expect("defmt UART init failed");
 
     (

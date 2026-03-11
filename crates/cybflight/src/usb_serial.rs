@@ -7,7 +7,7 @@ use crate::hal;
 use crate::motors::MOTOR_THROTTLE;
 use cybflight_msgs as msgs;
 use crate::platform;
-use crate::sensors::{DSHOT_TELEMETRY, RAW_IMU, RC_INPUT, RC_LINK_STATUS, VEHICLE_ATTITUDE};
+use crate::sensors::{DSHOT_TELEMETRY, GPS_FIX, MAG_EXT, RAW_IMU, RC_INPUT, RC_LINK_STATUS, VEHICLE_ATTITUDE};
 use crate::shell::format::ShellMsg;
 use crate::shell::write_all;
 use crate::shell::ShellLine;
@@ -32,9 +32,11 @@ const HELP_TEXT: &[u8] = b"\
   ocp                  one-shot OCP solver output\r\n\
   rc                   one-shot RC channel values\r\n\
   rcstats              one-shot RC link status\r\n\
+  dshot                one-shot DShot telemetry\r\n\
+  gps                  one-shot GPS fix\r\n\
+  magext               one-shot external compass\r\n\
   stream <topic> on    stream data on <topic>\r\n\
   stream <topic> off   stop data stream on <topic>\r\n\
-  dshot                one-shot DShot telemetry\r\n\
   motor <1-4> <0-100>  set motor throttle (test mode)\r\n\
   reboot               software reset\r\n\
   reboot --dfu         reset into USB DFU bootloader\r\n\
@@ -51,6 +53,8 @@ pub static STREAM_OCP: AtomicBool = AtomicBool::new(false);
 pub static STREAM_RC: AtomicBool = AtomicBool::new(false);
 pub static STREAM_RC_LINK: AtomicBool = AtomicBool::new(false);
 pub static STREAM_DSHOT: AtomicBool = AtomicBool::new(false);
+pub static STREAM_GPS: AtomicBool = AtomicBool::new(false);
+pub static STREAM_MAGEXT: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Generic stream bridge + concrete embassy task wrappers
@@ -117,6 +121,16 @@ pub async fn rc_link_stream_task() {
 #[embassy_executor::task]
 pub async fn dshot_stream_task() {
     msg_stream_task(&DSHOT_TELEMETRY, &STREAM_DSHOT).await
+}
+
+#[embassy_executor::task]
+pub async fn gps_stream_task() {
+    msg_stream_task(&GPS_FIX, &STREAM_GPS).await
+}
+
+#[embassy_executor::task]
+pub async fn magext_stream_task() {
+    msg_stream_task(&MAG_EXT, &STREAM_MAGEXT).await
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +208,8 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
     STREAM_RC.store(false, Ordering::Relaxed);
     STREAM_RC_LINK.store(false, Ordering::Relaxed);
     STREAM_DSHOT.store(false, Ordering::Relaxed);
+    STREAM_GPS.store(false, Ordering::Relaxed);
+    STREAM_MAGEXT.store(false, Ordering::Relaxed);
 
     let mut line_buf = [0u8; 64];
     let mut line_len = 0usize;
@@ -370,6 +386,36 @@ async fn dispatch<'d>(
         "stream dshot off" => {
             STREAM_DSHOT.store(false, Ordering::Relaxed);
             write_all(class, b"DShot telemetry stream off\r\n").await?;
+        }
+        "gps" => {
+            let mut sub = match GPS_FIX.subscriber() {
+                Ok(s) => s,
+                Err(_) => return write_all(class, b"error: no subscriber slot\r\n").await,
+            };
+            oneshot(class, &mut sub, 256).await?;
+        }
+        "magext" => {
+            let mut sub = match MAG_EXT.subscriber() {
+                Ok(s) => s,
+                Err(_) => return write_all(class, b"error: no subscriber slot\r\n").await,
+            };
+            oneshot(class, &mut sub, 256).await?;
+        }
+        "stream gps on" => {
+            STREAM_GPS.store(true, Ordering::Relaxed);
+            write_all(class, b"GPS stream on\r\n").await?;
+        }
+        "stream gps off" => {
+            STREAM_GPS.store(false, Ordering::Relaxed);
+            write_all(class, b"GPS stream off\r\n").await?;
+        }
+        "stream magext on" => {
+            STREAM_MAGEXT.store(true, Ordering::Relaxed);
+            write_all(class, b"mag ext stream on\r\n").await?;
+        }
+        "stream magext off" => {
+            STREAM_MAGEXT.store(false, Ordering::Relaxed);
+            write_all(class, b"mag ext stream off\r\n").await?;
         }
         "reboot" => {
             write_all(class, b"rebooting...\r\n").await?;

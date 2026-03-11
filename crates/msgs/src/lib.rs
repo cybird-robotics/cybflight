@@ -101,6 +101,32 @@ pub struct DshotTelemetry {
 }
 impl Message for DshotTelemetry {}
 
+#[derive(Clone, defmt::Format)]
+pub struct GpsFix {
+    pub timestamp: Instant,
+    pub lat_deg: f64,
+    pub lon_deg: f64,
+    pub alt_msl_mm: i32,
+    pub ground_speed_mm_s: u32,
+    pub heading_mot_1e5: i32,
+    pub fix_type: u8,
+    pub num_sv: u8,
+    pub h_acc_mm: u32,
+    pub v_acc_mm: u32,
+    pub pdop: u16,
+}
+
+impl Message for GpsFix {}
+
+#[derive(Clone, defmt::Format)]
+pub struct MagSample {
+    pub timestamp: Instant,
+    pub field_ut: Vector3<f32>,
+    pub temp_c: f32,
+}
+
+impl Message for MagSample {}
+
 const OCP_OUTPUT_SIZE: usize = 4;
 #[derive(Clone, defmt::Format)]
 pub struct OcpSolverOutput {

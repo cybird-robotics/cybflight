@@ -1,9 +1,13 @@
+use cybflight_drivers::gps::UbloxM10;
 use cybflight_drivers::imu::icm426xx::Icm426xx;
 use cybflight_drivers::imu::mpu6x00::Mpu6x00;
 use cybflight_drivers::imu::{DetectedImu, probe_imu_raw};
 use cybflight_drivers::led::Led;
+use cybflight_drivers::mag::Qmc5883l;
+use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::{SendSpawner, Spawner};
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::Timer;
 use static_cell::StaticCell;
@@ -11,7 +15,9 @@ use static_cell::StaticCell;
 use crate::bsp;
 use crate::hal;
 use crate::motors::{DshotQuadConfig, MotorTimerConfig};
+use crate::sensors::gps::GpsRunner;
 use crate::sensors::imu::{ImuReader, SpiBusMtx, icm_reader_task, mpu_reader_task};
+use crate::sensors::mag::{I2cBusMtx, MagReader};
 use crate::status;
 use crate::usb_serial;
 use hal::gpio::{AfType, Flex, OutputType, Speed};
@@ -22,6 +28,17 @@ use hal::timer::low_level::Timer as LLTimer;
 // Bind USART1 interrupt for SerialRx (CRSF/GHST) — BF default: SERIALRX_UART = USART1
 hal::bind_interrupts!(struct Usart1Irqs {
     USART1 => hal::usart::BufferedInterruptHandler<hal::peripherals::USART1>;
+});
+
+// Bind UART4 interrupt for GPS
+hal::bind_interrupts!(struct Uart4Irqs {
+    UART4 => hal::usart::BufferedInterruptHandler<hal::peripherals::UART4>;
+});
+
+// Bind I2C1 interrupts for DPS310 baro + QMC5883L external mag
+hal::bind_interrupts!(struct I2c1Irqs {
+    I2C1_EV => hal::i2c::EventInterruptHandler<hal::peripherals::I2C1>;
+    I2C1_ER => hal::i2c::ErrorInterruptHandler<hal::peripherals::I2C1>;
 });
 
 pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Board) {
@@ -169,6 +186,87 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                     .unwrap_or_else(|e| defmt::error!("Failed to spawn GHST task: {}", e));
             }
             Err(e) => defmt::error!("GHST USART1 init failed: {}", e),
+        }
+    }
+
+    // --- GPS: u-blox M10 on UART4 (PA0 TX, PA1 RX) at 38400 baud ---
+    defmt::info!("GPS: starting UART4 init");
+    {
+        static GPS_TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+        static GPS_RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+        let tx_buf = &mut GPS_TX_BUF.init([0u8; 256])[..];
+        let rx_buf = &mut GPS_RX_BUF.init([0u8; 256])[..];
+
+        let mut uart_config = hal::usart::Config::default();
+        uart_config.baudrate = 115_200;
+
+        match hal::usart::BufferedUart::new(
+            board.serial.uart4,
+            board.serial.uart4_rx,
+            board.serial.uart4_tx,
+            tx_buf,
+            rx_buf,
+            Uart4Irqs,
+            uart_config,
+        ) {
+            Ok(uart) => {
+                defmt::info!("GPS: UART4 OK, sending CFG-VALSET...");
+                let mut delay = embassy_time::Delay;
+                match UbloxM10::new(uart, &mut delay).await {
+                    Ok(gps) => {
+                        defmt::info!("GPS u-blox M10 init OK");
+                        spawner
+                            .spawn(crate::sensors::gps::ublox_gps_task(GpsRunner::new(gps)))
+                            .unwrap_or_else(|e| defmt::error!("Failed to spawn GPS task: {}", e));
+                    }
+                    Err(e) => defmt::warn!("GPS init failed: {}", e),
+                }
+            }
+            Err(e) => defmt::error!("GPS UART4 init failed: {}", e),
+        }
+    }
+
+    // --- I2C1 shared bus (PB8 SCL, PB9 SDA) for DPS310 baro + QMC5883L ---
+    defmt::info!("I2C1: starting init");
+    {
+        static I2C1_BUS: StaticCell<I2cBusMtx> = StaticCell::new();
+        let mut i2c_config = hal::i2c::Config::default();
+        i2c_config.frequency = Hertz(400_000);
+        let i2c1 = hal::i2c::I2c::new(
+            board.i2c.i2c1,
+            board.i2c.i2c1_scl,
+            board.i2c.i2c1_sda,
+            I2c1Irqs,
+            board.i2c.i2c1_tx_dma,
+            board.i2c.i2c1_rx_dma,
+            i2c_config,
+        );
+        defmt::info!("I2C1: bus created at 400 kHz");
+        let i2c1_bus: &'static I2cBusMtx = I2C1_BUS.init(Mutex::<NoopRawMutex, _>::new(i2c1));
+
+        // QMC5883L external compass (addr 0x0D)
+        defmt::info!("I2C1: probing QMC5883L at 0x0D...");
+        let mut probe_dev = I2cDevice::new(i2c1_bus);
+        if Qmc5883l::probe(&mut probe_dev).await {
+            defmt::info!("I2C1: QMC5883L found, initializing...");
+            let dev = I2cDevice::new(i2c1_bus);
+            let mut delay = embassy_time::Delay;
+            match Qmc5883l::new(dev, &mut delay).await {
+                Ok(mag) => {
+                    defmt::info!("QMC5883L init OK — spawning task");
+                    spawner
+                        .spawn(crate::sensors::mag::qmc5883l_mag_task(MagReader::new(
+                            mag,
+                            bsp_types::SensorAlign::Cw180Deg,
+                        )))
+                        .unwrap_or_else(|e| {
+                            defmt::error!("Failed to spawn QMC5883L task: {}", e)
+                        });
+                }
+                Err(e) => defmt::warn!("QMC5883L init failed: {}", e),
+            }
+        } else {
+            defmt::warn!("QMC5883L not detected on I2C1 (addr 0x0D)");
         }
     }
 

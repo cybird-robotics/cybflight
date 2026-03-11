@@ -1,5 +1,7 @@
 pub mod attitude;
+pub mod gps;
 pub mod imu;
+pub mod mag;
 pub mod rc;
 use cybflight_msgs as msgs;
 
@@ -41,4 +43,12 @@ pub static RC_LINK_STATUS: PubSubChannel<CriticalSectionRawMutex, msgs::RcLinkSt
 // DShot telemetry: CAP=2 (high publish rate, only latest matters),
 // SUBS=3 (oneshot + stream + spare), PUBS=1 (dshot_task).
 pub static DSHOT_TELEMETRY: PubSubChannel<CriticalSectionRawMutex, msgs::DshotTelemetry, 2, 3, 1> =
+    PubSubChannel::new();
+
+// GPS fix: CAP=2 (5 Hz, low rate), SUBS=4 (telemetry + shell + 2 spare), PUBS=1.
+pub static GPS_FIX: PubSubChannel<CriticalSectionRawMutex, msgs::GpsFix, 2, 4, 1> =
+    PubSubChannel::new();
+
+// External magnetometer: CAP=4 (200 Hz), SUBS=4 (attitude + telemetry + shell + spare), PUBS=1.
+pub static MAG_EXT: PubSubChannel<CriticalSectionRawMutex, msgs::MagSample, 4, 4, 1> =
     PubSubChannel::new();

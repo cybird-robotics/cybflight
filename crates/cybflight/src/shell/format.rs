@@ -122,6 +122,41 @@ impl fmt::Display for ShellMsg<'_, msgs::RcLinkStatus> {
     }
 }
 
+impl fmt::Display for ShellMsg<'_, msgs::GpsFix> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.0;
+        write!(
+            f,
+            "GpsFix(t={}, fix={}, sv={}, lat={:.7}, lon={:.7}, alt_msl={}mm, gspd={}mm/s, hacc={}mm, vacc={}mm, pdop={})",
+            s.timestamp.as_millis(),
+            s.fix_type,
+            s.num_sv,
+            s.lat_deg,
+            s.lon_deg,
+            s.alt_msl_mm,
+            s.ground_speed_mm_s,
+            s.h_acc_mm,
+            s.v_acc_mm,
+            s.pdop
+        )
+    }
+}
+
+impl fmt::Display for ShellMsg<'_, msgs::MagSample> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.0;
+        write!(
+            f,
+            "MagSample(t={}, field_ut=[{:.2},{:.2},{:.2}], temp_c={:.1})",
+            s.timestamp.as_millis(),
+            s.field_ut.x,
+            s.field_ut.y,
+            s.field_ut.z,
+            s.temp_c
+        )
+    }
+}
+
 impl fmt::Display for ShellMsg<'_, msgs::DshotTelemetry> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use cybflight_msgs::dshot::TelemetryValue;
@@ -156,6 +191,8 @@ pub struct ShellState {
     pub stream_rc: bool,
     pub stream_rcstats: bool,
     pub stream_dshot: bool,
+    pub stream_gps: bool,
+    pub stream_magext: bool,
 }
 
 impl Printable for msgs::Imu {
@@ -221,6 +258,26 @@ impl Printable for msgs::OcpSolverOutput {
 impl Printable for msgs::DshotTelemetry {
     fn should_print(&self, ctx: &ShellState) -> bool {
         ctx.stream_dshot
+    }
+
+    fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        write!(w, "{}", ShellMsg(self))
+    }
+}
+
+impl Printable for msgs::GpsFix {
+    fn should_print(&self, ctx: &ShellState) -> bool {
+        ctx.stream_gps
+    }
+
+    fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        write!(w, "{}", ShellMsg(self))
+    }
+}
+
+impl Printable for msgs::MagSample {
+    fn should_print(&self, ctx: &ShellState) -> bool {
+        ctx.stream_magext
     }
 
     fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {

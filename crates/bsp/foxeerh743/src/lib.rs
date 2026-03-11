@@ -22,6 +22,7 @@ pub const HAS_BARO: bool = true;
 pub const HAS_MAG: bool = false;
 pub const HAS_OSD: bool = true;
 pub const HAS_FLASH: bool = true;
+pub const HAS_GPS: bool = true;
 pub const HAS_SDCARD: bool = false;
 pub const LED_COUNT: usize = 1;
 
@@ -147,6 +148,8 @@ pub struct I2cPins {
     pub i2c1: hal::Peri<'static, hal::peripherals::I2C1>,
     pub i2c1_scl: hal::Peri<'static, hal::peripherals::PB8>,
     pub i2c1_sda: hal::Peri<'static, hal::peripherals::PB9>,
+    pub i2c1_tx_dma: hal::Peri<'static, hal::peripherals::DMA2_CH2>,
+    pub i2c1_rx_dma: hal::Peri<'static, hal::peripherals::DMA2_CH3>,
 }
 
 pub struct SerialPins {
@@ -346,6 +349,8 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
         i2c1: p.I2C1,
         i2c1_scl: p.PB8,
         i2c1_sda: p.PB9,
+        i2c1_tx_dma: p.DMA2_CH2,
+        i2c1_rx_dma: p.DMA2_CH3,
     };
 
     let serial = SerialPins {

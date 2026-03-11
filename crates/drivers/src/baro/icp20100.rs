@@ -132,30 +132,23 @@ where
     type Error = Error<I2C::Error>;
 
     async fn read(&mut self) -> Result<BaroReading, Self::Error> {
-        defmt::debug!("ICP20100: read() entered");
-
         // Poll FIFO until data available — yield between iterations so other
         // tasks sharing this I2C bus can acquire the mutex.
         let mut packets: usize = 0;
-        let mut poll_count: usize = 0;
-        for i in 0..200 {
+        for _ in 0..200 {
             let fill = read_reg(&mut self.i2c, self.addr, REG_FIFO_FILL).await?;
             packets = (fill & 0x1F) as usize;
-            poll_count = i + 1;
             if packets > 0 {
                 break;
             }
             crate::yield_now().await;
         }
 
-        defmt::debug!("ICP20100: fill={}, polls={}", packets, poll_count);
-
         if packets == 0 {
             return Err(Error::FifoOverflow);
         }
 
         if packets > 16 {
-            defmt::debug!("ICP20100: FIFO overflow, fill={}", packets);
             flush_fifo(&mut self.i2c, self.addr).await?;
             return Err(Error::FifoOverflow);
         }
@@ -163,21 +156,11 @@ where
         // Burst read all FIFO packets in one I2C transaction (per ArduPilot)
         let byte_count = packets * 6;
         let mut fifo_data = [0u8; 96]; // max 16 packets * 6 bytes
-        match self.i2c
+        self.i2c
             .write_read(self.addr, &[REG_FIFO_BASE], &mut fifo_data[..byte_count])
             .await
-        {
-            Ok(()) => {}
-            Err(e) => {
-                defmt::warn!("ICP20100: burst read failed: {}", e);
-                return Err(Error::I2c(e));
-            }
-        }
+            .map_err(Error::I2c)?;
         dummy(&mut self.i2c, self.addr).await;
-
-        defmt::debug!("ICP20100: raw[0..6]=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
-            fifo_data[0], fifo_data[1], fifo_data[2],
-            fifo_data[3], fifo_data[4], fifo_data[5]);
 
         // Parse all packets
         let mut pressure_sum: f64 = 0.0;

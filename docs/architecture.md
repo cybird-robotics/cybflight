@@ -14,7 +14,7 @@ this project MUST follow these patterns. Update this document when the design ch
                               | static channels (the boundary)
 +-----------------------------+-----------------------------+
 |                 Sensor Channels                            |
-|  FUSED_IMU, BARO, MAG, etc.                               |
+|  FUSED_IMU, BARO_1, BARO_2, MAG_EXT, MAG_INT, etc.        |
 |  Defined in sensors/mod.rs. Always the same type/shape.   |
 +-----------------------------+-----------------------------+
                               |
@@ -29,8 +29,9 @@ this project MUST follow these patterns. Update this document when the design ch
 +------+--+ +------+------+ +--------+--------+
 |   BSP   | |   Drivers   | |  Sensor Tasks   |
 | (pins)  | | (Icm426xx,  | | (icm_reader,    |
-|         | |  Mpu6x00,   | |  mpu_reader,    |
-|         | |  Dps310,..) | |  imu_fusion,..) |
+|         | |  Dps310,    | |  baro_reader,   |
+|         | |  Icp20100,  | |  mag_reader,    |
+|         | |  Ist8310,..)| |  imu_fusion,..) |
 +---------+ +-------------+ +-----------------+
 ```
 
@@ -55,19 +56,20 @@ crates/
     types/                # Shared types: SensorAlign, MotorMeta, DmaHint, etc.
     sakurah743/           # Board struct, pin mapping, init(), const capabilities
     foxeerh743/           # Board struct, pin mapping, init(), const capabilities
-  drivers/                # Hardware-agnostic: Icm426xx, Dps310, Led, Beeper
+  drivers/                # Hardware-agnostic: Icm426xx, Dps310, Icp20100, Ist8310, Qmc5883l, Led, Beeper
   cybflight/
     src/
       main.rs             # Entry: bsp::init() -> board_init::init() -> spawn controller
       lib.rs              # cfg-gated BSP re-export, shared types, apply_alignment
       board_init/
         mod.rs            # cfg-dispatch: pub use {board}::init
-        sakurah743.rs     # SPI4->IMU1, SPI1->IMU2, spawn fusion, no baro
-        foxeerh743.rs     # SPI2->IMU1 (probe: ICM or MPU), I2C1->baro, no fusion
+        sakurah743.rs     # SPI4->IMU1, SPI1->DPS310, I2C1->ICP20100+IST8310, I2C2->QMC5883L
+        foxeerh743.rs     # SPI2->IMU1 (probe: ICM or MPU), I2C1->DPS310+QMC5883L
       sensors/
-        mod.rs            # Channel defs: FUSED_IMU, BARO, MAG
+        mod.rs            # Channel defs: FUSED_IMU, BARO_1, BARO_2, MAG_EXT, MAG_INT
         imu.rs            # imu_reader_task, imu_fusion_task (reusable)
-        baro.rs           # baro_reader_task (reusable)
+        baro.rs           # baro_reader_task (DPS310 SPI/I2C, ICP20100)
+        mag.rs            # mag_reader_task (QMC5883L, IST8310)
       control/
         mod.rs            # Flight controller reads channels, board-agnostic
       status.rs           # Status LED task
@@ -142,8 +144,11 @@ pub async fn init(spawner: &Spawner, board: bsp::Board) {
 |---|---|
 | 1 IMU | Spawns 1 `imu_reader_task` -> writes directly to `FUSED_IMU` |
 | 2 IMUs | Spawns 2 `imu_reader_task` -> `RAW_IMU` -> `imu_fusion_task` -> `FUSED_IMU` |
-| Has baro | Inits baro driver, spawns `baro_reader_task` -> `BARO` channel |
-| No baro | Does nothing. `BARO` channel stays empty. |
+| Has baro | Inits baro driver, spawns `baro_reader_task` -> `BARO_1`/`BARO_2` channel |
+| No baro | Does nothing. `BARO_1`/`BARO_2` channels stay empty. |
+| Has mag | Inits mag driver, spawns `mag_reader_task` -> `MAG_EXT`/`MAG_INT` channel |
+| No mag | Does nothing. `MAG_EXT`/`MAG_INT` channels stay empty. |
+| Shared I2C bus | Inits ALL devices before spawning ANY tasks. See [sensor_bus_sharing.md](sensor_bus_sharing.md) |
 | 1 LED | Spawns status task with 1 LED |
 | 3 LEDs | Spawns status task with 1 primary LED, turns off extras |
 
@@ -201,9 +206,11 @@ Defined in `sensors/mod.rs`. These are the ONLY interface between hardware and
 control logic.
 
 ```rust
-pub static FUSED_IMU: Channel<CriticalSectionRawMutex, ImuSample, 4> = Channel::new();
-pub static BARO: Channel<CriticalSectionRawMutex, BaroSample, 4> = Channel::new();
-pub static MAG: Channel<CriticalSectionRawMutex, MagSample, 4> = Channel::new();
+pub static FUSED_IMU: PubSubChannel<CriticalSectionRawMutex, ImuSample, ...>;
+pub static BARO_1: PubSubChannel<CriticalSectionRawMutex, BaroSample, ...>;
+pub static BARO_2: PubSubChannel<CriticalSectionRawMutex, BaroSample, ...>;
+pub static MAG_EXT: PubSubChannel<CriticalSectionRawMutex, MagSample, ...>;
+pub static MAG_INT: PubSubChannel<CriticalSectionRawMutex, MagSample, ...>;
 ```
 
 ### Consuming optional sensors
@@ -305,11 +312,15 @@ These rules ensure the final binary contains ONLY the code for the target board:
 ## How to Add a New Sensor Type
 
 1. **Add driver** in `crates/drivers/src/` — generic over `embedded-hal-async` traits
-2. **Add channel** in `sensors/mod.rs` — e.g. `pub static GPS: Channel<...>`
+2. **Add channel** in `sensors/mod.rs` — e.g. `pub static GPS: PubSubChannel<...>`
 3. **Add reader task** in `sensors/{sensor}.rs` — generic, reusable
 4. **Add const flag** to `bsp-types` or BSP — e.g. `pub const HAS_GPS: bool`
 5. **Wire in board_init/** — only for boards that have the sensor
 6. **Consume in control/** — guarded by `if bsp::HAS_GPS { ... }`
+
+If the sensor shares a bus with other sensors, read
+[sensor_bus_sharing.md](sensor_bus_sharing.md) for Timer-based pacing and
+deferred task spawning patterns.
 
 ## Runtime Sensor Detection
 

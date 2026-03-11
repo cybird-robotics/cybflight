@@ -127,6 +127,15 @@ pub struct MagSample {
 
 impl Message for MagSample {}
 
+#[derive(Clone, defmt::Format)]
+pub struct BaroSample {
+    pub timestamp: Instant,
+    pub pressure_pa: f32,
+    pub temp_c: f32,
+}
+
+impl Message for BaroSample {}
+
 const OCP_OUTPUT_SIZE: usize = 4;
 #[derive(Clone, defmt::Format)]
 pub struct OcpSolverOutput {

@@ -1,4 +1,5 @@
 pub mod attitude;
+pub mod baro;
 pub mod gps;
 pub mod imu;
 pub mod mag;
@@ -51,4 +52,16 @@ pub static GPS_FIX: PubSubChannel<CriticalSectionRawMutex, msgs::GpsFix, 2, 4, 1
 
 // External magnetometer: CAP=4 (200 Hz), SUBS=4 (attitude + telemetry + shell + spare), PUBS=1.
 pub static MAG_EXT: PubSubChannel<CriticalSectionRawMutex, msgs::MagSample, 4, 4, 1> =
+    PubSubChannel::new();
+
+// Internal magnetometer: CAP=4 (100 Hz), SUBS=4, PUBS=1.
+pub static MAG_INT: PubSubChannel<CriticalSectionRawMutex, msgs::MagSample, 4, 4, 1> =
+    PubSubChannel::new();
+
+// Baro 1: CAP=2, SUBS=4 (altitude + telemetry + shell + spare), PUBS=1.
+pub static BARO_1: PubSubChannel<CriticalSectionRawMutex, msgs::BaroSample, 2, 4, 1> =
+    PubSubChannel::new();
+
+// Baro 2: same sizing for dual-baro boards.
+pub static BARO_2: PubSubChannel<CriticalSectionRawMutex, msgs::BaroSample, 2, 4, 1> =
     PubSubChannel::new();

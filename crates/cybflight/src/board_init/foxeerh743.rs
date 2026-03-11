@@ -1,3 +1,4 @@
+use cybflight_drivers::baro::dps310::Dps310;
 use cybflight_drivers::gps::UbloxM10;
 use cybflight_drivers::imu::icm426xx::Icm426xx;
 use cybflight_drivers::imu::mpu6x00::Mpu6x00;
@@ -15,6 +16,7 @@ use static_cell::StaticCell;
 use crate::bsp;
 use crate::hal;
 use crate::motors::{DshotQuadConfig, MotorTimerConfig};
+use crate::sensors::baro::BaroReader;
 use crate::sensors::gps::GpsRunner;
 use crate::sensors::imu::{ImuReader, SpiBusMtx, icm_reader_task, mpu_reader_task};
 use crate::sensors::mag::{I2cBusMtx, MagReader};
@@ -268,6 +270,31 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
             }
         } else {
             defmt::warn!("QMC5883L not detected on I2C1 (addr 0x0D)");
+        }
+
+        // DPS310 barometer (addr 0x76) on same I2C1 bus
+        defmt::info!("I2C1: probing DPS310 at {:#x}...", bsp::sensors::BARO_1_I2C_ADDR);
+        let mut probe_dev = I2cDevice::new(i2c1_bus);
+        if Dps310::probe_i2c(&mut probe_dev, bsp::sensors::BARO_1_I2C_ADDR).await {
+            defmt::info!("I2C1: DPS310 found, initializing...");
+            let dev = I2cDevice::new(i2c1_bus);
+            let mut delay = embassy_time::Delay;
+            match Dps310::new_i2c(dev, bsp::sensors::BARO_1_I2C_ADDR, &mut delay).await {
+                Ok(baro) => {
+                    defmt::info!("DPS310 (I2C) init OK — spawning baro1 task");
+                    spawner
+                        .spawn(crate::sensors::baro::dps310_i2c_baro_task(
+                            BaroReader::new(baro),
+                            &crate::sensors::BARO_1,
+                        ))
+                        .unwrap_or_else(|e| {
+                            defmt::error!("Failed to spawn DPS310 baro1 task: {}", e)
+                        });
+                }
+                Err(e) => defmt::warn!("DPS310 (I2C) init failed: {}", e),
+            }
+        } else {
+            defmt::warn!("DPS310 not detected on I2C1 (addr {:#x})", bsp::sensors::BARO_1_I2C_ADDR);
         }
     }
 

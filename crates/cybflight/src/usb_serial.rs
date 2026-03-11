@@ -7,7 +7,7 @@ use crate::hal;
 use crate::motors::MOTOR_THROTTLE;
 use cybflight_msgs as msgs;
 use crate::platform;
-use crate::sensors::{DSHOT_TELEMETRY, GPS_FIX, MAG_EXT, RAW_IMU, RC_INPUT, RC_LINK_STATUS, VEHICLE_ATTITUDE};
+use crate::sensors::{BARO_1, BARO_2, DSHOT_TELEMETRY, GPS_FIX, MAG_EXT, MAG_INT, RAW_IMU, RC_INPUT, RC_LINK_STATUS, VEHICLE_ATTITUDE};
 use crate::shell::format::ShellMsg;
 use crate::shell::write_all;
 use crate::shell::ShellLine;
@@ -35,6 +35,9 @@ const HELP_TEXT: &[u8] = b"\
   dshot                one-shot DShot telemetry\r\n\
   gps                  one-shot GPS fix\r\n\
   magext               one-shot external compass\r\n\
+  magint               one-shot internal compass\r\n\
+  baro1                one-shot barometer 1\r\n\
+  baro2                one-shot barometer 2\r\n\
   stream <topic> on    stream data on <topic>\r\n\
   stream <topic> off   stop data stream on <topic>\r\n\
   motor <1-4> <0-100>  set motor throttle (test mode)\r\n\
@@ -55,6 +58,9 @@ pub static STREAM_RC_LINK: AtomicBool = AtomicBool::new(false);
 pub static STREAM_DSHOT: AtomicBool = AtomicBool::new(false);
 pub static STREAM_GPS: AtomicBool = AtomicBool::new(false);
 pub static STREAM_MAGEXT: AtomicBool = AtomicBool::new(false);
+pub static STREAM_MAGINT: AtomicBool = AtomicBool::new(false);
+pub static STREAM_BARO1: AtomicBool = AtomicBool::new(false);
+pub static STREAM_BARO2: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Generic stream bridge + concrete embassy task wrappers
@@ -131,6 +137,21 @@ pub async fn gps_stream_task() {
 #[embassy_executor::task]
 pub async fn magext_stream_task() {
     msg_stream_task(&MAG_EXT, &STREAM_MAGEXT).await
+}
+
+#[embassy_executor::task]
+pub async fn magint_stream_task() {
+    msg_stream_task(&MAG_INT, &STREAM_MAGINT).await
+}
+
+#[embassy_executor::task]
+pub async fn baro1_stream_task() {
+    msg_stream_task(&BARO_1, &STREAM_BARO1).await
+}
+
+#[embassy_executor::task]
+pub async fn baro2_stream_task() {
+    msg_stream_task(&BARO_2, &STREAM_BARO2).await
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +231,9 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
     STREAM_DSHOT.store(false, Ordering::Relaxed);
     STREAM_GPS.store(false, Ordering::Relaxed);
     STREAM_MAGEXT.store(false, Ordering::Relaxed);
+    STREAM_MAGINT.store(false, Ordering::Relaxed);
+    STREAM_BARO1.store(false, Ordering::Relaxed);
+    STREAM_BARO2.store(false, Ordering::Relaxed);
 
     let mut line_buf = [0u8; 64];
     let mut line_len = 0usize;
@@ -416,6 +440,51 @@ async fn dispatch<'d>(
         "stream magext off" => {
             STREAM_MAGEXT.store(false, Ordering::Relaxed);
             write_all(class, b"mag ext stream off\r\n").await?;
+        }
+        "magint" => {
+            let mut sub = match MAG_INT.subscriber() {
+                Ok(s) => s,
+                Err(_) => return write_all(class, b"error: no subscriber slot\r\n").await,
+            };
+            oneshot(class, &mut sub, 256).await?;
+        }
+        "stream magint on" => {
+            STREAM_MAGINT.store(true, Ordering::Relaxed);
+            write_all(class, b"mag int stream on\r\n").await?;
+        }
+        "stream magint off" => {
+            STREAM_MAGINT.store(false, Ordering::Relaxed);
+            write_all(class, b"mag int stream off\r\n").await?;
+        }
+        "baro1" => {
+            let mut sub = match BARO_1.subscriber() {
+                Ok(s) => s,
+                Err(_) => return write_all(class, b"error: no subscriber slot\r\n").await,
+            };
+            oneshot(class, &mut sub, 256).await?;
+        }
+        "stream baro1 on" => {
+            STREAM_BARO1.store(true, Ordering::Relaxed);
+            write_all(class, b"baro1 stream on\r\n").await?;
+        }
+        "stream baro1 off" => {
+            STREAM_BARO1.store(false, Ordering::Relaxed);
+            write_all(class, b"baro1 stream off\r\n").await?;
+        }
+        "baro2" => {
+            let mut sub = match BARO_2.subscriber() {
+                Ok(s) => s,
+                Err(_) => return write_all(class, b"error: no subscriber slot\r\n").await,
+            };
+            oneshot(class, &mut sub, 256).await?;
+        }
+        "stream baro2 on" => {
+            STREAM_BARO2.store(true, Ordering::Relaxed);
+            write_all(class, b"baro2 stream on\r\n").await?;
+        }
+        "stream baro2 off" => {
+            STREAM_BARO2.store(false, Ordering::Relaxed);
+            write_all(class, b"baro2 stream off\r\n").await?;
         }
         "reboot" => {
             write_all(class, b"rebooting...\r\n").await?;

@@ -1,5 +1,7 @@
+pub mod ist8310;
 pub mod qmc5883l;
 
+pub use ist8310::Ist8310;
 pub use qmc5883l::Qmc5883l;
 
 use nalgebra::Vector3;

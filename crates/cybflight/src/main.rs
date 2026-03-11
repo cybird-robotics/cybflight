@@ -82,6 +82,15 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::usb_serial::magext_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn mag ext stream task"));
+    spawner
+        .spawn(cybflight::usb_serial::magint_stream_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn mag int stream task"));
+    spawner
+        .spawn(cybflight::usb_serial::baro1_stream_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn baro1 stream task"));
+    spawner
+        .spawn(cybflight::usb_serial::baro2_stream_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn baro2 stream task"));
 
     defmt::info!("all init done");
 }

@@ -157,6 +157,19 @@ impl fmt::Display for ShellMsg<'_, msgs::MagSample> {
     }
 }
 
+impl fmt::Display for ShellMsg<'_, msgs::BaroSample> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.0;
+        write!(
+            f,
+            "BaroSample(t={}, pressure_pa={:.2}, temp_c={:.2})",
+            s.timestamp.as_millis(),
+            s.pressure_pa,
+            s.temp_c
+        )
+    }
+}
+
 impl fmt::Display for ShellMsg<'_, msgs::DshotTelemetry> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use cybflight_msgs::dshot::TelemetryValue;
@@ -193,6 +206,9 @@ pub struct ShellState {
     pub stream_dshot: bool,
     pub stream_gps: bool,
     pub stream_magext: bool,
+    pub stream_magint: bool,
+    pub stream_baro1: bool,
+    pub stream_baro2: bool,
 }
 
 impl Printable for msgs::Imu {
@@ -278,6 +294,16 @@ impl Printable for msgs::GpsFix {
 impl Printable for msgs::MagSample {
     fn should_print(&self, ctx: &ShellState) -> bool {
         ctx.stream_magext
+    }
+
+    fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        write!(w, "{}", ShellMsg(self))
+    }
+}
+
+impl Printable for msgs::BaroSample {
+    fn should_print(&self, _ctx: &ShellState) -> bool {
+        true
     }
 
     fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {

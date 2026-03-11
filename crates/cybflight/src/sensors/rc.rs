@@ -6,9 +6,34 @@
 use embassy_time::{Instant, Timer};
 
 use crate::hal;
+use crate::motors::ARM_STATE;
 use cybflight_msgs as msgs;
 
 pub type RcUart = hal::usart::BufferedUart<'static>;
+
+/// RC arm channel index (0-based). Channel 6 on the transmitter.
+const ARM_CHANNEL: usize = 5;
+/// PWM threshold: armed when channel value exceeds this.
+const ARM_THRESHOLD: u16 = 1500;
+
+fn publish_arm_state(channels: &[u16; 16], channel_count: u8, was_armed: &mut bool) {
+    if (channel_count as usize) <= ARM_CHANNEL {
+        return;
+    }
+    let armed = channels[ARM_CHANNEL] > ARM_THRESHOLD;
+    if armed != *was_armed {
+        *was_armed = armed;
+        if armed {
+            defmt::info!("RC: ARMED (ch6={})", channels[ARM_CHANNEL]);
+        } else {
+            defmt::info!("RC: DISARMED (ch6={})", channels[ARM_CHANNEL]);
+        }
+        ARM_STATE.signal(msgs::ArmDisarm {
+            timestamp: Instant::now(),
+            armed,
+        });
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CRSF
@@ -43,6 +68,7 @@ pub mod crsf_runner {
         pub async fn run(&mut self) -> ! {
             let rc_pub = super::super::RC_INPUT.immediate_publisher();
             let link_pub = super::super::RC_LINK_STATUS.immediate_publisher();
+            let mut was_armed = false;
 
             loop {
                 match self.crsf.read_frame().await {
@@ -56,6 +82,7 @@ pub mod crsf_runner {
                                     channels: rc.channels,
                                     channel_count: rc.channel_count,
                                 });
+                                publish_arm_state(&rc.channels, rc.channel_count, &mut was_armed);
 
                                 // Send one telemetry frame per RC frame received
                                 self.send_telemetry().await;
@@ -173,6 +200,7 @@ pub mod ghst_runner {
         pub async fn run(&mut self) -> ! {
             let rc_pub = super::super::RC_INPUT.immediate_publisher();
             let link_pub = super::super::RC_LINK_STATUS.immediate_publisher();
+            let mut was_armed = false;
 
             let mut frame_count: u32 = 0;
             let mut err_count: u32 = 0;
@@ -243,6 +271,7 @@ pub mod ghst_runner {
                                     channels: rc.channels,
                                     channel_count: rc.channel_count,
                                 });
+                                publish_arm_state(&rc.channels, rc.channel_count, &mut was_armed);
 
                                 // Guard delay: GHST requires 1ms minimum gap after
                                 // the last received byte before transmitting telemetry

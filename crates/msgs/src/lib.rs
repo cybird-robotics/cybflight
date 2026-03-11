@@ -183,3 +183,9 @@ pub struct ActuatorMotors {
     pub timestamp: Instant,
     pub motor_commands: [NormalizedThrottle; 4],
 }
+
+#[derive(Clone, defmt::Format)]
+pub struct ArmDisarm {
+    pub timestamp: Instant,
+    pub armed: bool,
+}

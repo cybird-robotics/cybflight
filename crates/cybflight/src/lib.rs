@@ -33,6 +33,7 @@ pub const GIT_HASH: &str = match option_env!("GIT_HASH") {
 };
 
 use bsp_types::SensorAlign;
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, pubsub::PubSubChannel};
 use nalgebra::Vector3;
 
 /// Rotate a 3-axis sensor vector according to the board-defined alignment.
@@ -51,3 +52,6 @@ pub fn apply_alignment(align: SensorAlign, v: Vector3<f32>) -> Vector3<f32> {
         SensorAlign::Cw270DegFlip => Vector3::new(-v.y, -v.x, -v.z),
     }
 }
+
+pub static ARM_DISARM: PubSubChannel<CriticalSectionRawMutex, msgs::ArmDisarm, 4, 4, 1> =
+    PubSubChannel::new();

@@ -4,7 +4,7 @@ use crate::hal::pac::timer::regs::{CcerGp16, CcmrInput2ch, CcmrOutputGp16};
 use crate::hal::pac::timer::vals;
 use crate::hal::peripherals::{DMA1_CH0, DMA1_CH1, DMA1_CH2, DMA1_CH3};
 use crate::hal::Peri;
-use crate::motors::ACTUATOR_MOTORS;
+use crate::motors::{ACTUATOR_MOTORS, ARM_STATE};
 use crate::sensors::DSHOT_TELEMETRY;
 use cybflight_drivers::dshot::{
     gcr, telemetry, DSHOT600_GCR_TICKS_PER_BIT, DSHOT_CMD_MOTOR_STOP, DSHOT_DMA_BUFFER_SIZE,
@@ -86,20 +86,38 @@ pub async fn dshot_task(
 
     let mut telem_motor: usize = 0;
     let mut dshot_throttle: [u16; 4] = [0; 4];
+    let mut armed = false;
     // --- Bidirectional DShot frame loop ---
     loop {
-        if let Either::First(ActuatorMotors { motor_commands, .. }) =
-            select(ACTUATOR_MOTORS.wait(), Timer::after_micros(1)).await
-        {
-            dshot_throttle = motor_commands.map(|nrm| {
-                let nrm = nrm.value();
-                if nrm < 1e-6 {
-                    DSHOT_CMD_MOTOR_STOP
+        // Check for arm state changes (non-blocking)
+        if let Some(arm_msg) = ARM_STATE.try_take() {
+            if arm_msg.armed != armed {
+                armed = arm_msg.armed;
+                if armed {
+                    defmt::info!("DShot: ARMED — motors enabled");
                 } else {
-                    let range = (DSHOT_MAX_THROTTLE - DSHOT_MIN_THROTTLE) as f32;
-                    (nrm * range) as u16 + DSHOT_MIN_THROTTLE
+                    defmt::info!("DShot: DISARMED — motors stopped");
+                    dshot_throttle = [DSHOT_CMD_MOTOR_STOP; 4];
                 }
-            });
+            }
+        }
+
+        if armed {
+            if let Either::First(ActuatorMotors { motor_commands, .. }) =
+                select(ACTUATOR_MOTORS.wait(), Timer::after_micros(1)).await
+            {
+                dshot_throttle = motor_commands.map(|nrm| {
+                    let nrm = nrm.value();
+                    if nrm < 1e-6 {
+                        DSHOT_CMD_MOTOR_STOP
+                    } else {
+                        let range = (DSHOT_MAX_THROTTLE - DSHOT_MIN_THROTTLE) as f32;
+                        (nrm * range) as u16 + DSHOT_MIN_THROTTLE
+                    }
+                });
+            }
+        } else {
+            dshot_throttle = [DSHOT_CMD_MOTOR_STOP; 4];
         }
 
         // ======================== A: Output DShot frame ========================

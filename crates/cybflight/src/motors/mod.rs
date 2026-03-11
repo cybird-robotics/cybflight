@@ -10,6 +10,9 @@ use embassy_sync::signal::Signal;
 /// Default: DSHOT_MIN_THROTTLE (arm/idle). 0 = MOTOR_STOP command.
 pub static ACTUATOR_MOTORS: Signal<CriticalSectionRawMutex, msgs::ActuatorMotors> = Signal::new();
 
+/// Arm/disarm state from RC input. DShot task sends MOTOR_STOP when disarmed.
+pub static ARM_STATE: Signal<CriticalSectionRawMutex, msgs::ArmDisarm> = Signal::new();
+
 // DShot600 bit timing (at 12 MHz effective timer clock, 20 ticks/bit)
 pub const DSHOT600_BIT_0: u32 = 7; // 35% duty
 pub const DSHOT600_BIT_1: u32 = 14; // 70% duty

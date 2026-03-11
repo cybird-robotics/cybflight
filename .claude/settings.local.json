@@ -3,6 +3,9 @@
     "allow": [
       "Bash(cargo build:*)",
       "Bash(grep:*)",
+      "Bash(fd:*)",
+      "Bash(rg:*)",
+      "Bash(fzf:*)",
       "WebSearch"
     ]
   }

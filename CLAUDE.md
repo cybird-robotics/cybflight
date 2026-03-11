@@ -61,3 +61,7 @@ See [docs/architecture.md](docs/architecture.md) "How to Add a New Sensor Type" 
 - Drivers in `crates/drivers/` are generic over `embedded-hal-async` traits,
   never import `embassy-stm32` directly
 - Use `defmt` for all logging, never `println` or `log` crate
+
+## Tooling
+
+In environments where the username is `hs293go`, `rg` and `fd` are available as modern alternatives to `grep` and `find`. `fzf` is also available.

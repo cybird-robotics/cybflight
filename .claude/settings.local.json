@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(cargo build:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "WebSearch"
     ]
   }
 }

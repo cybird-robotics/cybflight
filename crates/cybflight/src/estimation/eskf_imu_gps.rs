@@ -13,7 +13,6 @@
 
 use core::f64::consts::PI;
 
-use cybflight_core::eskf::{Eskf, EskfConfig};
 use embassy_futures::select::{Either3, select3};
 use embassy_sync::pubsub::WaitResult;
 use embassy_time::{Duration, Instant};
@@ -29,10 +28,6 @@ pub async fn estimation_task() {
     let mut gps_sub = sensors::GPS_FIX.subscriber().unwrap();
     let mut baro_sub = sensors::BARO_1.subscriber().unwrap();
     let odom_pub = sensors::VEHICLE_ODOMETRY.immediate_publisher();
-
-    // Declare Eskf before first await so it lives in the task's static Future
-    // storage, not on a transient stack frame.
-    let mut eskf = Eskf::new(EskfConfig::default());
 
     // --- Phase 1A: Init — get baro baseline ---
     let baro_ref_pa: f32 = loop {
@@ -91,54 +86,46 @@ pub async fn estimation_task() {
         }
     };
 
-    // --- Phase 1E: Compute orientation and biases ---
-    let roll = libm::atan2f(accel_avg.y, accel_avg.z);
-    let pitch = libm::atan2f(
+    // --- Phase 1E: Compute roll/pitch from gravity for initial status ---
+    let roll_init = libm::atan2f(accel_avg.y, accel_avg.z);
+    let pitch_init = libm::atan2f(
         -accel_avg.x,
         libm::sqrtf(accel_avg.y * accel_avg.y + accel_avg.z * accel_avg.z),
     );
 
-    let yaw = 0.0_f32; // No magnetometer — GPS velocity will correct heading
-
-    let q_init: nalgebra::Unit<nalgebra::Quaternion<f32>> =
-        UnitQuaternion::from_euler_angles(roll, pitch, yaw);
-
-    let gyro_bias_init = gyro_avg;
-    let g_up = Vector3::new(0.0f32, 0.0, 9.81);
-    let accel_bias_init = accel_avg - q_init.inverse() * g_up;
-
-    eskf.init(Vector3::zeros(), q_init, gyro_bias_init, accel_bias_init);
     defmt::info!(
-        "ESKF init: roll={}° pitch={}° yaw={}°  gyro_bias={} accel_bias={}  origin lat={} lon={} alt={}m baro_ref={}Pa",
-        roll.to_degrees(),
-        pitch.to_degrees(),
-        yaw.to_degrees(),
-        gyro_bias_init,
-        accel_bias_init,
+        "Init: roll={}° pitch={}°  origin lat={} lon={} alt={}m baro_ref={}Pa",
+        roll_init.to_degrees(),
+        pitch_init.to_degrees(),
         lat0_deg as f32,
         lon0_deg as f32,
         alt0_m as f32,
         baro_ref_pa,
     );
 
-    // Seed Running status immediately after init so a shell query never sees a stale phase.
-    let gb = eskf.gyro_bias();
-    let ab = eskf.accel_bias();
     ESTIMATOR_STATUS.lock(|c| {
         c.set(EstimatorPhase::Running {
-            roll_deg: roll.to_degrees(),
-            pitch_deg: pitch.to_degrees(),
-            yaw_deg: yaw.to_degrees(),
+            roll_deg: roll_init.to_degrees(),
+            pitch_deg: pitch_init.to_degrees(),
+            yaw_deg: 0.0,
             pos: [0.0; 3],
             vel: [0.0; 3],
-            gyro_bias: [gb.x, gb.y, gb.z],
-            accel_bias: [ab.x, ab.y, ab.z],
+            gyro_bias: [0.0; 3],
+            accel_bias: [0.0; 3],
         })
     });
 
-    // --- Phase 2: Main estimation loop ---
-    let mut prev_imu_ts: Option<Instant> = None;
+    // --- Phase 2: Main loop — raw GPS pos + IMU tilt, no ESKF ---
     let mut imu_count: u32 = 0;
+    let mut roll_deg = roll_init.to_degrees();
+    let mut pitch_deg = pitch_init.to_degrees();
+    let mut gps_pos = [0.0f32; 3];
+    let mut gps_vel = [0.0f32; 3];
+
+    // Welford online variance for GPS ENU position (E, N, U).
+    let mut gps_n: u32 = 0;
+    let mut gps_mean = [0.0f32; 3];
+    let mut gps_m2 = [0.0f32; 3]; // sum of squared deviations
 
     loop {
         match select3(
@@ -152,47 +139,46 @@ pub async fn estimation_task() {
                 let sample = match result {
                     WaitResult::Message(m) => m,
                     WaitResult::Lagged(n) => {
-                        defmt::warn!("ESKF: dropped {} IMU samples", n);
-                        prev_imu_ts = None;
+                        defmt::warn!("estimation: dropped {} IMU samples", n);
                         continue;
                     }
                 };
 
-                let dt = prev_imu_ts.map_or(0.001_f32, |prev| {
-                    sample.timestamp.duration_since(prev).as_micros() as f32 / 1_000_000.0
-                });
-                prev_imu_ts = Some(sample.timestamp);
-
-                let ts_us = sample.timestamp.as_micros();
-                eskf.predict(sample.accel_m_s2, sample.gyro_rad_s, dt, ts_us);
+                let a = sample.accel_m_s2;
+                roll_deg = libm::atan2f(a.y, a.z).to_degrees();
+                pitch_deg = libm::atan2f(
+                    -a.x,
+                    libm::sqrtf(a.y * a.y + a.z * a.z),
+                )
+                .to_degrees();
 
                 imu_count = imu_count.wrapping_add(1);
                 if imu_count % 10 == 0 {
-                    let pos = eskf.position();
-                    let vel = eskf.velocity();
-                    let gb = eskf.gyro_bias();
-                    let ab = eskf.accel_bias();
-                    let (roll_r, pitch_r, yaw_r) = eskf.orientation().euler_angles();
                     ESTIMATOR_STATUS.lock(|c| {
                         c.set(EstimatorPhase::Running {
-                            roll_deg: roll_r.to_degrees(),
-                            pitch_deg: pitch_r.to_degrees(),
-                            yaw_deg: yaw_r.to_degrees(),
-                            pos: [pos.x, pos.y, pos.z],
-                            vel: [vel.x, vel.y, vel.z],
-                            gyro_bias: [gb.x, gb.y, gb.z],
-                            accel_bias: [ab.x, ab.y, ab.z],
+                            roll_deg,
+                            pitch_deg,
+                            yaw_deg: 0.0,
+                            pos: gps_pos,
+                            vel: gps_vel,
+                            gyro_bias: [0.0; 3],
+                            accel_bias: [0.0; 3],
                         })
                     });
+                    let q = UnitQuaternion::from_euler_angles(
+                        roll_deg.to_radians(),
+                        pitch_deg.to_radians(),
+                        0.0,
+                    );
                     odom_pub.publish_immediate(msgs::VehicleOdometry {
                         timestamp: Instant::now(),
                         pose: msgs::Pose {
-                            position: pos,
-                            orientation: eskf.orientation(),
+                            position: Vector3::new(gps_pos[0], gps_pos[1], gps_pos[2]),
+                            orientation: q,
                         },
                         twist: msgs::Twist {
-                            linear: vel,
-                            angular: sample.gyro_rad_s - gb,
+                            linear: Vector3::new(gps_vel[0], gps_vel[1], gps_vel[2]),
+                            angular: sample.gyro_rad_s,
                         },
                     });
                 }
@@ -204,8 +190,11 @@ pub async fn estimation_task() {
                     WaitResult::Lagged(_) => continue,
                 };
 
-                // Require at least a 2D fix with reasonable accuracy.
                 if fix.fix_type < 2 || fix.h_acc_mm > 5000 {
+                    defmt::warn!(
+                        "GPS rejected: fix_type={} h_acc={}mm",
+                        fix.fix_type, fix.h_acc_mm,
+                    );
                     continue;
                 }
 
@@ -213,30 +202,52 @@ pub async fn estimation_task() {
                 let east = ((fix.lon_deg - lon0_deg) * 111_320.0 * cos_lat0) as f32;
                 let north = ((fix.lat_deg - lat0_deg) * 111_320.0) as f32;
                 let up = (fix.alt_msl_mm as f64 / 1000.0 - alt0_m) as f32;
-                let pos = Vector3::new(east, north, up);
-
-                // Velocity is already in ENU [m/s] — converted in sensors/gps.rs.
                 let vel = fix.vel_enu_m_s;
+                gps_pos = [east, north, up];
+                gps_vel = [vel.x, vel.y, vel.z];
 
-                let pos_std = fix.h_acc_mm as f32 / 1000.0;
-                let vel_std = if fix.s_acc_m_s > 0.0 {
-                    fix.s_acc_m_s
-                } else {
-                    EskfConfig::default().vel_noise_std
-                };
+                // Log raw ENU position + quality indicators on every accepted fix.
+                // v_acc is intentionally separate — it is typically 3–5× worse than
+                // h_acc and explains large U errors during receiver warm-up.
+                // pdop < 2.0 is excellent, < 5.0 acceptable.
+                defmt::info!(
+                    "GPS fix#{} type={} sv={} | E={}mm N={}mm U={}mm | h_acc={}mm v_acc={}mm pdop={}",
+                    gps_n + 1,
+                    fix.fix_type,
+                    fix.num_sv,
+                    (east * 1000.0) as i32,
+                    (north * 1000.0) as i32,
+                    (up * 1000.0) as i32,
+                    fix.h_acc_mm,
+                    fix.v_acc_mm,
+                    fix.pdop,
+                );
 
-                let ts_us = fix.timestamp.as_micros();
-                eskf.update_gnss_delayed(pos, vel, pos_std, vel_std, ts_us);
+                // Welford update.
+                gps_n += 1;
+                for i in 0..3 {
+                    let delta = gps_pos[i] - gps_mean[i];
+                    gps_mean[i] += delta / gps_n as f32;
+                    let delta2 = gps_pos[i] - gps_mean[i];
+                    gps_m2[i] += delta * delta2;
+                }
+
+                if gps_n >= 2 {
+                    let std_mm = [
+                        (libm::sqrtf(gps_m2[0] / (gps_n - 1) as f32) * 1000.0) as i32,
+                        (libm::sqrtf(gps_m2[1] / (gps_n - 1) as f32) * 1000.0) as i32,
+                        (libm::sqrtf(gps_m2[2] / (gps_n - 1) as f32) * 1000.0) as i32,
+                    ];
+                    defmt::info!(
+                        "GPS pos std (n={}): E={}mm N={}mm U={}mm",
+                        gps_n, std_mm[0], std_mm[1], std_mm[2],
+                    );
+                }
             }
 
             Either3::Third(result) => {
-                let baro = match result {
-                    WaitResult::Message(m) => m,
-                    WaitResult::Lagged(_) => continue,
-                };
-                // Simple linear Pa → m conversion (≈1% error below 500 m AGL).
-                let rel_alt = (baro_ref_pa - baro.pressure_pa) / 12.01;
-                eskf.update_altitude(rel_alt);
+                // Baro received — no-op in passthrough mode.
+                let _ = result;
             }
         }
     }

@@ -6,7 +6,8 @@
       "Bash(fd:*)",
       "Bash(rg:*)",
       "Bash(fzf:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(git show:*)"
     ]
   }
 }

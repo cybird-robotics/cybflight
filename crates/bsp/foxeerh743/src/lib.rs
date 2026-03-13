@@ -160,6 +160,7 @@ pub struct SerialPins {
 
     pub usart2: hal::Peri<'static, hal::peripherals::USART2>,
     pub usart2_tx: hal::Peri<'static, hal::peripherals::PA2>,
+    pub usart2_rx: hal::Peri<'static, hal::peripherals::PA3>,
 
     pub uart4: hal::Peri<'static, hal::peripherals::UART4>,
     pub uart4_tx: hal::Peri<'static, hal::peripherals::PA0>,
@@ -364,6 +365,7 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
 
         usart2: p.USART2,
         usart2_tx: p.PA2,
+        usart2_rx: p.PA3,
 
         uart4: p.UART4,
         uart4_tx: p.PA0,

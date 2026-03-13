@@ -142,7 +142,7 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
     }
 
     // --- SerialRx ---
-    // CRSF: full-duplex on USART1 (T1=PA9, R1=PA10)
+    // CRSF: full-duplex on USART2 (T2=PA2, R2=PA3)
     // GHST: half-duplex on USART2 TX pin (T2 pad = PA2)
     #[cfg(feature = "rx_crsf")]
     {
@@ -155,21 +155,21 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
         uart_config.baudrate = 420_000;
 
         match hal::usart::BufferedUart::new(
-            board.serial.usart1,
-            board.serial.usart1_rx,
-            board.serial.usart1_tx,
+            board.serial.usart2,
+            board.serial.usart2_rx,
+            board.serial.usart2_tx,
             tx_buf,
             rx_buf,
-            Usart1Irqs,
+            Usart2Irqs,
             uart_config,
         ) {
             Ok(uart) => {
-                defmt::info!("CRSF USART1 init OK");
+                defmt::info!("CRSF USART2 init OK (T2=PA2, R2=PA3)");
                 spawner
                     .spawn(crate::sensors::rc::crsf_runner::crsf_task(uart))
                     .unwrap_or_else(|e| defmt::error!("Failed to spawn CRSF task: {}", e));
             }
-            Err(e) => defmt::error!("CRSF USART1 init failed: {}", e),
+            Err(e) => defmt::error!("CRSF USART2 init failed: {}", e),
         }
     }
 

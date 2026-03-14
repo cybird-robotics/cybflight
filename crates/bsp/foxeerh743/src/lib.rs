@@ -6,7 +6,7 @@ use hal::exti;
 use hal::gpio::{Level, Output, Pull, Speed};
 use hal::{bind_interrupts, Config, Peripherals};
 
-pub use bsp_types::{DmaHint, MotorMeta, SensorAlign, SerialPortId, SerialRole, TimerChannel, TimerId};
+pub use bsp_types::{DmaHint, MotorMeta, SensorAlign, SerialPortId, TimerChannel, TimerId};
 pub use cybflight_drivers::beeper::Beeper;
 
 /// Board name from Betaflight target.
@@ -26,9 +26,10 @@ pub const HAS_GPS: bool = true;
 pub const HAS_SDCARD: bool = false;
 pub const LED_COUNT: usize = 1;
 
-pub const DEFAULT_SERIAL_ROLE_MAP: &[(SerialRole, SerialPortId)] = &[
-    (SerialRole::SerialRx, SerialPortId::Usart1),
-];
+/// Serial port role assignments — the single place to reassign a role to a different UART.
+/// Changing one constant here is the only edit needed to move that role to a different port.
+pub const PORT_SERIAL_RX: SerialPortId = SerialPortId::Usart2;
+pub const PORT_GPS: SerialPortId = SerialPortId::Uart4;
 
 /// Sensor identities from Betaflight header.
 pub mod sensors {

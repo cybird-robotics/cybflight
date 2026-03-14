@@ -27,19 +27,13 @@ use hal::spi::{self, Spi};
 use hal::time::Hertz;
 use hal::timer::low_level::Timer as LLTimer;
 
-// Bind USART1 interrupt for SerialRx (CRSF) — BF default: SERIALRX_UART = USART1
-hal::bind_interrupts!(struct Usart1Irqs {
+// Single interrupt struct covering all serial UARTs used as role candidates.
+// board_init dispatches based on bsp::PORT_SERIAL_RX / bsp::PORT_GPS; LLVM
+// eliminates dead arms since the discriminants are compile-time constants.
+hal::bind_interrupts!(struct SerialIrqs {
     USART1 => hal::usart::BufferedInterruptHandler<hal::peripherals::USART1>;
-});
-
-// Bind USART2 interrupt for SerialRx (GHST half-duplex on T2 pad = PA2)
-hal::bind_interrupts!(struct Usart2Irqs {
     USART2 => hal::usart::BufferedInterruptHandler<hal::peripherals::USART2>;
-});
-
-// Bind UART4 interrupt for GPS
-hal::bind_interrupts!(struct Uart4Irqs {
-    UART4 => hal::usart::BufferedInterruptHandler<hal::peripherals::UART4>;
+    UART4  => hal::usart::BufferedInterruptHandler<hal::peripherals::UART4>;
 });
 
 // Bind I2C1 interrupts for DPS310 baro + QMC5883L external mag
@@ -141,103 +135,143 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
         }
     }
 
-    // --- SerialRx ---
-    // CRSF: full-duplex on USART2 (T2=PA2, R2=PA3)
-    // GHST: half-duplex on USART2 TX pin (T2 pad = PA2)
+    static TX_BUF: StaticCell<[u8; 128]> = StaticCell::new();
+    static RX_BUF: StaticCell<[u8; 128]> = StaticCell::new();
+    let tx_buf = &mut TX_BUF.init([0u8; 128])[..];
+    let rx_buf = &mut RX_BUF.init([0u8; 128])[..];
+    let mut rc_uart_cfg = hal::usart::Config::default();
+    rc_uart_cfg.baudrate = 420_000;
+
+    // --- SerialRx: bsp::PORT_SERIAL_RX selects the UART. ---
+    // To move SerialRx to USART1: change PORT_SERIAL_RX in bsp/foxeerh743/src/lib.rs.
+    // LLVM eliminates the dead match arms since PORT_SERIAL_RX is a compile-time constant.
     #[cfg(feature = "rx_crsf")]
-    {
-        static TX_BUF: StaticCell<[u8; 128]> = StaticCell::new();
-        static RX_BUF: StaticCell<[u8; 128]> = StaticCell::new();
-        let tx_buf = &mut TX_BUF.init([0u8; 128])[..];
-        let rx_buf = &mut RX_BUF.init([0u8; 128])[..];
-
-        let mut uart_config = hal::usart::Config::default();
-        uart_config.baudrate = 420_000;
-
-        match hal::usart::BufferedUart::new(
-            board.serial.usart2,
-            board.serial.usart2_rx,
-            board.serial.usart2_tx,
-            tx_buf,
-            rx_buf,
-            Usart2Irqs,
-            uart_config,
-        ) {
-            Ok(uart) => {
-                defmt::info!("CRSF USART2 init OK (T2=PA2, R2=PA3)");
-                spawner
-                    .spawn(crate::sensors::rc::crsf_runner::crsf_task(uart))
-                    .unwrap_or_else(|e| defmt::error!("Failed to spawn CRSF task: {}", e));
+    match bsp::PORT_SERIAL_RX {
+        bsp::SerialPortId::Usart2 => {
+            match hal::usart::BufferedUart::new(
+                board.serial.usart2,
+                board.serial.usart2_rx,
+                board.serial.usart2_tx,
+                tx_buf,
+                rx_buf,
+                SerialIrqs,
+                rc_uart_cfg,
+            ) {
+                Ok(uart) => {
+                    defmt::info!("CRSF USART2 init OK (T2=PA2, R2=PA3)");
+                    spawner
+                        .spawn(crate::sensors::rc::crsf_runner::crsf_task(uart))
+                        .unwrap_or_else(|e| defmt::error!("Failed to spawn CRSF task: {}", e));
+                }
+                Err(e) => defmt::error!("CRSF USART2 init failed: {}", e),
             }
-            Err(e) => defmt::error!("CRSF USART2 init failed: {}", e),
         }
+        bsp::SerialPortId::Usart1 => {
+            match hal::usart::BufferedUart::new(
+                board.serial.usart1,
+                board.serial.usart1_rx,
+                board.serial.usart1_tx,
+                tx_buf,
+                rx_buf,
+                SerialIrqs,
+                rc_uart_cfg,
+            ) {
+                Ok(uart) => {
+                    defmt::info!("CRSF USART1 init OK (T1=PA9, R1=PA10)");
+                    spawner
+                        .spawn(crate::sensors::rc::crsf_runner::crsf_task(uart))
+                        .unwrap_or_else(|e| defmt::error!("Failed to spawn CRSF task: {}", e));
+                }
+                Err(e) => defmt::error!("CRSF USART1 init failed: {}", e),
+            }
+        }
+        _ => defmt::warn!("CRSF: PORT_SERIAL_RX is not a supported SerialRx port on this board"),
     }
 
     #[cfg(feature = "rx_ghst")]
-    {
-        static TX_BUF: StaticCell<[u8; 128]> = StaticCell::new();
-        static RX_BUF: StaticCell<[u8; 128]> = StaticCell::new();
-        let tx_buf = &mut TX_BUF.init([0u8; 128])[..];
-        let rx_buf = &mut RX_BUF.init([0u8; 128])[..];
-
-        let mut uart_config = hal::usart::Config::default();
-        uart_config.baudrate = 420_000;
-
-        match hal::usart::BufferedUart::new_half_duplex(
-            board.serial.usart2,
-            board.serial.usart2_tx,
-            Usart2Irqs,
-            tx_buf,
-            rx_buf,
-            uart_config,
-            hal::usart::HalfDuplexReadback::NoReadback,
-        ) {
-            Ok(uart) => {
-                defmt::info!("GHST USART2 half-duplex init OK (T2 pad = PA2)");
-                spawner
-                    .spawn(crate::sensors::rc::ghst_runner::ghst_task(uart))
-                    .unwrap_or_else(|e| defmt::error!("Failed to spawn GHST task: {}", e));
+    match bsp::PORT_SERIAL_RX {
+        bsp::SerialPortId::Usart2 => {
+            match hal::usart::BufferedUart::new_half_duplex(
+                board.serial.usart2,
+                board.serial.usart2_tx,
+                SerialIrqs,
+                tx_buf,
+                rx_buf,
+                rc_uart_cfg,
+                hal::usart::HalfDuplexReadback::NoReadback,
+            ) {
+                Ok(uart) => {
+                    defmt::info!("GHST USART2 half-duplex init OK (T2 pad = PA2)");
+                    spawner
+                        .spawn(crate::sensors::rc::ghst_runner::ghst_task(uart))
+                        .unwrap_or_else(|e| defmt::error!("Failed to spawn GHST task: {}", e));
+                }
+                Err(e) => defmt::error!("GHST USART2 init failed: {}", e),
             }
-            Err(e) => defmt::error!("GHST USART2 init failed: {}", e),
         }
+        bsp::SerialPortId::Usart1 => {
+            match hal::usart::BufferedUart::new_half_duplex(
+                board.serial.usart1,
+                board.serial.usart1_tx,
+                SerialIrqs,
+                tx_buf,
+                rx_buf,
+                rc_uart_cfg,
+                hal::usart::HalfDuplexReadback::NoReadback,
+            ) {
+                Ok(uart) => {
+                    defmt::info!("GHST USART1 half-duplex init OK (T1 pad = PA9)");
+                    spawner
+                        .spawn(crate::sensors::rc::ghst_runner::ghst_task(uart))
+                        .unwrap_or_else(|e| defmt::error!("Failed to spawn GHST task: {}", e));
+                }
+                Err(e) => defmt::error!("GHST USART1 init failed: {}", e),
+            }
+        }
+        _ => defmt::warn!("GHST: PORT_SERIAL_RX is not a supported SerialRx port on this board"),
     }
 
-    // --- GPS: u-blox M10 on UART4 (PA0 TX, PA1 RX) at 38400 baud ---
-    defmt::info!("GPS: starting UART4 init");
-    {
-        static GPS_TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-        static GPS_RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-        let tx_buf = &mut GPS_TX_BUF.init([0u8; 256])[..];
-        let rx_buf = &mut GPS_RX_BUF.init([0u8; 256])[..];
-
-        let mut uart_config = hal::usart::Config::default();
-        uart_config.baudrate = 115_200;
-
-        match hal::usart::BufferedUart::new(
-            board.serial.uart4,
-            board.serial.uart4_rx,
-            board.serial.uart4_tx,
-            tx_buf,
-            rx_buf,
-            Uart4Irqs,
-            uart_config,
-        ) {
-            Ok(uart) => {
-                defmt::info!("GPS: UART4 OK, sending CFG-VALSET...");
-                let mut delay = embassy_time::Delay;
-                match with_timeout(Duration::from_secs(3), UbloxM10::new(uart, &mut delay)).await {
-                    Ok(Ok(gps)) => {
-                        defmt::info!("GPS u-blox M10 init OK");
-                        spawner
-                            .spawn(crate::sensors::gps::ublox_gps_task(GpsRunner::new(gps)))
-                            .unwrap_or_else(|e| defmt::error!("Failed to spawn GPS task: {}", e));
+    // --- GPS: bsp::PORT_GPS selects the UART. ---
+    match bsp::PORT_GPS {
+        bsp::SerialPortId::Uart4 => {
+            defmt::info!("GPS: starting UART4 init");
+            static GPS_TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+            static GPS_RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+            let tx_buf = &mut GPS_TX_BUF.init([0u8; 256])[..];
+            let rx_buf = &mut GPS_RX_BUF.init([0u8; 256])[..];
+            let mut uart_config = hal::usart::Config::default();
+            uart_config.baudrate = 115_200;
+            match hal::usart::BufferedUart::new(
+                board.serial.uart4,
+                board.serial.uart4_rx,
+                board.serial.uart4_tx,
+                tx_buf,
+                rx_buf,
+                SerialIrqs,
+                uart_config,
+            ) {
+                Ok(uart) => {
+                    defmt::info!("GPS: UART4 OK, sending CFG-VALSET...");
+                    let mut delay = embassy_time::Delay;
+                    match with_timeout(Duration::from_secs(3), UbloxM10::new(uart, &mut delay))
+                        .await
+                    {
+                        Ok(Ok(gps)) => {
+                            defmt::info!("GPS u-blox M10 init OK");
+                            spawner
+                                .spawn(crate::sensors::gps::ublox_gps_task(GpsRunner::new(gps)))
+                                .unwrap_or_else(|e| {
+                                    defmt::error!("Failed to spawn GPS task: {}", e)
+                                });
+                        }
+                        Ok(Err(e)) => defmt::warn!("GPS init failed: {}", e),
+                        Err(_) => defmt::warn!("GPS init timed out (no module?)"),
                     }
-                    Ok(Err(e)) => defmt::warn!("GPS init failed: {}", e),
-                    Err(_) => defmt::warn!("GPS init timed out (no module?)"),
                 }
+                Err(e) => defmt::error!("GPS UART4 init failed: {}", e),
             }
-            Err(e) => defmt::error!("GPS UART4 init failed: {}", e),
         }
+        _ => defmt::warn!("GPS: PORT_GPS is not a supported GPS port on this board"),
     }
 
     // --- I2C1 shared bus (PB8 SCL, PB9 SDA) for DPS310 baro + QMC5883L ---
@@ -282,7 +316,10 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
         }
 
         // DPS310 barometer (addr 0x76) on same I2C1 bus
-        defmt::info!("I2C1: probing DPS310 at {:#x}...", bsp::sensors::BARO_1_I2C_ADDR);
+        defmt::info!(
+            "I2C1: probing DPS310 at {:#x}...",
+            bsp::sensors::BARO_1_I2C_ADDR
+        );
         let mut probe_dev = I2cDevice::new(i2c1_bus);
         if Dps310::probe_i2c(&mut probe_dev, bsp::sensors::BARO_1_I2C_ADDR).await {
             defmt::info!("I2C1: DPS310 found, initializing...");
@@ -303,7 +340,10 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                 Err(e) => defmt::warn!("DPS310 (I2C) init failed: {}", e),
             }
         } else {
-            defmt::warn!("DPS310 not detected on I2C1 (addr {:#x})", bsp::sensors::BARO_1_I2C_ADDR);
+            defmt::warn!(
+                "DPS310 not detected on I2C1 (addr {:#x})",
+                bsp::sensors::BARO_1_I2C_ADDR
+            );
         }
     }
 

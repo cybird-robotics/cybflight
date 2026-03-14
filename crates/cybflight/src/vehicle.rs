@@ -1,47 +1,66 @@
-use cybflight_core::vehicle_model::VehicleModel;
-use nalgebra as na;
+use cybflight_core::mixer::{
+    LinearAllocator, MotorEffectiveness, MotorParams, RigidBodyParams, SpinDir,
+};
 
-pub struct QuadrotorModel {}
+// ---------------------------------------------------------------------------
+// Quadrotor physical parameters — Betaflight QuadX motor ordering, FLU frame.
+//
+// Body frame: FLU (Forward-Left-Up): x = forward, y = left, z = up.
+//
+// Motor index convention (Betaflight QuadX):
+//   0 = REAR_RIGHT  (CW  from above) — position (−d, −d): rear and right = negative y
+//   1 = FRONT_RIGHT (CCW from above) — position (+d, −d)
+//   2 = REAR_LEFT   (CCW from above) — position (−d, +d): left = positive y
+//   3 = FRONT_LEFT  (CW  from above) — position (+d, +d)
+//
+// Arm length 100 mm at 45° → motor offset d = 0.1 / √2 ≈ 70.7 mm.
+// ---------------------------------------------------------------------------
 
-impl VehicleModel for QuadrotorModel {
-    type Scalar = f32;
+const D: f32 = 0.070_71; // motor offset [m] = arm / √2
 
-    fn mass(&self) -> f32 {
-        1.5
-    }
+pub const QUADROTOR_BODY: RigidBodyParams = RigidBodyParams {
+    mass_kg: 1.5,
+    // Diagonal inertia [Ixx, Ixy, Ixz, Iyx, Iyy, Iyz, Izx, Izy, Izz] (kg·m²).
+    // Roll/pitch symmetric (Ixx = Iyy = 0.02), yaw larger (Izz = 0.04).
+    // Calibrate from a bifilar pendulum test or CAD model.
+    inertia_kg_m2: [0.0025, 0.0, 0.0, 0.0, 0.0021, 0.0, 0.0, 0.0, 0.0043],
+};
 
-    fn inertia_ixx(&self) -> f32 {
-        0.02
-    }
+pub const QUADROTOR_MOTORS: [MotorParams; 4] = [
+    // M0: REAR_RIGHT — CW, position (−d, −d) in FLU (right = −y).
+    MotorParams {
+        position_m: [0.075, 0.1],
+        spin_dir: SpinDir::Cw,
+        max_thrust_n: 8.5, // ~600 g per motor for a 5" prop. Calibrate from test stand.
+        torque_coeff_m: 0.022,
+    },
+    // M1: FRONT_RIGHT — CCW, position (+d, −d) in FLU.
+    MotorParams {
+        position_m: [0.075, 0.1],
+        spin_dir: SpinDir::Ccw,
+        max_thrust_n: 8.5,
+        torque_coeff_m: 0.022,
+    },
+    // M2: REAR_LEFT — CCW, position (−d, +d) in FLU (left = +y).
+    MotorParams {
+        position_m: [0.075, 0.1],
+        spin_dir: SpinDir::Ccw,
+        max_thrust_n: 8.5,
+        torque_coeff_m: 0.022,
+    },
+    // M3: FRONT_LEFT — CW, position (+d, +d) in FLU.
+    MotorParams {
+        position_m: [0.075, 0.1],
+        spin_dir: SpinDir::Cw,
+        max_thrust_n: 8.5,
+        torque_coeff_m: 0.022,
+    },
+];
 
-    fn inertia_iyy(&self) -> f32 {
-        0.02
-    }
-
-    fn inertia_izz(&self) -> f32 {
-        0.04
-    }
-
-    fn front_motor_position(&self) -> na::Vector2<f32> {
-        na::Vector2::new(0.1, 0.1)
-    }
-
-    fn rear_motor_position(&self) -> na::Vector2<f32> {
-        na::Vector2::new(0.1, 0.1)
-    }
-
-    fn torque_constant(&self) -> f32 {
-        0.01
-    }
-
-    fn motor_time_constant_up(&self) -> f32 {
-        0.02
-    }
-
-    fn max_thrust_per_motor(&self) -> f32 {
-        // ~600 g thrust per motor for a 5" prop — placeholder, calibrate from test stand.
-        5.9
-    }
+/// Construct the quadrotor linear allocator.
+///
+/// Called once at firmware startup (e.g. in `board_init` or the attitude task).
+/// Panics at construction time if the motor geometry is degenerate.
+pub fn quadrotor_allocator() -> LinearAllocator<4> {
+    LinearAllocator::new(MotorEffectiveness::from_motors(&QUADROTOR_MOTORS))
 }
-
-pub static QUADROTOR: QuadrotorModel = QuadrotorModel {};

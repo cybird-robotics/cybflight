@@ -1,4 +1,5 @@
 pub mod attitude_control;
+pub mod failsafe;
 pub mod nmpc_driver;
 pub mod rc_interpreter;
 

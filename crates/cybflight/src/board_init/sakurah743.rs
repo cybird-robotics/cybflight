@@ -91,7 +91,7 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
             defmt::info!("IMU1 init OK");
             spawner
                 .spawn(icm_reader_task(
-                    ImuReader::new(imu1, board.sensors.gyro1_align, 80.0, 200.0),
+                    ImuReader::new(imu1, board.sensors.gyro1_align, 80.0, 200.0, Some(&crate::sensors::GYRO_CALIBRATED)),
                     &crate::sensors::IMU_1,
                 ))
                 .unwrap_or_else(|e| defmt::error!("Failed to spawn IMU1 reader task: {}", e));
@@ -377,7 +377,7 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                 defmt::info!("IMU2 (IIM42652) init OK");
                 spawner
                     .spawn(icm_reader_task(
-                        ImuReader::new(imu2, board.sensors.gyro2_align, 80.0, 200.0),
+                        ImuReader::new(imu2, board.sensors.gyro2_align, 80.0, 200.0, None),
                         &crate::sensors::IMU_2,
                     ))
                     .unwrap_or_else(|e| defmt::error!("Failed to spawn IMU2 reader task: {}", e));

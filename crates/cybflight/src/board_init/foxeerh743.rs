@@ -103,6 +103,7 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                                 board.sensors.gyro1_align,
                                 ACCEL_CUTOFF_HZ,
                                 GYRO_CUTOFF_HZ,
+                                Some(&crate::sensors::GYRO_CALIBRATED),
                             ),
                             &crate::sensors::IMU_1,
                         ))
@@ -122,6 +123,7 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                                 board.sensors.gyro1_align,
                                 ACCEL_CUTOFF_HZ,
                                 GYRO_CUTOFF_HZ,
+                                Some(&crate::sensors::GYRO_CALIBRATED),
                             ),
                             &crate::sensors::IMU_1,
                         ))

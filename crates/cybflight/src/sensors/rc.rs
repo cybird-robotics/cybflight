@@ -3,35 +3,164 @@
 //! Each task reads frames from the UART, publishes RC channel data and link
 //! statistics to the pub/sub channels, and sends telemetry in the inter-frame gaps.
 
-use embassy_time::{Instant, Timer};
+use core::sync::atomic::Ordering;
+
+use embassy_time::Instant;
 
 use crate::hal;
 use crate::motors::ARM_STATE;
+use crate::sensors::GYRO_CALIBRATED;
+use crate::status;
 use cybflight_msgs as msgs;
 
 pub type RcUart = hal::usart::BufferedUart<'static>;
 
-/// RC arm channel index (0-based). Channel 6 on the transmitter.
-const ARM_CHANNEL: usize = 5;
-/// PWM threshold: armed when channel value exceeds this.
-const ARM_THRESHOLD: u16 = 1500;
+// ---------------------------------------------------------------------------
+// Arming parameters
+// ---------------------------------------------------------------------------
 
-fn publish_arm_state(channels: &[u16; 16], channel_count: u8, was_armed: &mut bool) {
-    if (channel_count as usize) <= ARM_CHANNEL {
-        return;
-    }
-    let armed = channels[ARM_CHANNEL] > ARM_THRESHOLD;
-    if armed != *was_armed {
-        *was_armed = armed;
-        if armed {
-            defmt::info!("RC: ARMED (ch6={})", channels[ARM_CHANNEL]);
-        } else {
-            defmt::info!("RC: DISARMED (ch6={})", channels[ARM_CHANNEL]);
+/// RC arm channel index (0-based). Channel 6 on the transmitter (AUX2).
+const ARM_CHANNEL: usize = 5;
+/// PWM threshold: armed when channel value exceeds this (µs).
+const ARM_THRESHOLD: u16 = 1500;
+/// Throttle channel index (AETR order: index 2 = throttle).
+const THROTTLE_CHANNEL: usize = 2;
+/// Throttle must be below this to arm (µs). Matches BF `rxConfig.mincheck` default.
+const THROTTLE_MINCHECK: u16 = 1050;
+/// Arm switch must be held for this long before arming (ms).
+/// BF does not debounce the arm switch; this is a cybflight safety addition.
+const ARM_SWITCH_HOLD_MS: u64 = 100;
+/// Minimum link quality to allow arming [0..100].
+const MIN_LINK_QUALITY: u8 = 50;
+/// Link stats older than this block arming (ms). Mirrors BF `ARMING_DISABLED_RX_FAILSAFE`.
+const LINK_STATS_MAX_AGE_MS: u64 = 500;
+
+// ---------------------------------------------------------------------------
+// Arming state machine
+// ---------------------------------------------------------------------------
+
+/// Arming state machine with debounce, throttle gate, and link quality gate.
+///
+/// Enforces three pre-conditions before allowing arm:
+/// 1. Throttle at minimum (BF: `ARMING_DISABLED_THROTTLE`, threshold = `mincheck`)
+/// 2. RC link active with acceptable quality (BF: `ARMING_DISABLED_RX_FAILSAFE`)
+/// 3. Arm switch held for debounce duration (cybflight safety addition)
+///
+/// Disarming via switch is always immediate (no debounce) for safety.
+struct ArmStateMachine {
+    armed: bool,
+    /// Timestamp when arm switch first entered "arm" position (for hold debounce).
+    switch_arm_start: Option<Instant>,
+    /// Last known link quality [0..100].
+    link_quality: u8,
+    /// Whether any link stats frame has been received.
+    link_active: bool,
+    /// Timestamp of the most recent link stats frame.
+    link_stats_time: Instant,
+}
+
+impl ArmStateMachine {
+    fn new() -> Self {
+        Self {
+            armed: false,
+            switch_arm_start: None,
+            link_quality: 0,
+            link_active: false,
+            link_stats_time: Instant::from_ticks(0),
         }
+    }
+
+    /// Feed latest link statistics. Call on every link-stats frame.
+    fn update_link(&mut self, quality: u8) {
+        self.link_quality = quality;
+        self.link_active = true;
+        self.link_stats_time = Instant::now();
+    }
+
+    /// Evaluate arm/disarm on each RC channel frame.
+    fn update_channels(&mut self, channels: &[u16; 16], channel_count: u8) {
+        if (channel_count as usize) <= ARM_CHANNEL {
+            return;
+        }
+
+        let now = Instant::now();
+        let switch_armed = channels[ARM_CHANNEL] > ARM_THRESHOLD;
+
+        // --- Disarm: always immediate, no gates ---
+        if !switch_armed {
+            self.switch_arm_start = None;
+            if self.armed {
+                self.armed = false;
+                defmt::info!(
+                    "DISARMED (ch{}={})",
+                    ARM_CHANNEL + 1,
+                    channels[ARM_CHANNEL]
+                );
+                ARM_STATE.signal(msgs::ArmDisarm {
+                    timestamp: now,
+                    armed: false,
+                });
+                status::STATUS
+                    .sender()
+                    .send(status::SystemStatus::Disarmed);
+            }
+            return;
+        }
+
+        // --- Switch is in arm position; check gates ---
+        if self.armed {
+            return; // already armed
+        }
+
+        // Gate 1: failsafe not active (BF: ARMING_DISABLED_FAILSAFE)
+        if crate::control::failsafe::FAILSAFE_ACTIVE.load(Ordering::Acquire) {
+            self.switch_arm_start = None;
+            return;
+        }
+
+        // Gate 2: gyro calibrated (BF: ARMING_DISABLED_GYRO_NOT_CALIBRATED)
+        if !GYRO_CALIBRATED.load(Ordering::Relaxed) {
+            self.switch_arm_start = None;
+            return;
+        }
+
+        // Gate 3: throttle at minimum (BF: ARMING_DISABLED_THROTTLE)
+        if channels[THROTTLE_CHANNEL] > THROTTLE_MINCHECK {
+            self.switch_arm_start = None;
+            return;
+        }
+
+        // Gate 4: link active & quality (BF: ARMING_DISABLED_RX_FAILSAFE)
+        if !self.link_active
+            || now.duration_since(self.link_stats_time).as_millis() > LINK_STATS_MAX_AGE_MS
+            || self.link_quality < MIN_LINK_QUALITY
+        {
+            self.switch_arm_start = None;
+            return;
+        }
+
+        // Gate 5: switch hold duration (debounce)
+        let start = *self.switch_arm_start.get_or_insert(now);
+        if now.duration_since(start).as_millis() < ARM_SWITCH_HOLD_MS {
+            return;
+        }
+
+        // All gates passed — arm
+        self.armed = true;
+        defmt::info!(
+            "ARMED (ch{}={}, throttle={}, lq={}%)",
+            ARM_CHANNEL + 1,
+            channels[ARM_CHANNEL],
+            channels[THROTTLE_CHANNEL],
+            self.link_quality,
+        );
         ARM_STATE.signal(msgs::ArmDisarm {
-            timestamp: Instant::now(),
-            armed,
+            timestamp: now,
+            armed: true,
         });
+        status::STATUS
+            .sender()
+            .send(status::SystemStatus::Armed);
     }
 }
 
@@ -68,7 +197,7 @@ pub mod crsf_runner {
         pub async fn run(&mut self) -> ! {
             let rc_pub = super::super::RC_INPUT.immediate_publisher();
             let link_pub = super::super::RC_LINK_STATUS.immediate_publisher();
-            let mut was_armed = false;
+            let mut arm = ArmStateMachine::new();
 
             loop {
                 match self.crsf.read_frame().await {
@@ -82,13 +211,14 @@ pub mod crsf_runner {
                                     channels: rc.channels,
                                     channel_count: rc.channel_count,
                                 });
-                                publish_arm_state(&rc.channels, rc.channel_count, &mut was_armed);
+                                arm.update_channels(&rc.channels, rc.channel_count);
 
                                 // Send one telemetry frame per RC frame received
                                 self.send_telemetry().await;
                             }
                             CrsfEvent::LinkStatistics(stats)
                             | CrsfEvent::LinkStatisticsTx(stats) => {
+                                arm.update_link(stats.link_quality);
                                 link_pub.publish_immediate(msgs::RcLinkStatus {
                                     timestamp: now,
                                     rssi_dbm: stats.rssi_dbm,
@@ -176,7 +306,7 @@ pub mod crsf_runner {
 pub mod ghst_runner {
     use super::*;
     use cybflight_drivers::rc::ghst::{Ghst, GhstEvent};
-    use embassy_time::{with_timeout, Duration};
+    use embassy_time::{with_timeout, Duration, Timer};
 
     /// GHST runner: reads frames, publishes channels/link stats, sends telemetry.
     pub struct GhstRunner {
@@ -200,7 +330,7 @@ pub mod ghst_runner {
         pub async fn run(&mut self) -> ! {
             let rc_pub = super::super::RC_INPUT.immediate_publisher();
             let link_pub = super::super::RC_LINK_STATUS.immediate_publisher();
-            let mut was_armed = false;
+            let mut arm = ArmStateMachine::new();
 
             let mut frame_count: u32 = 0;
             let mut err_count: u32 = 0;
@@ -271,7 +401,7 @@ pub mod ghst_runner {
                                     channels: rc.channels,
                                     channel_count: rc.channel_count,
                                 });
-                                publish_arm_state(&rc.channels, rc.channel_count, &mut was_armed);
+                                arm.update_channels(&rc.channels, rc.channel_count);
 
                                 // Guard delay: GHST requires 1ms minimum gap after
                                 // the last received byte before transmitting telemetry
@@ -280,6 +410,7 @@ pub mod ghst_runner {
                                 self.send_telemetry().await;
                             }
                             GhstEvent::RssiFrame(stats) => {
+                                arm.update_link(stats.link_quality);
                                 defmt::debug!(
                                     "GHST link: rssi={}dBm lq={}% rf_mode={}",
                                     stats.rssi_dbm,

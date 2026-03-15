@@ -3,7 +3,11 @@ use cybflight_core::{
     mixer::LinearAllocator,
 };
 use embassy_time::Instant;
-use nalgebra::{UnitQuaternion, Vector4};
+use nalgebra::{UnitQuaternion, Vector3, Vector4};
+
+/// If no MANUAL_CONTROL update for this long, zero thrust and rates.
+/// Defense-in-depth: catches stale RC data even if failsafe task is delayed.
+const RC_STALE_TIMEOUT_MS: u64 = 250;
 
 use crate::{
     motors::ACTUATOR_MOTORS,
@@ -39,6 +43,8 @@ impl<const N: usize> AttitudeControl<N> {
 
         // Normalized thrust [0, 1] from the RC interpreter.
         let mut thrust_normalized = 0.0_f32;
+        // Track when we last received a valid RC setpoint for stale-data detection.
+        let mut last_rc_time = Instant::now();
 
         loop {
             // Await the highest-rate input (IMU at 8 kHz) to drive the loop.
@@ -53,6 +59,12 @@ impl<const N: usize> AttitudeControl<N> {
                 att_ref.body_rate_rad_s =
                     [rc.roll_rate, rc.pitch_rate, rc.yaw_rate].into();
                 thrust_normalized = rc.thrust;
+                last_rc_time = Instant::now();
+            }
+
+            if Instant::now().duration_since(last_rc_time).as_millis() > RC_STALE_TIMEOUT_MS {
+                thrust_normalized = 0.0;
+                att_ref.body_rate_rad_s = Vector3::zeros();
             }
 
             let AttitudeControlOutput {

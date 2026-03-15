@@ -4,9 +4,14 @@ pub mod gps;
 pub mod imu;
 pub mod mag;
 pub mod rc;
+use core::sync::atomic::AtomicBool;
 use cybflight_msgs as msgs;
 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, pubsub::PubSubChannel};
+
+/// Set to `true` when primary gyro calibration completes.
+/// Checked by the arming state machine (mirrors BF `ARMING_DISABLED_GYRO_NOT_CALIBRATED`).
+pub static GYRO_CALIBRATED: AtomicBool = AtomicBool::new(false);
 
 // IMU 1: CAP=4 (small queue, fresh data preferred), SUBS=4 (attitude + telemetry + shell + spare), PUBS=1.
 pub static IMU_1: PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 4, 1> =

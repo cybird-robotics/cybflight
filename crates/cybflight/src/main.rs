@@ -28,7 +28,7 @@ async fn main(spawner: embassy_executor::Spawner) {
     defmt::info!("cybflight: {} starting", cybflight::bsp::BOARD_NAME);
     cybflight::status::STATUS
         .sender()
-        .send(cybflight::status::SystemStatus::Alive);
+        .send(cybflight::status::SystemStatus::Booting);
 
     // --- Start high-priority interrupt executor for DShot ---
     //
@@ -62,6 +62,10 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::control::rc_interpreter::rc_interpreter_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn RC interpreter task"));
+
+    spawner
+        .spawn(cybflight::control::failsafe::failsafe_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn failsafe task"));
 
     spawner
         .spawn(cybflight::usb_serial::imu1_stream_task())

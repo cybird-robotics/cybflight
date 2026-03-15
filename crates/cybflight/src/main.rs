@@ -51,14 +51,14 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::watchdog::iwdg_feed_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn IWDG feed task"));
-    spawner
-        .spawn(cybflight::sensors::attitude::mahony_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude task"));
-
-    spawner
-        .spawn(cybflight::control::nmpc_driver::nmpc_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn NMPC driver task"));
-
+    // spawner
+    //     .spawn(cybflight::sensors::attitude::mahony_task())
+    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude task"));
+    //
+    // spawner
+    //     .spawn(cybflight::control::nmpc_driver::nmpc_task())
+    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn NMPC driver task"));
+    //
     spawner
         .spawn(cybflight::control::rc_interpreter::rc_interpreter_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn RC interpreter task"));
@@ -87,21 +87,21 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::usb_serial::dshot_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn DShot stream task"));
-    spawner
-        .spawn(cybflight::usb_serial::gps_stream_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn GPS stream task"));
-    spawner
-        .spawn(cybflight::usb_serial::magext_stream_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn mag ext stream task"));
-    spawner
-        .spawn(cybflight::usb_serial::magint_stream_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn mag int stream task"));
-    spawner
-        .spawn(cybflight::usb_serial::baro1_stream_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn baro1 stream task"));
-    spawner
-        .spawn(cybflight::usb_serial::baro2_stream_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn baro2 stream task"));
+    // spawner
+    //     .spawn(cybflight::usb_serial::gps_stream_task())
+    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn GPS stream task"));
+    // spawner
+    //     .spawn(cybflight::usb_serial::magext_stream_task())
+    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn mag ext stream task"));
+    // spawner
+    //     .spawn(cybflight::usb_serial::magint_stream_task())
+    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn mag int stream task"));
+    // spawner
+    //     .spawn(cybflight::usb_serial::baro1_stream_task())
+    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn baro1 stream task"));
+    // spawner
+    //     .spawn(cybflight::usb_serial::baro2_stream_task())
+    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn baro2 stream task"));
     spawner
         .spawn(cybflight::usb_serial::attitude_control_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude control stream task"));

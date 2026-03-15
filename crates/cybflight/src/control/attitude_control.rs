@@ -27,7 +27,7 @@ impl<const N: usize> AttitudeControl<N> {
             ac: geometric_controller::GeometricAttitudeController::new(
                 Vector3::new(1.0, 1.0, 0.5),
                 Vector3::new(1.0, 1.0, 0.2),
-                Vector3::new(0.1, 0.1, 0.05),
+                Vector3::new(0.3, 0.25, 0.15),
             )
             .with_inertia(QUADROTOR_BODY.inertia_matrix()),
             allocator,

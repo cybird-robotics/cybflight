@@ -66,7 +66,7 @@ impl ArmStateMachine {
             switch_arm_start: None,
             link_quality: 0,
             link_active: false,
-            link_stats_time: Instant::from_ticks(0),
+            link_stats_time: Instant::now(),
         }
     }
 

@@ -37,6 +37,15 @@ impl ChannelCalibration {
             invert: false,
         }
     }
+    pub fn centered_inverted(index: usize) -> Self {
+        Self {
+            index,
+            min: 988,
+            max: 2012,
+            center: 1500,
+            invert: true,
+        }
+    }
 
     pub fn throttle(index: usize) -> Self {
         Self {
@@ -60,10 +69,18 @@ impl ChannelCalibration {
             // Centered stick: [-1, 1]
             if value >= self.center {
                 let half = (self.max - self.center) as f32;
-                if half <= 0.0 { 0.0 } else { (value - self.center) as f32 / half }
+                if half <= 0.0 {
+                    0.0
+                } else {
+                    (value - self.center) as f32 / half
+                }
             } else {
                 let half = (self.center - self.min) as f32;
-                if half <= 0.0 { 0.0 } else { (value - self.center) as f32 / half }
+                if half <= 0.0 {
+                    0.0
+                } else {
+                    (value - self.center) as f32 / half
+                }
             }
         };
         let v = if self.invert { -v } else { v };
@@ -94,7 +111,11 @@ impl Default for ChannelSetting {
 
 impl ChannelSetting {
     pub fn new(rate: f32, expo: f32, deadband: f32) -> Self {
-        Self { rate, expo, deadband }
+        Self {
+            rate,
+            expo,
+            deadband,
+        }
     }
 
     pub fn apply(&self, x: f32) -> f32 {
@@ -161,31 +182,35 @@ pub struct RcSettings {
 impl RcMapper {
     /// Create a mapper with AETR channel order (typical for CRSF/GHST).
     /// Channels: 0=Roll, 1=Pitch, 2=Throttle, 3=Yaw.
+    /// Yaw is inverted: stick-left (low PWM) → positive yaw (CCW in FLU).
     pub fn aetr(settings: RcSettings) -> Self {
         Self {
             roll: ChannelCalibration::centered(0),
             pitch: ChannelCalibration::centered(1),
             throttle: ChannelCalibration::throttle(2),
-            yaw: ChannelCalibration::centered(3),
+            yaw: ChannelCalibration::centered_inverted(3),
             settings,
         }
     }
 
     /// Create a mapper with TAER channel order.
     /// Channels: 0=Throttle, 1=Roll, 2=Pitch, 3=Yaw.
+    /// Yaw is inverted: stick-left (low PWM) → positive yaw (CCW in FLU).
     pub fn taer(settings: RcSettings) -> Self {
         Self {
             throttle: ChannelCalibration::throttle(0),
             roll: ChannelCalibration::centered(1),
             pitch: ChannelCalibration::centered(2),
-            yaw: ChannelCalibration::centered(3),
+            yaw: ChannelCalibration::centered_inverted(3),
             settings,
         }
     }
 
     /// Map raw RC channels to thrust + rates.
     pub fn map(&self, channels: &[u16; 16]) -> ThrustRates {
-        let thr_norm = self.throttle.normalize(channels[self.throttle.index] as i16);
+        let thr_norm = self
+            .throttle
+            .normalize(channels[self.throttle.index] as i16);
         let roll_norm = self.roll.normalize(channels[self.roll.index] as i16);
         let pitch_norm = self.pitch.normalize(channels[self.pitch.index] as i16);
         let yaw_norm = self.yaw.normalize(channels[self.yaw.index] as i16);

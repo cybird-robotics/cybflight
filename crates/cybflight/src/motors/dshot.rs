@@ -116,8 +116,8 @@ pub async fn dshot_task(
                 // When armed, 0.0 maps to DSHOT_IDLE_THROTTLE (not MOTOR_STOP).
                 // Only the disarm path sends MOTOR_STOP.
                 dshot_throttle = motor_commands.map(|nrm| {
-                    let raw = (nrm.value() * DSHOT_THROTTLE_RANGE as f32) as u16
-                        + DSHOT_MIN_THROTTLE;
+                    let raw =
+                        (nrm.value() * DSHOT_THROTTLE_RANGE as f32) as u16 + DSHOT_MIN_THROTTLE;
                     raw.max(DSHOT_IDLE_THROTTLE)
                 });
             }
@@ -126,13 +126,12 @@ pub async fn dshot_task(
         }
 
         defmt::debug!(
-            "DShot throttles: M0={} M1={} M2={} M3={}",
+            "DShot throttles: M1={} M2={} M3={} M4={}",
             dshot_throttle[0],
             dshot_throttle[1],
             dshot_throttle[2],
             dshot_throttle[3]
         );
-
 
         // ======================== A: Output DShot frame ========================
         let mut bufs = [[0u32; DSHOT_DMA_BUFFER_SIZE]; 4];

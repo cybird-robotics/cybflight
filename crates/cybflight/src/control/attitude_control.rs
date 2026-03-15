@@ -13,7 +13,7 @@ use crate::{
     motors::ACTUATOR_MOTORS,
     msgs,
     sensors::{self, MANUAL_CONTROL},
-    vehicle::quadrotor_allocator,
+    vehicle::{self, quadrotor_allocator, QUADROTOR_BODY},
 };
 
 pub struct AttitudeControl<const N: usize> {
@@ -24,7 +24,12 @@ pub struct AttitudeControl<const N: usize> {
 impl<const N: usize> AttitudeControl<N> {
     pub fn new(allocator: LinearAllocator<N>) -> Self {
         Self {
-            ac: geometric_controller::GeometricAttitudeController::default(),
+            ac: geometric_controller::GeometricAttitudeController::new(
+                Vector3::new(1.0, 1.0, 0.5),
+                Vector3::new(1.0, 1.0, 0.2),
+                Vector3::new(0.1, 0.1, 0.05),
+            )
+            .with_inertia(QUADROTOR_BODY.inertia_matrix()),
             allocator,
         }
     }
@@ -56,8 +61,7 @@ impl<const N: usize> AttitudeControl<N> {
                 state.attitude_quaternion = att.orientation;
             }
             while let Some(rc) = rc_sub.try_next_message_pure() {
-                att_ref.body_rate_rad_s =
-                    [rc.roll_rate, rc.pitch_rate, rc.yaw_rate].into();
+                att_ref.body_rate_rad_s = [rc.roll_rate, rc.pitch_rate, rc.yaw_rate].into();
                 thrust_normalized = rc.thrust;
                 last_rc_time = Instant::now();
             }

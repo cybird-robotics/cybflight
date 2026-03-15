@@ -10,6 +10,13 @@ use cybflight_drivers::dshot::{
     gcr, telemetry, DSHOT600_GCR_TICKS_PER_BIT, DSHOT_CMD_MOTOR_STOP, DSHOT_DMA_BUFFER_SIZE,
     DSHOT_MAX_THROTTLE, DSHOT_MIN_THROTTLE, MAX_GCR_EDGES, MIN_GCR_EDGES,
 };
+
+const DSHOT_THROTTLE_RANGE: u16 = DSHOT_MAX_THROTTLE - DSHOT_MIN_THROTTLE;
+/// Minimum DShot throttle sent when motors are armed and controller commands
+/// a non-zero output. Prevents motor stall at very low throttle.
+/// 0.5% of throttle range ≈ 10 DShot steps above DSHOT_MIN_THROTTLE.
+const DSHOT_IDLE_THROTTLE: u16 = DSHOT_MIN_THROTTLE + (DSHOT_THROTTLE_RANGE / 20);
+
 use cybflight_msgs::{ActuatorMotors, DshotMotorTelemetry, DshotTelemetry};
 use embassy_futures::join::join4;
 use embassy_futures::select::{select, Either};
@@ -106,19 +113,26 @@ pub async fn dshot_task(
             if let Either::First(ActuatorMotors { motor_commands, .. }) =
                 select(ACTUATOR_MOTORS.wait(), Timer::after_micros(1)).await
             {
+                // When armed, 0.0 maps to DSHOT_IDLE_THROTTLE (not MOTOR_STOP).
+                // Only the disarm path sends MOTOR_STOP.
                 dshot_throttle = motor_commands.map(|nrm| {
-                    let nrm = nrm.value();
-                    if nrm < 1e-6 {
-                        DSHOT_CMD_MOTOR_STOP
-                    } else {
-                        let range = (DSHOT_MAX_THROTTLE - DSHOT_MIN_THROTTLE) as f32;
-                        (nrm * range) as u16 + DSHOT_MIN_THROTTLE
-                    }
+                    let raw = (nrm.value() * DSHOT_THROTTLE_RANGE as f32) as u16
+                        + DSHOT_MIN_THROTTLE;
+                    raw.max(DSHOT_IDLE_THROTTLE)
                 });
             }
         } else {
             dshot_throttle = [DSHOT_CMD_MOTOR_STOP; 4];
         }
+
+        defmt::debug!(
+            "DShot throttles: M0={} M1={} M2={} M3={}",
+            dshot_throttle[0],
+            dshot_throttle[1],
+            dshot_throttle[2],
+            dshot_throttle[3]
+        );
+
 
         // ======================== A: Output DShot frame ========================
         let mut bufs = [[0u32; DSHOT_DMA_BUFFER_SIZE]; 4];

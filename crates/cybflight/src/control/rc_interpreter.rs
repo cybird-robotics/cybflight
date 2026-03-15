@@ -15,9 +15,9 @@ use crate::sensors::{MANUAL_CONTROL, RC_INPUT};
 /// Throttle: linear, full range.
 fn default_acro_settings() -> RcSettings {
     RcSettings {
-        roll: ChannelSetting::new(core::f32::consts::PI / 180.0 * 800.0, 0.3, 0.02),
-        pitch: ChannelSetting::new(core::f32::consts::PI / 180.0 * 800.0, 0.3, 0.02),
-        yaw: ChannelSetting::new(core::f32::consts::PI / 180.0 * 400.0, 0.2, 0.02),
+        roll: ChannelSetting::new(270.0_f32.to_radians(), 0.0, 0.02),
+        pitch: ChannelSetting::new(270.0_f32.to_radians(), 0.0, 0.02),
+        yaw: ChannelSetting::new(90.0_f32.to_radians(), 0.0, 0.02),
         throttle: ChannelSetting::default(),
     }
 }

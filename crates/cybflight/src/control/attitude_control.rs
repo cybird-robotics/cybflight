@@ -2,8 +2,6 @@ use cybflight_core::{
     attitude_control::{self, geometric_controller, AttitudeControlOutput},
     mixer::LinearAllocator,
 };
-use embassy_futures::select::{select3, Either3};
-use embassy_sync::pubsub::WaitResult;
 use embassy_time::Instant;
 use nalgebra::{UnitQuaternion, Vector4};
 
@@ -43,52 +41,19 @@ impl<const N: usize> AttitudeControl<N> {
         let mut thrust_normalized = 0.0_f32;
 
         loop {
-            match select3(
-                att_sub.next_message(),
-                rate_sub.next_message(),
-                rc_sub.next_message(),
-            )
-            .await
-            {
-                Either3::First(att) => match att {
-                    WaitResult::Message(msgs::VehicleAttitude { orientation, .. }) => {
-                        state.attitude_quaternion = orientation;
-                    }
-                    WaitResult::Lagged(n) => {
-                        defmt::warn!("Attitude control: dropped {} attitude updates", n);
-                        continue;
-                    }
-                },
+            // Await the highest-rate input (IMU at 8 kHz) to drive the loop.
+            let imu = rate_sub.next_message_pure().await;
+            state.body_rate_rad_s = imu.gyro_rad_s;
 
-                Either3::Second(rate) => match rate {
-                    WaitResult::Message(msgs::Imu { gyro_rad_s, .. }) => {
-                        state.body_rate_rad_s = gyro_rad_s;
-                    }
-                    WaitResult::Lagged(n) => {
-                        defmt::warn!("Attitude control: dropped {} IMU updates", n);
-                        continue;
-                    }
-                },
-
-                Either3::Third(rc) => {
-                    match rc {
-                        WaitResult::Message(msgs::ManualControlSetpoint {
-                            timestamp: _,
-                            thrust,
-                            roll_rate,
-                            pitch_rate,
-                            yaw_rate,
-                        }) => {
-                            att_ref.body_rate_rad_s = [roll_rate, pitch_rate, yaw_rate].into();
-                            thrust_normalized = thrust;
-                        }
-                        WaitResult::Lagged(n) => {
-                            defmt::warn!("Attitude control: dropped {} RC updates", n);
-                            continue;
-                        }
-                    };
-                }
-            };
+            // Drain attitude and RC non-blockingly so they never starve.
+            while let Some(att) = att_sub.try_next_message_pure() {
+                state.attitude_quaternion = att.orientation;
+            }
+            while let Some(rc) = rc_sub.try_next_message_pure() {
+                att_ref.body_rate_rad_s =
+                    [rc.roll_rate, rc.pitch_rate, rc.yaw_rate].into();
+                thrust_normalized = rc.thrust;
+            }
 
             let AttitudeControlOutput {
                 body_rate_rad_s,
@@ -96,7 +61,16 @@ impl<const N: usize> AttitudeControl<N> {
             } = self.ac.compute(&state, &att_ref);
 
             // Convert normalized thrust [0, 1] → total Newtons, then allocate.
-            let total_thrust_n = thrust_normalized * max_thrust_n;
+            // When thrust is near zero, send a small idle command so motors keep
+            // spinning for gyroscopic stability. The DShot driver enforces a
+            // separate anti-stall floor as a safety net.
+            const IDLE_THROTTLE: f32 = 0.005; // 0.5% normalized
+            let effective_thrust = if thrust_normalized < IDLE_THROTTLE {
+                IDLE_THROTTLE
+            } else {
+                thrust_normalized
+            };
+            let total_thrust_n = effective_thrust * max_thrust_n;
             let demand = Vector4::new(total_thrust_n, torque_n_m.x, torque_n_m.y, torque_n_m.z);
             let throttles = self.allocator.allocate(demand);
 

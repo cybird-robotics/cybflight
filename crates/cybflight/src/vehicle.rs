@@ -16,8 +16,6 @@ use cybflight_core::mixer::{
 // Arm length 100 mm at 45° → motor offset d = 0.1 / √2 ≈ 70.7 mm.
 // ---------------------------------------------------------------------------
 
-const D: f32 = 0.070_71; // motor offset [m] = arm / √2
-
 pub const QUADROTOR_BODY: RigidBodyParams = RigidBodyParams {
     mass_kg: 1.5,
     // Diagonal inertia [Ixx, Ixy, Ixz, Iyx, Iyy, Iyz, Izx, Izy, Izz] (kg·m²).
@@ -29,21 +27,21 @@ pub const QUADROTOR_BODY: RigidBodyParams = RigidBodyParams {
 pub const QUADROTOR_MOTORS: [MotorParams; 4] = [
     // M0: REAR_RIGHT — CW, position (−d, −d) in FLU (right = −y).
     MotorParams {
-        position_m: [0.075, 0.1],
+        position_m: [-0.075, -0.1],
         spin_dir: SpinDir::Cw,
         max_thrust_n: 8.5, // ~600 g per motor for a 5" prop. Calibrate from test stand.
         torque_coeff_m: 0.022,
     },
     // M1: FRONT_RIGHT — CCW, position (+d, −d) in FLU.
     MotorParams {
-        position_m: [0.075, 0.1],
+        position_m: [0.075, -0.1],
         spin_dir: SpinDir::Ccw,
         max_thrust_n: 8.5,
         torque_coeff_m: 0.022,
     },
     // M2: REAR_LEFT — CCW, position (−d, +d) in FLU (left = +y).
     MotorParams {
-        position_m: [0.075, 0.1],
+        position_m: [-0.075, 0.1],
         spin_dir: SpinDir::Ccw,
         max_thrust_n: 8.5,
         torque_coeff_m: 0.022,

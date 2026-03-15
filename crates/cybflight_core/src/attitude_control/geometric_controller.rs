@@ -109,11 +109,11 @@ impl<T: na::RealField + Copy + FloatCore> Default for GeometricAttitudeControlle
             k_ang_rate: na::Vector3::new(T::one(), T::one(), T::from(0.5).unwrap()),
             k_ang_torque: na::Vector3::new(T::one(), T::one(), T::from(0.2).unwrap()),
             k_rate_torque: na::Vector3::new(
-                T::from(0.6).unwrap(),
-                T::from(0.6).unwrap(),
                 T::from(0.4).unwrap(),
+                T::from(0.4).unwrap(),
+                T::from(0.2).unwrap(),
             ),
-            attitude_error_law: AttitudeErrorLaw::GeometricSO3,
+            attitude_error_law: AttitudeErrorLaw::TiltPrioritizing,
             max_body_rate: na::Vector3::new(
                 T::from(360.0).unwrap().to_radians(),
                 T::from(360.0).unwrap().to_radians(),

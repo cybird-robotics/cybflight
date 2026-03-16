@@ -15,6 +15,31 @@ You must install versions earlier than 1.94.0. In vscode, go to the `rust-analyz
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
+### Configure Private Registry
+
+Add the following to `~/.cargo/config.toml` to proxy crates.io through the self-hosted registry:
+
+```toml
+[registry]
+global-credential-providers = ["cargo:token"]
+
+[registries]
+utadr-cratesio = { index = "sparse+https://crates.yifanl.com/api/v1/cratesio/" }
+
+[source.utadr-cratesio]
+registry = "sparse+https://crates.yifanl.com/api/v1/cratesio/"
+
+[source.crates-io]
+replace-with = "utadr-cratesio"
+```
+
+Then authenticate with both registries:
+
+```bash
+cargo login --registry utadr-cratesio
+cargo login --registry utadr
+```
+
 ## Build
 
 ```bash

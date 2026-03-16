@@ -10,5 +10,4 @@ members = [
   "crates/bsp/foxeerh743",
   "crates/bsp/types",
   "crates/drivers",
-  "crates/msgs",
 ]

@@ -8,4 +8,3 @@ pub mod nmpc;
 pub mod params;
 pub mod rc;
 pub mod rotation;
-pub mod vehicle_model;

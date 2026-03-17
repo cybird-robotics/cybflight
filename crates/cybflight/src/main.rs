@@ -71,7 +71,7 @@ async fn main(spawner: embassy_executor::Spawner) {
         .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude task"));
 
     spawner
-        .spawn(cybflight::estimation::eskf_imu_gps::estimation_task())
+        .spawn(cybflight::estimation::eskf_imu_mocap::estimation_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn estimation task"));
 
     spawner

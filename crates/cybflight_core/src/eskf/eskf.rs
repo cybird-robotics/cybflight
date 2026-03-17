@@ -5,10 +5,6 @@ use crate::rotation::hat;
 /// Gravity in ENU frame [m/s²].
 const GRAVITY_VEC: Vector3<f32> = Vector3::new(0.0, 0.0, -9.81);
 
-/// Number of IMU history slots for delayed-update support.
-/// At 1 kHz IMU and 200 ms GPS latency: 200 slots.
-const HISTORY_LEN: usize = 200;
-
 /// ESKF noise / measurement configuration.
 pub struct EskfConfig {
     /// Accelerometer noise density [m/s²/√Hz].
@@ -26,8 +22,6 @@ pub struct EskfConfig {
     /// Outlier gate threshold in sigma units (per dimension).
     /// Measurement is rejected if zᵀ S⁻¹ z / dof > gate_sigma².
     pub gate_sigma: f32,
-    /// GPS velocity noise [m/s], used as fallback when s_acc is unavailable.
-    pub vel_noise_std: f32,
 }
 
 impl Default for EskfConfig {
@@ -40,7 +34,6 @@ impl Default for EskfConfig {
             baro_noise_std: 0.5,
             mag_noise_std: 0.05,
             gate_sigma: 5.0,
-            vel_noise_std: 0.1,
         }
     }
 }
@@ -81,32 +74,7 @@ impl NominalState {
     }
 }
 
-/// One slot in the IMU history ring buffer.
-/// Covariance is NOT stored here — 15×15 × 200 = 180 KB is too large for embedded.
-#[derive(Clone, Copy)]
-struct HistoryEntry {
-    timestamp_us: u64,
-    state: NominalState,
-    accel: Vector3<f32>,
-    gyro: Vector3<f32>,
-    dt: f32,
-    valid: bool,
-}
-
-impl Default for HistoryEntry {
-    fn default() -> Self {
-        Self {
-            timestamp_us: 0,
-            state: NominalState::default(),
-            accel: Vector3::zeros(),
-            gyro: Vector3::zeros(),
-            dt: 0.0,
-            valid: false,
-        }
-    }
-}
-
-/// 15-state Error-State Kalman Filter with delayed-update support.
+/// 15-state Error-State Kalman Filter.
 ///
 /// State layout: [position(3), orientation_error(3), velocity(3),
 ///                accel_bias(3), gyro_bias(3)].
@@ -116,11 +84,6 @@ pub struct Eskf {
     state: NominalState,
     cov: SMatrix<f32, 15, 15>,
     initialized: bool,
-    history: [HistoryEntry; HISTORY_LEN],
-    /// Index of the next slot to write.
-    history_idx: usize,
-    /// Number of valid entries currently in the buffer.
-    history_count: usize,
 }
 
 impl Eskf {
@@ -130,13 +93,10 @@ impl Eskf {
             state: NominalState::default(),
             cov: SMatrix::zeros(),
             initialized: false,
-            history: [HistoryEntry::default(); HISTORY_LEN],
-            history_idx: 0,
-            history_count: 0,
         }
     }
 
-    /// Initialise filter with a known pose and sensor biases; resets covariance and clears history.
+    /// Initialise filter with a known pose and sensor biases; resets covariance.
     pub fn init(
         &mut self,
         position: Vector3<f32>,
@@ -159,11 +119,6 @@ impl Eskf {
         cov.fixed_view_mut::<3, 3>(12, 12).fill_diagonal(0.001); // gyro bias
         self.cov = cov;
         self.initialized = true;
-        self.history_idx = 0;
-        self.history_count = 0;
-        for entry in self.history.iter_mut() {
-            entry.valid = false;
-        }
     }
 
     /// Propagate nominal state and covariance forward by `dt`.
@@ -219,48 +174,15 @@ impl Eskf {
         (new_state, new_cov)
     }
 
-    /// Propagate nominal state only, without touching covariance.
-    /// Used during delayed-update replay.
-    fn propagate_nominal_only(
-        state: &NominalState,
-        accel: Vector3<f32>,
-        gyro: Vector3<f32>,
-        dt: f32,
-    ) -> NominalState {
-        let a_ub = accel - state.accel_bias;
-        let w_ub = gyro - state.gyro_bias;
-        let rmat = *state.orientation.to_rotation_matrix().matrix();
-        NominalState {
-            position: state.position + state.velocity * dt,
-            orientation: state.orientation * UnitQuaternion::from_scaled_axis(w_ub * dt),
-            velocity: state.velocity + (rmat * a_ub + GRAVITY_VEC) * dt,
-            accel_bias: state.accel_bias,
-            gyro_bias: state.gyro_bias,
-        }
-    }
-
-    /// IMU predict step. Saves a history snapshot before propagating.
+    /// IMU predict step. Propagates nominal state and covariance forward.
     pub fn predict(
         &mut self,
         accel: Vector3<f32>,
         gyro: Vector3<f32>,
         dt: f32,
-        timestamp_us: u64,
     ) {
         if !self.initialized {
             return;
-        }
-        self.history[self.history_idx] = HistoryEntry {
-            timestamp_us,
-            state: self.state,
-            accel,
-            gyro,
-            dt,
-            valid: true,
-        };
-        self.history_idx = (self.history_idx + 1) % HISTORY_LEN;
-        if self.history_count < HISTORY_LEN {
-            self.history_count += 1;
         }
         let (new_state, new_cov) = self.propagate_state(accel, gyro, dt);
         self.state = new_state;
@@ -325,61 +247,6 @@ impl Eskf {
             let i_kh = SMatrix::<f32, 15, 15>::identity() - k * h;
             self.cov = i_kh * self.cov * i_kh.transpose() + k * r * k.transpose();
             self.cov = (self.cov + self.cov.transpose()) * 0.5;
-        }
-    }
-
-    /// GPS combined delayed update.
-    ///
-    /// Rewinds nominal state to the history entry at or before `timestamp_us`,
-    /// applies pos+vel updates using the **current** covariance (approximation —
-    /// avoids replaying 200 covariance propagation steps), then replays the
-    /// nominal state forward using stored IMU inputs.
-    pub fn update_gnss_delayed(
-        &mut self,
-        pos: Vector3<f32>,
-        vel: Vector3<f32>,
-        pos_std: f32,
-        vel_std: f32,
-        timestamp_us: u64,
-    ) {
-        if !self.initialized {
-            return;
-        }
-
-        // Find newest history entry whose timestamp <= measurement timestamp.
-        // age=0 is the newest entry, age=history_count-1 is the oldest.
-        let mut anchor_age: Option<usize> = None;
-        for age in 0..self.history_count {
-            let slot = (self.history_idx + HISTORY_LEN - 1 - age) % HISTORY_LEN;
-            if self.history[slot].timestamp_us <= timestamp_us {
-                anchor_age = Some(age);
-                break;
-            }
-        }
-
-        let Some(age) = anchor_age else {
-            // No suitable history; apply as immediate update.
-            self.update_pos(pos, pos_std);
-            self.update_vel(vel, vel_std);
-            return;
-        };
-
-        let anchor_slot = (self.history_idx + HISTORY_LEN - 1 - age) % HISTORY_LEN;
-
-        // Rewind nominal state to anchor (covariance stays at current value).
-        self.state = self.history[anchor_slot].state;
-
-        // Apply GPS updates at anchor point using current covariance.
-        self.update_pos(pos, pos_std);
-        self.update_vel(vel, vel_std);
-
-        // Replay nominal state forward from anchor to now (no covariance replay).
-        // age=age-1 is the step just after anchor, age=0 is the most recent step.
-        for replay_age in (0..age).rev() {
-            let slot = (self.history_idx + HISTORY_LEN - 1 - replay_age) % HISTORY_LEN;
-            let entry = self.history[slot]; // Copy
-            self.state =
-                Self::propagate_nominal_only(&self.state, entry.accel, entry.gyro, entry.dt);
         }
     }
 

@@ -13,13 +13,12 @@ use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, pubsub::PubSubC
 /// Checked by the arming state machine (mirrors BF `ARMING_DISABLED_GYRO_NOT_CALIBRATED`).
 pub static GYRO_CALIBRATED: AtomicBool = AtomicBool::new(false);
 
-// IMU 1: CAP=4 (small queue, fresh data preferred), SUBS=4 (attitude + telemetry + shell + spare), PUBS=1.
-pub static IMU_1: PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 4, 1> =
-    PubSubChannel::new();
+// IMU 1: CAP=4 (small queue, fresh data preferred),
+// SUBS=6 (attitude + estimation + attitude_control + esp_bridge + shell stream + oneshot), PUBS=1.
+pub static IMU_1: PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 6, 1> = PubSubChannel::new();
 
-// IMU 2: same sizing. Empty on single-IMU boards (shell prints "no data").
-pub static IMU_2: PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 4, 1> =
-    PubSubChannel::new();
+// IMU 2: same sizing as IMU_1. Empty on single-IMU boards (shell prints "no data").
+pub static IMU_2: PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 6, 1> = PubSubChannel::new();
 
 // CAP=4, SUBS=6 (attitude_control + nmpc + CRSF telem + esp_bridge + shell stream + spare),
 // PUBS=1 (single attitude estimator).
@@ -51,6 +50,10 @@ pub static DSHOT_TELEMETRY: PubSubChannel<CriticalSectionRawMutex, msgs::DshotTe
 
 // GPS fix: CAP=2 (5 Hz, low rate), SUBS=4 (telemetry + shell + 2 spare), PUBS=1.
 pub static GPS_FIX: PubSubChannel<CriticalSectionRawMutex, msgs::GpsFix, 2, 4, 1> =
+    PubSubChannel::new();
+
+// Vehicle odometry (ESKF output): CAP=4 (100 Hz), SUBS=4 (telemetry + shell + control + spare), PUBS=1.
+pub static VEHICLE_ODOMETRY: PubSubChannel<CriticalSectionRawMutex, msgs::VehicleOdometry, 4, 4, 1> =
     PubSubChannel::new();
 
 // External magnetometer: CAP=4 (200 Hz), SUBS=4 (attitude + telemetry + shell + spare), PUBS=1.

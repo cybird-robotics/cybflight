@@ -46,6 +46,9 @@ critical-section = "1"
 embedded-io = "0.7"
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 
+# COBS framing for ESP bridge communication
+cobs = { version = "0.5", default-features = false }
+
 # Math (no_std)
 nalgebra = { version = "0.34.1", default-features = false, features = ["libm", "defmt"] }
 

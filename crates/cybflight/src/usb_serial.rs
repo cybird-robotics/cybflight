@@ -10,7 +10,7 @@ use crate::msgs;
 use crate::platform;
 use crate::sensors::{
     BARO_1, BARO_2, DSHOT_TELEMETRY, GPS_FIX, IMU_1, IMU_2, MAG_EXT, MAG_INT, RC_INPUT,
-    RC_LINK_STATUS, VEHICLE_ATTITUDE,
+    RC_LINK_STATUS, VEHICLE_ATTITUDE, VICON_POSE,
 };
 use crate::shell::format::ShellMsg;
 use crate::shell::write_all;
@@ -43,6 +43,7 @@ const HELP_TEXT: &[u8] = b"\
   magint               one-shot internal compass\r\n\
   baro1                one-shot barometer 1\r\n\
   baro2                one-shot barometer 2\r\n\
+  vicon                one-shot Vicon pose\r\n\
   stream <topic> on    stream data on <topic>\r\n\
   stream <topic> off   stop data stream on <topic>\r\n\
   motor <1-4> <0-100>  set motor throttle (test mode)\r\n\
@@ -68,6 +69,7 @@ pub static STREAM_MAGINT: AtomicBool = AtomicBool::new(false);
 pub static STREAM_BARO1: AtomicBool = AtomicBool::new(false);
 pub static STREAM_BARO2: AtomicBool = AtomicBool::new(false);
 pub static STREAM_ATTITUDE_CONTROL: AtomicBool = AtomicBool::new(false);
+pub static STREAM_VICON: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Generic stream bridge + concrete embassy task wrappers
@@ -171,6 +173,11 @@ pub async fn attitude_control_stream_task() {
     msg_stream_task(&ATTITUDE_CONTROL_SETPOINT, &STREAM_ATTITUDE_CONTROL).await
 }
 
+#[embassy_executor::task]
+pub async fn vicon_stream_task() {
+    msg_stream_task(&VICON_POSE, &STREAM_VICON).await
+}
+
 // ---------------------------------------------------------------------------
 // Task entry points
 // ---------------------------------------------------------------------------
@@ -253,6 +260,7 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
     STREAM_BARO1.store(false, Ordering::Relaxed);
     STREAM_BARO2.store(false, Ordering::Relaxed);
     STREAM_ATTITUDE_CONTROL.store(false, Ordering::Relaxed);
+    STREAM_VICON.store(false, Ordering::Relaxed);
 
     let mut line_buf = [0u8; 64];
     let mut line_len = 0usize;
@@ -459,6 +467,13 @@ async fn dispatch<'d>(
             };
             oneshot(class, &mut sub, 256).await?;
         }
+        "vicon" => {
+            let mut sub = match VICON_POSE.subscriber() {
+                Ok(s) => s,
+                Err(_) => return write_all(class, b"error: no subscriber slot\r\n").await,
+            };
+            oneshot(class, &mut sub, 256).await?;
+        }
         "magext" => {
             let mut sub = match MAG_EXT.subscriber() {
                 Ok(s) => s,
@@ -534,6 +549,14 @@ async fn dispatch<'d>(
         "stream attcontrol off" => {
             STREAM_ATTITUDE_CONTROL.store(false, Ordering::Relaxed);
             write_all(class, b"attitude control setpoint stream off\r\n").await?;
+        }
+        "stream vicon on" => {
+            STREAM_VICON.store(true, Ordering::Relaxed);
+            write_all(class, b"Vicon pose stream on\r\n").await?;
+        }
+        "stream vicon off" => {
+            STREAM_VICON.store(false, Ordering::Relaxed);
+            write_all(class, b"Vicon pose stream off\r\n").await?;
         }
         "reboot" => {
             write_all(class, b"rebooting...\r\n").await?;

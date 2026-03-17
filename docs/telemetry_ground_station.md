@@ -32,14 +32,14 @@ back.
                           ┌──────────┴───────────────────────┐
                           │  STM32H743 (cybflight)           │
                           │                                  │
-                          │  telemetry_tx_task               │
+                          │  esp_bridge_tx_task              │
                           │    subscribes to all channels    │
                           │    → serialize → COBS → UART TX  │
                           │                                  │
-                          │  position_rx_task                │
+                          │  esp_bridge_rx_task              │
                           │    UART RX → COBS decode         │
                           │    → deserialize                 │
-                          │    → publish to VEHICLE_ODOMETRY │
+                          │    → publish to VICON_POSE       │
                           └──────────────────────────────────┘
 ```
 
@@ -98,30 +98,34 @@ payload: repr(C, packed) struct, little-endian, fixed size per type
 
 ### Message Types
 
-| msg_id | Type | Key Fields |
-|--------|------|------------|
-| 1 | Imu | timestamp, accel[3], gyro[3], temp |
-| 2 | VehicleAttitude | timestamp, quaternion[4] |
-| 3 | PowerStatus | timestamp, voltage_mv, current_ma, mah_drawn, cell_count |
-| 4 | RcInput | timestamp, channels[16], channel_count |
-| 5 | RcLinkStatus | timestamp, rssi_dbm, link_quality, snr, rf_mode |
-| 6 | DshotTelemetry | timestamp, motor_values[4] |
-| 7 | OcpSolverOutput | timestamp, command[4], iterations, converged, solve_time_us |
-| 8 | VehicleOdometry | timestamp, position[3], orientation[4], linear_vel[3], angular_vel[3] |
+Downlink msg_ids use the low range (1–127), uplink uses the high range
+(128–255).
+
+| msg_id | Direction | Type | Key Fields |
+|--------|-----------|------|------------|
+| 1 | down | Imu | timestamp, accel[3], gyro[3], temp |
+| 2 | down | VehicleAttitude | timestamp, orientation[4] |
+| 3 | down | RcInput | timestamp, channels[16], channel_count |
+| 4 | down | RcLinkStatus | timestamp, rssi_dbm, link_quality, snr, rf_mode |
+| 5 | down | DshotTelemetry | timestamp, erpm[4], raw[4] |
+| 6 | down | OcpSolverOutput | timestamp, cmd[4], iterations, converged, solve_time_us |
+| 7 | down | Imu (IMU_2) | timestamp, accel[3], gyro[3], temp |
+| 8 | down | GpsFix | timestamp, lat, lon, alt, speed, heading, fix, sv, acc, pdop |
+| 9 | down | MagSample (ext) | timestamp, field_ut[3], temp |
+| 10 | down | MagSample (int) | timestamp, field_ut[3], temp |
+| 11 | down | BaroSample (1) | timestamp, pressure_pa, temp |
+| 12 | down | BaroSample (2) | timestamp, pressure_pa, temp |
+| 13 | down | AttitudeControlSetpoint | timestamp, thrust, quat[4], rate[3], torque[3] |
+| 14 | down | ManualControlSetpoint | timestamp, thrust, roll/pitch/yaw rates |
+| 128 | up | ViconPose | timestamp, position[3], orientation[4] |
 
 Message IDs and struct layouts are defined in the shared `cybflight-msgs` crate.
 
 ## Shared Crate: `cybflight-msgs`
 
-A new no_std crate at `crates/msgs/` defines all message types used by both
-STM32 firmware and ESP32 bridge firmware. This is the single source of truth for
-wire format.
-
-```
-crates/msgs/
-  Cargo.toml          # no_std, no dependencies beyond defmt (optional feature)
-  src/lib.rs          # Message structs with #[repr(C, packed)], msg_id consts
-```
+A standalone no_std crate published to the `utadr` registry defines all message
+types used by both STM32 firmware and ESP32 bridge firmware. This is the single
+source of truth for wire format.
 
 Both `cybflight` (STM32) and the ESP32 firmware depend on this crate. The
 Python ground station uses a corresponding `struct.Struct` format string per
@@ -206,11 +210,11 @@ forwards it to the drone:
 
 ```
 Vicon DataStream SDK (callback @ ~200 Hz)
-  → pack as VehicleOdometry (msg_id=8)
+  → pack as ViconPose (msg_id=128)
   → UDP TX to ESP32 (port 4211)
   → ESP32 COBS-encodes, forwards over UART
-  → STM32 position_rx_task deserializes
-  → publishes to VEHICLE_ODOMETRY channel
+  → STM32 esp_bridge_rx_task deserializes
+  → publishes to VICON_POSE channel
 ```
 
 Latency budget: Vicon processing (~2 ms) + WiFi (~1–3 ms) + UART (~0.5 ms) +
@@ -236,7 +240,7 @@ decode (~0.1 ms) ≈ **4–6 ms** end-to-end. Acceptable for position control at
 2. **UART telemetry TX task** on STM32 — subscribes to all PubSubChannels,
    packs wire structs, COBS-encodes, DMA writes to UART.
 3. **UART position RX task** on STM32 — reads UART, COBS-decodes,
-   deserializes `VehicleOdometry`, publishes to channel.
+   deserializes `ViconPose`, publishes to channel.
 4. **ESP32 bridge firmware** — UART↔UDP forwarding, AP mode WiFi.
 5. **Python ground station** — UDP receive, rerun visualization, Vicon
    forwarding.

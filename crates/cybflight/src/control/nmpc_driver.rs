@@ -24,8 +24,8 @@ impl NmpcDriver {
         let mass = self.solver.model.mass;
         let grav = self.solver.model.grav;
 
-        // Stub position and velocity — zeros until VEHICLE_ODOMETRY is wired up.
-        // TODO: subscribe to sensors::VEHICLE_ODOMETRY and track last-known state.
+        // Stub position and velocity — zeros until VICON_POSE is wired up.
+        // TODO: subscribe to sensors::VICON_POSE and track last-known state.
         let position = Vector3::zeros();
         let velocity = Vector3::zeros();
 

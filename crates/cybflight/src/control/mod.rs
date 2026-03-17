@@ -24,6 +24,6 @@ pub static ATTITUDE_CONTROL_SETPOINT: PubSubChannel<
     CriticalSectionRawMutex,
     msgs::AttitudeControlSetpoint,
     2,
-    2,
+    3,
     1,
 > = PubSubChannel::new();

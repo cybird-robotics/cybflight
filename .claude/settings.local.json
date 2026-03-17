@@ -8,6 +8,10 @@
       "Bash(fzf:*)",
       "WebSearch",
       "Bash(git show:*)"
+    ],
+    "additionalDirectories": [
+      "../cybflight-msgs",
+      "../cybesp-bridge"
     ]
   }
 }

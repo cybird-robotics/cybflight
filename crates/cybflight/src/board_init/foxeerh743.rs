@@ -42,6 +42,11 @@ hal::bind_interrupts!(struct I2c1Irqs {
     I2C1_ER => hal::i2c::ErrorInterruptHandler<hal::peripherals::I2C1>;
 });
 
+// Bind USART6 interrupt for ESP bridge (DMA UART)
+hal::bind_interrupts!(struct Usart6Irqs {
+    USART6 => hal::usart::InterruptHandler<hal::peripherals::USART6>;
+});
+
 pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Board) {
     // --- LED: only 1 LED, use it for status ---
     let led0 = Led::new(board.leds.led0, false);
@@ -346,6 +351,34 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
                 "DPS310 not detected on I2C1 (addr {:#x})",
                 bsp::sensors::BARO_1_I2C_ADDR
             );
+        }
+    }
+
+    // --- ESP bridge: USART6 (PC6 TX / PC7 RX) at 921600 baud, DMA-backed ---
+    {
+        let mut uart_config = hal::usart::Config::default();
+        uart_config.baudrate = 921_600;
+
+        match hal::usart::Uart::new(
+            board.serial.usart6,
+            board.serial.usart6_rx,
+            board.serial.usart6_tx,
+            Usart6Irqs,
+            board.motors.dma1_ch4,
+            board.motors.dma1_ch5,
+            uart_config,
+        ) {
+            Ok(uart) => {
+                let (tx, rx) = uart.split();
+                defmt::info!("ESP bridge USART6 init OK (DMA)");
+                spawner
+                    .spawn(crate::comm::esp_bridge::esp_bridge_rx_task(rx))
+                    .unwrap_or_else(|e| defmt::error!("Failed to spawn ESP bridge RX: {}", e));
+                spawner
+                    .spawn(crate::comm::esp_bridge::esp_bridge_tx_task(tx))
+                    .unwrap_or_else(|e| defmt::error!("Failed to spawn ESP bridge TX: {}", e));
+            }
+            Err(e) => defmt::error!("ESP bridge USART6 init failed: {}", e),
         }
     }
 

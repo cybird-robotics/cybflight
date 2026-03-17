@@ -109,6 +109,9 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::usb_serial::attitude_control_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude control stream task"));
+    spawner
+        .spawn(cybflight::usb_serial::vicon_stream_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn Vicon stream task"));
 
     defmt::info!("all init done");
 }

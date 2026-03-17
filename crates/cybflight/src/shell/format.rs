@@ -78,6 +78,19 @@ impl fmt::Display for ShellMsg<'_, msgs::VehicleOdometry> {
     }
 }
 
+impl fmt::Display for ShellMsg<'_, msgs::ViconPose> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.0;
+        write!(
+            f,
+            "ViconPose(timestamp={:.4}, position=[{:.4},{:.4},{:.4}], orientation=Quaternion(x={:.4},y={:.4},z={:.4},w={:.4}))",
+            s.timestamp.as_millis(),
+            s.position.x, s.position.y, s.position.z,
+            s.orientation.i, s.orientation.j, s.orientation.k, s.orientation.w,
+        )
+    }
+}
+
 impl fmt::Display for ShellMsg<'_, msgs::OcpSolverOutput> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = self.0;
@@ -224,7 +237,7 @@ pub trait Printable {
 pub struct ShellState {
     pub stream_imu: bool,
     pub stream_att: bool,
-    pub stream_odom: bool,
+    pub stream_vicon: bool,
     pub stream_rc: bool,
     pub stream_rcstats: bool,
     pub stream_dshot: bool,
@@ -257,8 +270,18 @@ impl Printable for msgs::VehicleAttitude {
 }
 
 impl Printable for msgs::VehicleOdometry {
+    fn should_print(&self, _ctx: &ShellState) -> bool {
+        false // VehicleOdometry has no dedicated stream flag
+    }
+
+    fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        write!(w, "{}", ShellMsg(self))
+    }
+}
+
+impl Printable for msgs::ViconPose {
     fn should_print(&self, ctx: &ShellState) -> bool {
-        ctx.stream_odom
+        ctx.stream_vicon
     }
 
     fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {

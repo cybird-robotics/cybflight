@@ -21,36 +21,32 @@ pub static IMU_1: PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 4, 1> =
 pub static IMU_2: PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 4, 1> =
     PubSubChannel::new();
 
-// CAP=4, SUBS=4 (control + telemetry + 2 spare), PUBS=1 (single attitude estimator).
+// CAP=4, SUBS=6 (attitude_control + nmpc + CRSF telem + esp_bridge + shell stream + spare),
+// PUBS=1 (single attitude estimator).
 pub static VEHICLE_ATTITUDE: PubSubChannel<
     CriticalSectionRawMutex,
     msgs::VehicleAttitude,
     4,
-    4,
+    6,
     1,
 > = PubSubChannel::new();
 
-// Vehicle odometry (position + velocity): PUBS=1 (single odometry source, e.g. VIO/GPS-EKF),
-// SUBS=4 (control + telemetry + 2 spare).
-pub static VEHICLE_ODOMETRY: PubSubChannel<
-    CriticalSectionRawMutex,
-    msgs::VehicleOdometry,
-    4,
-    4,
-    1,
-> = PubSubChannel::new();
+// Vicon pose (position + orientation): PUBS=1 (ESP bridge RX),
+// SUBS=4 (control + telemetry + shell + spare).
+pub static VICON_POSE: PubSubChannel<CriticalSectionRawMutex, msgs::ViconPose, 4, 4, 1> =
+    PubSubChannel::new();
 
 // RC input: CAP=4, SUBS=4 (control + telemetry + 2 spare), PUBS=1 (single RC task).
 pub static RC_INPUT: PubSubChannel<CriticalSectionRawMutex, msgs::RcInput, 4, 4, 1> =
     PubSubChannel::new();
 
-// RC link status: CAP=2, SUBS=3 (telemetry + shell + spare), PUBS=1 (single RC task).
-pub static RC_LINK_STATUS: PubSubChannel<CriticalSectionRawMutex, msgs::RcLinkStatus, 2, 3, 1> =
+// RC link status: CAP=2, SUBS=4 (esp_bridge + shell stream + oneshot + spare), PUBS=1 (single RC task).
+pub static RC_LINK_STATUS: PubSubChannel<CriticalSectionRawMutex, msgs::RcLinkStatus, 2, 4, 1> =
     PubSubChannel::new();
 
 // DShot telemetry: CAP=2 (high publish rate, only latest matters),
-// SUBS=3 (oneshot + stream + spare), PUBS=1 (dshot_task).
-pub static DSHOT_TELEMETRY: PubSubChannel<CriticalSectionRawMutex, msgs::DshotTelemetry, 2, 3, 1> =
+// SUBS=4 (esp_bridge + shell stream + oneshot + spare), PUBS=1 (dshot_task).
+pub static DSHOT_TELEMETRY: PubSubChannel<CriticalSectionRawMutex, msgs::DshotTelemetry, 2, 4, 1> =
     PubSubChannel::new();
 
 // GPS fix: CAP=2 (5 Hz, low rate), SUBS=4 (telemetry + shell + 2 spare), PUBS=1.

@@ -231,20 +231,8 @@ pub async fn estimator_stream_task() {
 /// Format the estimator phase into `w`.
 fn write_eskf_phase(w: &mut WriteBuf<'_>, phase: &EstimatorPhase) -> core::fmt::Result {
     match phase {
-        EstimatorPhase::AwaitingBaro => write!(w, "ESKF[Phase1] baro=WAIT gps=WAIT imu=WAIT"),
-        EstimatorPhase::AwaitingGps {
-            imu_ready,
-            roll_deg,
-            pitch_deg,
-        } => {
-            let imu_str = if *imu_ready { "OK  " } else { "WAIT" };
-            write!(w, "ESKF[Phase1] baro=OK   gps=WAIT imu={imu_str}")?;
-            if let (Some(r), Some(p)) = (roll_deg, pitch_deg) {
-                write!(w, "  orientation: roll={r:.1} pitch={p:.1}")?;
-            }
-            Ok(())
-        }
-        EstimatorPhase::CalibImu => write!(w, "ESKF[Phase1] baro=OK   gps=OK   imu=WAIT"),
+        EstimatorPhase::AwaitingExteroceptive => write!(w, "ESKF awaiting mocap"),
+        EstimatorPhase::CalibImu => write!(w, "ESKF calibrating IMU"),
         EstimatorPhase::Running {
             roll_deg,
             pitch_deg,

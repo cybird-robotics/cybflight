@@ -164,7 +164,7 @@ impl<D: ReadImu> ImuReader<D> {
 
     pub async fn run(
         &mut self,
-        channel: &'static PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 4, 1>,
+        channel: &'static PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 6, 1>,
     ) -> ! {
         let publisher = channel.immediate_publisher();
         let sample_rate = self.imu.sample_rate_hz();
@@ -266,7 +266,7 @@ impl<D: ReadImu> ImuReader<D> {
 #[embassy_executor::task(pool_size = 2)]
 pub async fn icm_reader_task(
     mut reader: ImuReader<IcmDev>,
-    channel: &'static PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 4, 1>,
+    channel: &'static PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 6, 1>,
 ) {
     reader.run(channel).await;
 }
@@ -274,7 +274,7 @@ pub async fn icm_reader_task(
 #[embassy_executor::task(pool_size = 2)]
 pub async fn mpu_reader_task(
     mut reader: ImuReader<MpuDev>,
-    channel: &'static PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 4, 1>,
+    channel: &'static PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 6, 1>,
 ) {
     reader.run(channel).await;
 }

@@ -24,15 +24,6 @@ impl GpsRunner {
         loop {
             match self.gps.read_fix().await {
                 Ok(pvt) => {
-                    // Convert NED velocity (GPS native) → ENU (filter frame) here,
-                    // so the channel always carries frame-consistent data.
-                    // ENU: X=East, Y=North, Z=Up = (velE, velN, -velD).
-                    use nalgebra::Vector3;
-                    let vel_enu_m_s = Vector3::new(
-                        pvt.vel_east_mm_s as f32 / 1000.0,
-                        pvt.vel_north_mm_s as f32 / 1000.0,
-                        -pvt.vel_down_mm_s as f32 / 1000.0,
-                    );
                     publisher.publish_immediate(msgs::GpsFix {
                         timestamp: Instant::now(),
                         lat_deg: pvt.lat_1e7 as f64 * 1e-7,
@@ -40,8 +31,6 @@ impl GpsRunner {
                         alt_msl_mm: pvt.alt_msl_mm,
                         ground_speed_mm_s: pvt.ground_speed_mm_s,
                         heading_mot_1e5: pvt.heading_mot_1e5,
-                        vel_enu_m_s,
-                        s_acc_m_s: pvt.s_acc_mm_s as f32 / 1000.0,
                         fix_type: pvt.fix_type,
                         num_sv: pvt.num_sv,
                         h_acc_mm: pvt.h_acc_mm,

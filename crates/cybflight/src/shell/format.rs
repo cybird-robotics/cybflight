@@ -83,8 +83,10 @@ impl fmt::Display for ShellMsg<'_, msgs::ViconPose> {
         let s = self.0;
         write!(
             f,
-            "ViconPose(timestamp={:.4}, position=[{:.4},{:.4},{:.4}], orientation=Quaternion(x={:.4},y={:.4},z={:.4},w={:.4}))",
+            "ViconPose(t={:.4}, cap_utc={}, gs_utc={}, pos=[{:.4},{:.4},{:.4}], q=[{:.4},{:.4},{:.4},{:.4}])",
             s.timestamp.as_millis(),
+            s.capture_time_utc_us,
+            s.gs_send_time_utc_us,
             s.position.x, s.position.y, s.position.z,
             s.orientation.i, s.orientation.j, s.orientation.k, s.orientation.w,
         )

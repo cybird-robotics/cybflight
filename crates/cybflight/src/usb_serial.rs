@@ -2,6 +2,7 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bsp;
+use crate::comm;
 use crate::control::ATTITUDE_CONTROL_SETPOINT;
 use crate::control::OCP_SOLVER_OUTPUT;
 use crate::hal;
@@ -70,6 +71,7 @@ pub static STREAM_BARO1: AtomicBool = AtomicBool::new(false);
 pub static STREAM_BARO2: AtomicBool = AtomicBool::new(false);
 pub static STREAM_ATTITUDE_CONTROL: AtomicBool = AtomicBool::new(false);
 pub static STREAM_VICON: AtomicBool = AtomicBool::new(false);
+pub static STREAM_TIMESYNC: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Generic stream bridge + concrete embassy task wrappers
@@ -178,6 +180,26 @@ pub async fn vicon_stream_task() {
     msg_stream_task(&VICON_POSE, &STREAM_VICON).await
 }
 
+#[embassy_executor::task]
+pub async fn timesync_stream_task() {
+    loop {
+        embassy_time::Timer::after_millis(1000).await;
+        if STREAM_TIMESYNC.load(Ordering::Relaxed) {
+            let s = crate::comm::time_sync::status();
+            let mut line = ShellLine::new();
+            line.format(|w| {
+                write!(
+                    w,
+                    "TimeSync(synced={}, offset={} us, ping_rtt={} us, clock_err={} us)\r\n",
+                    s.synced, s.offset_us, s.ping_rtt_us, s.ping_clock_err_us
+                )
+                .ok();
+            });
+            SHELL_OUT.try_send(line).ok();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Task entry points
 // ---------------------------------------------------------------------------
@@ -261,6 +283,7 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
     STREAM_BARO2.store(false, Ordering::Relaxed);
     STREAM_ATTITUDE_CONTROL.store(false, Ordering::Relaxed);
     STREAM_VICON.store(false, Ordering::Relaxed);
+    STREAM_TIMESYNC.store(false, Ordering::Relaxed);
 
     let mut line_buf = [0u8; 64];
     let mut line_len = 0usize;
@@ -557,6 +580,27 @@ async fn dispatch<'d>(
         "stream vicon off" => {
             STREAM_VICON.store(false, Ordering::Relaxed);
             write_all(class, b"Vicon pose stream off\r\n").await?;
+        }
+        "timesync" => {
+            let s = comm::time_sync::status();
+            let mut line = ShellLine::new();
+            line.format(|w| {
+                write!(
+                    w,
+                    "TimeSync(synced={}, offset={} us, ping_rtt={} us, clock_err={} us)\r\n",
+                    s.synced, s.offset_us, s.ping_rtt_us, s.ping_clock_err_us
+                )
+                .ok();
+            });
+            write_all(class, line.as_bytes()).await?;
+        }
+        "stream timesync on" => {
+            STREAM_TIMESYNC.store(true, Ordering::Relaxed);
+            write_all(class, b"Time sync stream on\r\n").await?;
+        }
+        "stream timesync off" => {
+            STREAM_TIMESYNC.store(false, Ordering::Relaxed);
+            write_all(class, b"Time sync stream off\r\n").await?;
         }
         "reboot" => {
             write_all(class, b"rebooting...\r\n").await?;

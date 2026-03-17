@@ -1,0 +1,25 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../cybflight-msgs"
+		},
+		{
+			"path": "../../cybesp-bridge"
+		},
+		{
+			"path": "../../cybgcs"
+		}
+	],
+	"settings": {
+		"rust-analyzer.cargo.target": "thumbv7em-none-eabihf",
+		"rust-analyzer.check.command": "clippy",
+		"rust-analyzer.check.allTargets": false,
+		"[rust]": {
+        	"editor.defaultFormatter": "rust-lang.rust-analyzer",
+        	"editor.formatOnSave": true
+    	}
+	}
+}

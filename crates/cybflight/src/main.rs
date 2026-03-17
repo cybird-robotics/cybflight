@@ -112,6 +112,9 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::usb_serial::vicon_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn Vicon stream task"));
+    spawner
+        .spawn(cybflight::usb_serial::timesync_stream_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn time sync stream task"));
 
     defmt::info!("all init done");
 }

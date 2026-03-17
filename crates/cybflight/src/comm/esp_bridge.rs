@@ -11,7 +11,8 @@ use crate::{control, sensors};
 use cybflight_msgs::wire::{
     self, WireArmDisarm, WireAttitudeControlSetpoint, WireBaroSample, WireDshotTelemetry,
     WireGpsFix, WireImu, WireMagSample, WireManualControlSetpoint, WireMessage,
-    WireOcpSolverOutput, WirePose, WireRcInput, WireRcLinkStatus, WireVehicleAttitude,
+    WireOcpSolverOutput, WirePing, WirePingResp, WirePose, WireRcInput, WireRcLinkStatus,
+    WireTimeSync, WireTimeSyncStatus, WireVehicleAttitude,
 };
 
 use super::{encode_frame, FrameAccumulator};
@@ -48,6 +49,27 @@ pub async fn esp_bridge_rx_task(mut rx: UartRx<'static, crate::hal::mode::Async>
                                     pose_pub.publish_immediate(wp.to_vicon_pose(rx_time));
                                 }
                             }
+                            wire::msg_id::TIME_SYNC => {
+                                if let Some(ts) = WireTimeSync::from_bytes(payload) {
+                                    let rx_time = embassy_time::Instant::now();
+                                    super::time_sync::process_time_sync(
+                                        rx_time,
+                                        ts.esp_send_ntp_us,
+                                        ts.prev_tx_complete_ntp_us,
+                                    );
+                                }
+                            }
+                            wire::msg_id::PING_RESP => {
+                                if let Some(pr) = WirePingResp::from_bytes(payload) {
+                                    let rx_time = embassy_time::Instant::now();
+                                    super::time_sync::process_ping_resp(
+                                        rx_time,
+                                        pr.stm32_send_us,
+                                        pr.gs_recv_time_us,
+                                        pr.gs_send_time_us,
+                                    );
+                                }
+                            }
                             _ => {
                                 defmt::warn!("ESP bridge: unknown msg_id={}", msg_id);
                             }
@@ -70,6 +92,14 @@ pub async fn esp_bridge_rx_task(mut rx: UartRx<'static, crate::hal::mode::Async>
 /// Timer period for TX polling (100 Hz).
 const TX_PERIOD_MS: u64 = 10;
 
+/// Ping interval in TX ticks (500 × 10ms = 5s).
+const PING_INTERVAL_TICKS: u32 = 500;
+
+/// Convert a monotonic Instant to UTC microseconds for telemetry.
+fn utc_ts(instant: embassy_time::Instant) -> u64 {
+    super::time_sync::to_utc_us(instant) as u64
+}
+
 #[embassy_executor::task]
 pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>) {
     let mut imu1_sub = sensors::IMU_1.subscriber().unwrap();
@@ -90,8 +120,12 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
 
     let mut seq: u8 = 0;
     // Batch buffer: holds all COBS-encoded frames for one tick.
-    // Worst case ~14 frames × ~60 bytes each = ~840 bytes; 1024 gives headroom.
+    // Worst case ~15 frames × ~60 bytes each = ~900 bytes; 1024 gives headroom.
     let mut batch = [0u8; 1024];
+
+    // Ping state.
+    let mut ping_counter: u32 = 0;
+    let mut ping_id: u32 = 0;
 
     defmt::info!("ESP bridge TX task started (DMA)");
 
@@ -105,53 +139,107 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
         //
         // All frames are batch-encoded into one contiguous buffer,
         // then sent as a single DMA transfer (one interrupt total).
+        //
+        // All telemetry timestamps are converted to UTC via time_sync.
 
         let mut pos = 0;
 
         if let Some(m) = drain_latest(&mut imu1_sub) {
-            pos += encode_and_advance(&WireImu::from_msg(&m), &mut seq, &mut batch[pos..]);
+            let mut w = WireImu::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
         if let Some(m) = drain_latest(&mut imu2_sub) {
-            pos += encode_with_id(&WireImu::from_msg(&m), wire::msg_id::IMU_2, &mut seq, &mut batch[pos..]);
+            let mut w = WireImu::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_with_id(&w, wire::msg_id::IMU_2, &mut seq, &mut batch[pos..]);
         }
         if let Some(m) = drain_latest(&mut att_sub) {
-            pos += encode_and_advance(&WireVehicleAttitude::from_msg(&m), &mut seq, &mut batch[pos..]);
+            let mut w = WireVehicleAttitude::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
         if let Some(m) = drain_latest(&mut rc_sub) {
-            pos += encode_and_advance(&WireRcInput::from_msg(&m), &mut seq, &mut batch[pos..]);
+            let mut w = WireRcInput::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
         if let Some(m) = drain_latest(&mut rc_link_sub) {
-            pos += encode_and_advance(&WireRcLinkStatus::from_msg(&m), &mut seq, &mut batch[pos..]);
+            let mut w = WireRcLinkStatus::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
         if let Some(m) = drain_latest(&mut dshot_sub) {
-            pos += encode_and_advance(&WireDshotTelemetry::from_msg(&m), &mut seq, &mut batch[pos..]);
+            let mut w = WireDshotTelemetry::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
         if let Some(m) = drain_latest(&mut ocp_sub) {
-            pos += encode_and_advance(&WireOcpSolverOutput::from_msg(&m), &mut seq, &mut batch[pos..]);
+            let mut w = WireOcpSolverOutput::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
         if let Some(m) = drain_latest(&mut gps_sub) {
-            pos += encode_and_advance(&WireGpsFix::from_msg(&m), &mut seq, &mut batch[pos..]);
+            let mut w = WireGpsFix::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
         if let Some(m) = drain_latest(&mut mag_ext_sub) {
-            pos += encode_and_advance(&WireMagSample::from_msg(&m), &mut seq, &mut batch[pos..]);
+            let mut w = WireMagSample::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
         if let Some(m) = drain_latest(&mut mag_int_sub) {
-            pos += encode_with_id(&WireMagSample::from_msg(&m), wire::msg_id::MAG_INT, &mut seq, &mut batch[pos..]);
+            let mut w = WireMagSample::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_with_id(&w, wire::msg_id::MAG_INT, &mut seq, &mut batch[pos..]);
         }
         if let Some(m) = drain_latest(&mut baro1_sub) {
-            pos += encode_and_advance(&WireBaroSample::from_msg(&m), &mut seq, &mut batch[pos..]);
+            let mut w = WireBaroSample::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
         if let Some(m) = drain_latest(&mut baro2_sub) {
-            pos += encode_with_id(&WireBaroSample::from_msg(&m), wire::msg_id::BARO_2, &mut seq, &mut batch[pos..]);
+            let mut w = WireBaroSample::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_with_id(&w, wire::msg_id::BARO_2, &mut seq, &mut batch[pos..]);
         }
         if let Some(m) = drain_latest(&mut att_ctrl_sub) {
-            pos += encode_and_advance(&WireAttitudeControlSetpoint::from_msg(&m), &mut seq, &mut batch[pos..]);
+            let mut w = WireAttitudeControlSetpoint::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
         if let Some(m) = drain_latest(&mut manual_sub) {
-            pos += encode_and_advance(&WireManualControlSetpoint::from_msg(&m), &mut seq, &mut batch[pos..]);
+            let mut w = WireManualControlSetpoint::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
         if let Some(m) = drain_latest(&mut arm_sub) {
-            pos += encode_and_advance(&WireArmDisarm::from_msg(&m), &mut seq, &mut batch[pos..]);
+            let mut w = WireArmDisarm::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+        }
+
+        // Periodic ping + time sync status telemetry (every 5s).
+        ping_counter += 1;
+        if ping_counter >= PING_INTERVAL_TICKS {
+            ping_counter = 0;
+            let ping = WirePing {
+                ping_id,
+                stm32_send_us: embassy_time::Instant::now().as_micros(),
+            };
+            ping_id += 1;
+            pos += encode_and_advance(&ping, &mut seq, &mut batch[pos..]);
+
+            // Send time sync diagnostics to ground.
+            let s = super::time_sync::status();
+            let status = WireTimeSyncStatus {
+                synced: s.synced as u8,
+                offset_us: s.offset_us,
+                ping_rtt_us: s.ping_rtt_us,
+                ping_clock_err_us: s.ping_clock_err_us,
+            };
+            pos += encode_and_advance(&status, &mut seq, &mut batch[pos..]);
         }
 
         if pos > 0 {

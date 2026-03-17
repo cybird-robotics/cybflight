@@ -48,6 +48,11 @@ const HELP_TEXT: &[u8] = b"\
   stream <topic> on    stream data on <topic>\r\n\
   stream <topic> off   stop data stream on <topic>\r\n\
   motor <1-4> <0-100>  set motor throttle (test mode)\r\n\
+  param list           list all vehicle parameters\r\n\
+  param get <name>     get a parameter value\r\n\
+  param set <name> <v> set a parameter (in-memory)\r\n\
+  param save           write params to flash\r\n\
+  param defaults       reset to compile-time defaults\r\n\
   reboot               software reset\r\n\
   reboot --dfu         reset into USB DFU bootloader\r\n\
   help                 show this message\r\n\
@@ -613,6 +618,9 @@ async fn dispatch<'d>(
         line if line.starts_with("motor ") => {
             dispatch_motor(class, line).await?;
         }
+        line if line.starts_with("param") => {
+            dispatch_param(class, line).await?;
+        }
         _ => {
             write_all(class, b"unknown command (try 'help')\r\n").await?;
         }
@@ -658,6 +666,129 @@ async fn dispatch_motor<'d>(
     let mut w = WriteBuf::new(&mut buf);
     write!(w, "motor {} = {}%\r\n", idx, pct).ok();
     write_all(class, w.as_slice()).await
+}
+
+async fn dispatch_param<'d>(
+    class: &mut CdcAcmClass<'d, UsbDriver<'d>>,
+    line: &str,
+) -> Result<(), EndpointError> {
+    use cybflight_core::params::{ParamKey, ALL_KEYS};
+
+    let mut parts = line.split_ascii_whitespace();
+    parts.next(); // skip "param"
+    let sub = parts.next().unwrap_or("");
+
+    match sub {
+        "list" => {
+            let params = crate::params::get();
+            for &key in ALL_KEYS {
+                let mut buf = [0u8; 64];
+                let mut w = WriteBuf::new(&mut buf);
+                write!(w, "  {:12} = {}\r\n", key.as_str(), params.get(key)).ok();
+                write_all(class, w.as_slice()).await?;
+            }
+        }
+        "get" => {
+            let name = parts.next();
+            match name.and_then(ParamKey::from_str) {
+                Some(key) => {
+                    let val = crate::params::get().get(key);
+                    let mut buf = [0u8; 64];
+                    let mut w = WriteBuf::new(&mut buf);
+                    write!(w, "{} = {}\r\n", key.as_str(), val).ok();
+                    write_all(class, w.as_slice()).await?;
+                }
+                None => {
+                    write_all(class, b"unknown param (try 'param list')\r\n").await?;
+                }
+            }
+        }
+        "set" => {
+            let name = parts.next();
+            let val_str = parts.next();
+            let key = name.and_then(ParamKey::from_str);
+            match (key, val_str) {
+                (Some(key), Some(val_str)) => {
+                    if let Some(val) = parse_f32(val_str) {
+                        let mut params = crate::params::get();
+                        params.set(key, val);
+                        crate::params::set(params);
+                        let mut buf = [0u8; 64];
+                        let mut w = WriteBuf::new(&mut buf);
+                        write!(w, "{} = {}\r\n", key.as_str(), val).ok();
+                        write_all(class, w.as_slice()).await?;
+                    } else {
+                        write_all(class, b"invalid number\r\n").await?;
+                    }
+                }
+                _ => {
+                    write_all(class, b"usage: param set <name> <value>\r\n").await?;
+                }
+            }
+        }
+        "save" => match crate::params::save_to_flash() {
+            Ok(()) => {
+                write_all(class, b"params saved to flash\r\n").await?;
+            }
+            Err(e) => {
+                let mut buf = [0u8; 64];
+                let mut w = WriteBuf::new(&mut buf);
+                write!(w, "error: {}\r\n", e).ok();
+                write_all(class, w.as_slice()).await?;
+            }
+        },
+        "defaults" => {
+            crate::params::set(crate::vehicle::default_params());
+            write_all(class, b"params reset to defaults (not saved)\r\n").await?;
+        }
+        _ => {
+            write_all(class, b"usage: param list|get|set|save|defaults\r\n").await?;
+        }
+    }
+    Ok(())
+}
+
+/// Minimal f32 parser for no_std (core::str::parse::<f32> requires std).
+/// Handles optional sign, integer part, optional decimal fraction.
+fn parse_f32(s: &str) -> Option<f32> {
+    if s.is_empty() {
+        return None;
+    }
+    let (s, neg) = if let Some(rest) = s.strip_prefix('-') {
+        (rest, true)
+    } else if let Some(rest) = s.strip_prefix('+') {
+        (rest, false)
+    } else {
+        (s, false)
+    };
+    let (int_part, frac_part) = match s.find('.') {
+        Some(dot) => (&s[..dot], Some(&s[dot + 1..])),
+        None => (s, None),
+    };
+    if int_part.is_empty() && frac_part.map_or(true, |f| f.is_empty()) {
+        return None;
+    }
+    let mut val: f64 = 0.0;
+    for &b in int_part.as_bytes() {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val * 10.0 + (b - b'0') as f64;
+    }
+    if let Some(frac) = frac_part {
+        let mut factor = 0.1;
+        for &b in frac.as_bytes() {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            val += (b - b'0') as f64 * factor;
+            factor *= 0.1;
+        }
+    }
+    if neg {
+        val = -val;
+    }
+    Some(val as f32)
 }
 
 // ---------------------------------------------------------------------------

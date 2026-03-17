@@ -13,7 +13,6 @@ use crate::{
     motors::ACTUATOR_MOTORS,
     msgs,
     sensors::{self, MANUAL_CONTROL},
-    vehicle::{self, quadrotor_allocator, QUADROTOR_BODY},
 };
 
 pub struct AttitudeControl<const N: usize> {
@@ -22,14 +21,14 @@ pub struct AttitudeControl<const N: usize> {
 }
 
 impl<const N: usize> AttitudeControl<N> {
-    pub fn new(allocator: LinearAllocator<N>) -> Self {
+    pub fn new(body: &cybflight_core::mixer::RigidBodyParams, allocator: LinearAllocator<N>) -> Self {
         Self {
             ac: geometric_controller::GeometricAttitudeController::new(
                 Vector3::new(1.0, 1.0, 0.5),
                 Vector3::new(1.0, 1.0, 0.2),
                 Vector3::new(0.3, 0.25, 0.15),
             )
-            .with_inertia(QUADROTOR_BODY.inertia_matrix()),
+            .with_inertia(body.inertia_matrix()),
             allocator,
         }
     }
@@ -118,6 +117,10 @@ impl<const N: usize> AttitudeControl<N> {
 
 #[embassy_executor::task(pool_size = 2)]
 pub async fn attitude_control_task() {
-    let mut driver = AttitudeControl::new(quadrotor_allocator());
+    let params = crate::params::get();
+    let effectiveness =
+        cybflight_core::mixer::MotorEffectiveness::from_motors(&params.motors);
+    let allocator = LinearAllocator::new(effectiveness);
+    let mut driver = AttitudeControl::new(&params.body, allocator);
     driver.run().await;
 }

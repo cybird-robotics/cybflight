@@ -43,6 +43,34 @@ pub fn feed() {
         .write(|w| w.set_key(pac::iwdg::vals::Key::RESET));
 }
 
+/// Temporarily extend the IWDG timeout to ~4 s for long-running blocking
+/// operations (e.g. flash sector erase). Feeds the counter immediately so
+/// the full extended period starts now.
+///
+/// The IWDG prescaler and reload registers can be modified while running by
+/// first writing the unlock key (0x5555) to KR.
+pub fn extend_timeout() {
+    let iwdg = pac::IWDG1;
+    // Unlock PR/RLR
+    iwdg.kr().write(|w| w.set_key(pac::iwdg::vals::Key::ENABLE));
+    // Prescaler /256 → 32 kHz / 256 = 125 Hz tick, reload 500 → 4 s
+    iwdg.pr().write(|w| w.set_pr(pac::iwdg::vals::Pr::DIVIDE_BY256));
+    // Wait for prescaler update to take effect
+    while iwdg.sr().read().pvu() {}
+    feed();
+}
+
+/// Restore the IWDG timeout to the normal ~500 ms and feed immediately.
+pub fn restore_timeout() {
+    let iwdg = pac::IWDG1;
+    // Unlock PR/RLR
+    iwdg.kr().write(|w| w.set_key(pac::iwdg::vals::Key::ENABLE));
+    // Prescaler /32 → 1 kHz tick, reload 500 → 500 ms
+    iwdg.pr().write(|w| w.set_pr(pac::iwdg::vals::Pr::DIVIDE_BY32));
+    while iwdg.sr().read().pvu() {}
+    feed();
+}
+
 /// Watchdog feeder task — runs at lowest priority on the thread executor.
 ///
 /// Feeds the IWDG every 200 ms. If the thread executor stalls for >500 ms

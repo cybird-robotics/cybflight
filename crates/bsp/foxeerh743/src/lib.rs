@@ -265,6 +265,9 @@ pub struct Board {
     pub flash: FlashPins,
     pub osd: OsdPins,
     pub usb: UsbPins,
+
+    /// Internal flash peripheral for parameter storage.
+    pub internal_flash: hal::Peri<'static, hal::peripherals::FLASH>,
 }
 
 /// Board clock/power configuration.
@@ -449,6 +452,7 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
             flash: FlashPins { flash_cs },
             osd: OsdPins { osd_cs },
             usb,
+            internal_flash: p.FLASH,
         },
         defmt_uart,
     )

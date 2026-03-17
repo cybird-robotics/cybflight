@@ -52,6 +52,9 @@ hal::bind_interrupts!(struct Usart6Irqs {
 });
 
 pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Board) {
+    // --- Load vehicle parameters from flash (or defaults) ---
+    crate::params::init_from_flash(board.internal_flash);
+
     // --- LEDs: turn off led1 & led2, use led0 for status ---
     let mut led1 = Led::new(board.leds.led1, false);
     let mut led2 = Led::new(board.leds.led2, false);

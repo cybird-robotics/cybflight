@@ -334,6 +334,9 @@ pub struct Board {
     pub can: CanPins,
     pub usb: UsbPins,
 
+    /// Internal flash peripheral for parameter storage.
+    pub internal_flash: hal::Peri<'static, hal::peripherals::FLASH>,
+
     /// USB detect input (PD4). Pull-down matches Betaflight IOCFG_IPD.
     pub usb_detect: Input<'static>,
 }
@@ -582,6 +585,7 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
             sensors,
             can,
             usb,
+            internal_flash: p.FLASH,
             usb_detect,
         },
         defmt_uart,

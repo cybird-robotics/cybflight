@@ -55,6 +55,14 @@ pub const QUADROTOR_MOTORS: [MotorParams; 4] = [
     },
 ];
 
+/// Return the compile-time default vehicle parameters.
+pub fn default_params() -> cybflight_core::params::VehicleParams {
+    cybflight_core::params::VehicleParams {
+        body: QUADROTOR_BODY,
+        motors: QUADROTOR_MOTORS,
+    }
+}
+
 /// Construct the quadrotor linear allocator.
 ///
 /// Called once at firmware startup (e.g. in `board_init` or the attitude task).

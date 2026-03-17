@@ -13,6 +13,7 @@ pub mod serial_logger;
 pub mod control;
 pub mod motors;
 pub use cybflight_msgs as msgs;
+pub mod params;
 pub mod platform;
 pub mod sensors;
 pub mod shell;

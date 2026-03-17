@@ -117,6 +117,7 @@ Downlink msg_ids use the low range (1–127), uplink uses the high range
 | 12 | down | BaroSample (2) | timestamp, pressure_pa, temp |
 | 13 | down | AttitudeControlSetpoint | timestamp, thrust, quat[4], rate[3], torque[3] |
 | 14 | down | ManualControlSetpoint | timestamp, thrust, roll/pitch/yaw rates |
+| 15 | down | ArmDisarm | timestamp, armed |
 | 128 | up | ViconPose | timestamp, position[3], orientation[4] |
 
 Message IDs and struct layouts are defined in the shared `cybflight-msgs` crate.

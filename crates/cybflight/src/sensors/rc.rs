@@ -175,7 +175,7 @@ pub mod crsf_runner {
     use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, pubsub::Subscriber};
 
     type AttitudeSub =
-        Subscriber<'static, CriticalSectionRawMutex, msgs::VehicleAttitude, 4, 4, 1>;
+        Subscriber<'static, CriticalSectionRawMutex, msgs::VehicleAttitude, 4, 6, 1>;
 
     /// CRSF runner: reads frames, publishes channels/link stats, sends telemetry.
     pub struct CrsfRunner {

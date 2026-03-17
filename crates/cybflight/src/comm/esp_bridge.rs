@@ -9,9 +9,9 @@ use embassy_time::Timer;
 use crate::hal::usart::{UartRx, UartTx};
 use crate::{control, sensors};
 use cybflight_msgs::wire::{
-    self, WireAttitudeControlSetpoint, WireBaroSample, WireDshotTelemetry, WireGpsFix, WireImu,
-    WireMagSample, WireManualControlSetpoint, WireMessage, WireOcpSolverOutput, WirePose,
-    WireRcInput, WireRcLinkStatus, WireVehicleAttitude,
+    self, WireArmDisarm, WireAttitudeControlSetpoint, WireBaroSample, WireDshotTelemetry,
+    WireGpsFix, WireImu, WireMagSample, WireManualControlSetpoint, WireMessage,
+    WireOcpSolverOutput, WirePose, WireRcInput, WireRcLinkStatus, WireVehicleAttitude,
 };
 
 use super::{encode_frame, FrameAccumulator};
@@ -86,6 +86,7 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
     let mut baro2_sub = sensors::BARO_2.subscriber().unwrap();
     let mut att_ctrl_sub = control::ATTITUDE_CONTROL_SETPOINT.subscriber().unwrap();
     let mut manual_sub = sensors::MANUAL_CONTROL.subscriber().unwrap();
+    let mut arm_sub = crate::ARM_DISARM.subscriber().unwrap();
 
     let mut seq: u8 = 0;
     // Batch buffer: holds all COBS-encoded frames for one tick.
@@ -148,6 +149,9 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
         }
         if let Some(m) = drain_latest(&mut manual_sub) {
             pos += encode_and_advance(&WireManualControlSetpoint::from_msg(&m), &mut seq, &mut batch[pos..]);
+        }
+        if let Some(m) = drain_latest(&mut arm_sub) {
+            pos += encode_and_advance(&WireArmDisarm::from_msg(&m), &mut seq, &mut batch[pos..]);
         }
 
         if pos > 0 {

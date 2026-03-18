@@ -45,6 +45,7 @@ const HELP_TEXT: &[u8] = b"\
   baro1                one-shot barometer 1\r\n\
   baro2                one-shot barometer 2\r\n\
   vicon                one-shot Vicon pose\r\n\
+  timesync             one-shot time sync status\r\n\
   stream <topic> on    stream data on <topic>\r\n\
   stream <topic> off   stop data stream on <topic>\r\n\
   motor <1-4> <0-100>  set motor throttle (test mode)\r\n\

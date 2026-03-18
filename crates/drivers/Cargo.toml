@@ -5,7 +5,11 @@ edition = "2024"
 publish = false
 
 [dependencies]
+<<<<<<< HEAD
 cybflight-msgs = { version = "0.1.4", registry = "utadr" }
+=======
+cybflight-msgs = { path = "../../../cybflight-msgs" }
+>>>>>>> 2ce39cd (Implement autopilot)
 embedded-hal = "1.0"
 embedded-hal-async = "1.0"
 defmt = "1.0.1"

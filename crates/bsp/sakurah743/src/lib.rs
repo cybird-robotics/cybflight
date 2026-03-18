@@ -229,7 +229,6 @@ pub struct SerialPins {
     pub uart7_rx: hal::Peri<'static, hal::peripherals::PE7>,
     pub uart7_cts: hal::Peri<'static, hal::peripherals::PE10>,
     pub uart7_rts: hal::Peri<'static, hal::peripherals::PE9>,
-
 }
 
 pub struct AdcPins {
@@ -364,21 +363,23 @@ fn board_config() -> Config {
         use hal::rcc::*;
         config.rcc.pll1 = Some(Pll {
             source: PllSource::HSI,
-            prediv: PllPreDiv::DIV4,   // 64 / 4 = 16 MHz ref
-            mul:    PllMul::MUL60,     // 16 * 60 = 960 MHz VCO
-            fracn:  None,
-            divp:   Some(PllDiv::DIV2), // 480 MHz SYSCLK
-            divq:   Some(PllDiv::DIV4), // 240 MHz for SPI123
-            divr:   None,
+            prediv: PllPreDiv::DIV4, // 64 / 4 = 16 MHz ref
+            mul: PllMul::MUL60,      // 16 * 60 = 960 MHz VCO
+            fracn: None,
+            divp: Some(PllDiv::DIV2), // 480 MHz SYSCLK
+            divq: Some(PllDiv::DIV4), // 240 MHz for SPI123
+            divr: None,
         });
-        config.rcc.sys      = Sysclk::PLL1_P;
-        config.rcc.ahb_pre  = AHBPrescaler::DIV2;  // 240 MHz AHB
-        config.rcc.apb1_pre = APBPrescaler::DIV2;  // 120 MHz
+        config.rcc.sys = Sysclk::PLL1_P;
+        config.rcc.ahb_pre = AHBPrescaler::DIV2; // 240 MHz AHB
+        config.rcc.apb1_pre = APBPrescaler::DIV2; // 120 MHz
         config.rcc.apb2_pre = APBPrescaler::DIV2;
         config.rcc.apb3_pre = APBPrescaler::DIV2;
         config.rcc.apb4_pre = APBPrescaler::DIV2;
-        config.rcc.hsi48 = Some(Hsi48Config { sync_from_usb: true }); // USB clock
-        config.rcc.mux.usbsel    = mux::Usbsel::HSI48;
+        config.rcc.hsi48 = Some(Hsi48Config {
+            sync_from_usb: true,
+        }); // USB clock
+        config.rcc.mux.usbsel = mux::Usbsel::HSI48;
         config.rcc.mux.spi123sel = mux::Saisel::PLL1_Q;
     }
     config
@@ -490,7 +491,6 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
         uart7_rx: p.PE7,
         uart7_cts: p.PE10,
         uart7_rts: p.PE9,
-
     };
 
     let adc = AdcPins {

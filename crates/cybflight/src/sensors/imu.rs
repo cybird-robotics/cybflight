@@ -1,21 +1,21 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::apply_alignment;
+use crate::hal;
 use bsp_types::SensorAlign;
 use cybflight_core::butterworth::ButterworthFilter;
 use cybflight_drivers::imu::ReadImu;
 use cybflight_drivers::imu::icm426xx::Icm426xx;
 use cybflight_drivers::imu::mpu6x00::Mpu6x00;
+use cybflight_msgs as msgs;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::mutex::Mutex;
 use embassy_sync::pubsub::PubSubChannel;
 use embassy_time::{Instant, Timer};
-use nalgebra::Vector3;
-use crate::hal;
-use cybflight_msgs as msgs;
-use crate::apply_alignment;
 use hal::gpio::Output;
 use hal::spi::{self, Spi};
+use nalgebra::Vector3;
 
 pub type SpiBus = Spi<'static, hal::mode::Async, spi::mode::Master>;
 pub type SpiBusMtx = Mutex<NoopRawMutex, SpiBus>;

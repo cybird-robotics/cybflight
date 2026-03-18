@@ -1,5 +1,5 @@
 use cybflight_core::{
-    attitude_control::{self, geometric_controller, AttitudeControlOutput},
+    attitude_control::{self, AttitudeControlOutput, geometric_controller},
     mixer::LinearAllocator,
 };
 use embassy_time::Instant;
@@ -13,6 +13,10 @@ use crate::{
     motors::ACTUATOR_MOTORS,
     msgs,
     sensors::{self, MANUAL_CONTROL},
+<<<<<<< HEAD
+=======
+    vehicle::{self, QUADROTOR_BODY, quadrotor_allocator},
+>>>>>>> 2ce39cd (Implement autopilot)
 };
 
 pub struct AttitudeControl<const N: usize> {
@@ -61,7 +65,7 @@ impl<const N: usize> AttitudeControl<N> {
             }
             while let Some(rc) = rc_sub.try_next_message_pure() {
                 att_ref.body_rate_rad_s = [rc.roll_rate, rc.pitch_rate, rc.yaw_rate].into();
-                thrust_normalized = rc.thrust;
+                thrust_normalized = rc.thrust; // The thrust command is obtained from the RC
                 last_rc_time = Instant::now();
             }
 
@@ -70,6 +74,8 @@ impl<const N: usize> AttitudeControl<N> {
                 att_ref.body_rate_rad_s = Vector3::zeros();
             }
 
+
+            // Compute the control command:  body_rate_rad_s and torque_n_m
             let AttitudeControlOutput {
                 body_rate_rad_s,
                 torque_n_m,

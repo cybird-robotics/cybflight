@@ -81,3 +81,13 @@ pub static MANUAL_CONTROL: PubSubChannel<
     4,
     1,
 > = PubSubChannel::new();
+
+// Stabilized control setpoint (thrust + angles from RC sticks): CAP=2 (fresh only),
+// SUBS=4 (attitude_control + telemetry + shell + spare), PUBS=1 (rc_interpreter).
+pub static STABILIZED_CONTROL: PubSubChannel<
+    CriticalSectionRawMutex,
+    msgs::StablizedControlSetpoint,
+    2,
+    4,
+    1,
+> = PubSubChannel::new();

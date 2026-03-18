@@ -59,6 +59,19 @@ async fn main(spawner: embassy_executor::Spawner) {
     //     .spawn(cybflight::control::nmpc_driver::nmpc_task())
     //     .unwrap_or_else(|_| defmt::panic!("failed to spawn NMPC driver task"));
     //
+
+    spawner
+        .spawn(cybflight::estimate::feedthrough_estimate::feedthrough_estimate())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn feedthrough estimate task"));
+
+    spawner
+        .spawn(cybflight::control::inner_loop::inner_loop_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn inner loop task"));
+
+
+    // TODO: create a outer_loop task that runs around 100Hz
+    // TODO: create a mission_plan_task that runs around 10 Hz
+
     spawner
         .spawn(cybflight::control::rc_interpreter::rc_interpreter_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn RC interpreter task"));
@@ -66,17 +79,17 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::control::failsafe::failsafe_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn failsafe task"));
-    spawner
-        .spawn(cybflight::sensors::attitude::mahony_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude task"));
+    // spawner
+    //     .spawn(cybflight::sensors::attitude::mahony_task())
+    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude task"));
 
     spawner
         .spawn(cybflight::estimation::eskf_imu_mocap::estimation_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn estimation task"));
 
-    spawner
-        .spawn(cybflight::control::nmpc_driver::nmpc_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn NMPC driver task"));
+    // spawner
+    //     .spawn(cybflight::control::nmpc_driver::nmpc_task())
+    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn NMPC driver task"));
 
     spawner
         .spawn(cybflight::usb_serial::imu1_stream_task())
@@ -84,9 +97,10 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::usb_serial::imu2_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn IMU2 stream task"));
-    spawner
-        .spawn(cybflight::control::attitude_control::attitude_control_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude control task"));
+    // inner_loop_task replaces attitude_control as the sole controller.
+    // spawner
+    //     .spawn(cybflight::control::attitude_control::attitude_control_task())
+    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude control task"));
     spawner
         .spawn(cybflight::usb_serial::att_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude stream task"));
@@ -129,6 +143,9 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::usb_serial::estimator_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn estimator stream task"));
+
+    // spawner.spawn(cybflight::usb_serial::feedthrough_stream_task())
+    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn feedthrough stream task"));
 
     defmt::info!("all init done");
 }

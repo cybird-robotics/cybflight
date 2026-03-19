@@ -1,6 +1,12 @@
+use core::time::Duration;
+
 use cybflight_core::{
     attitude_control::{self, geometric_controller, AttitudeControlOutput},
     mixer::LinearAllocator,
+};
+use discrete_pid::{
+    pid::{PidConfigBuilder, PidController},
+    time::Micros,
 };
 use embassy_time::Instant;
 use nalgebra::{UnitQuaternion, Vector3, Vector4};
@@ -9,26 +15,79 @@ use nalgebra::{UnitQuaternion, Vector3, Vector4};
 /// Defense-in-depth: catches stale RC data even if failsafe task is delayed.
 const RC_STALE_TIMEOUT_MS: u64 = 250;
 
+/// Nominal IMU loop period. Used as sample_time for the rate PIDs so that when
+/// I/D terms are later enabled, their gains are time-invariant at this rate.
+const RATE_PID_SAMPLE_TIME: Duration = Duration::from_micros(125); // 8 kHz
+
 use crate::{
     motors::ACTUATOR_MOTORS,
     msgs,
     sensors::{self, MANUAL_CONTROL},
 };
 
+/// Per-axis rate PID controllers (roll, pitch, yaw).
+///
+/// `input`   = measured body rate (rad/s)
+/// `setpoint`= rate reference from the outer attitude loop (rad/s)
+/// `output`  = rate torque contribution (N·m)
+///
+/// With ki = kd = 0, `output = kp * (setpoint − input) = −kp * rate_error`,
+/// which is exactly the old `−k_rate_torque * rate_error` term from the
+/// geometric controller when `kp[axis] == k_rate_torque[axis]`.
+struct RatePids {
+    roll: PidController<Micros, f32>,
+    pitch: PidController<Micros, f32>,
+    yaw: PidController<Micros, f32>,
+}
+
+impl RatePids {
+    fn new(kp_roll: f32, kp_pitch: f32, kp_yaw: f32) -> Self {
+        let make = |kp: f32| {
+            let config = PidConfigBuilder::<f32>::default()
+                .kp(kp)
+                .ki(0.0)
+                .kd(0.0)
+                .sample_time(RATE_PID_SAMPLE_TIME)
+                .build()
+                .expect("rate PID config invalid");
+            PidController::new_uninit(config)
+        };
+        Self {
+            roll: make(kp_roll),
+            pitch: make(kp_pitch),
+            yaw: make(kp_yaw),
+        }
+    }
+
+    fn compute(&mut self, rate_fb: Vector3<f32>, rate_ref: Vector3<f32>) -> Vector3<f32> {
+        let ts = Micros(Instant::now().as_micros());
+        Vector3::new(
+            self.roll.compute(rate_fb.x, rate_ref.x, ts, None),
+            self.pitch.compute(rate_fb.y, rate_ref.y, ts, None),
+            self.yaw.compute(rate_fb.z, rate_ref.z, ts, None),
+        )
+    }
+}
+
 pub struct AttitudeControl<const N: usize> {
     ac: geometric_controller::GeometricAttitudeController<f32>,
+    rate_pids: RatePids,
     allocator: LinearAllocator<N>,
 }
 
 impl<const N: usize> AttitudeControl<N> {
-    pub fn new(body: &cybflight_core::mixer::RigidBodyParams, allocator: LinearAllocator<N>) -> Self {
+    pub fn new(
+        body: &cybflight_core::mixer::RigidBodyParams,
+        allocator: LinearAllocator<N>,
+    ) -> Self {
         Self {
             ac: geometric_controller::GeometricAttitudeController::new(
-                Vector3::new(1.0, 1.0, 0.5),
-                Vector3::new(1.0, 1.0, 0.2),
-                Vector3::new(0.3, 0.25, 0.15),
+                Vector3::new(1.0, 1.0, 0.5), // k_ang_rate  [roll, pitch, yaw]
+                Vector3::new(1.0, 1.0, 0.2), // k_ang_torque [roll, pitch, yaw]
             )
             .with_inertia(body.inertia_matrix()),
+            // kp values match the old k_rate_torque for identical behavior when I=D=0
+            rate_pids: RatePids::new(0.3, 0.25, 0.15),
             allocator,
         }
     }
@@ -70,10 +129,15 @@ impl<const N: usize> AttitudeControl<N> {
                 att_ref.body_rate_rad_s = Vector3::zeros();
             }
 
+            // Outer loop: attitude error → rate setpoint + feedforward torque.
             let AttitudeControlOutput {
-                body_rate_rad_s,
-                torque_n_m,
+                body_rate_rad_s: rate_ref,
+                torque_n_m: outer_torque,
             } = self.ac.compute(&state, &att_ref);
+
+            // Inner loop: per-axis rate PID → rate feedback torque.
+            let rate_torque = self.rate_pids.compute(state.body_rate_rad_s, rate_ref);
+            let torque_n_m = outer_torque + rate_torque;
 
             // Convert normalized thrust [0, 1] → total Newtons, then allocate.
             // When thrust is near zero, send a small idle command so motors keep
@@ -106,7 +170,7 @@ impl<const N: usize> AttitudeControl<N> {
                 attitude_quaternion: att_ref
                     .attitude_quaternion
                     .unwrap_or(UnitQuaternion::identity()),
-                body_rate_rad_s,
+                body_rate_rad_s: rate_ref,
                 torque_n_m,
             });
 
@@ -118,8 +182,7 @@ impl<const N: usize> AttitudeControl<N> {
 #[embassy_executor::task(pool_size = 2)]
 pub async fn attitude_control_task() {
     let params = crate::params::get();
-    let effectiveness =
-        cybflight_core::mixer::MotorEffectiveness::from_motors(&params.motors);
+    let effectiveness = cybflight_core::mixer::MotorEffectiveness::from_motors(&params.motors);
     let allocator = LinearAllocator::new(effectiveness);
     let mut driver = AttitudeControl::new(&params.body, allocator);
     driver.run().await;

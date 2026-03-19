@@ -96,7 +96,6 @@ fn evaluate_attitude_error<T: na::RealField + Copy + NumCast>(
 pub struct GeometricAttitudeController<T> {
     k_ang_rate: na::Vector3<T>,
     k_ang_torque: na::Vector3<T>,
-    k_rate_torque: na::Vector3<T>,
     attitude_error_law: AttitudeErrorLaw,
     max_body_rate: na::Vector3<T>,
     enable_exact_linearization: bool,
@@ -108,11 +107,6 @@ impl<T: na::RealField + Copy + FloatCore> Default for GeometricAttitudeControlle
         Self {
             k_ang_rate: na::Vector3::new(T::one(), T::one(), T::from(0.5).unwrap()),
             k_ang_torque: na::Vector3::new(T::one(), T::one(), T::from(0.2).unwrap()),
-            k_rate_torque: na::Vector3::new(
-                T::from(0.3).unwrap(),
-                T::from(0.25).unwrap(),
-                T::from(0.15).unwrap(),
-            ),
             attitude_error_law: AttitudeErrorLaw::TiltPrioritizing,
             max_body_rate: na::Vector3::new(
                 T::from(360.0).unwrap().to_radians(),
@@ -129,12 +123,10 @@ impl<T: na::RealField + Copy + NumCast + FloatCore> GeometricAttitudeController<
     pub fn new(
         k_ang_rate: na::Vector3<T>,
         k_ang_torque: na::Vector3<T>,
-        k_rate_torque: na::Vector3<T>,
     ) -> Self {
         Self {
             k_ang_rate,
             k_ang_torque,
-            k_rate_torque,
             attitude_error_law: AttitudeErrorLaw::GeometricSO3,
             max_body_rate: na::Vector3::new(
                 T::from(360.0).unwrap().to_radians(),
@@ -182,7 +174,7 @@ impl<T: na::RealField + Copy + NumCast + FloatCore> GeometricAttitudeController<
         } = setpoint;
 
         let rot_fb = q.to_rotation_matrix();
-        let (angle_error, out_body_rate, rate_error, accel_ref_body, rate_ref_body) =
+        let (angle_error, out_body_rate, accel_ref_body, rate_ref_body) =
             if let Some(q_des) = attitude_quaternion {
                 // Convention check: Lee defines e_R such that positive error drives
                 // negative moment e_R = 0.5 * (R_d^T * R - R^T * R_d) Using standard
@@ -207,20 +199,16 @@ impl<T: na::RealField + Copy + NumCast + FloatCore> GeometricAttitudeController<
                 // Resolve body rate reference and angular acceleration in current body frame.
                 let accel_ref_body = rot_des_to_curr * ref_angular_accel;
                 let rate_ref_body = rot_des_to_curr * ref_body_rate;
-                let rate_error = rate_fb - rate_ref_body;
                 (
                     Some(angle_error), // Angle error is only well defined when attitude setpoint is provided
                     -rate_ref_comp,    // Feedback attitude control can give a rate setpoint
-                    rate_error,
                     accel_ref_body,
                     rate_ref_body,
                 )
             } else {
-                let rate_error = rate_fb - ref_body_rate;
                 (
                     None,
                     *ref_body_rate,
-                    rate_error,
                     *ref_angular_accel,
                     *ref_body_rate,
                 )
@@ -231,22 +219,20 @@ impl<T: na::RealField + Copy + NumCast + FloatCore> GeometricAttitudeController<
         });
 
         let out_torque = if let Some(inertia) = self.inertia {
-            let out_torque = angle_error_feedback - self.k_rate_torque.component_mul(&rate_error)
-                + inertia * accel_ref_body;
+            let out_torque = angle_error_feedback + inertia * accel_ref_body;
             let inertia_by_rate = inertia * rate_fb;
             let gyro_term = rate_fb.cross(&inertia_by_rate);
-            // 2. Gyroscopic / Transport Toggle
+            // Gyroscopic / Transport Toggle
             out_torque
                 + if self.enable_exact_linearization {
-                    // Strategy A: Exact Linearization (Lee 2010)
-                    // Cancel natural gyro dynamics (w x Jw)
-                    // Handle transport theorem cross-term J(w x w_ref)
+                    // Exact Linearization (Lee 2010): cancel natural gyro dynamics
+                    // (w x Jw) and transport theorem cross-term J(w x w_ref)
                     gyro_term - inertia_by_rate.cross(&rate_ref_body)
                 } else {
                     gyro_term
                 }
         } else {
-            angle_error_feedback - self.k_rate_torque.component_mul(&rate_error)
+            angle_error_feedback
         };
 
         AttitudeControlOutput {

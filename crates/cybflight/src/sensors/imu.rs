@@ -1,21 +1,23 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::apply_alignment;
+use crate::hal;
+use air_filters::iir::biquad::DirectForm2;
+use air_filters::iir::biquad::{BiquadFilter, BiquadFilterConfigBuilder, BiquadFilterType};
+use air_filters::Filter;
 use bsp_types::SensorAlign;
-use cybflight_core::butterworth::ButterworthFilter;
-use cybflight_drivers::imu::ReadImu;
 use cybflight_drivers::imu::icm426xx::Icm426xx;
 use cybflight_drivers::imu::mpu6x00::Mpu6x00;
+use cybflight_drivers::imu::ReadImu;
+use cybflight_msgs as msgs;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::mutex::Mutex;
 use embassy_sync::pubsub::PubSubChannel;
 use embassy_time::{Instant, Timer};
-use nalgebra::Vector3;
-use crate::hal;
-use cybflight_msgs as msgs;
-use crate::apply_alignment;
 use hal::gpio::Output;
 use hal::spi::{self, Spi};
+use nalgebra::Vector3;
 
 pub type SpiBus = Spi<'static, hal::mode::Async, spi::mode::Master>;
 pub type SpiBusMtx = Mutex<NoopRawMutex, SpiBus>;
@@ -102,8 +104,8 @@ impl GyroCal {
 pub struct ImuReader<D: ReadImu> {
     imu: D,
     align: SensorAlign,
-    accel_filter: ButterworthFilter<f32, 3>,
-    gyro_filter: ButterworthFilter<f32, 3>,
+    accel_filter: [BiquadFilter<f32, DirectForm2<f32>>; 3],
+    gyro_filter: [BiquadFilter<f32, DirectForm2<f32>>; 3],
     /// Optional flag set to `true` when gyro calibration completes.
     /// Pass `Some(&GYRO_CALIBRATED)` for the primary IMU.
     cal_flag: Option<&'static AtomicBool>,
@@ -118,11 +120,44 @@ impl<D: ReadImu> ImuReader<D> {
         cal_flag: Option<&'static AtomicBool>,
     ) -> Self {
         let sample_hz = imu.sample_rate_hz();
+        let common_config_options = BiquadFilterConfigBuilder::direct_form_2()
+            .sample_frequency_hz(sample_hz)
+            .filter_type(BiquadFilterType::LowPass);
         Self {
             imu,
             align,
-            accel_filter: ButterworthFilter::new(accel_cutoff_hz, sample_hz, None, None),
-            gyro_filter: ButterworthFilter::new(gyro_cutoff_hz, sample_hz, None, None),
+            accel_filter: core::array::from_fn(|_| {
+                BiquadFilter::new(
+                    common_config_options
+                        .clone()
+                        .cutoff_frequency_hz(accel_cutoff_hz)
+                        .build()
+                        .unwrap_or_else(|_| {
+                            defmt::error!(
+                                "Got in valid accel filter config: cutoff {}Hz, sample {}Hz",
+                                accel_cutoff_hz,
+                                sample_hz
+                            );
+                            panic!();
+                        }),
+                )
+            }),
+            gyro_filter: core::array::from_fn(|_| {
+                BiquadFilter::new(
+                    common_config_options
+                        .clone()
+                        .cutoff_frequency_hz(gyro_cutoff_hz)
+                        .build()
+                        .unwrap_or_else(|_| {
+                            defmt::error!(
+                                "Got in valid gyro filter config: cutoff {}Hz, sample {}Hz",
+                                gyro_cutoff_hz,
+                                sample_hz
+                            );
+                            panic!();
+                        }),
+                )
+            }),
             cal_flag,
         }
     }
@@ -156,8 +191,8 @@ impl<D: ReadImu> ImuReader<D> {
                     }
                     // Publish during calibration (bias=0) so Mahony can start converging
                     let accel = apply_alignment(self.align, reading.accel_m_s2);
-                    let af = self.accel_filter.compute(&accel.into());
-                    let gf = self.gyro_filter.compute(&gyro.into());
+                    let af = self.accel_filter.apply(accel.into());
+                    let gf = self.gyro_filter.apply(gyro.into());
                     publisher.publish_immediate(msgs::Imu {
                         accel_m_s2: af.into(),
                         gyro_rad_s: gf.into(),
@@ -189,7 +224,9 @@ impl<D: ReadImu> ImuReader<D> {
         }
 
         // Reset filters so the step change from bias subtraction doesn't ring
-        self.gyro_filter.reset_input_output(None, None);
+        self.gyro_filter
+            .reset([0.0; 3])
+            .expect("gyro filter reset failed");
 
         // --- Normal operation: subtract bias ---
         loop {
@@ -198,8 +235,8 @@ impl<D: ReadImu> ImuReader<D> {
                     let accel = apply_alignment(self.align, reading.accel_m_s2);
                     let gyro = apply_alignment(self.align, reading.gyro_rad_s) - gyro_bias;
 
-                    let af = self.accel_filter.compute(&accel.into());
-                    let gf = self.gyro_filter.compute(&gyro.into());
+                    let af = self.accel_filter.apply(accel.into());
+                    let gf = self.gyro_filter.apply(gyro.into());
 
                     publisher.publish_immediate(msgs::Imu {
                         accel_m_s2: af.into(),
@@ -212,8 +249,12 @@ impl<D: ReadImu> ImuReader<D> {
                     defmt::warn!("IMU read error: {}", e);
                     if let Err(re) = self.imu.recover().await {
                         defmt::error!("IMU recovery failed: {}", re);
-                        self.accel_filter.reset_input_output(None, None);
-                        self.gyro_filter.reset_input_output(None, None);
+                        self.accel_filter
+                            .reset([0.0; 3])
+                            .expect("accel filter reset failed");
+                        self.gyro_filter
+                            .reset([0.0; 3])
+                            .expect("gyro filter reset failed");
                         Timer::after_millis(100).await;
                     }
                 }

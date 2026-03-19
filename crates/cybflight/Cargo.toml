@@ -51,6 +51,7 @@ cobs = { version = "0.5", default-features = false }
 
 # Math (no_std)
 nalgebra = { version = "0.34.1", default-features = false, features = ["libm", "defmt"] }
+air-filters = { version = "0.0.3", default-features = false, features = ["libm"] }
 
 [profile.release]
 debug = 2

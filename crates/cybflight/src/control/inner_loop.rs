@@ -116,7 +116,7 @@ impl<const N: usize> InnerLoop<N> {
                     kd: 0.0,
                 },
                 Pids {
-                    kp: 0.5,
+                    kp: 0.05,
                     ki: 0.0,
                     kd: 0.0,
                 },

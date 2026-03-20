@@ -9,7 +9,6 @@ use embassy_time::Instant;
 
 use crate::hal;
 use crate::motors::ARM_STATE;
-use crate::sensors::GYRO_CALIBRATED;
 use crate::status;
 use cybflight_msgs as msgs;
 
@@ -118,19 +117,13 @@ impl ArmStateMachine {
             return;
         }
 
-        // Gate 2: gyro calibrated (BF: ARMING_DISABLED_GYRO_NOT_CALIBRATED)
-        if !GYRO_CALIBRATED.load(Ordering::Relaxed) {
-            self.switch_arm_start = None;
-            return;
-        }
-
-        // Gate 3: throttle at minimum (BF: ARMING_DISABLED_THROTTLE)
+        // Gate 2: throttle at minimum (BF: ARMING_DISABLED_THROTTLE)
         if channels[THROTTLE_CHANNEL] > THROTTLE_MINCHECK {
             self.switch_arm_start = None;
             return;
         }
 
-        // Gate 4: link active & quality (BF: ARMING_DISABLED_RX_FAILSAFE)
+        // Gate 3: link active & quality (BF: ARMING_DISABLED_RX_FAILSAFE)
         if !self.link_active
             || now.duration_since(self.link_stats_time).as_millis() > LINK_STATS_MAX_AGE_MS
             || self.link_quality < MIN_LINK_QUALITY
@@ -139,7 +132,7 @@ impl ArmStateMachine {
             return;
         }
 
-        // Gate 5: switch hold duration (debounce)
+        // Gate 4: switch hold duration (debounce)
         let start = *self.switch_arm_start.get_or_insert(now);
         if now.duration_since(start).as_millis() < ARM_SWITCH_HOLD_MS {
             return;

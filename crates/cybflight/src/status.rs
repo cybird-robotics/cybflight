@@ -10,8 +10,6 @@ use crate::hal;
 pub enum SystemStatus {
     /// Boot / pre-calibration: slow heartbeat.
     Booting,
-    /// Gyro calibrating: fast double-blink.
-    Calibrating,
     /// Disarmed, ready to arm: slow blink (1 Hz).
     Disarmed,
     /// Armed: solid on.
@@ -26,7 +24,6 @@ pub static STATUS: Watch<CriticalSectionRawMutex, SystemStatus, 2> = Watch::new(
 fn pattern(status: SystemStatus) -> &'static [(u64, u64)] {
     match status {
         SystemStatus::Booting => &[(200, 800)],
-        SystemStatus::Calibrating => &[(50, 100), (50, 800)],
         SystemStatus::Disarmed => &[(500, 500)],
         SystemStatus::Armed => &[(1000, 0)],
         SystemStatus::Failsafe => &[(50, 50)],

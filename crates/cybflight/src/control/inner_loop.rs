@@ -100,24 +100,24 @@ impl<const N: usize> InnerLoop<N> {
                 },
             ),
             ac: geometric_controller::GeometricAttitudeController::new(
-                Vector3::new(6.0, 6.0, 1.5), // k_ang_rate  [roll, pitch, yaw]
+                Vector3::new(3.0, 3.0, 1.0), // k_ang_rate  [roll, pitch, yaw]
                 Vector3::new(1.0, 1.0, 0.2), // k_ang_torque (unused — discarded below)
             )
             .with_inertia(QUADROTOR_BODY.inertia_matrix()),
             rate_pids: RatePids::new(
                 Pids {
-                    kp: 0.3,
+                    kp: 0.1,
                     ki: 0.0,
                     kd: 0.0,
                 },
                 Pids {
-                    kp: 0.25,
+                    kp: 0.08,
                     ki: 0.0,
                     kd: 0.0,
                 },
                 Pids {
-                    kp: 0.15,
-                    ki: 0.00,
+                    kp: 0.5,
+                    ki: 0.0,
                     kd: 0.0,
                 },
             ),
@@ -221,11 +221,14 @@ impl<const N: usize> InnerLoop<N> {
             let demand = Vector4::new(effective_thrust_n, torque_n_m.x, torque_n_m.y, torque_n_m.z);
             let throttles = self.allocator.allocate(demand);
 
+            // Thrust linearization: motor thrust ∝ throttle² (quadratic in RPM),
+            // so apply sqrt() to convert from desired normalized thrust to the
+            // throttle command that produces it. Standard in PX4/Betaflight.
             let motor_commands = [
-                msgs::NormalizedThrottle::new_saturating(throttles[0]),
-                msgs::NormalizedThrottle::new_saturating(throttles[1]),
-                msgs::NormalizedThrottle::new_saturating(throttles[2]),
-                msgs::NormalizedThrottle::new_saturating(throttles[3]),
+                msgs::NormalizedThrottle::new_saturating(libm::sqrtf(throttles[0])),
+                msgs::NormalizedThrottle::new_saturating(libm::sqrtf(throttles[1])),
+                msgs::NormalizedThrottle::new_saturating(libm::sqrtf(throttles[2])),
+                msgs::NormalizedThrottle::new_saturating(libm::sqrtf(throttles[3])),
             ];
             let publish_time = Instant::now();
             ACTUATOR_MOTORS.signal(msgs::ActuatorMotors {

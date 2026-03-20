@@ -13,7 +13,7 @@
 use super::{PositionControlOutput, PositionControlSetpoint, PositionControlState, VehicleParams};
 use core::marker::Copy;
 use nalgebra as na;
-use num_traits::{NumCast, float::FloatCore};
+use num_traits::{float::FloatCore, NumCast};
 
 /// SE(3) geometric position controller (outer loop only).
 ///
@@ -36,19 +36,19 @@ impl<T: na::RealField + Copy + FloatCore> Default for PositionController<T> {
     fn default() -> Self {
         Self {
             kp: na::Vector3::new(
-                T::from(6.0).unwrap(),
-                T::from(6.0).unwrap(),
-                T::from(8.0).unwrap(),
-            ),
-            kd: na::Vector3::new(
                 T::from(4.0).unwrap(),
                 T::from(4.0).unwrap(),
                 T::from(5.0).unwrap(),
             ),
+            kd: na::Vector3::new(
+                T::from(4.0).unwrap(),
+                T::from(4.0).unwrap(),
+                T::from(4.0).unwrap(),
+            ),
             p_err_max: na::Vector3::new(
-                T::from(0.6).unwrap(),
-                T::from(0.6).unwrap(),
-                T::from(0.3).unwrap(),
+                T::from(1.0).unwrap(),
+                T::from(1.0).unwrap(),
+                T::from(1.0).unwrap(),
             ),
             v_err_max: na::Vector3::new(
                 T::from(1.0).unwrap(),

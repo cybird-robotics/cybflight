@@ -1,7 +1,13 @@
+use core::time::Duration;
+
 use cybflight_core::{
     attitude_control::{self, AttitudeControlOutput, geometric_controller},
     mixer::LinearAllocator,
     position_control::{self, pd_ff_control},
+};
+use discrete_pid::{
+    pid::{PidConfigBuilder, PidController},
+    time::Micros,
 };
 use embassy_time::Instant;
 use nalgebra::{UnitQuaternion, Vector3, Vector4};
@@ -36,13 +42,55 @@ fn odom_is_valid(odom: &msgs::VehicleOdometry) -> bool {
         && fin(&odom.twist.angular)
 }
 
-/// Rate feedback gain for the inner rate loop (P-only).
-/// Matches the old `k_rate_torque` from the self-contained geometric controller.
-const K_RATE_TORQUE: Vector3<f32> = Vector3::new(0.3, 0.25, 0.15);
+/// Nominal odometry loop period (~100 Hz from ESKF).
+const RATE_PID_SAMPLE_TIME: Duration = Duration::from_millis(2);
+
+struct Pids {
+    pub kp: f32,
+    pub ki: f32,
+    pub kd: f32,
+}
+
+struct RatePids {
+    roll: PidController<Micros, f32>,
+    pitch: PidController<Micros, f32>,
+    yaw: PidController<Micros, f32>,
+}
+
+impl RatePids {
+    fn new(k_roll: Pids, k_pitch: Pids, k_yaw: Pids) -> Self {
+        let make = |k: Pids| {
+            let Pids { kp, ki, kd } = k;
+            let config = PidConfigBuilder::<f32>::default()
+                .kp(kp)
+                .ki(ki)
+                .kd(kd)
+                .sample_time(RATE_PID_SAMPLE_TIME)
+                .build()
+                .expect("rate PID config invalid");
+            PidController::new_uninit(config)
+        };
+        Self {
+            roll: make(k_roll),
+            pitch: make(k_pitch),
+            yaw: make(k_yaw),
+        }
+    }
+
+    fn compute(&mut self, rate_fb: Vector3<f32>, rate_ref: Vector3<f32>) -> Vector3<f32> {
+        let ts = Micros(Instant::now().as_micros());
+        Vector3::new(
+            self.roll.compute(rate_fb.x, rate_ref.x, ts, None),
+            self.pitch.compute(rate_fb.y, rate_ref.y, ts, None),
+            self.yaw.compute(rate_fb.z, rate_ref.z, ts, None),
+        )
+    }
+}
 
 pub struct InnerLoop<const N: usize> {
     pc: pd_ff_control::PositionController<f32>,
     ac: geometric_controller::GeometricAttitudeController<f32>,
+    rate_pids: RatePids,
     allocator: LinearAllocator<N>,
 }
 
@@ -56,10 +104,15 @@ impl<const N: usize> InnerLoop<N> {
                 },
             ),
             ac: geometric_controller::GeometricAttitudeController::new(
-                Vector3::new(1.0, 1.0, 0.5),
-                Vector3::new(1.0, 1.0, 0.2),
+                Vector3::new(6.0, 6.0, 1.5), // k_ang_rate  [roll, pitch, yaw]
+                Vector3::new(1.0, 1.0, 0.2),  // k_ang_torque (unused — discarded below)
             )
             .with_inertia(QUADROTOR_BODY.inertia_matrix()),
+            rate_pids: RatePids::new(
+                Pids { kp: 0.3, ki: 0.1, kd: 0.01 },
+                Pids { kp: 0.25, ki: 0.1, kd: 0.01 },
+                Pids { kp: 0.15, ki: 0.01, kd: 0.0 },
+            ),
             allocator,
         }
     }
@@ -132,16 +185,15 @@ impl<const N: usize> InnerLoop<N> {
             att_ref.attitude_quaternion = Some(pc_out.desired_attitude_quaternion);
             att_ref.body_rate_rad_s = pc_out.desired_body_rate_rad_s;
 
-            // 5. Attitude controller: outer (attitude → rate setpoint + feedforward torque).
+            // 4. Attitude controller: outer (attitude error → rate setpoint).
             let AttitudeControlOutput {
                 body_rate_rad_s: rate_ref,
-                torque_n_m: ff_torque,
+                torque_n_m: _,
             } = self.ac.compute(&att_state, &att_ref);
 
-            // 6. Rate feedback: P-only rate error → torque.
-            let rate_error = att_state.body_rate_rad_s - rate_ref;
-            let rate_torque = K_RATE_TORQUE.component_mul(&rate_error);
-            let torque_n_m = ff_torque - rate_torque;
+            // 5. Rate feedback: PID rate error → torque.
+            let rate_torque = self.rate_pids.compute(att_state.body_rate_rad_s, rate_ref);
+            let torque_n_m = rate_torque;
             let body_rate_rad_s = rate_ref;
 
             // 7. Non-finite guard: skip frame if controller produced NaN/Inf.

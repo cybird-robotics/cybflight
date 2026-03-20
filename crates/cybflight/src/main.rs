@@ -51,22 +51,9 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::watchdog::iwdg_feed_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn IWDG feed task"));
-    // spawner
-    //     .spawn(cybflight::sensors::attitude::mahony_task())
-    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude task"));
-    //
-    // spawner
-    //     .spawn(cybflight::control::nmpc_driver::nmpc_task())
-    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn NMPC driver task"));
-    //
-
     spawner
-        .spawn(cybflight::control::inner_loop::inner_loop_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn inner loop task"));
-
-
-    // TODO: create a outer_loop task that runs around 100Hz
-    // TODO: create a mission_plan_task that runs around 10 Hz
+        .spawn(cybflight::estimation::eskf_imu_mocap::estimation_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn estimation task"));
 
     spawner
         .spawn(cybflight::control::rc_interpreter::rc_interpreter_task())
@@ -75,18 +62,10 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::control::failsafe::failsafe_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn failsafe task"));
-    // Mahony is redundant when ESKF provides full odometry (attitude + position).
-    // spawner
-    //     .spawn(cybflight::sensors::attitude::mahony_task())
-    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude task"));
 
     spawner
-        .spawn(cybflight::estimation::eskf_imu_mocap::estimation_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn estimation task"));
-
-    // spawner
-    //     .spawn(cybflight::control::nmpc_driver::nmpc_task())
-    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn NMPC driver task"));
+        .spawn(cybflight::control::inner_loop::inner_loop_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn inner loop task"));
 
     spawner
         .spawn(cybflight::usb_serial::imu1_stream_task())

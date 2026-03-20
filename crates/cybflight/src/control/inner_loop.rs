@@ -119,7 +119,8 @@ impl<const N: usize> InnerLoop<N> {
 
     pub async fn run(&mut self) -> ! {
         let mut odom_sub = VEHICLE_ODOMETRY.subscriber().unwrap();
-        let publisher = super::ATTITUDE_CONTROL_SETPOINT.immediate_publisher();
+        let att_pub = super::ATTITUDE_CONTROL_SETPOINT.immediate_publisher();
+        let pos_pub = super::POSITION_CONTROL_SETPOINT.immediate_publisher();
         let max_thrust_n = self.allocator.max_collective_thrust_n();
 
         let mut pos_state = position_control::PositionControlState::<f32>::default();
@@ -228,14 +229,21 @@ impl<const N: usize> InnerLoop<N> {
             super::LAST_CONTROLLER_PUBLISH.lock(|c| c.set(Some(publish_time)));
 
             // 10. Publish telemetry.
-            publisher.publish_immediate(msgs::AttitudeControlSetpoint {
-                timestamp: Instant::now(),
+            att_pub.publish_immediate(msgs::AttitudeControlSetpoint {
+                timestamp: publish_time,
                 collective_thrust_n: effective_thrust_n,
                 attitude_quaternion: att_ref
                     .attitude_quaternion
                     .unwrap_or(UnitQuaternion::identity()),
                 body_rate_rad_s,
                 torque_n_m,
+            });
+            pos_pub.publish_immediate(msgs::PositionControlSetpoint {
+                timestamp: publish_time,
+                position: pos_setpoint.position,
+                velocity: pos_setpoint.velocity,
+                yaw: pos_setpoint.yaw,
+                collective_thrust_n,
             });
 
             // 11. Yield to other tasks.

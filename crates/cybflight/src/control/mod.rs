@@ -40,6 +40,15 @@ pub static ATTITUDE_CONTROL_SETPOINT: PubSubChannel<
     1,
 > = PubSubChannel::new();
 
+// Position control setpoint: CAP=2 (fresh only), SUBS=3 (esp_bridge + shell stream + spare), PUBS=1.
+pub static POSITION_CONTROL_SETPOINT: PubSubChannel<
+    CriticalSectionRawMutex,
+    msgs::PositionControlSetpoint,
+    2,
+    3,
+    1,
+> = PubSubChannel::new();
+
 // Auto-mode setpoint: current desired state for autonomous flight.
 // Written by rc_interpreter (initial), mission_plan_task, ESP bridge, etc.
 pub static AUTO_SETPOINT: Signal<CriticalSectionRawMutex, msgs::VehicleOdometry> = Signal::new();

@@ -1,11 +1,18 @@
-//! Failsafe: monitors RC link health and disarms on signal loss.
+//! Failsafe: monitors RC link health and controller liveness, disarms on failure.
 //!
-//! Implements a Betaflight-inspired two-stage failsafe:
+//! Single task monitors two independent conditions:
 //!
+//! ## RC link failsafe
+//! Betaflight-inspired two-stage failsafe:
 //! - **Stage 1 (guard period):** 1.5 s after first frame timeout (150 ms).
 //!   If RC recovers during the guard period, return to normal immediately.
 //! - **Stage 2 (DROP_IT):** Disarm via `ARM_STATE`, block re-arming via
 //!   `FAILSAFE_ACTIVE` until 500 ms of continuous valid RC data is received.
+//!
+//! ## Controller watchdog
+//! If the inner loop hasn't published a motor command for `CTRL_TIMEOUT`,
+//! disarm immediately. Catches sustained failures: ESKF divergence, NaN
+//! in the controller, stale odometry, or stale RC setpoints.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -16,7 +23,7 @@ use crate::sensors::RC_INPUT;
 use cybflight_msgs as msgs;
 
 // ---------------------------------------------------------------------------
-// Timing constants (match Betaflight defaults)
+// Timing constants
 // ---------------------------------------------------------------------------
 
 /// No valid RC frame for this long triggers Stage 1.
@@ -31,14 +38,44 @@ const GUARD_PERIOD: Duration = Duration::from_millis(1500);
 /// BF: `failsafe_recovery_delay` default = 5 (×100 ms) = 500 ms.
 const RECOVERY_PERIOD: Duration = Duration::from_millis(500);
 
+/// If no motor command published for this long, disarm.
+/// Must be longer than any single-frame skip (odom stale = 100 ms, RC stale = 250 ms)
+/// but short enough to catch sustained failures before the vehicle falls far.
+const CTRL_TIMEOUT: Duration = Duration::from_millis(500);
+
 // ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
 
-/// `true` while Stage 2 failsafe is active. Checked by the arming state
+/// `true` while failsafe is active. Checked by the arming state
 /// machine in `sensors/rc.rs` to block re-arming (mirrors BF
 /// `ARMING_DISABLED_FAILSAFE`).
 pub static FAILSAFE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Disarm and enter failsafe state.
+fn enter_failsafe(reason: &str) {
+    defmt::error!("FAILSAFE: {} — DISARMING", reason);
+    FAILSAFE_ACTIVE.store(true, Ordering::Release);
+    ARM_STATE.signal(msgs::ArmDisarm {
+        timestamp: Instant::now(),
+        armed: false,
+    });
+    crate::status::STATUS
+        .sender()
+        .send(crate::status::SystemStatus::Failsafe);
+}
+
+/// Check if the controller heartbeat has timed out.
+fn controller_timed_out() -> bool {
+    match super::LAST_CONTROLLER_PUBLISH.lock(|c| c.get()) {
+        Some(t) => Instant::now().duration_since(t) > CTRL_TIMEOUT,
+        None => false, // Controller hasn't started yet — not a failure
+    }
+}
 
 // ---------------------------------------------------------------------------
 // State machine
@@ -64,9 +101,19 @@ pub async fn failsafe_task() {
         .expect("failsafe: RC_INPUT subscriber");
     let mut phase = Phase::Idle;
 
-    defmt::info!("Failsafe: monitoring RC link");
+    defmt::info!("Failsafe: monitoring RC link + controller heartbeat");
 
     loop {
+        // --- Controller watchdog: check on every loop iteration ---
+        if controller_timed_out() {
+            enter_failsafe("controller silent for >500ms");
+            super::LAST_CONTROLLER_PUBLISH.lock(|c| c.set(None));
+            phase = Phase::Landed {
+                recovery_start: None,
+            };
+            // Fall through to Landed phase which waits for RC recovery.
+        }
+
         match phase {
             // ----------------------------------------------------------
             // IDLE: wait for RC frames, timeout starts guard period
@@ -96,19 +143,7 @@ pub async fn failsafe_task() {
 
                 match remaining {
                     None | Some(Duration::MIN) => {
-                        // Guard period expired — Stage 2: DISARM.
-                        defmt::error!(
-                            "FAILSAFE: RC loss for {}ms — DISARMING (DROP_IT)",
-                            GUARD_PERIOD.as_millis(),
-                        );
-                        FAILSAFE_ACTIVE.store(true, Ordering::Release);
-                        ARM_STATE.signal(msgs::ArmDisarm {
-                            timestamp: Instant::now(),
-                            armed: false,
-                        });
-                        crate::status::STATUS
-                            .sender()
-                            .send(crate::status::SystemStatus::Failsafe);
+                        enter_failsafe("RC loss for >1500ms");
                         phase = Phase::Landed {
                             recovery_start: None,
                         };

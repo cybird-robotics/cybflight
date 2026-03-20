@@ -167,12 +167,10 @@ impl<const N: usize> InnerLoop<N> {
                 last_setpoint_time = now;
             }
 
-            // RC stale guard: if no setpoint update for RC_STALE_TIMEOUT_MS,
-            // freeze at current position with zero velocity reference.
-            let rc_stale = now.duration_since(last_setpoint_time).as_millis() > RC_STALE_TIMEOUT_MS;
-            if rc_stale {
-                pos_setpoint.position = odom.pose.position;
-                pos_setpoint.velocity = Vector3::zeros();
+            // RC stale guard: skip control entirely when setpoint is stale.
+            // Failsafe controller_watchdog_task will disarm if this persists.
+            if now.duration_since(last_setpoint_time).as_millis() > RC_STALE_TIMEOUT_MS {
+                continue;
             }
 
             // 4. Position controller (runs every odom tick).
@@ -220,10 +218,14 @@ impl<const N: usize> InnerLoop<N> {
                 msgs::NormalizedThrottle::new_saturating(throttles[2]),
                 msgs::NormalizedThrottle::new_saturating(throttles[3]),
             ];
+            let publish_time = Instant::now();
             ACTUATOR_MOTORS.signal(msgs::ActuatorMotors {
-                timestamp: Instant::now(),
+                timestamp: publish_time,
                 motor_commands,
             });
+
+            // Stamp heartbeat for controller watchdog.
+            super::LAST_CONTROLLER_PUBLISH.lock(|c| c.set(Some(publish_time)));
 
             // 10. Publish telemetry.
             publisher.publish_immediate(msgs::AttitudeControlSetpoint {

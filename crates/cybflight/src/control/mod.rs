@@ -8,11 +8,13 @@ pub mod rc_interpreter;
 
 use cybflight_msgs as msgs;
 
+use core::cell::Cell;
 use embassy_sync::{
-    blocking_mutex::raw::CriticalSectionRawMutex,
+    blocking_mutex::{self, raw::CriticalSectionRawMutex},
     pubsub::PubSubChannel,
     signal::Signal,
 };
+use embassy_time::Instant;
 
 // Flight mode signal: written by rc_interpreter, read by attitude_control.
 pub static FLIGHT_MODE: Signal<CriticalSectionRawMutex, flight_mode::FlightMode> = Signal::new();
@@ -41,3 +43,8 @@ pub static ATTITUDE_CONTROL_SETPOINT: PubSubChannel<
 // Auto-mode setpoint: current desired state for autonomous flight.
 // Written by rc_interpreter (initial), mission_plan_task, ESP bridge, etc.
 pub static AUTO_SETPOINT: Signal<CriticalSectionRawMutex, msgs::VehicleOdometry> = Signal::new();
+
+// Last time the inner loop successfully published a motor command.
+// Written by inner_loop, read by failsafe controller_watchdog_task.
+pub static LAST_CONTROLLER_PUBLISH: blocking_mutex::Mutex<CriticalSectionRawMutex, Cell<Option<Instant>>> =
+    blocking_mutex::Mutex::new(Cell::new(None));

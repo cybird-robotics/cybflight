@@ -1,7 +1,7 @@
 use core::time::Duration;
 
 use cybflight_core::{
-    attitude_control::{self, AttitudeControlOutput, geometric_controller},
+    attitude_control::{self, geometric_controller, AttitudeControlOutput},
     mixer::LinearAllocator,
     position_control::{self, pd_ff_control},
 };
@@ -16,7 +16,7 @@ use crate::{
     motors::ACTUATOR_MOTORS,
     msgs,
     sensors::VEHICLE_ODOMETRY,
-    vehicle::{QUADROTOR_BODY, quadrotor_allocator},
+    vehicle::{quadrotor_allocator, QUADROTOR_BODY},
 };
 
 /// If no AUTO_SETPOINT update for this long, freeze at current position.
@@ -105,13 +105,25 @@ impl<const N: usize> InnerLoop<N> {
             ),
             ac: geometric_controller::GeometricAttitudeController::new(
                 Vector3::new(6.0, 6.0, 1.5), // k_ang_rate  [roll, pitch, yaw]
-                Vector3::new(1.0, 1.0, 0.2),  // k_ang_torque (unused — discarded below)
+                Vector3::new(1.0, 1.0, 0.2), // k_ang_torque (unused — discarded below)
             )
             .with_inertia(QUADROTOR_BODY.inertia_matrix()),
             rate_pids: RatePids::new(
-                Pids { kp: 0.3, ki: 0.1, kd: 0.01 },
-                Pids { kp: 0.25, ki: 0.1, kd: 0.01 },
-                Pids { kp: 0.15, ki: 0.01, kd: 0.0 },
+                Pids {
+                    kp: 0.3,
+                    ki: 0.0,
+                    kd: 0.0,
+                },
+                Pids {
+                    kp: 0.25,
+                    ki: 0.0,
+                    kd: 0.0,
+                },
+                Pids {
+                    kp: 0.15,
+                    ki: 0.00,
+                    kd: 0.0,
+                },
             ),
             allocator,
         }
@@ -126,7 +138,6 @@ impl<const N: usize> InnerLoop<N> {
         let mut pos_state = position_control::PositionControlState::<f32>::default();
         let mut att_state = attitude_control::AttitudeControlState::<f32>::default();
         let mut att_ref = attitude_control::AttitudeControlSetpoint::<f32>::default();
-        let mut collective_thrust_n: f32 = 0.0;
         let mut last_odom_time: Option<Instant> = None;
 
         // Wait for first AUTO_SETPOINT before entering the control loop.
@@ -180,7 +191,7 @@ impl<const N: usize> InnerLoop<N> {
             pos_state.attitude = odom.pose.orientation;
 
             let pc_out = self.pc.compute(&pos_state, &pos_setpoint);
-            collective_thrust_n = pc_out.collective_thrust_n;
+            let collective_thrust_n = pc_out.collective_thrust_n;
             att_ref.attitude_quaternion = Some(pc_out.desired_attitude_quaternion);
             att_ref.body_rate_rad_s = pc_out.desired_body_rate_rad_s;
 
@@ -190,9 +201,17 @@ impl<const N: usize> InnerLoop<N> {
                 torque_n_m: _,
             } = self.ac.compute(&att_state, &att_ref);
 
+            const MAX_ROLL_TORQUE_N_M: f32 = 0.8;
+            const MAX_PITCH_TORQUE_N_M: f32 = 0.6;
+            const MAX_YAW_TORQUE_N_M: f32 = 0.15;
+
             // 5. Rate feedback: PID rate error → torque.
             let rate_torque = self.rate_pids.compute(att_state.body_rate_rad_s, rate_ref);
-            let torque_n_m = rate_torque;
+            let torque_n_m = Vector3::new(
+                rate_torque[0].clamp(-MAX_ROLL_TORQUE_N_M, MAX_ROLL_TORQUE_N_M),
+                rate_torque[1].clamp(-MAX_PITCH_TORQUE_N_M, MAX_PITCH_TORQUE_N_M),
+                rate_torque[2].clamp(-MAX_YAW_TORQUE_N_M, MAX_YAW_TORQUE_N_M),
+            );
             let body_rate_rad_s = rate_ref;
 
             // 7. Non-finite guard: skip frame if controller produced NaN/Inf.

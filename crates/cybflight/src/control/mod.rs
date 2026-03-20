@@ -1,4 +1,5 @@
-pub mod attitude_control;
+// attitude_control is disabled: inner_loop_task is the sole controller.
+// pub mod attitude_control;
 pub mod failsafe;
 pub mod inner_loop;
 pub mod flight_mode;

@@ -47,8 +47,8 @@ pub static DSHOT_TELEMETRY: PubSubChannel<CriticalSectionRawMutex, msgs::DshotTe
 pub static GPS_FIX: PubSubChannel<CriticalSectionRawMutex, msgs::GpsFix, 2, 4, 1> =
     PubSubChannel::new();
 
-// Vehicle odometry (ESKF output): CAP=4 (100 Hz), SUBS=4 (telemetry + shell + control + spare), PUBS=1.
-pub static VEHICLE_ODOMETRY: PubSubChannel<CriticalSectionRawMutex, msgs::VehicleOdometry, 4, 4, 1> =
+// Vehicle odometry (ESKF output): CAP=8 (1 kHz), SUBS=4 (inner_loop + rc_interpreter + esp_bridge + spare), PUBS=1.
+pub static VEHICLE_ODOMETRY: PubSubChannel<CriticalSectionRawMutex, msgs::VehicleOdometry, 8, 4, 1> =
     PubSubChannel::new();
 
 // External magnetometer: CAP=4 (200 Hz), SUBS=4 (attitude + telemetry + shell + spare), PUBS=1.
@@ -67,22 +67,3 @@ pub static BARO_1: PubSubChannel<CriticalSectionRawMutex, msgs::BaroSample, 2, 4
 pub static BARO_2: PubSubChannel<CriticalSectionRawMutex, msgs::BaroSample, 2, 4, 1> =
     PubSubChannel::new();
 
-// Manual control setpoint (thrust + rates from RC sticks): CAP=2 (fresh only),
-// SUBS=4 (control + telemetry + shell + spare), PUBS=1 (rc_interpreter).
-pub static MANUAL_CONTROL: PubSubChannel<
-    CriticalSectionRawMutex,
-    msgs::ManualControlSetpoint,
-    2,
-    4,
-    1,
-> = PubSubChannel::new();
-
-// Stabilized control setpoint (thrust + angles from RC sticks): CAP=2 (fresh only),
-// SUBS=4 (attitude_control + telemetry + shell + spare), PUBS=1 (rc_interpreter).
-pub static STABILIZED_CONTROL: PubSubChannel<
-    CriticalSectionRawMutex,
-    msgs::StablizedControlSetpoint,
-    2,
-    4,
-    1,
-> = PubSubChannel::new();

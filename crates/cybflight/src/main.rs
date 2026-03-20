@@ -60,10 +60,6 @@ async fn main(spawner: embassy_executor::Spawner) {
     //     .unwrap_or_else(|_| defmt::panic!("failed to spawn NMPC driver task"));
     //
 
-    // spawner
-    //     .spawn(cybflight::estimate::feedthrough_estimate::feedthrough_estimate())
-    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn feedthrough estimate task"));
-
     spawner
         .spawn(cybflight::control::inner_loop::inner_loop_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn inner loop task"));
@@ -79,9 +75,10 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::control::failsafe::failsafe_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn failsafe task"));
-    spawner
-        .spawn(cybflight::sensors::attitude::mahony_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude task"));
+    // Mahony is redundant when ESKF provides full odometry (attitude + position).
+    // spawner
+    //     .spawn(cybflight::sensors::attitude::mahony_task())
+    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude task"));
 
     spawner
         .spawn(cybflight::estimation::eskf_imu_mocap::estimation_task())

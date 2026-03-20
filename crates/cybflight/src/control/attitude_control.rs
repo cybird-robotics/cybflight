@@ -1,7 +1,7 @@
 use core::time::Duration;
 
 use cybflight_core::{
-    attitude_control::{self, geometric_controller, AttitudeControlOutput},
+    attitude_control::{self, AttitudeControlOutput, geometric_controller},
     mixer::LinearAllocator,
 };
 use discrete_pid::{
@@ -120,7 +120,7 @@ impl<const N: usize> AttitudeControl<N> {
             }
             while let Some(rc) = rc_sub.try_next_message_pure() {
                 att_ref.body_rate_rad_s = [rc.roll_rate, rc.pitch_rate, rc.yaw_rate].into();
-                thrust_normalized = rc.thrust;
+                thrust_normalized = rc.thrust; // The thrust command is obtained from the RC
                 last_rc_time = Instant::now();
             }
 

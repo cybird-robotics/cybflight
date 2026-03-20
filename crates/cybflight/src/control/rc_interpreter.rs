@@ -1,56 +1,85 @@
 //! RC interpreter: subscribes to raw RC channels and publishes
-//! `ManualControlSetpoint` (thrust + body rates) via `RcMapper`.
+//! `AUTO_SETPOINT` (position commands) derived from stick inputs.
 
 use embassy_time::Instant;
+use nalgebra::{UnitQuaternion, Vector3};
 
-use cybflight_core::rc::rc_mapping::{RcMapper, RcSettings, ChannelSetting};
+use cybflight_core::rc::rc_mapping::ChannelCalibration;
 use cybflight_msgs as msgs;
 
-use crate::sensors::{MANUAL_CONTROL, RC_INPUT};
+use crate::sensors::{RC_INPUT, VEHICLE_ODOMETRY};
 
-/// Create default rate-mode settings.
-///
-/// Roll/pitch: 800 deg/s max rate, moderate expo.
-/// Yaw: 400 deg/s max rate.
-/// Throttle: linear, full range.
-fn default_acro_settings() -> RcSettings {
-    RcSettings {
-        roll: ChannelSetting::new(270.0_f32.to_radians(), 0.0, 0.02),
-        pitch: ChannelSetting::new(270.0_f32.to_radians(), 0.0, 0.02),
-        yaw: ChannelSetting::new(90.0_f32.to_radians(), 0.0, 0.02),
-        throttle: ChannelSetting::default(),
-    }
+/// Half-range for position mapping: stick ±1 → ±0.5 m (1 m cube).
+const HALF_RANGE: f32 = 0.5;
+const POSITION_THRESHOLD: f32 = 0.01; // 10 mm
+
+/// Extract yaw angle from a unit quaternion (ZYX Euler convention).
+fn extract_yaw(q: &UnitQuaternion<f32>) -> f32 {
+    let (_roll, _pitch, yaw) = q.euler_angles();
+    yaw
 }
 
 #[embassy_executor::task]
 pub async fn rc_interpreter_task() {
-    let mut sub = RC_INPUT
+    let mut rc_sub = RC_INPUT
         .subscriber()
         .expect("rc_interpreter: RC_INPUT subscriber");
-    let pub_ = MANUAL_CONTROL.immediate_publisher();
-    let mapper = RcMapper::aetr(default_acro_settings());
+    let mut odom_sub = VEHICLE_ODOMETRY
+        .subscriber()
+        .expect("rc_interpreter: VEHICLE_ODOMETRY subscriber");
+
+    // All three axes use centered calibration (stick center = zero offset).
+    let pitch_cal = ChannelCalibration::centered(1);
+    let roll_cal = ChannelCalibration::centered(0);
+    let throttle_cal = ChannelCalibration::centered(2);
+
+    // Phase 1: Wait for first odometry to establish origin.
+    let odom = odom_sub.next_message_pure().await;
+    let origin = odom.pose.position;
+    let yaw = extract_yaw(&odom.pose.orientation);
+    let yaw_quat = UnitQuaternion::from_euler_angles(0.0, 0.0, yaw);
+
+    // Publish initial setpoint at origin.
+    super::AUTO_SETPOINT.signal(msgs::VehicleOdometry {
+        timestamp: Instant::now(),
+        pose: msgs::Pose {
+            position: origin,
+            orientation: yaw_quat,
+        },
+        twist: msgs::Twist {
+            linear: Vector3::zeros(),
+            angular: Vector3::zeros(),
+        },
+    });
+
+    // Phase 2: Map RC stick inputs to position offsets from origin.
+    let mut last_target = origin;
 
     loop {
-        let rc = sub.next_message_pure().await;
-        let tr = mapper.map(&rc.channels);
-        pub_.publish_immediate(msgs::ManualControlSetpoint {
+        let rc = rc_sub.next_message_pure().await;
+
+        let dx = pitch_cal.normalize(rc.channels[pitch_cal.index] as i16) * HALF_RANGE;
+        let dy = roll_cal.normalize(rc.channels[roll_cal.index] as i16) * HALF_RANGE;
+        let dz = throttle_cal.normalize(rc.channels[throttle_cal.index] as i16) * HALF_RANGE;
+
+        // let target = origin + Vector3::new(dx, dy, dz);
+        let target = origin + Vector3::new(0.0, 0.0, dz);
+
+        if (target - last_target).norm() < POSITION_THRESHOLD {
+            continue;
+        }
+        last_target = target;
+
+        super::AUTO_SETPOINT.signal(msgs::VehicleOdometry {
             timestamp: Instant::now(),
-            thrust: tr.thrust,
-            roll_rate: tr.roll_rate,
-            pitch_rate: tr.pitch_rate,
-            yaw_rate: tr.yaw_rate,
+            pose: msgs::Pose {
+                position: target,
+                orientation: yaw_quat,
+            },
+            twist: msgs::Twist {
+                linear: Vector3::zeros(),
+                angular: Vector3::zeros(),
+            },
         });
-        defmt::debug!(
-            "RC: ch[0..4]={} {} {} {} {}, setpoint: thrust={} roll_rate={} pitch_rate={} yaw_rate={}",
-            rc.channels[0],
-            rc.channels[1],
-            rc.channels[2],
-            rc.channels[3],
-            rc.channels[4],
-            tr.thrust,
-            tr.roll_rate,
-            tr.pitch_rate,
-            tr.yaw_rate
-        );
     }
 }

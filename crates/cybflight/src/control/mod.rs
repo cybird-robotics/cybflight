@@ -1,11 +1,20 @@
 pub mod attitude_control;
 pub mod failsafe;
+pub mod inner_loop;
+pub mod flight_mode;
 pub mod nmpc_driver;
 pub mod rc_interpreter;
 
 use cybflight_msgs as msgs;
 
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, pubsub::PubSubChannel};
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex,
+    pubsub::PubSubChannel,
+    signal::Signal,
+};
+
+// Flight mode signal: written by rc_interpreter, read by attitude_control.
+pub static FLIGHT_MODE: Signal<CriticalSectionRawMutex, flight_mode::FlightMode> = Signal::new();
 
 pub static OCP_SOLVER_OUTPUT: PubSubChannel<
     CriticalSectionRawMutex,
@@ -17,8 +26,8 @@ pub static OCP_SOLVER_OUTPUT: PubSubChannel<
 
 // NMPC position setpoint: CAP=2 (fresh setpoints only), SUBS=2 (nmpc_driver + spare),
 // PUBS=1 (single RC-to-setpoint converter, not yet implemented).
-pub static NMPC_SETPOINT: PubSubChannel<CriticalSectionRawMutex, msgs::NmpcSetpoint, 2, 2, 1> =
-    PubSubChannel::new();
+// pub static NMPC_SETPOINT: PubSubChannel<CriticalSectionRawMutex, msgs::NmpcSetpoint, 2, 2, 1> =
+//     PubSubChannel::new();
 
 pub static ATTITUDE_CONTROL_SETPOINT: PubSubChannel<
     CriticalSectionRawMutex,
@@ -27,3 +36,7 @@ pub static ATTITUDE_CONTROL_SETPOINT: PubSubChannel<
     3,
     1,
 > = PubSubChannel::new();
+
+// Auto-mode setpoint: current desired state for autonomous flight.
+// Written by rc_interpreter (initial), mission_plan_task, ESP bridge, etc.
+pub static AUTO_SETPOINT: Signal<CriticalSectionRawMutex, msgs::VehicleOdometry> = Signal::new();

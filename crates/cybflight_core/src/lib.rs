@@ -5,5 +5,6 @@ pub mod mahony;
 pub mod mixer;
 pub mod nmpc;
 pub mod params;
+pub mod position_control;
 pub mod rc;
 pub mod rotation;

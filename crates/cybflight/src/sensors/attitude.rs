@@ -11,7 +11,7 @@ use cybflight_msgs as msgs;
 pub async fn mahony_task() {
     let mut sub = IMU_1.subscriber().unwrap();
     let publisher = VEHICLE_ATTITUDE.immediate_publisher();
-    let mut mahony = Mahony::<f32>::new();
+    let mut mahony: Mahony<f32> = Mahony::<f32>::new();
     let mut prev_timestamp: Option<Instant> = None;
 
     loop {

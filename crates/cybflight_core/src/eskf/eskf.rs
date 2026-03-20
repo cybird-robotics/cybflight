@@ -115,7 +115,7 @@ impl Eskf {
         cov.fixed_view_mut::<3, 3>(3, 3).fill_diagonal(0.1); // orientation
         cov.fixed_view_mut::<3, 3>(6, 6).fill_diagonal(1.0); // velocity
         cov.fixed_view_mut::<3, 3>(9, 9).fill_diagonal(0.01); // accel bias
-        cov.fixed_view_mut::<3, 3>(12, 12).fill_diagonal(0.001); // gyro bias
+        cov.fixed_view_mut::<3, 3>(12, 12).fill_diagonal(0.01); // gyro bias
         self.cov = cov;
         self.initialized = true;
     }
@@ -325,6 +325,11 @@ impl Eskf {
 
     pub fn covariance(&self) -> &SMatrix<f32, 15, 15> {
         &self.cov
+    }
+
+    /// Sum of the three diagonal gyro-bias covariance entries (indices 12–14).
+    pub fn gyro_bias_cov_trace(&self) -> f32 {
+        self.cov[(12, 12)] + self.cov[(13, 13)] + self.cov[(14, 14)]
     }
 
     pub fn is_initialized(&self) -> bool {

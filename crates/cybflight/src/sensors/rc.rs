@@ -38,12 +38,14 @@ const LINK_STATS_MAX_AGE_MS: u64 = 500;
 // Arming state machine
 // ---------------------------------------------------------------------------
 
-/// Arming state machine with debounce, throttle gate, and link quality gate.
+/// Arming state machine with debounce, throttle gate, link quality gate,
+/// and estimator readiness gate.
 ///
-/// Enforces three pre-conditions before allowing arm:
+/// Enforces four pre-conditions before allowing arm:
 /// 1. Throttle at minimum (BF: `ARMING_DISABLED_THROTTLE`, threshold = `mincheck`)
 /// 2. RC link active with acceptable quality (BF: `ARMING_DISABLED_RX_FAILSAFE`)
-/// 3. Arm switch held for debounce duration (cybflight safety addition)
+/// 3. ESKF estimator initialised and running
+/// 4. Arm switch held for debounce duration (cybflight safety addition)
 ///
 /// Disarming via switch is always immediate (no debounce) for safety.
 struct ArmStateMachine {
@@ -132,7 +134,13 @@ impl ArmStateMachine {
             return;
         }
 
-        // Gate 4: switch hold duration (debounce)
+        // Gate 4: ESKF estimator ready
+        if !crate::estimation::ESTIMATOR_READY.load(Ordering::Acquire) {
+            self.switch_arm_start = None;
+            return;
+        }
+
+        // Gate 5: switch hold duration (debounce)
         let start = *self.switch_arm_start.get_or_insert(now);
         if now.duration_since(start).as_millis() < ARM_SWITCH_HOLD_MS {
             return;

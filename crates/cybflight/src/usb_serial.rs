@@ -232,7 +232,35 @@ pub async fn estimator_stream_task() {
 fn write_eskf_phase(w: &mut WriteBuf<'_>, phase: &EstimatorPhase) -> core::fmt::Result {
     match phase {
         EstimatorPhase::AwaitingExteroceptive => write!(w, "ESKF awaiting mocap"),
-        EstimatorPhase::CalibImu => write!(w, "ESKF calibrating IMU"),
+        EstimatorPhase::Converging {
+            roll_deg,
+            pitch_deg,
+            yaw_deg,
+            pos,
+            vel,
+            gyro_bias,
+            accel_bias,
+        } => write!(
+            w,
+            "ESKF[Converging] roll={:.1} pitch={:.1} yaw={:.1}  \
+             pos=[{:.2},{:.2},{:.2}]m  vel=[{:.2},{:.2},{:.2}]m/s  \
+             gyro_bias=[{:.4},{:.4},{:.4}]rad/s  accel_bias=[{:.3},{:.3},{:.3}]m/s2",
+            roll_deg,
+            pitch_deg,
+            yaw_deg,
+            pos[0],
+            pos[1],
+            pos[2],
+            vel[0],
+            vel[1],
+            vel[2],
+            gyro_bias[0],
+            gyro_bias[1],
+            gyro_bias[2],
+            accel_bias[0],
+            accel_bias[1],
+            accel_bias[2],
+        ),
         EstimatorPhase::Running {
             roll_deg,
             pitch_deg,
@@ -243,7 +271,7 @@ fn write_eskf_phase(w: &mut WriteBuf<'_>, phase: &EstimatorPhase) -> core::fmt::
             accel_bias,
         } => write!(
             w,
-            "ESKF[Phase2] roll={:.1} pitch={:.1} yaw={:.1}  \
+            "ESKF[Running] roll={:.1} pitch={:.1} yaw={:.1}  \
              pos=[{:.2},{:.2},{:.2}]m  vel=[{:.2},{:.2},{:.2}]m/s  \
              gyro_bias=[{:.4},{:.4},{:.4}]rad/s  accel_bias=[{:.3},{:.3},{:.3}]m/s2",
             roll_deg,

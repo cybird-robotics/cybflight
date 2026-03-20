@@ -134,7 +134,14 @@ impl<const N: usize> InnerLoop<N> {
         let mut pos_state = position_control::PositionControlState::<f32>::default();
         let mut att_state = attitude_control::AttitudeControlState::<f32>::default();
         let mut att_ref = attitude_control::AttitudeControlSetpoint::<f32>::default();
+        let mut collective_thrust_n: f32 = 0.0;
         let mut last_odom_time: Option<Instant> = None;
+        let mut pos_ctrl_counter: u32 = 0;
+
+        /// Position controller runs at odom_rate / POS_CTRL_DECIMATION.
+        /// With 1 kHz odom, this gives 100 Hz position control — matching
+        /// the mocap correction rate for clean velocity feedback.
+        const POS_CTRL_DECIMATION: u32 = 10;
 
         // Wait for first AUTO_SETPOINT before entering the control loop.
         let sp = super::AUTO_SETPOINT.wait().await;
@@ -174,17 +181,24 @@ impl<const N: usize> InnerLoop<N> {
                 pos_setpoint.yaw = extract_yaw(&sp.pose.orientation);
             }
 
-            // 4. Position controller (runs every odom tick).
-            pos_state.position = odom.pose.position;
-            pos_state.velocity = odom.twist.linear;
-            pos_state.attitude = odom.pose.orientation;
+            // 4. Position controller (100 Hz — decimated from odom rate).
+            // Runs on mocap-corrected state for clean velocity feedback.
+            // Output (att_ref, collective_thrust_n) persists between updates.
+            pos_ctrl_counter += 1;
+            if pos_ctrl_counter >= POS_CTRL_DECIMATION {
+                pos_ctrl_counter = 0;
 
-            let pc_out = self.pc.compute(&pos_state, &pos_setpoint);
-            let collective_thrust_n = pc_out.collective_thrust_n;
-            att_ref.attitude_quaternion = Some(pc_out.desired_attitude_quaternion);
-            att_ref.body_rate_rad_s = pc_out.desired_body_rate_rad_s;
+                pos_state.position = odom.pose.position;
+                pos_state.velocity = odom.twist.linear;
+                pos_state.attitude = odom.pose.orientation;
 
-            // 4. Attitude controller: outer (attitude error → rate setpoint).
+                let pc_out = self.pc.compute(&pos_state, &pos_setpoint);
+                collective_thrust_n = pc_out.collective_thrust_n;
+                att_ref.attitude_quaternion = Some(pc_out.desired_attitude_quaternion);
+                att_ref.body_rate_rad_s = pc_out.desired_body_rate_rad_s;
+            }
+
+            // 5. Attitude controller: outer (attitude error → rate setpoint).
             let AttitudeControlOutput {
                 body_rate_rad_s: rate_ref,
                 torque_n_m: _,
@@ -203,7 +217,7 @@ impl<const N: usize> InnerLoop<N> {
             );
             let body_rate_rad_s = rate_ref;
 
-            // 7. Non-finite guard: skip frame if controller produced NaN/Inf.
+            // 6. Non-finite guard: skip frame if controller produced NaN/Inf.
             if !collective_thrust_n.is_finite()
                 || !torque_n_m.x.is_finite()
                 || !torque_n_m.y.is_finite()
@@ -213,11 +227,11 @@ impl<const N: usize> InnerLoop<N> {
                 continue;
             }
 
-            // 8. Clamp thrust: idle floor for gyroscopic stability, cap at motor capacity.
+            // 7. Clamp thrust: idle floor for gyroscopic stability, cap at motor capacity.
             let idle_thrust_n = 0.005 * max_thrust_n;
             let effective_thrust_n = collective_thrust_n.max(idle_thrust_n).min(max_thrust_n);
 
-            // 9. Allocate thrust + torque to motor throttles.
+            // 8. Allocate thrust + torque to motor throttles.
             let demand = Vector4::new(effective_thrust_n, torque_n_m.x, torque_n_m.y, torque_n_m.z);
             let throttles = self.allocator.allocate(demand);
 
@@ -239,7 +253,7 @@ impl<const N: usize> InnerLoop<N> {
             // Stamp heartbeat for controller watchdog.
             super::LAST_CONTROLLER_PUBLISH.lock(|c| c.set(Some(publish_time)));
 
-            // 10. Publish telemetry.
+            // 9. Publish telemetry.
             att_pub.publish_immediate(msgs::AttitudeControlSetpoint {
                 timestamp: publish_time,
                 collective_thrust_n: effective_thrust_n,
@@ -257,7 +271,7 @@ impl<const N: usize> InnerLoop<N> {
                 collective_thrust_n,
             });
 
-            // 11. Yield to other tasks.
+            // 10. Yield to other tasks.
             embassy_futures::yield_now().await;
         }
     }

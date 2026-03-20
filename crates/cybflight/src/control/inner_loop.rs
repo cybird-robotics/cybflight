@@ -19,10 +19,6 @@ use crate::{
     vehicle::{quadrotor_allocator, QUADROTOR_BODY},
 };
 
-/// If no AUTO_SETPOINT update for this long, freeze at current position.
-/// Defense-in-depth: catches stale RC data even if failsafe task is delayed.
-const RC_STALE_TIMEOUT_MS: u64 = 250;
-
 /// Extract yaw angle from a unit quaternion (ZYX Euler convention).
 fn extract_yaw(q: &UnitQuaternion<f32>) -> f32 {
     let (_roll, _pitch, yaw) = q.euler_angles();
@@ -148,8 +144,6 @@ impl<const N: usize> InnerLoop<N> {
             yaw: extract_yaw(&sp.pose.orientation),
             ..Default::default()
         };
-        let mut last_setpoint_time = Instant::now();
-
         const ODOM_STALE_TIMEOUT_MS: u64 = 100;
 
         loop {
@@ -172,17 +166,12 @@ impl<const N: usize> InnerLoop<N> {
             att_state.attitude_quaternion = odom.pose.orientation;
 
             // 3. Check for new auto-mode setpoint (Signal: consume if available).
+            // When sticks are centered, rc_interpreter doesn't publish (deadband),
+            // so the last setpoint is held. RC loss is handled by failsafe_task.
             if let Some(sp) = super::AUTO_SETPOINT.try_take() {
                 pos_setpoint.position = sp.pose.position;
                 pos_setpoint.velocity = sp.twist.linear;
                 pos_setpoint.yaw = extract_yaw(&sp.pose.orientation);
-                last_setpoint_time = now;
-            }
-
-            // RC stale guard: skip control entirely when setpoint is stale.
-            // Failsafe controller_watchdog_task will disarm if this persists.
-            if now.duration_since(last_setpoint_time).as_millis() > RC_STALE_TIMEOUT_MS {
-                continue;
             }
 
             // 4. Position controller (runs every odom tick).

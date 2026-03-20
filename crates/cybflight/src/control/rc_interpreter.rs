@@ -9,8 +9,10 @@ use cybflight_msgs as msgs;
 
 use crate::sensors::{RC_INPUT, VEHICLE_ODOMETRY};
 
-/// Half-range for position mapping: stick ±1 → ±0.5 m (1 m cube).
-const HALF_RANGE: f32 = 0.5;
+/// Lateral half-range: centered stick ±1 → ±0.5 m.
+const XY_HALF_RANGE: f32 = 0.5;
+/// Throttle full range: stick 0–1 → 0–1 m above origin.
+const Z_RANGE: f32 = 1.0;
 const POSITION_THRESHOLD: f32 = 0.01; // 10 mm
 
 /// Extract yaw angle from a unit quaternion (ZYX Euler convention).
@@ -28,10 +30,11 @@ pub async fn rc_interpreter_task() {
         .subscriber()
         .expect("rc_interpreter: VEHICLE_ODOMETRY subscriber");
 
-    // All three axes use centered calibration (stick center = zero offset).
+    // Roll/pitch: centered (stick center = zero offset).
+    // Throttle: low = 0, high = +1 (not centered — stick starts low).
     let pitch_cal = ChannelCalibration::centered(1);
     let roll_cal = ChannelCalibration::centered(0);
-    let throttle_cal = ChannelCalibration::centered(2);
+    let throttle_cal = ChannelCalibration::throttle(2);
 
     // Phase 1: Wait for first odometry to establish origin.
     let odom = odom_sub.next_message_pure().await;
@@ -58,9 +61,9 @@ pub async fn rc_interpreter_task() {
     loop {
         let rc = rc_sub.next_message_pure().await;
 
-        let dx = pitch_cal.normalize(rc.channels[pitch_cal.index] as i16) * HALF_RANGE;
-        let dy = roll_cal.normalize(rc.channels[roll_cal.index] as i16) * HALF_RANGE;
-        let dz = throttle_cal.normalize(rc.channels[throttle_cal.index] as i16) * HALF_RANGE;
+        let dx = pitch_cal.normalize(rc.channels[pitch_cal.index] as i16) * XY_HALF_RANGE;
+        let dy = roll_cal.normalize(rc.channels[roll_cal.index] as i16) * XY_HALF_RANGE;
+        let dz = throttle_cal.normalize(rc.channels[throttle_cal.index] as i16) * Z_RANGE;
 
         // let target = origin + Vector3::new(dx, dy, dz);
         let target = origin + Vector3::new(0.0, 0.0, dz);

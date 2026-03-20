@@ -1,15 +1,15 @@
 use cybflight_core::{
     attitude_control::{self, AttitudeControlOutput, geometric_controller},
-    position_control::{self, pd_ff_control},
     mixer::LinearAllocator,
+    position_control::{self, pd_ff_control},
 };
 use embassy_time::Instant;
 use nalgebra::{UnitQuaternion, Vector3, Vector4};
 
 use crate::{
-    estimate::VEHICLE_ODOMETRY,
     motors::ACTUATOR_MOTORS,
     msgs,
+    sensors::VEHICLE_ODOMETRY,
     vehicle::{QUADROTOR_BODY, quadrotor_allocator},
 };
 
@@ -24,7 +24,10 @@ fn odom_is_valid(odom: &msgs::VehicleOdometry) -> bool {
     let fin = |v: &Vector3<f32>| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
     let q = odom.pose.orientation.as_vector();
     fin(&odom.pose.position)
-        && q.x.is_finite() && q.y.is_finite() && q.z.is_finite() && q.w.is_finite()
+        && q.x.is_finite()
+        && q.y.is_finite()
+        && q.z.is_finite()
+        && q.w.is_finite()
         && fin(&odom.twist.linear)
         && fin(&odom.twist.angular)
 }
@@ -38,10 +41,12 @@ pub struct InnerLoop<const N: usize> {
 impl<const N: usize> InnerLoop<N> {
     pub fn new(allocator: LinearAllocator<N>) -> Self {
         Self {
-            pc: pd_ff_control::PositionController::default().with_vehicle(position_control::VehicleParams {
-                mass: QUADROTOR_BODY.mass_kg,
-                gravity: 9.81,
-            }),
+            pc: pd_ff_control::PositionController::default().with_vehicle(
+                position_control::VehicleParams {
+                    mass: QUADROTOR_BODY.mass_kg,
+                    gravity: 9.81,
+                },
+            ),
             ac: geometric_controller::GeometricAttitudeController::new(
                 Vector3::new(1.0, 1.0, 0.5),
                 Vector3::new(1.0, 1.0, 0.2),
@@ -58,18 +63,24 @@ impl<const N: usize> InnerLoop<N> {
         let max_thrust_n = self.allocator.max_collective_thrust_n();
 
         let mut pos_state = position_control::PositionControlState::<f32>::default();
-        let mut pos_setpoint = position_control::PositionControlSetpoint::<f32>::default();
         let mut att_state = attitude_control::AttitudeControlState::<f32>::default();
         let mut att_ref = attitude_control::AttitudeControlSetpoint::<f32>::default();
         let mut collective_thrust_n: f32 = 0.0;
         let mut last_odom_time: Option<Instant> = None;
 
+        // Wait for first AUTO_SETPOINT before entering the control loop.
+        let sp = super::AUTO_SETPOINT.wait().await;
+        let mut pos_setpoint = position_control::PositionControlSetpoint {
+            position: sp.pose.position,
+            velocity: sp.twist.linear,
+            yaw: extract_yaw(&sp.pose.orientation),
+            ..Default::default()
+        };
+
         const ODOM_STALE_TIMEOUT_MS: u64 = 100;
 
         loop {
-            // 1. Await VEHICLE_ODOMETRY (8 kHz) — drives the loop.
-            //    feedthrough_estimate publishes at IMU rate; twist.angular
-            //    is a direct copy of the raw gyro.
+            // 1. Await VEHICLE_ODOMETRY (100 Hz from ESKF) — drives the loop.
             let odom = odom_sub.next_message_pure().await;
 
             // 2. Staleness + validity guard: skip control when estimate is unreliable.
@@ -94,35 +105,38 @@ impl<const N: usize> InnerLoop<N> {
                 pos_setpoint.yaw = extract_yaw(&sp.pose.orientation);
             }
 
-            // 3. Staleness check: run position controller only when position changed.
-            if odom.pose.position != pos_state.position {
-                pos_state.position = odom.pose.position;
-                pos_state.velocity = odom.twist.linear;
-                pos_state.attitude = odom.pose.orientation;
+            // 3. Position controller (runs every odom tick at 500 Hz).
+            pos_state.position = odom.pose.position;
+            pos_state.velocity = odom.twist.linear;
+            pos_state.attitude = odom.pose.orientation;
 
-                let pc_out = self.pc.compute(&pos_state, &pos_setpoint);
-                collective_thrust_n = pc_out.collective_thrust;
-                att_ref.attitude_quaternion = Some(pc_out.desired_attitude);
-                att_ref.body_rate_rad_s = pc_out.desired_body_rate;
-            }
+            let pc_out = self.pc.compute(&pos_state, &pos_setpoint);
+            collective_thrust_n = pc_out.collective_thrust_n;
+            att_ref.attitude_quaternion = Some(pc_out.desired_attitude_quaternion);
+            att_ref.body_rate_rad_s = pc_out.desired_body_rate_rad_s;
 
-            // 4. Attitude controller (runs every odom tick at 8 kHz).
+            // 4. Attitude controller (runs every odom tick).
             let AttitudeControlOutput {
                 body_rate_rad_s,
                 torque_n_m,
             } = self.ac.compute(&att_state, &att_ref);
 
-            // 5. Idle thrust floor: keep motors spinning for gyroscopic stability.
-            let idle_thrust_n = 0.005 * max_thrust_n;
-            let effective_thrust_n = if collective_thrust_n < idle_thrust_n {
-                idle_thrust_n
-            } else {
-                collective_thrust_n
-            };
+            // 5. Non-finite guard: skip frame if controller produced NaN/Inf.
+            if !collective_thrust_n.is_finite()
+                || !torque_n_m.x.is_finite()
+                || !torque_n_m.y.is_finite()
+                || !torque_n_m.z.is_finite()
+            {
+                defmt::warn!("inner_loop: non-finite controller output, skipping frame");
+                continue;
+            }
 
-            // 6. Allocate thrust + torque to motor throttles.
-            let demand =
-                Vector4::new(effective_thrust_n, torque_n_m.x, torque_n_m.y, torque_n_m.z);
+            // 6. Clamp thrust: idle floor for gyroscopic stability, cap at motor capacity.
+            let idle_thrust_n = 0.005 * max_thrust_n;
+            let effective_thrust_n = collective_thrust_n.max(idle_thrust_n).min(max_thrust_n);
+
+            // 7. Allocate thrust + torque to motor throttles.
+            let demand = Vector4::new(effective_thrust_n, torque_n_m.x, torque_n_m.y, torque_n_m.z);
             let throttles = self.allocator.allocate(demand);
 
             let motor_commands = [
@@ -136,7 +150,7 @@ impl<const N: usize> InnerLoop<N> {
                 motor_commands,
             });
 
-            // 7. Publish telemetry.
+            // 8. Publish telemetry.
             publisher.publish_immediate(msgs::AttitudeControlSetpoint {
                 timestamp: Instant::now(),
                 collective_thrust_n: effective_thrust_n,
@@ -147,7 +161,7 @@ impl<const N: usize> InnerLoop<N> {
                 torque_n_m,
             });
 
-            // 8. Yield to other tasks.
+            // 9. Yield to other tasks.
             embassy_futures::yield_now().await;
         }
     }

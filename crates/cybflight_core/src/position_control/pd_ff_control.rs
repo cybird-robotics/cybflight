@@ -13,7 +13,7 @@
 use super::{PositionControlOutput, PositionControlSetpoint, PositionControlState, VehicleParams};
 use core::marker::Copy;
 use nalgebra as na;
-use num_traits::{float::FloatCore, NumCast};
+use num_traits::{NumCast, float::FloatCore};
 
 /// SE(3) geometric position controller (outer loop only).
 ///
@@ -24,6 +24,10 @@ pub struct PositionController<T> {
     kp: na::Vector3<T>,
     /// Velocity derivative gain (diagonal).
     kd: na::Vector3<T>,
+    /// Maximum position error per axis [m] before clamping.
+    p_err_max: na::Vector3<T>,
+    /// Maximum velocity error per axis [m/s] before clamping.
+    v_err_max: na::Vector3<T>,
     /// Vehicle parameters.
     vehicle: VehicleParams<T>,
 }
@@ -41,6 +45,16 @@ impl<T: na::RealField + Copy + FloatCore> Default for PositionController<T> {
                 T::from(4.0).unwrap(),
                 T::from(5.0).unwrap(),
             ),
+            p_err_max: na::Vector3::new(
+                T::from(0.6).unwrap(),
+                T::from(0.6).unwrap(),
+                T::from(0.3).unwrap(),
+            ),
+            v_err_max: na::Vector3::new(
+                T::from(1.0).unwrap(),
+                T::from(1.0).unwrap(),
+                T::from(1.0).unwrap(),
+            ),
             vehicle: VehicleParams {
                 mass: T::from(0.55).unwrap(),
                 gravity: T::from(9.81).unwrap(),
@@ -51,7 +65,14 @@ impl<T: na::RealField + Copy + FloatCore> Default for PositionController<T> {
 
 impl<T: na::RealField + Copy + NumCast + FloatCore> PositionController<T> {
     pub fn new(kp: na::Vector3<T>, kd: na::Vector3<T>, vehicle: VehicleParams<T>) -> Self {
-        Self { kp, kd, vehicle }
+        let default = Self::default();
+        Self {
+            kp,
+            kd,
+            p_err_max: default.p_err_max,
+            v_err_max: default.v_err_max,
+            vehicle,
+        }
     }
 
     pub fn with_kp(mut self, kp: na::Vector3<T>) -> Self {
@@ -69,6 +90,16 @@ impl<T: na::RealField + Copy + NumCast + FloatCore> PositionController<T> {
         self
     }
 
+    pub fn with_error_limits(
+        mut self,
+        p_err_max: na::Vector3<T>,
+        v_err_max: na::Vector3<T>,
+    ) -> Self {
+        self.p_err_max = p_err_max;
+        self.v_err_max = v_err_max;
+        self
+    }
+
     /// Compute the desired attitude and collective thrust.
     ///
     /// Algorithm (Lee 2010, Section IV):
@@ -81,8 +112,10 @@ impl<T: na::RealField + Copy + NumCast + FloatCore> PositionController<T> {
         state: &PositionControlState<T>,
         setpoint: &PositionControlSetpoint<T>,
     ) -> PositionControlOutput<T> {
-        let pos_error = setpoint.position - state.position;
-        let vel_error = setpoint.velocity - state.velocity;
+        let pos_error = (setpoint.position - state.position)
+            .zip_map(&self.p_err_max, |e, m| na::RealField::clamp(e, -m, m));
+        let vel_error = (setpoint.velocity - state.velocity)
+            .zip_map(&self.v_err_max, |e, m| na::RealField::clamp(e, -m, m));
 
         // Gravity compensation vector (FLU/ENU: z-up)
         let g_vec = na::Vector3::new(T::zero(), T::zero(), self.vehicle.gravity);
@@ -122,23 +155,23 @@ impl<T: na::RealField + Copy + NumCast + FloatCore> PositionController<T> {
         let rot_des = na::Rotation3::from_matrix_unchecked(na::Matrix3::from_columns(&[
             x_b_des, y_b_des, z_b_des,
         ]));
-        let desired_attitude = na::UnitQuaternion::from_rotation_matrix(&rot_des);
+        let desired_attitude_quaternion = na::UnitQuaternion::from_rotation_matrix(&rot_des);
 
         // Collective thrust: project desired acceleration onto current body z-axis
         let body_z = state.attitude * na::Vector3::z();
-        let collective_thrust = self.vehicle.mass * a_des.dot(&body_z);
+        let collective_thrust_n = self.vehicle.mass * a_des.dot(&body_z);
 
         // Clamp thrust to non-negative (can't push down)
-        let collective_thrust = if collective_thrust < T::zero() {
+        let collective_thrust_n = if collective_thrust_n < T::zero() {
             T::zero()
         } else {
-            collective_thrust
+            collective_thrust_n
         };
 
         PositionControlOutput {
-            desired_attitude,
-            desired_body_rate: na::Vector3::zeros(),
-            collective_thrust,
+            desired_attitude_quaternion,
+            desired_body_rate_rad_s: na::Vector3::zeros(),
+            collective_thrust_n,
         }
     }
 }
@@ -161,11 +194,14 @@ mod tests {
         let out = ctrl.compute(&state, &setpoint);
 
         // At hover: desired attitude should be identity (no tilt needed)
-        let angle = out.desired_attitude.angle();
-        assert!(angle < 1e-4, "expected near-identity attitude, got angle={angle}");
+        let angle = out.desired_attitude_quaternion.angle();
+        assert!(
+            angle < 1e-4,
+            "expected near-identity attitude, got angle={angle}"
+        );
 
-        // Thrust should equal weight: m*g = 0.5 * 9.81 = 4.905 N
-        assert_approx_eq!(f32, out.collective_thrust, 0.5 * 9.81, epsilon = 0.01);
+        // Thrust should equal weight: m*g = 0.55 * 9.81 = 5.3955 N
+        assert_approx_eq!(f32, out.collective_thrust_n, 0.55 * 9.81, epsilon = 0.01);
     }
 
     #[test]
@@ -181,11 +217,11 @@ mod tests {
         let out = ctrl.compute(&state, &setpoint);
 
         // Desired attitude should have some roll (tilt toward +y)
-        let angle = out.desired_attitude.angle();
+        let angle = out.desired_attitude_quaternion.angle();
         assert!(angle > 0.01, "expected nonzero tilt, got angle={angle}");
 
         // Thrust should be greater than hover weight due to tilt compensation
-        assert!(out.collective_thrust > 0.0);
+        assert!(out.collective_thrust_n > 0.0);
     }
 
     #[test]
@@ -200,7 +236,7 @@ mod tests {
         let out = ctrl.compute(&state, &setpoint);
 
         // The desired yaw should be ~90 degrees
-        let (_, _, yaw) = out.desired_attitude.euler_angles();
+        let (_, _, yaw) = out.desired_attitude_quaternion.euler_angles();
         assert_approx_eq!(f32, yaw, core::f32::consts::FRAC_PI_2, epsilon = 0.01);
     }
 }

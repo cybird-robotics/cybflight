@@ -158,7 +158,7 @@ pub async fn estimation_task() {
                         },
                         twist: msgs::Twist {
                             linear: vel,
-                            angular: sample.gyro_rad_s,
+                            angular: sample.gyro_rad_s - eskf.gyro_bias(),
                         },
                     });
                 }

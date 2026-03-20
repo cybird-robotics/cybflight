@@ -13,10 +13,6 @@ use crate::{
     motors::ACTUATOR_MOTORS,
     msgs,
     sensors::{self, MANUAL_CONTROL},
-<<<<<<< HEAD
-=======
-    vehicle::{self, QUADROTOR_BODY, quadrotor_allocator},
->>>>>>> 2ce39cd (Implement autopilot)
 };
 
 pub struct AttitudeControl<const N: usize> {

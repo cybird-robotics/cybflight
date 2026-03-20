@@ -60,9 +60,9 @@ async fn main(spawner: embassy_executor::Spawner) {
     //     .unwrap_or_else(|_| defmt::panic!("failed to spawn NMPC driver task"));
     //
 
-    spawner
-        .spawn(cybflight::estimate::feedthrough_estimate::feedthrough_estimate())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn feedthrough estimate task"));
+    // spawner
+    //     .spawn(cybflight::estimate::feedthrough_estimate::feedthrough_estimate())
+    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn feedthrough estimate task"));
 
     spawner
         .spawn(cybflight::control::inner_loop::inner_loop_task())

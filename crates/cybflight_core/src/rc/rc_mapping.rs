@@ -160,28 +160,14 @@ pub struct ThrustRates {
     pub yaw_rate: f32,
 }
 
-/// Thrust + angle setpoint output.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ThrustAngles {
-    /// Normalized thrust [0, 1].
-    pub thrust: f32,
-    /// Roll angle command (rad).
-    pub roll: f32,
-    /// Pitch angle command (rad).
-    pub pitch: f32,
-    /// Yaw angle command (rad).
-    pub yaw: f32,
-}
-
-/// Maps raw RC channel values to thrust + rate or angle setpoints.
+/// Maps raw RC channel values to thrust + rate setpoints.
 #[derive(Debug, Clone)]
 pub struct RcMapper {
     pub roll: ChannelCalibration,
     pub pitch: ChannelCalibration,
     pub throttle: ChannelCalibration,
     pub yaw: ChannelCalibration,
-    pub rate_settings: RcSettings,
-    pub angle_settings: RcSettings,
+    pub settings: RcSettings,
 }
 
 /// Rate/expo settings for all four axes.
@@ -197,59 +183,43 @@ impl RcMapper {
     /// Create a mapper with AETR channel order (typical for CRSF/GHST).
     /// Channels: 0=Roll, 1=Pitch, 2=Throttle, 3=Yaw.
     /// Yaw is inverted: stick-left (low PWM) → positive yaw (CCW in FLU).
-    pub fn aetr(rate_settings: RcSettings, angle_settings: RcSettings) -> Self {
+    pub fn aetr(settings: RcSettings) -> Self {
         Self {
             roll: ChannelCalibration::centered(0),
             pitch: ChannelCalibration::centered(1),
             throttle: ChannelCalibration::throttle(2),
             yaw: ChannelCalibration::centered_inverted(3),
-            rate_settings,
-            angle_settings,
+            settings,
         }
     }
 
     /// Create a mapper with TAER channel order.
     /// Channels: 0=Throttle, 1=Roll, 2=Pitch, 3=Yaw.
     /// Yaw is inverted: stick-left (low PWM) → positive yaw (CCW in FLU).
-    pub fn taer(rate_settings: RcSettings, angle_settings: RcSettings) -> Self {
+    pub fn taer(settings: RcSettings) -> Self {
         Self {
             throttle: ChannelCalibration::throttle(0),
             roll: ChannelCalibration::centered(1),
             pitch: ChannelCalibration::centered(2),
             yaw: ChannelCalibration::centered_inverted(3),
-            rate_settings,
-            angle_settings,
+            settings,
         }
     }
 
-    /// Normalize stick inputs (shared by rate and angle mapping).
-    fn normalize(&self, channels: &[u16; 16]) -> (f32, f32, f32, f32) {
-        let thr = self.throttle.normalize(channels[self.throttle.index] as i16);
-        let roll = self.roll.normalize(channels[self.roll.index] as i16);
-        let pitch = self.pitch.normalize(channels[self.pitch.index] as i16);
-        let yaw = self.yaw.normalize(channels[self.yaw.index] as i16);
-        (thr, roll, pitch, yaw)
-    }
+    /// Map raw RC channels to thrust + rates.
+    pub fn map(&self, channels: &[u16; 16]) -> ThrustRates {
+        let thr_norm = self
+            .throttle
+            .normalize(channels[self.throttle.index] as i16);
+        let roll_norm = self.roll.normalize(channels[self.roll.index] as i16);
+        let pitch_norm = self.pitch.normalize(channels[self.pitch.index] as i16);
+        let yaw_norm = self.yaw.normalize(channels[self.yaw.index] as i16);
 
-    /// Map raw RC channels to thrust + body rates (acro mode).
-    pub fn map_rates(&self, channels: &[u16; 16]) -> ThrustRates {
-        let (thr, roll, pitch, yaw) = self.normalize(channels);
         ThrustRates {
-            thrust: self.rate_settings.throttle.apply_throttle(thr),
-            roll_rate: self.rate_settings.roll.apply(roll),
-            pitch_rate: self.rate_settings.pitch.apply(pitch),
-            yaw_rate: self.rate_settings.yaw.apply(yaw),
-        }
-    }
-
-    /// Map raw RC channels to thrust + angles (angle/stabilized mode).
-    pub fn map_angles(&self, channels: &[u16; 16]) -> ThrustAngles {
-        let (thr, roll, pitch, yaw) = self.normalize(channels);
-        ThrustAngles {
-            thrust: self.angle_settings.throttle.apply_throttle(thr),
-            roll: self.angle_settings.roll.apply(roll),
-            pitch: self.angle_settings.pitch.apply(pitch),
-            yaw: self.angle_settings.yaw.apply(yaw),
+            thrust: self.settings.throttle.apply_throttle(thr_norm),
+            roll_rate: self.settings.roll.apply(roll_norm),
+            pitch_rate: self.settings.pitch.apply(pitch_norm),
+            yaw_rate: self.settings.yaw.apply(yaw_norm),
         }
     }
 }
@@ -301,11 +271,11 @@ mod tests {
     }
 
     #[test]
-    fn test_mapper_aetr_rates() {
-        let mapper = RcMapper::aetr(RcSettings::default(), RcSettings::default());
+    fn test_mapper_aetr() {
+        let mapper = RcMapper::aetr(RcSettings::default());
         let mut channels = [1500u16; 16];
         channels[2] = 988; // throttle min
-        let out = mapper.map_rates(&channels);
+        let out = mapper.map(&channels);
         assert!(out.thrust.abs() < 0.02);
         assert!(out.roll_rate.abs() < 0.02);
         assert!(out.pitch_rate.abs() < 0.02);
@@ -313,28 +283,8 @@ mod tests {
 
         channels[2] = 2012; // throttle max
         channels[0] = 2012; // roll max
-        let out = mapper.map_rates(&channels);
+        let out = mapper.map(&channels);
         assert!((out.thrust - 1.0).abs() < 0.02);
         assert!((out.roll_rate - 1.0).abs() < 0.02);
-    }
-
-    #[test]
-    fn test_mapper_aetr_angles() {
-        let angle_settings = RcSettings {
-            roll: ChannelSetting::new(0.6, 0.0, 0.0),  // ~35° max
-            pitch: ChannelSetting::new(0.6, 0.0, 0.0),
-            yaw: ChannelSetting::new(core::f32::consts::PI, 0.0, 0.0),
-            throttle: ChannelSetting::default(),
-        };
-        let mapper = RcMapper::aetr(RcSettings::default(), angle_settings);
-        let mut channels = [1500u16; 16];
-        channels[2] = 988;
-        let out = mapper.map_angles(&channels);
-        assert!(out.thrust.abs() < 0.02);
-        assert!(out.roll.abs() < 0.02);
-
-        channels[0] = 2012; // roll max
-        let out = mapper.map_angles(&channels);
-        assert!((out.roll - 0.6).abs() < 0.02);
     }
 }

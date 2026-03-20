@@ -11,11 +11,7 @@ pub mod board_init;
 pub mod comm;
 pub mod serial_logger;
 pub mod control;
-<<<<<<< HEAD
 pub mod estimation;
-=======
-pub mod estimate;
->>>>>>> 2ce39cd (Implement autopilot)
 pub mod motors;
 pub use cybflight_msgs as msgs;
 pub mod params;

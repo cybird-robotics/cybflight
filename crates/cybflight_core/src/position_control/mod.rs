@@ -50,11 +50,11 @@ impl<T: na::RealField> Default for PositionControlSetpoint<T> {
 /// Output of the position controller — feeds into the attitude inner loop.
 pub struct PositionControlOutput<T> {
     /// Desired attitude quaternion (world → body).
-    pub desired_attitude: na::UnitQuaternion<T>,
+    pub desired_attitude_quaternion: na::UnitQuaternion<T>,
     /// Feedforward body rate [rad/s] (zero for now).
-    pub desired_body_rate: na::Vector3<T>,
+    pub desired_body_rate_rad_s: na::Vector3<T>,
     /// Scalar collective thrust along body z [N].
-    pub collective_thrust: T,
+    pub collective_thrust_n: T,
 }
 
 pub mod pd_ff_control;

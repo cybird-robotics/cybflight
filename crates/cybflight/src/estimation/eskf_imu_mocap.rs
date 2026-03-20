@@ -13,14 +13,14 @@
 //!    - IMU   → decimate to 1 kHz, `eskf.predict()`, publish odometry at ~100 Hz
 //!    - Mocap → `eskf.update_pos()` + `eskf.update_att()` (direct pose)
 
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{select, Either};
 use embassy_sync::pubsub::WaitResult;
 use embassy_time::{Duration, Instant};
 use nalgebra::Vector3;
 
 use cybflight_core::eskf::{Eskf, EskfConfig};
 
-use crate::estimation::{ESTIMATOR_STATUS, EstimatorPhase};
+use crate::estimation::{EstimatorPhase, ESTIMATOR_STATUS};
 use crate::sensors;
 use cybflight_msgs as msgs;
 
@@ -28,7 +28,7 @@ use cybflight_msgs as msgs;
 const PREDICT_DECIMATION: u32 = 8;
 
 /// Odometry publish decimation relative to predict rate.  1 kHz / 10 = 100 Hz.
-const ODOM_DECIMATION: u32 = 10;
+const ODOM_DECIMATION: u32 = 1;
 
 /// Mocap position noise std-dev [m].
 const MOCAP_POS_STD: f32 = 0.001;
@@ -83,8 +83,8 @@ pub async fn estimation_task() {
     eskf.init(
         first_pose.position,
         first_pose.orientation,
-        gyro_avg,          // gyro bias from stationary average
-        Vector3::zeros(),  // accel bias — let filter estimate
+        gyro_avg,         // gyro bias from stationary average
+        Vector3::zeros(), // accel bias — let filter estimate
     );
 
     defmt::info!(
@@ -102,7 +102,11 @@ pub async fn estimation_task() {
             roll_deg: 0.0,
             pitch_deg: 0.0,
             yaw_deg: 0.0,
-            pos: [first_pose.position.x, first_pose.position.y, first_pose.position.z],
+            pos: [
+                first_pose.position.x,
+                first_pose.position.y,
+                first_pose.position.z,
+            ],
             vel: [0.0; 3],
             gyro_bias: [gyro_avg.x, gyro_avg.y, gyro_avg.z],
             accel_bias: [0.0; 3],
@@ -117,12 +121,7 @@ pub async fn estimation_task() {
     let mut last_predict_ts = Instant::now();
 
     loop {
-        match select(
-            imu_sub.next_message(),
-            mocap_sub.next_message(),
-        )
-        .await
-        {
+        match select(imu_sub.next_message(), mocap_sub.next_message()).await {
             Either::First(result) => {
                 let sample = match result {
                     WaitResult::Message(m) => m,
@@ -151,7 +150,7 @@ pub async fn estimation_task() {
                 eskf.predict(sample.accel_m_s2, sample.gyro_rad_s, dt);
 
                 predict_count = predict_count.wrapping_add(1);
-                if predict_count % ODOM_DECIMATION == 0 {
+                if predict_count.is_multiple_of(ODOM_DECIMATION) {
                     let pos = eskf.position();
                     let vel = eskf.velocity();
                     let q = eskf.orientation();

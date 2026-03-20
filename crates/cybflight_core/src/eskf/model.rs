@@ -48,13 +48,23 @@ impl<T: na::RealField + Copy> Manifold for NominalState<T> {
 
     fn boxminus(&self, other: &Self) -> Self::Tangent {
         let mut delta = Self::Tangent::zeros();
-        delta.fixed_rows_mut::<3>(0).copy_from(&(self.position - other.position));
+        delta
+            .fixed_rows_mut::<3>(0)
+            .copy_from(&(self.position - other.position));
         let q_err = other.orientation.inverse() * self.orientation;
         delta.fixed_rows_mut::<3>(3).copy_from(&q_err.scaled_axis());
-        delta.fixed_rows_mut::<3>(6).copy_from(&(self.velocity - other.velocity));
-        delta.fixed_rows_mut::<3>(9).copy_from(&(self.accel_bias - other.accel_bias));
-        delta.fixed_rows_mut::<3>(12).copy_from(&(self.gyro_bias - other.gyro_bias));
-        delta.fixed_rows_mut::<3>(15).copy_from(&(self.grav_vector - other.grav_vector));
+        delta
+            .fixed_rows_mut::<3>(6)
+            .copy_from(&(self.velocity - other.velocity));
+        delta
+            .fixed_rows_mut::<3>(9)
+            .copy_from(&(self.accel_bias - other.accel_bias));
+        delta
+            .fixed_rows_mut::<3>(12)
+            .copy_from(&(self.gyro_bias - other.gyro_bias));
+        delta
+            .fixed_rows_mut::<3>(15)
+            .copy_from(&(self.grav_vector - other.grav_vector));
         delta
     }
 }
@@ -142,30 +152,41 @@ where
     //    O, O,            O,      O,     O    , I   ];
     let mut fjac: na::SMatrix<T, 18, 18> = na::Matrix::zeros();
     // Position derivatives
-    fjac.fixed_view_mut::<3, 3>(0, 0).copy_from(&na::Matrix::identity());
-    fjac.fixed_view_mut::<3, 3>(0, 6).copy_from(&(na::Matrix::identity() * dt));
+    fjac.fixed_view_mut::<3, 3>(0, 0)
+        .copy_from(&na::Matrix::identity());
+    fjac.fixed_view_mut::<3, 3>(0, 6)
+        .copy_from(&(na::Matrix::identity() * dt));
 
     // Orientation derivatives
     fjac.fixed_view_mut::<3, 3>(3, 3).copy_from(
-        na::UnitQuaternion::from_scaled_axis(-delta_angle).to_rotation_matrix().matrix(),
+        na::UnitQuaternion::from_scaled_axis(-delta_angle)
+            .to_rotation_matrix()
+            .matrix(),
     );
-    fjac.fixed_view_mut::<3, 3>(3, 12).copy_from(&(-na::Matrix::identity() * dt));
+    fjac.fixed_view_mut::<3, 3>(3, 12)
+        .copy_from(&(-na::Matrix::identity() * dt));
 
     // Velocity derivatives
     let rmat: na::Matrix3<T> = *q.to_rotation_matrix().matrix();
-    fjac.fixed_view_mut::<3, 3>(6, 3).copy_from(&(-rmat * hat(&acc_unbiased) * dt));
-    fjac.fixed_view_mut::<3, 3>(6, 6).copy_from(&na::Matrix::identity());
+    fjac.fixed_view_mut::<3, 3>(6, 3)
+        .copy_from(&(-rmat * hat(&acc_unbiased) * dt));
+    fjac.fixed_view_mut::<3, 3>(6, 6)
+        .copy_from(&na::Matrix::identity());
     fjac.fixed_view_mut::<3, 3>(6, 9).copy_from(&(-rmat * dt));
-    fjac.fixed_view_mut::<3, 3>(6, 15).copy_from(&(na::Matrix::identity() * dt));
+    fjac.fixed_view_mut::<3, 3>(6, 15)
+        .copy_from(&(na::Matrix::identity() * dt));
 
     // Accel bias derivatives
-    fjac.fixed_view_mut::<3, 3>(9, 9).copy_from(&na::Matrix::identity());
+    fjac.fixed_view_mut::<3, 3>(9, 9)
+        .copy_from(&na::Matrix::identity());
 
     // Gyro bias derivatives
-    fjac.fixed_view_mut::<3, 3>(12, 12).copy_from(&na::Matrix::identity());
+    fjac.fixed_view_mut::<3, 3>(12, 12)
+        .copy_from(&na::Matrix::identity());
 
     // Gravity vector derivatives
-    fjac.fixed_view_mut::<3, 3>(15, 15).copy_from(&na::Matrix::identity());
+    fjac.fixed_view_mut::<3, 3>(15, 15)
+        .copy_from(&na::Matrix::identity());
 
     // G = blkdiag(O, ...
     //             σ_gn * dt.^2 * I, ...
@@ -182,15 +203,19 @@ where
     } = cfg;
 
     let mut gjac = na::SMatrix::<T, 18, 18>::identity();
-    gjac.fixed_view_mut::<3, 3>(3, 3).fill_diagonal(*gyro_noise_density * dt_sq);
-    gjac.fixed_view_mut::<3, 3>(6, 6).fill_diagonal(*accel_noise_density * dt_sq);
-    gjac.fixed_view_mut::<3, 3>(9, 9).fill_diagonal(*accel_bias_random_walk * dt);
-    gjac.fixed_view_mut::<3, 3>(12, 12).fill_diagonal(*gyro_bias_random_walk * dt);
+    gjac.fixed_view_mut::<3, 3>(3, 3)
+        .fill_diagonal(*gyro_noise_density * dt_sq);
+    gjac.fixed_view_mut::<3, 3>(6, 6)
+        .fill_diagonal(*accel_noise_density * dt_sq);
+    gjac.fixed_view_mut::<3, 3>(9, 9)
+        .fill_diagonal(*accel_bias_random_walk * dt);
+    gjac.fixed_view_mut::<3, 3>(12, 12)
+        .fill_diagonal(*gyro_bias_random_walk * dt);
 
     Jacobians { fjac, gjac }
 }
 
-struct Pose<T> {
+pub struct Pose<T> {
     pub position: na::Vector3<T>,
     pub orientation: na::UnitQuaternion<T>,
 }
@@ -216,7 +241,9 @@ impl<T: na::RealField + Copy> Manifold for Pose<T> {
 
     fn boxminus(&self, other: &Self) -> Self::Tangent {
         let mut delta = Self::Tangent::zeros();
-        delta.fixed_rows_mut::<3>(0).copy_from(&(self.position - other.position));
+        delta
+            .fixed_rows_mut::<3>(0)
+            .copy_from(&(self.position - other.position));
         let q_err = other.orientation.inverse() * self.orientation;
         delta.fixed_rows_mut::<3>(3).copy_from(&q_err.scaled_axis());
         delta
@@ -232,6 +259,7 @@ pub fn pose_observation<T: na::RealField + Copy>(state: &NominalState<T>) -> Pos
 
 pub fn pose_observation_jacobian<T: na::RealField + Copy>() -> na::SMatrix<T, 6, 18> {
     let mut jac = na::SMatrix::<T, 6, 18>::zeros();
-    jac.fixed_view_mut::<6, 6>(0, 0).copy_from(&na::Matrix::identity());
+    jac.fixed_view_mut::<6, 6>(0, 0)
+        .copy_from(&na::Matrix::identity());
     jac
 }

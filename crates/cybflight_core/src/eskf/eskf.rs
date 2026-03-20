@@ -65,8 +65,7 @@ impl NominalState {
     fn boxplus(&self, dx: &SMatrix<f32, 15, 1>) -> Self {
         Self {
             position: self.position + dx.fixed_rows::<3>(0),
-            orientation: self.orientation
-                * UnitQuaternion::from_scaled_axis(dx.fixed_rows::<3>(3)),
+            orientation: self.orientation * UnitQuaternion::from_scaled_axis(dx.fixed_rows::<3>(3)),
             velocity: self.velocity + dx.fixed_rows::<3>(6),
             accel_bias: self.accel_bias + dx.fixed_rows::<3>(9),
             gyro_bias: self.gyro_bias + dx.fixed_rows::<3>(12),
@@ -145,7 +144,8 @@ impl Eskf {
             .to_rotation_matrix()
             .matrix();
         let mut f = SMatrix::<f32, 15, 15>::zeros();
-        f.fixed_view_mut::<3, 3>(0, 0).copy_from(&Matrix3::identity());
+        f.fixed_view_mut::<3, 3>(0, 0)
+            .copy_from(&Matrix3::identity());
         f.fixed_view_mut::<3, 3>(0, 6)
             .copy_from(&(Matrix3::identity() * dt));
         f.fixed_view_mut::<3, 3>(3, 3).copy_from(&rot_neg);
@@ -153,34 +153,31 @@ impl Eskf {
             .copy_from(&(-Matrix3::identity() * dt));
         f.fixed_view_mut::<3, 3>(6, 3)
             .copy_from(&(-rmat * hat(&a_ub) * dt));
-        f.fixed_view_mut::<3, 3>(6, 6).copy_from(&Matrix3::identity());
+        f.fixed_view_mut::<3, 3>(6, 6)
+            .copy_from(&Matrix3::identity());
         f.fixed_view_mut::<3, 3>(6, 9).copy_from(&(-rmat * dt));
-        f.fixed_view_mut::<3, 3>(9, 9).copy_from(&Matrix3::identity());
-        f.fixed_view_mut::<3, 3>(12, 12).copy_from(&Matrix3::identity());
+        f.fixed_view_mut::<3, 3>(9, 9)
+            .copy_from(&Matrix3::identity());
+        f.fixed_view_mut::<3, 3>(12, 12)
+            .copy_from(&Matrix3::identity());
 
         let cfg = &self.config;
-        let dt2 = dt * dt;
         let mut q = SMatrix::<f32, 15, 15>::zeros();
         q.fixed_view_mut::<3, 3>(3, 3)
-            .fill_diagonal(cfg.gyro_noise_density * cfg.gyro_noise_density * dt2);
+            .fill_diagonal(cfg.gyro_noise_density * cfg.gyro_noise_density * dt);
         q.fixed_view_mut::<3, 3>(6, 6)
-            .fill_diagonal(cfg.accel_noise_density * cfg.accel_noise_density * dt2);
+            .fill_diagonal(cfg.accel_noise_density * cfg.accel_noise_density * dt);
         q.fixed_view_mut::<3, 3>(9, 9)
-            .fill_diagonal(cfg.accel_bias_random_walk * dt);
+            .fill_diagonal(cfg.accel_bias_random_walk * cfg.accel_bias_random_walk * dt);
         q.fixed_view_mut::<3, 3>(12, 12)
-            .fill_diagonal(cfg.gyro_bias_random_walk * dt);
+            .fill_diagonal(cfg.gyro_bias_random_walk * cfg.gyro_bias_random_walk * dt);
 
         let new_cov = f * self.cov * f.transpose() + q;
         (new_state, new_cov)
     }
 
     /// IMU predict step. Propagates nominal state and covariance forward.
-    pub fn predict(
-        &mut self,
-        accel: Vector3<f32>,
-        gyro: Vector3<f32>,
-        dt: f32,
-    ) {
+    pub fn predict(&mut self, accel: Vector3<f32>, gyro: Vector3<f32>, dt: f32) {
         if !self.initialized {
             return;
         }
@@ -196,7 +193,8 @@ impl Eskf {
         }
         let z = pos - self.state.position;
         let mut h = SMatrix::<f32, 3, 15>::zeros();
-        h.fixed_view_mut::<3, 3>(0, 0).copy_from(&Matrix3::identity());
+        h.fixed_view_mut::<3, 3>(0, 0)
+            .copy_from(&Matrix3::identity());
         let pv = pos_std * pos_std;
         let r = Matrix3::identity() * pv;
         let s_mat = h * self.cov * h.transpose() + r;
@@ -216,7 +214,8 @@ impl Eskf {
         }
         let z = vel - self.state.velocity;
         let mut h = SMatrix::<f32, 3, 15>::zeros();
-        h.fixed_view_mut::<3, 3>(0, 6).copy_from(&Matrix3::identity());
+        h.fixed_view_mut::<3, 3>(0, 6)
+            .copy_from(&Matrix3::identity());
         let vv = vel_std * vel_std;
         let r = Matrix3::identity() * vv;
         let s_mat = h * self.cov * h.transpose() + r;
@@ -237,7 +236,8 @@ impl Eskf {
         let q_err = self.state.orientation.inverse() * q;
         let z = q_err.scaled_axis();
         let mut h = SMatrix::<f32, 3, 15>::zeros();
-        h.fixed_view_mut::<3, 3>(0, 3).copy_from(&Matrix3::identity());
+        h.fixed_view_mut::<3, 3>(0, 3)
+            .copy_from(&Matrix3::identity());
         let av = att_std * att_std;
         let r = Matrix3::identity() * av;
         let s_mat = h * self.cov * h.transpose() + r;

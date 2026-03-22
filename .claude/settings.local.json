@@ -16,7 +16,8 @@
     ],
     "additionalDirectories": [
       "../cybflight-msgs",
-      "../cybesp-bridge"
+      "../cybesp-bridge",
+      "../cybgcs"
     ]
   }
 }

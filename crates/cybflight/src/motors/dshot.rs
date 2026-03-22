@@ -100,6 +100,8 @@ pub async fn dshot_task(
         if let Some(arm_msg) = ARM_STATE.try_take() {
             if arm_msg.armed != armed {
                 armed = arm_msg.armed;
+                // Update IS_ARMED atomic for other tasks (INDI, etc.)
+                crate::motors::IS_ARMED.store(armed, core::sync::atomic::Ordering::Release);
                 if armed {
                     defmt::info!("DShot: ARMED — motors enabled");
                 } else {

@@ -2,6 +2,8 @@ use core::cell::Cell;
 use core::sync::atomic::AtomicBool;
 
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
+use embassy_sync::signal::Signal;
+use nalgebra::Vector3;
 
 pub mod eskf_imu_mocap;
 
@@ -43,3 +45,8 @@ pub static ESTIMATOR_STATUS: Mutex<CriticalSectionRawMutex, Cell<EstimatorPhase>
 /// Read by the arming state machine to block arming until the estimator
 /// is ready (mirrors the `FAILSAFE_ACTIVE` pattern).
 pub static ESTIMATOR_READY: AtomicBool = AtomicBool::new(false);
+
+/// Current ESKF gyro bias estimate (rad/s).
+/// Written by estimation_task every predict step, read by INDI task to
+/// bias-correct raw gyro before rate control and angular acceleration estimation.
+pub static GYRO_BIAS: Signal<CriticalSectionRawMutex, Vector3<f32>> = Signal::new();

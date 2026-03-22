@@ -1,0 +1,250 @@
+// INDI effectiveness matrices (G1, G2) in acceleration space.
+//
+// G1 maps motor commands u ∈ [0,1] to pseudo-controls:
+//   ν = G1 · u,  where ν = [fx, fy, fz, α_roll, α_pitch, α_yaw]
+//
+// Force rows are specific force (N/kg = m/s²).
+// Torque rows are angular acceleration (rad/s²) via I⁻¹ · τ.
+//
+// G2 captures rate-dependent effectiveness (reaction torque from motor
+// angular acceleration). Only the torque rows (3..6) are non-zero for
+// standard multirotors.
+//
+// See docs/indi_effectiveness.tex for the full derivation.
+
+use nalgebra::{Matrix3, SMatrix, SVector, Vector3};
+
+use crate::mixer::{MotorParams, RigidBodyParams};
+
+/// INDI effectiveness model for an N-motor vehicle.
+///
+/// Stores G1 (6×N, acceleration space) and G2 (3×N, angular acceleration
+/// per motor angular acceleration), plus per-motor parameters for the
+/// G2 scaler computation.
+pub struct IndiEffectiveness<const N: usize> {
+    /// G1 effectiveness matrix (6×N). Columns are motors; rows are
+    /// [fx, fy, fz, roll_accel, pitch_accel, yaw_accel].
+    pub g1: SMatrix<f32, 6, N>,
+
+    /// G2 rate-dependent effectiveness (3×N). Rows are
+    /// [roll_accel, pitch_accel, yaw_accel] per motor angular acceleration.
+    /// For standard quads, only the yaw row is non-zero.
+    pub g2: SMatrix<f32, 3, N>,
+
+    /// Pre-computed G2 scaler per motor: ω_max² / (2 · τ_motor).
+    pub g2_scaler: SVector<f32, N>,
+
+    /// Maximum motor angular speed (rad/s) per motor.
+    pub max_omega: SVector<f32, N>,
+}
+
+/// Per-motor INDI parameters not in the base MotorParams.
+#[derive(Clone, Copy, Debug)]
+pub struct IndiMotorParams {
+    /// Motor time constant (seconds). Typical: 0.020–0.030 s.
+    pub time_const_s: f32,
+
+    /// Maximum motor RPM.
+    pub max_rpm: f32,
+
+    /// G2 yaw effectiveness (from system identification).
+    /// Sign follows G1 yaw: positive for CW motors in FLU.
+    /// Set to 0.0 if unknown.
+    pub g2_yaw: f32,
+}
+
+impl<const N: usize> IndiEffectiveness<N> {
+    /// Build the INDI effectiveness model from motor geometry + body params.
+    ///
+    /// Derives the 6×N G1 matrix in acceleration space (FLU frame) from
+    /// the physical motor parameters and rigid body inertia. See
+    /// `docs/indi_effectiveness.tex` Eq. (10) for the derivation.
+    ///
+    /// # Panics
+    /// Panics if the inertia tensor is singular.
+    pub fn new(
+        motors: &[MotorParams; N],
+        body: &RigidBodyParams,
+        indi_params: &[IndiMotorParams; N],
+    ) -> Self {
+        let inertia_inv = body
+            .inertia_matrix()
+            .try_inverse()
+            .expect("indi: inertia tensor is singular");
+
+        let mut g1 = SMatrix::<f32, 6, N>::zeros();
+        let mut g2 = SMatrix::<f32, 3, N>::zeros();
+        let mut g2_scaler = SVector::<f32, N>::zeros();
+        let mut max_omega = SVector::<f32, N>::zeros();
+
+        for (i, (m, ip)) in motors.iter().zip(indi_params.iter()).enumerate() {
+            let [px, py] = m.position_m;
+            let t = m.max_thrust_n;
+            let spin_sign = m.spin_dir as i32 as f32;
+
+            // Force rows: only fz for standard multirotor (thrust along body +z in FLU)
+            g1[(2, i)] = t / body.mass_kg;
+
+            // Torque vector in FLU (matches mixer.rs derivation)
+            let torque = Vector3::new(
+                py * t,                           // roll torque (N·m)
+                -px * t,                          // pitch torque (N·m)
+                spin_sign * m.torque_coeff_m * t,  // yaw torque (N·m)
+            );
+
+            // Angular acceleration = I⁻¹ · τ
+            let ang_accel = inertia_inv * torque;
+            g1[(3, i)] = ang_accel[0]; // roll accel (rad/s²)
+            g1[(4, i)] = ang_accel[1]; // pitch accel (rad/s²)
+            g1[(5, i)] = ang_accel[2]; // yaw accel (rad/s²)
+
+            // G2: rate-dependent effectiveness (from system ID)
+            // For standard quads, only yaw is non-zero.
+            g2[(2, i)] = ip.g2_yaw;
+
+            // G2 scaler: ω_max² / (2 · τ_motor)
+            let omega_max = ip.max_rpm / 60.0 * core::f32::consts::TAU;
+            max_omega[i] = omega_max;
+            g2_scaler[i] = 0.5 * omega_max * omega_max / ip.time_const_s;
+        }
+
+        Self { g1, g2, g2_scaler, max_omega }
+    }
+
+    /// Build the combined G1+G2 effectiveness matrix for the current timestep.
+    ///
+    /// `omega_fs` is the filtered motor speed (rad/s) per motor.
+    /// `g2_valid` indicates per-motor whether G2 should be active (RPM valid).
+    ///
+    /// Returns the 6×N combined matrix used as B in the WLS problem.
+    pub fn combined_g1g2(
+        &self,
+        omega_fs: &SVector<f32, N>,
+        g2_valid: &[bool; N],
+    ) -> SMatrix<f32, 6, N> {
+        let mut g1g2 = self.g1;
+
+        for i in 0..N {
+            if !g2_valid[i] {
+                continue;
+            }
+
+            // omega_inv with threshold at 10% of max to avoid division by zero
+            let inv_thresh = 0.1 * self.max_omega[i];
+            let omega_inv = if num_traits::Float::abs(omega_fs[i]) > inv_thresh {
+                1.0 / omega_fs[i]
+            } else {
+                1.0 / inv_thresh
+            };
+
+            // Add G2 contribution to torque rows (3, 4, 5)
+            for j in 0..3 {
+                g1g2[(j + 3, i)] += self.g2_scaler[i] * omega_inv * self.g2[(j, i)];
+            }
+        }
+
+        g1g2
+    }
+
+    /// Inertia-inverse helper: convert physical torque column to acceleration space.
+    ///
+    /// Useful if you need to add custom effectiveness rows not covered by
+    /// `from_motors` (e.g. tilting rotors with lateral force).
+    pub fn torque_to_accel(inertia_inv: &Matrix3<f32>, torque: &Vector3<f32>) -> Vector3<f32> {
+        inertia_inv * torque
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mixer::SpinDir;
+
+    fn test_body() -> RigidBodyParams {
+        RigidBodyParams {
+            mass_kg: 0.55,
+            inertia_kg_m2: [0.0025, 0.0, 0.0, 0.0, 0.0021, 0.0, 0.0, 0.0, 0.0043],
+        }
+    }
+
+    fn test_motors() -> [MotorParams; 4] {
+        [
+            MotorParams { position_m: [-0.075, -0.1], spin_dir: SpinDir::Cw,  max_thrust_n: 8.5, torque_coeff_m: 0.022 },
+            MotorParams { position_m: [ 0.075, -0.1], spin_dir: SpinDir::Ccw, max_thrust_n: 8.5, torque_coeff_m: 0.022 },
+            MotorParams { position_m: [-0.075,  0.1], spin_dir: SpinDir::Ccw, max_thrust_n: 8.5, torque_coeff_m: 0.022 },
+            MotorParams { position_m: [ 0.075,  0.1], spin_dir: SpinDir::Cw,  max_thrust_n: 8.5, torque_coeff_m: 0.022 },
+        ]
+    }
+
+    fn test_indi_params() -> [IndiMotorParams; 4] {
+        [IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 }; 4]
+    }
+
+    #[test]
+    fn g1_fz_positive() {
+        let eff = IndiEffectiveness::new(&test_motors(), &test_body(), &test_indi_params());
+        for i in 0..4 {
+            assert!(eff.g1[(2, i)] > 0.0, "fz should be positive (upward) in FLU");
+        }
+        let expected_fz = 8.5 / 0.55;
+        assert!((eff.g1[(2, 0)] - expected_fz).abs() < 1e-4);
+    }
+
+    #[test]
+    fn g1_roll_signs() {
+        let eff = IndiEffectiveness::new(&test_motors(), &test_body(), &test_indi_params());
+        // Right motors (M0, M1, py < 0): negative roll
+        assert!(eff.g1[(3, 0)] < 0.0, "M0 right → negative roll");
+        assert!(eff.g1[(3, 1)] < 0.0, "M1 right → negative roll");
+        // Left motors (M2, M3, py > 0): positive roll
+        assert!(eff.g1[(3, 2)] > 0.0, "M2 left → positive roll");
+        assert!(eff.g1[(3, 3)] > 0.0, "M3 left → positive roll");
+    }
+
+    #[test]
+    fn g1_pitch_signs() {
+        let eff = IndiEffectiveness::new(&test_motors(), &test_body(), &test_indi_params());
+        // Rear motors (M0, M2, px < 0): positive pitch (nose down in FLU)
+        assert!(eff.g1[(4, 0)] > 0.0, "M0 rear → positive pitch");
+        assert!(eff.g1[(4, 2)] > 0.0, "M2 rear → positive pitch");
+        // Front motors (M1, M3, px > 0): negative pitch
+        assert!(eff.g1[(4, 1)] < 0.0, "M1 front → negative pitch");
+        assert!(eff.g1[(4, 3)] < 0.0, "M3 front → negative pitch");
+    }
+
+    #[test]
+    fn g1_yaw_signs() {
+        let eff = IndiEffectiveness::new(&test_motors(), &test_body(), &test_indi_params());
+        // CW motors (M0, M3): positive yaw in FLU
+        assert!(eff.g1[(5, 0)] > 0.0, "M0 CW → positive yaw in FLU");
+        assert!(eff.g1[(5, 3)] > 0.0, "M3 CW → positive yaw in FLU");
+        // CCW motors (M1, M2): negative yaw
+        assert!(eff.g1[(5, 1)] < 0.0, "M1 CCW → negative yaw in FLU");
+        assert!(eff.g1[(5, 2)] < 0.0, "M2 CCW → negative yaw in FLU");
+    }
+
+    #[test]
+    fn g1_numerical_values() {
+        let eff = IndiEffectiveness::new(&test_motors(), &test_body(), &test_indi_params());
+        // M0: rear-right, CW. From indi_effectiveness.tex Section 6:
+        let tol = 0.5; // allow rounding
+        assert!((eff.g1[(2, 0)] - 15.45).abs() < tol, "fz M0");
+        assert!((eff.g1[(3, 0)] - (-340.0)).abs() < tol, "roll M0");
+        assert!((eff.g1[(4, 0)] - 303.6).abs() < tol, "pitch M0");
+        assert!((eff.g1[(5, 0)] - 43.5).abs() < tol, "yaw M0");
+    }
+
+    #[test]
+    fn combined_g1g2_without_rpm() {
+        let eff = IndiEffectiveness::new(&test_motors(), &test_body(), &test_indi_params());
+        let omega_fs = SVector::<f32, 4>::zeros();
+        let g2_valid = [false; 4];
+        let combined = eff.combined_g1g2(&omega_fs, &g2_valid);
+        // With G2 disabled, combined should equal G1
+        for i in 0..4 {
+            for j in 0..6 {
+                assert!((combined[(j, i)] - eff.g1[(j, i)]).abs() < 1e-6);
+            }
+        }
+    }
+}

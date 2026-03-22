@@ -214,7 +214,7 @@ impl<T: na::RealField + Copy + NumCast + FloatCore> GeometricAttitudeController<
                 )
             };
 
-        let angle_error_feedback = angle_error.map_or(na::Vector::zeros(), |e| {
+        let angle_error_feedback = angle_error.map_or(na::Vector3::<T>::zeros(), |e| {
             -self.k_ang_torque.component_mul(&e)
         });
 

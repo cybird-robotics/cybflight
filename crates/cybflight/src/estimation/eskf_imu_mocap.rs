@@ -139,6 +139,9 @@ pub async fn estimation_task() {
 
                 eskf.predict(sample.accel_m_s2, sample.gyro_rad_s, dt);
 
+                // Publish gyro bias for INDI bias correction (every predict step)
+                super::GYRO_BIAS.signal(eskf.gyro_bias());
+
                 predict_count = predict_count.wrapping_add(1);
                 if predict_count.is_multiple_of(ODOM_DECIMATION) {
                     let (roll_deg, pitch_deg, yaw_deg, pos, vel, gyro_bias, accel_bias) =

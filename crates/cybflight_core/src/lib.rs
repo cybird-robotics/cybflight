@@ -2,6 +2,7 @@
 pub mod attitude_control;
 pub mod eskf;
 pub mod mahony;
+pub mod indi;
 pub mod mixer;
 pub mod nmpc;
 pub mod params;

@@ -4,7 +4,11 @@ compile_error!("features est_mahony and est_eskf are mutually exclusive");
 compile_error!("one of est_mahony or est_eskf must be selected");
 
 // attitude_control is folded into inner_loop — one unified control loop.
+// INDI controller (est_eskf) replaces rate PIDs + linear allocation.
 pub mod failsafe;
+pub mod indi;
+#[cfg(feature = "est_eskf")]
+pub mod indi_task;
 pub mod inner_loop;
 pub mod nmpc_driver;
 pub mod rc_interpreter;
@@ -58,9 +62,20 @@ pub static POSITION_CONTROL_SETPOINT: PubSubChannel<
 > = PubSubChannel::new();
 
 // Last time the control loop published a motor command.
-// Written by inner_loop (est_eskf), read by failsafe controller watchdog.
+// Written by inner_loop or indi_task (est_eskf), read by failsafe controller watchdog.
 #[cfg(feature = "est_eskf")]
 pub static LAST_CONTROLLER_PUBLISH: blocking_mutex::Mutex<
     CriticalSectionRawMutex,
     Cell<Option<Instant>>,
 > = blocking_mutex::Mutex::new(Cell::new(None));
+
+// Motor command telemetry: published by INDI task, subscribed by ESP bridge.
+// CAP=2 (latest only), SUBS=2 (esp_bridge + spare), PUBS=1 (indi_task).
+#[cfg(feature = "est_eskf")]
+pub static ACTUATOR_MOTORS_TELEM: PubSubChannel<
+    CriticalSectionRawMutex,
+    msgs::ActuatorMotors,
+    2,
+    2,
+    1,
+> = PubSubChannel::new();

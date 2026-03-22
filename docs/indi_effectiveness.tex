@@ -1,0 +1,372 @@
+\documentclass[11pt]{article}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath, amssymb, bm}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\newcommand{\body}{\mathrm{B}}
+\newcommand{\ned}{\mathrm{NED}}
+\newcommand{\flu}{\mathrm{FLU}}
+\newcommand{\spf}{\mathrm{spf}}
+\newcommand{\diag}{\operatorname{diag}}
+
+\title{INDI Effectiveness Matrices: \\ NED (Indiflight) to FLU (Cybflight)}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Notation}
+
+\begin{tabular}{ll}
+    $N_u$ & Number of actuators (motors) \\
+    $N_v$ & Number of pseudo-controls (6: $f_x, f_y, f_z, \tau_\phi, \tau_\theta, \tau_\psi$) \\
+    $u_i \in [0,1]$ & Normalised motor command (force-proportional) \\
+    $\bm{\omega}^\body$ & Body angular rate vector (rad/s) \\
+    $\dot{\bm{\omega}}^\body$ & Body angular acceleration (rad/s$^2$) \\
+    $\bm{a}_\spf^\body$ & Specific force in body frame (m/s$^2$), measured by accelerometer \\
+    $\omega_{\mathrm{mot},i}$ & Motor $i$ angular speed (rad/s) \\
+    $\dot{\omega}_{\mathrm{mot},i}$ & Motor $i$ angular acceleration (rad/s$^2$) \\
+    $m$ & Vehicle mass (kg) \\
+    $\bm{I}$ & Body inertia tensor (kg$\cdot$m$^2$), 3$\times$3 \\
+    $T_i$ & Maximum thrust of motor $i$ (N) \\
+    $\bm{r}_i = (p_{x,i}, p_{y,i}, 0)$ & Motor $i$ position in body frame (m) \\
+    $s_i$ & Spin sign: $+1$ for CW-from-above, $-1$ for CCW \\
+    $c_i$ & Torque coefficient (m): $|\tau_\mathrm{drag}| = c_i \cdot T_i$ \\
+\end{tabular}
+
+%% ============================================================================
+\section{Indiflight Definitions (NED / FRD Frame)}
+%% ============================================================================
+
+Indiflight operates in NED/FRD: $x$ = forward, $y$ = right, $z$ = down.
+Positive roll = right wing down, positive pitch = nose up, positive yaw = nose right.
+Thrust acts in $-z$ (upward).
+
+\subsection{G1: Static Effectiveness}
+
+The $G_1$ matrix maps motor commands $\bm{u}$ to pseudo-controls
+(specific forces and angular accelerations):
+
+\begin{equation}
+    \bm{\nu} = G_1 \, \bm{u}, \qquad
+    G_1 \in \mathbb{R}^{6 \times N_u}
+\end{equation}
+
+Column $i$ of $G_1$ represents the effect of motor $i$ at full throttle ($u_i = 1$):
+
+\begin{equation}\label{eq:g1_ned}
+    G_1^{\ned}[:,i] = \begin{pmatrix}
+        f_{x,i} \\[2pt] f_{y,i} \\[2pt] f_{z,i} \\[6pt]
+        \alpha_{\phi,i} \\[2pt] \alpha_{\theta,i} \\[2pt] \alpha_{\psi,i}
+    \end{pmatrix}
+\end{equation}
+
+For standard multirotors with all propellers producing thrust along body $-z_\ned$ (upward):
+
+\begin{align}
+    f_{x,i} &= 0 \label{eq:g1_fx_ned} \\
+    f_{y,i} &= 0 \\
+    f_{z,i} &= -\frac{T_i}{m} \qquad \text{(negative: thrust opposes $+z_\ned$ = down)} \label{eq:g1_fz_ned}
+\end{align}
+
+The angular acceleration rows are the torque divided by inertia.
+In NED/FRD, the torque from thrust $\bm{F}_i = (0, 0, -T_i)$ at position
+$\bm{r}_i = (p_{x,i}, p_{y,i}, 0)$ is:
+
+\begin{equation}
+    \bm{\tau}_i = \bm{r}_i \times \bm{F}_i + \bm{\tau}_{\mathrm{drag},i}
+\end{equation}
+
+Computing the cross product ($\bm{F}_i = (0, 0, -T_i)$ in NED):
+\begin{align}
+    \tau_{\phi,i}   &= p_{y,i} \cdot (-T_i) - 0 = -p_{y,i} \, T_i \\
+    \tau_{\theta,i} &= 0 - p_{x,i} \cdot (-T_i) = +p_{x,i} \, T_i
+\end{align}
+
+For the yaw (drag reaction) torque: a CW-from-above propeller has positive
+$\omega_z$ in NED ($z$ = down). The aerodynamic drag opposes the spin, so
+drag acts on the propeller in $-z_\ned$.  By Newton's third law the body
+reaction is also in $-z_\ned$ (the air pushes back on the body).
+Therefore the yaw reaction torque is \emph{negative} for a CW motor ($s_i = +1$):
+\begin{equation}
+    \tau_{\psi,i} = -s_i \, c_i \, T_i
+\end{equation}
+
+The angular acceleration effectiveness:
+\begin{equation}\label{eq:g1_alpha_ned}
+    \begin{pmatrix} \alpha_{\phi,i} \\ \alpha_{\theta,i} \\ \alpha_{\psi,i} \end{pmatrix}
+    = \bm{I}^{-1} \begin{pmatrix} \tau_{\phi,i} \\ \tau_{\theta,i} \\ \tau_{\psi,i} \end{pmatrix}
+    = \bm{I}^{-1} \begin{pmatrix} -p_{y,i} \, T_i \\ +p_{x,i} \, T_i \\ -s_i \, c_i \, T_i \end{pmatrix}
+\end{equation}
+
+For diagonal inertia $\bm{I} = \diag(I_{xx}, I_{yy}, I_{zz})$:
+\begin{align}
+    \alpha_{\phi,i}   &= -p_{y,i} \, T_i \,/\, I_{xx} \\
+    \alpha_{\theta,i} &= +p_{x,i} \, T_i \,/\, I_{yy} \\
+    \alpha_{\psi,i}   &= -s_i \, c_i \, T_i \,/\, I_{zz}
+\end{align}
+
+\paragraph{Units.} Force rows: N/kg = m/s$^2$. Torque rows: Nm/(kg$\cdot$m$^2$) = rad/s$^2$.
+Config scaling: \texttt{actG1\_fz} stored $\times 100$, \texttt{actG1\_roll/pitch/yaw} stored $\times 10$.
+
+\subsection{G2: Rate-Dependent Effectiveness}
+
+$G_2 \in \mathbb{R}^{3 \times N_u}$ captures the reaction torque from motor angular
+acceleration. When motor $i$ accelerates ($\dot{\omega}_{\mathrm{mot},i} \neq 0$),
+the propeller+rotor inertia $J_{\mathrm{prop},i}$ exerts a reaction torque on the body:
+
+\begin{equation}
+    \bm{\tau}_{\mathrm{react},i} = -J_{\mathrm{prop},i} \, \dot{\omega}_{\mathrm{mot},i} \, \hat{\bm{e}}_z
+\end{equation}
+
+For standard quads, only the yaw axis is affected:
+\begin{equation}\label{eq:g2_ned}
+    G_2^{\ned}[:,i] = \begin{pmatrix} 0 \\ 0 \\ G_{2,\psi,i} \end{pmatrix}
+\end{equation}
+
+The G2 values are configured directly (from system identification) and enter the
+allocation via the G2 scaler:
+
+\begin{equation}
+    \text{G2\_scaler}_i = \frac{\omega_{\max,i}^2}{2 \, \tau_{\mathrm{mot},i}}
+\end{equation}
+
+where $\tau_{\mathrm{mot},i}$ is the motor time constant (s). The combined
+effectiveness matrix used in the WLS allocation is:
+
+\begin{equation}\label{eq:g1g2_combined}
+    \widetilde{G}[j,i] = G_1[j,i] + \begin{cases}
+        \dfrac{\text{G2\_scaler}_i}{\omega_{\mathrm{mot},i}} \, G_2[j-3,i]
+            & \text{if } j > 2 \\[6pt]
+        0 & \text{if } j \le 2
+    \end{cases}
+\end{equation}
+
+\subsection{Pseudo-Control (INDI Law)}
+
+The incremental pseudo-control error:
+\begin{equation}\label{eq:dv_ned}
+    \Delta\bm{\nu} = \begin{pmatrix}
+        0 \\ 0 \\
+        f_{z,\mathrm{sp}} - f_{z,\mathrm{meas}} \\
+        \dot{\omega}_{\phi,\mathrm{sp}} - \dot{\omega}_{\phi,\mathrm{meas}} \\
+        \dot{\omega}_{\theta,\mathrm{sp}} - \dot{\omega}_{\theta,\mathrm{meas}} \\
+        \dot{\omega}_{\psi,\mathrm{sp}} - \dot{\omega}_{\psi,\mathrm{meas}}
+    \end{pmatrix}
+    + \begin{pmatrix} 0 \\ 0 \\ 0 \\
+        \sum_i G_2[0,i] \, \dot{\omega}_{\mathrm{mot},i} \\
+        \sum_i G_2[1,i] \, \dot{\omega}_{\mathrm{mot},i} \\
+        \sum_i G_2[2,i] \, \dot{\omega}_{\mathrm{mot},i}
+    \end{pmatrix}
+\end{equation}
+
+(Both terms multiplied by \texttt{doIndi} flag; when on ground, the controller
+solves the non-incremental problem instead.)
+
+%% ============================================================================
+\section{Frame Transform: NED $\to$ FLU}
+%% ============================================================================
+
+Cybflight uses FLU: $x$ = forward, $y$ = left, $z$ = up.
+
+\begin{equation}
+    \begin{pmatrix} x \\ y \\ z \end{pmatrix}_{\!\flu}
+    = \begin{pmatrix} 1 & 0 & 0 \\ 0 & -1 & 0 \\ 0 & 0 & -1 \end{pmatrix}
+    \begin{pmatrix} x \\ y \\ z \end{pmatrix}_{\!\ned}
+\end{equation}
+
+\paragraph{Position.} $x$ unchanged, $y$ flips, $z$ flips:
+\begin{equation}
+    p_x^{\flu} = p_x^{\ned}, \qquad
+    p_y^{\flu} = -p_y^{\ned}, \qquad
+    p_z^{\flu} = -p_z^{\ned}
+\end{equation}
+
+\paragraph{Angular rates and torques.} Same transform (pseudovectors under proper rotation):
+\begin{equation}
+    \omega_\phi^{\flu} = \omega_\phi^{\ned}, \qquad
+    \omega_\theta^{\flu} = -\omega_\theta^{\ned}, \qquad
+    \omega_\psi^{\flu} = -\omega_\psi^{\ned}
+\end{equation}
+
+\paragraph{Rotor handedness label vs.\ yaw torque sign.}
+The rotor handedness label $s_i$ is a geometric property of the propeller
+(CW-from-above $= +1$, CCW $= -1$) and is the same in both frames.
+However, the \emph{yaw torque} sign changes between frames because the
+body $z$-axis flips:
+\begin{alignat}{2}
+    \tau_{\psi,i}^{\ned} &= -s_i \, c_i \, T_i &\qquad& \text{(CW $\to$ negative yaw in NED)} \\
+    \tau_{\psi,i}^{\flu} &= +s_i \, c_i \, T_i && \text{(CW $\to$ positive yaw in FLU)}
+\end{alignat}
+This is consistent: $\tau_\psi^{\flu} = -\tau_\psi^{\ned}$ (z-axis flips).
+Cybflight's \texttt{SpinDir::Cw = 1} directly gives the FLU sign.
+
+%% ============================================================================
+\section{Cybflight G1 Derivation (FLU Frame)}
+%% ============================================================================
+
+\subsection{From First Principles}
+
+In FLU, thrust acts in $+z$ (upward). For motor $i$ with
+$\bm{F}_i = (0, 0, +T_i)$ at $\bm{r}_i = (p_{x,i}^{\flu}, p_{y,i}^{\flu}, 0)$:
+
+\begin{equation}
+    \bm{\tau}_i^{\flu} = \bm{r}_i \times \bm{F}_i + \bm{\tau}_{\mathrm{drag},i}
+\end{equation}
+
+Cross product:
+\begin{align}
+    \tau_{\phi,i}^{\flu}   &= p_{y,i}^{\flu} \cdot T_i \label{eq:tau_roll_flu} \\
+    \tau_{\theta,i}^{\flu} &= -p_{x,i}^{\flu} \cdot T_i \label{eq:tau_pitch_flu} \\
+    \tau_{\psi,i}^{\flu}   &= s_i^{\flu} \cdot c_i \cdot T_i \label{eq:tau_yaw_flu}
+\end{align}
+
+These match \texttt{mixer.rs} lines 151--155 exactly.
+
+The INDI G1 in FLU:
+\begin{equation}\label{eq:g1_flu}
+    \boxed{
+    G_1^{\flu}[:,i] = \begin{pmatrix}
+        0 \\[2pt]
+        0 \\[2pt]
+        T_i \,/\, m \\[6pt]
+        \multicolumn{1}{c}{\bm{I}^{-1} \begin{pmatrix}
+            p_{y,i}^{\flu} \, T_i \\
+            -p_{x,i}^{\flu} \, T_i \\
+            s_i^{\flu} \, c_i \, T_i
+        \end{pmatrix}}
+    \end{pmatrix}
+    }
+\end{equation}
+
+For diagonal inertia:
+\begin{align}
+    G_1^{\flu}[0,i] &= 0 \\
+    G_1^{\flu}[1,i] &= 0 \\
+    G_1^{\flu}[2,i] &= +T_i / m & \text{(positive = upward in FLU)} \label{eq:g1_fz_flu} \\
+    G_1^{\flu}[3,i] &= +p_{y,i}^{\flu} \, T_i / I_{xx} & \text{(roll)} \\
+    G_1^{\flu}[4,i] &= -p_{x,i}^{\flu} \, T_i / I_{yy} & \text{(pitch)} \\
+    G_1^{\flu}[5,i] &= +s_i^{\flu} \, c_i \, T_i / I_{zz} & \text{(yaw)}
+\end{align}
+
+\subsection{From Existing Cybflight G1 (Physical Units)}
+
+Cybflight's \texttt{mixer.rs} already computes a 4-row G1 in physical units (FLU):
+\begin{equation}
+    G_{1,\mathrm{phys}}^{\flu}[:,i] = \begin{pmatrix}
+        T_i \\
+        p_{y,i}^{\flu} \, T_i \\
+        -p_{x,i}^{\flu} \, T_i \\
+        s_i^{\flu} \, c_i \, T_i
+    \end{pmatrix}
+    = \begin{pmatrix}
+        \text{thrust (N)} \\
+        \text{roll torque (N\,m)} \\
+        \text{pitch torque (N\,m)} \\
+        \text{yaw torque (N\,m)}
+    \end{pmatrix}
+\end{equation}
+
+The INDI G1 is obtained by converting to acceleration space:
+\begin{equation}\label{eq:g1_from_phys}
+    \boxed{
+    G_1^{\flu}[:,i] = \begin{pmatrix}
+        0 \\[2pt]
+        0 \\[2pt]
+        G_{1,\mathrm{phys}}[0,i] \;/\; m \\[6pt]
+        \multicolumn{1}{c}{\bm{I}^{-1} \begin{pmatrix}
+            G_{1,\mathrm{phys}}[1,i] \\
+            G_{1,\mathrm{phys}}[2,i] \\
+            G_{1,\mathrm{phys}}[3,i]
+        \end{pmatrix}}
+    \end{pmatrix}
+    }
+\end{equation}
+
+This handles non-diagonal inertia correctly via full $\bm{I}^{-1}$.
+
+%% ============================================================================
+\section{Cybflight G2 Derivation (FLU Frame)}
+%% ============================================================================
+
+G2 follows the same sign convention as the torque rows of G1.
+For standard multirotors (vertical motors), only yaw is affected:
+
+\begin{equation}\label{eq:g2_flu}
+    \boxed{
+    G_2^{\flu}[:,i] = \begin{pmatrix} 0 \\ 0 \\ G_{2,\psi,i}^{\flu} \end{pmatrix}
+    }
+\end{equation}
+
+The yaw G2 sign equals the G1 yaw sign for the same motor:
+\begin{itemize}
+    \item CW motor ($s_i = +1$): speeding up $\Rightarrow$ reaction torque in $+z_{\flu}$
+        $\Rightarrow$ positive yaw G2
+    \item CCW motor ($s_i = -1$): speeding up $\Rightarrow$ reaction torque in $-z_{\flu}$
+        $\Rightarrow$ negative yaw G2
+\end{itemize}
+
+G2 values come from system identification, not first principles.
+The combined effectiveness matrix (same as Eq.~\ref{eq:g1g2_combined})
+uses the G2 scaler to adapt based on operating point:
+
+\begin{equation}
+    \widetilde{G}^{\flu}[j,i] = G_1^{\flu}[j,i] +
+    \begin{cases}
+        \dfrac{\text{G2\_scaler}_i}{\omega_{\mathrm{mot},i}} \, G_2^{\flu}[j-3,i]
+        & j > 2 \\[6pt]
+        0 & j \le 2
+    \end{cases}
+\end{equation}
+
+%% ============================================================================
+\section{Numerical Verification}
+%% ============================================================================
+
+Using cybflight's SAKURAH743 quad parameters:
+\begin{align*}
+    m &= 0.55 \text{ kg}, \quad I_{xx} = 0.0025, \quad I_{yy} = 0.0021, \quad I_{zz} = 0.0043 \text{ kg\,m}^2 \\
+    T_i &= 8.5 \text{ N}, \quad c_i = 0.022 \text{ m}
+\end{align*}
+
+\begin{center}
+\begin{tabular}{lcccc}
+    \toprule
+    & M0 (RR, CW) & M1 (FR, CCW) & M2 (RL, CCW) & M3 (FL, CW) \\
+    & $p=(-d,-d)$ & $p=(+d,-d)$ & $p=(-d,+d)$ & $p=(+d,+d)$ \\
+    \midrule
+    $f_z$ (m/s$^2$)           & $+15.45$ & $+15.45$ & $+15.45$ & $+15.45$ \\
+    $\alpha_\phi$ (rad/s$^2$) & $-340.0$ & $-340.0$ & $+340.0$ & $+340.0$ \\
+    $\alpha_\theta$ (rad/s$^2$)& $+303.6$ & $-303.6$ & $+303.6$ & $-303.6$ \\
+    $\alpha_\psi$ (rad/s$^2$) & $+43.5$  & $-43.5$  & $-43.5$  & $+43.5$  \\
+    \bottomrule
+\end{tabular}
+\end{center}
+
+\noindent where $d_x = 0.075$ m, $d_y = 0.1$ m. Physical checks:
+\begin{itemize}
+    \item All $f_z > 0$: thrust is upward in FLU. \checkmark
+    \item M0 (rear-right): $\alpha_\phi < 0$ (right motor $\Rightarrow$ left-side-up roll). \checkmark
+    \item M0 (rear): $\alpha_\theta > 0$. In FLU, positive $\tau_y$ rotates $+x$ toward
+        $-z$ via $\bm{\omega} \times \bm{r}$, i.e.\ nose down. Rear motor thrusting
+        up pitches nose down. \checkmark
+    \item M0 (CW): $\alpha_\psi > 0$ (CW reaction $= +z_{\flu}$). \checkmark
+    \item Yaw signs: CW motors (M0, M3) positive, CCW (M1, M2) negative. \checkmark
+    \item Roll: right motors (M0, M1, $p_y < 0$) negative, left (M2, M3) positive. \checkmark
+    \item Pitch: rear motors (M0, M2, $p_x < 0$) positive, front (M1, M3) negative. \checkmark
+\end{itemize}
+
+\paragraph{Cross-check with NED.} Applying the frame transform to the FLU values:
+\begin{align*}
+    G_1^{\ned}[2,\text{M0}] &= -G_1^{\flu}[2,\text{M0}] = -15.45 & \text{($-z$ = upward in NED)} \\
+    G_1^{\ned}[3,\text{M0}] &= +G_1^{\flu}[3,\text{M0}] = -340.0 & \text{(roll, $x$ unchanged)} \\
+    G_1^{\ned}[4,\text{M0}] &= -G_1^{\flu}[4,\text{M0}] = -303.6 & \text{(pitch, $y$ flips)} \\
+    G_1^{\ned}[5,\text{M0}] &= -G_1^{\flu}[5,\text{M0}] = -43.5  & \text{(yaw, $z$ flips)}
+\end{align*}
+
+In NED: CW motor yaw is negative (drag reaction in $-z_{\ned}$), rear motor pitch is
+negative (nose-down in NED sign convention). All consistent with indiflight. \checkmark
+
+\end{document}

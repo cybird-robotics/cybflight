@@ -27,7 +27,7 @@ bsp-sakurah743 = { path = "../bsp/sakurah743", optional = true }
 bsp-foxeerh743 = { path = "../bsp/foxeerh743", optional = true }
 bsp-types = { path = "../bsp/types" }
 cybflight-drivers = { path = "../drivers" }
-cybflight-msgs = { version = "0.1.8", registry = "utadr", features = ["embedded"] }
+cybflight-msgs = { version = "0.1.9", registry = "utadr", features = ["embedded"] }
 cybflight-core = { path = "../cybflight_core/" }
 
 # Embassy runtime pieces (board-agnostic)
@@ -59,6 +59,7 @@ nalgebra = { version = "0.34.1", default-features = false, features = ["libm", "
 air-filters = { version = "0.0.3", default-features = false, features = ["libm"] }
 discrete_pid = { version = "0.1.0", default-features = false }
 libm = "0.2"
+wls-alloc = { version = "0.1.2" }
 
 [profile.release]
 debug = 2

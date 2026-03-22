@@ -3,6 +3,8 @@ pub mod dshot;
 use crate::hal::pac::gpio::Gpio;
 use crate::hal::pac::timer::TimGp16;
 use crate::msgs;
+use core::sync::atomic::AtomicBool;
+
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 
@@ -10,8 +12,15 @@ use embassy_sync::signal::Signal;
 /// Default: DSHOT_MIN_THROTTLE (arm/idle). 0 = MOTOR_STOP command.
 pub static ACTUATOR_MOTORS: Signal<CriticalSectionRawMutex, msgs::ActuatorMotors> = Signal::new();
 
-/// Arm/disarm state from RC input. DShot task sends MOTOR_STOP when disarmed.
+/// Arm/disarm command signal. Written by RC input + failsafe, read by DShot task.
+/// Signal semantics: latest value wins (no queueing).
 pub static ARM_STATE: Signal<CriticalSectionRawMutex, msgs::ArmDisarm> = Signal::new();
+
+/// Current armed state as a simple atomic bool.
+/// Set by DShot task (the primary ARM_STATE consumer) after processing each
+/// arm/disarm command. Read by INDI task and any other consumer that needs
+/// the current arming state without consuming the Signal.
+pub static IS_ARMED: AtomicBool = AtomicBool::new(false);
 
 // DShot600 bit timing (at 12 MHz effective timer clock, 20 ticks/bit)
 pub const DSHOT600_BIT_0: u32 = 7; // 35% duty

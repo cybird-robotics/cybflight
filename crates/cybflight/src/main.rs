@@ -78,9 +78,16 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::usb_serial::imu2_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn IMU2 stream task"));
+    // est_mahony: rate PIDs + linear allocation (inner_loop).
+    // est_eskf:   INDI controller (replaces rate PIDs + mixer).
+    #[cfg(feature = "est_mahony")]
     spawner
         .spawn(cybflight::control::inner_loop::control_loop_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn control loop task"));
+    #[cfg(feature = "est_eskf")]
+    spawner
+        .spawn(cybflight::control::indi_task::indi_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn INDI task"));
     spawner
         .spawn(cybflight::usb_serial::att_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude stream task"));

@@ -41,6 +41,7 @@ const RECOVERY_PERIOD: Duration = Duration::from_millis(500);
 /// If no motor command published for this long, disarm.
 /// Must be longer than any single-frame skip (odom stale = 100 ms, RC stale = 250 ms)
 /// but short enough to catch sustained failures before the vehicle falls far.
+#[cfg(feature = "est_eskf")]
 const CTRL_TIMEOUT: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
@@ -70,11 +71,18 @@ fn enter_failsafe(reason: &str) {
 }
 
 /// Check if the controller heartbeat has timed out.
+/// Only meaningful in position mode where inner_loop stamps LAST_CONTROLLER_PUBLISH.
+#[cfg(feature = "est_eskf")]
 fn controller_timed_out() -> bool {
     match super::LAST_CONTROLLER_PUBLISH.lock(|c| c.get()) {
         Some(t) => Instant::now().duration_since(t) > CTRL_TIMEOUT,
         None => false, // Controller hasn't started yet — not a failure
     }
+}
+
+#[cfg(not(feature = "est_eskf"))]
+fn controller_timed_out() -> bool {
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +115,7 @@ pub async fn failsafe_task() {
         // --- Controller watchdog: check on every loop iteration ---
         if controller_timed_out() {
             enter_failsafe("controller silent for >500ms");
+            #[cfg(feature = "est_eskf")]
             super::LAST_CONTROLLER_PUBLISH.lock(|c| c.set(None));
             phase = Phase::Landed {
                 recovery_start: None,

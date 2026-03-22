@@ -6,7 +6,7 @@ publish = false
 
 [features]
 # Pick one board by default; enable CRSF RC and UART logging by default
-default = ["board_sakurah743", "rx_crsf", "defmt_uart"]
+default = ["board_sakurah743", "rx_crsf", "defmt_uart", "est_mahony"]
 
 board_sakurah743 = ["dep:bsp-sakurah743"]
 board_foxeerh743 = ["dep:bsp-foxeerh743"]
@@ -16,6 +16,11 @@ rx_ghst = []
 # blocking UART overhead and free USART2 (the peripheral is still consumed
 # and dropped at init, but no bytes are ever transmitted).
 defmt_uart = []
+# est_mahony: Mahony attitude filter → angle-mode stick control.
+# est_eskf:   ESKF (IMU + Vicon) → full ENU position control.
+# Exactly one must be selected.
+est_mahony = []
+est_eskf = []
 
 [dependencies]
 bsp-sakurah743 = { path = "../bsp/sakurah743", optional = true }

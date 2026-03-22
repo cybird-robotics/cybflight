@@ -52,20 +52,25 @@ async fn main(spawner: embassy_executor::Spawner) {
         .spawn(cybflight::watchdog::iwdg_feed_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn IWDG feed task"));
     spawner
-        .spawn(cybflight::estimation::eskf_imu_mocap::estimation_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn estimation task"));
-
-    spawner
         .spawn(cybflight::control::rc_interpreter::rc_interpreter_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn RC interpreter task"));
 
     spawner
         .spawn(cybflight::control::failsafe::failsafe_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn failsafe task"));
-
+    // Mahony attitude filter (est_mahony always; est_eskf for attitude bootstrap).
     spawner
-        .spawn(cybflight::control::inner_loop::inner_loop_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn inner loop task"));
+        .spawn(cybflight::sensors::attitude::mahony_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude task"));
+
+    #[cfg(feature = "est_eskf")]
+    spawner
+        .spawn(cybflight::estimation::eskf_imu_mocap::estimation_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn estimation task"));
+
+    // spawner
+    //     .spawn(cybflight::control::nmpc_driver::nmpc_task())
+    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn NMPC driver task"));
 
     spawner
         .spawn(cybflight::usb_serial::imu1_stream_task())
@@ -73,10 +78,9 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::usb_serial::imu2_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn IMU2 stream task"));
-    // inner_loop_task replaces attitude_control as the sole controller.
-    // spawner
-    //     .spawn(cybflight::control::attitude_control::attitude_control_task())
-    //     .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude control task"));
+    spawner
+        .spawn(cybflight::control::inner_loop::control_loop_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn control loop task"));
     spawner
         .spawn(cybflight::usb_serial::att_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude stream task"));

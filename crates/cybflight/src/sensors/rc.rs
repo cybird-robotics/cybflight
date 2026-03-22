@@ -44,7 +44,7 @@ const LINK_STATS_MAX_AGE_MS: u64 = 500;
 /// Enforces four pre-conditions before allowing arm:
 /// 1. Throttle at minimum (BF: `ARMING_DISABLED_THROTTLE`, threshold = `mincheck`)
 /// 2. RC link active with acceptable quality (BF: `ARMING_DISABLED_RX_FAILSAFE`)
-/// 3. ESKF estimator initialised and running
+/// 3. ESKF estimator initialised and running (`est_eskf` only)
 /// 4. Arm switch held for debounce duration (cybflight safety addition)
 ///
 /// Disarming via switch is always immediate (no debounce) for safety.
@@ -134,7 +134,8 @@ impl ArmStateMachine {
             return;
         }
 
-        // Gate 4: ESKF estimator ready
+        // Gate 4: ESKF estimator ready (Mahony has no convergence phase)
+        #[cfg(feature = "est_eskf")]
         if !crate::estimation::ESTIMATOR_READY.load(Ordering::Acquire) {
             self.switch_arm_start = None;
             return;

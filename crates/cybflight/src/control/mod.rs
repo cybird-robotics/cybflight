@@ -1,23 +1,27 @@
-// attitude_control is disabled: inner_loop_task is the sole controller.
-// pub mod attitude_control;
+#[cfg(all(feature = "est_mahony", feature = "est_eskf"))]
+compile_error!("features est_mahony and est_eskf are mutually exclusive");
+#[cfg(not(any(feature = "est_mahony", feature = "est_eskf")))]
+compile_error!("one of est_mahony or est_eskf must be selected");
+
+// attitude_control is folded into inner_loop — one unified control loop.
 pub mod failsafe;
 pub mod inner_loop;
-pub mod flight_mode;
 pub mod nmpc_driver;
 pub mod rc_interpreter;
 
+#[cfg(feature = "est_eskf")]
+pub mod flight_mode;
+
 use cybflight_msgs as msgs;
 
-use core::cell::Cell;
-use embassy_sync::{
-    blocking_mutex::{self, raw::CriticalSectionRawMutex},
-    pubsub::PubSubChannel,
-    signal::Signal,
-};
-use embassy_time::Instant;
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, pubsub::PubSubChannel};
 
-// Flight mode signal: written by rc_interpreter, read by attitude_control.
-pub static FLIGHT_MODE: Signal<CriticalSectionRawMutex, flight_mode::FlightMode> = Signal::new();
+#[cfg(feature = "est_eskf")]
+use core::cell::Cell;
+#[cfg(feature = "est_eskf")]
+use embassy_sync::{blocking_mutex, signal::Signal};
+#[cfg(feature = "est_eskf")]
+use embassy_time::Instant;
 
 pub static OCP_SOLVER_OUTPUT: PubSubChannel<
     CriticalSectionRawMutex,
@@ -29,8 +33,8 @@ pub static OCP_SOLVER_OUTPUT: PubSubChannel<
 
 // NMPC position setpoint: CAP=2 (fresh setpoints only), SUBS=2 (nmpc_driver + spare),
 // PUBS=1 (single RC-to-setpoint converter, not yet implemented).
-// pub static NMPC_SETPOINT: PubSubChannel<CriticalSectionRawMutex, msgs::NmpcSetpoint, 2, 2, 1> =
-//     PubSubChannel::new();
+pub static NMPC_SETPOINT: PubSubChannel<CriticalSectionRawMutex, msgs::NmpcSetpoint, 2, 2, 1> =
+    PubSubChannel::new();
 
 pub static ATTITUDE_CONTROL_SETPOINT: PubSubChannel<
     CriticalSectionRawMutex,
@@ -40,7 +44,11 @@ pub static ATTITUDE_CONTROL_SETPOINT: PubSubChannel<
     1,
 > = PubSubChannel::new();
 
-// Position control setpoint: CAP=2 (fresh only), SUBS=3 (esp_bridge + shell stream + spare), PUBS=1.
+#[cfg(feature = "est_eskf")]
+pub static AUTO_SETPOINT: Signal<CriticalSectionRawMutex, msgs::VehicleOdometry> = Signal::new();
+
+// Position control setpoint telemetry: CAP=2, SUBS=3 (esp_bridge + shell + spare), PUBS=1.
+#[cfg(feature = "est_eskf")]
 pub static POSITION_CONTROL_SETPOINT: PubSubChannel<
     CriticalSectionRawMutex,
     msgs::PositionControlSetpoint,
@@ -49,11 +57,10 @@ pub static POSITION_CONTROL_SETPOINT: PubSubChannel<
     1,
 > = PubSubChannel::new();
 
-// Auto-mode setpoint: current desired state for autonomous flight.
-// Written by rc_interpreter (initial), mission_plan_task, ESP bridge, etc.
-pub static AUTO_SETPOINT: Signal<CriticalSectionRawMutex, msgs::VehicleOdometry> = Signal::new();
-
-// Last time the inner loop successfully published a motor command.
-// Written by inner_loop, read by failsafe controller_watchdog_task.
-pub static LAST_CONTROLLER_PUBLISH: blocking_mutex::Mutex<CriticalSectionRawMutex, Cell<Option<Instant>>> =
-    blocking_mutex::Mutex::new(Cell::new(None));
+// Last time the control loop published a motor command.
+// Written by inner_loop (est_eskf), read by failsafe controller watchdog.
+#[cfg(feature = "est_eskf")]
+pub static LAST_CONTROLLER_PUBLISH: blocking_mutex::Mutex<
+    CriticalSectionRawMutex,
+    Cell<Option<Instant>>,
+> = blocking_mutex::Mutex::new(Cell::new(None));

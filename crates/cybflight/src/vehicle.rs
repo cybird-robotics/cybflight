@@ -55,11 +55,23 @@ pub const QUADROTOR_MOTORS: [MotorParams; 4] = [
     },
 ];
 
+/// Compile-time default control gains matching the inner-loop hardcoded values.
+pub const DEFAULT_CONTROL_GAINS: cybflight_core::params::ControlGains =
+    cybflight_core::params::ControlGains {
+        pos_kp: [4.0, 4.0, 8.0],
+        pos_kd: [4.0, 4.0, 6.0],
+        att_k_rate: [3.0, 3.0, 1.0],
+        rate_kp: [0.1, 0.08, 0.05],
+        rate_ki: [0.0, 0.0, 0.0],
+        rate_kd: [0.0, 0.0, 0.0],
+    };
+
 /// Return the compile-time default vehicle parameters.
 pub fn default_params() -> cybflight_core::params::VehicleParams {
     cybflight_core::params::VehicleParams {
         body: QUADROTOR_BODY,
         motors: QUADROTOR_MOTORS,
+        control: DEFAULT_CONTROL_GAINS,
     }
 }
 

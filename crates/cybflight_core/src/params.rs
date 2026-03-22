@@ -14,20 +14,60 @@
 use crate::mixer::{MotorParams, RigidBodyParams, SpinDir};
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 1;
+const VERSION: u32 = 3;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
 /// Body: mass(4) + inertia(9*4=36) = 40 bytes
 /// Motor: px(4) + py(4) + spin_dir(4) + max_thrust(4) + torque_coeff(4) = 20 bytes each
-/// Total payload: 40 + 4*20 = 120 bytes
-const PAYLOAD_SIZE: usize = 120;
-/// Padded to 32-byte flash word boundary: ceil((16+120)/32)*32 = 160
-pub const PADDED_SIZE: usize = 160;
+/// Control: pos_kp(12) + pos_kd(12) + att_k_rate(12) + rate_roll(12) + rate_pitch(12) + rate_yaw(12) = 72 bytes
+/// Total payload: 40 + 4*20 + 72 = 192 bytes
+const PAYLOAD_SIZE: usize = 192;
+/// Padded to 32-byte flash word boundary: ceil((16+192)/32)*32 = 224
+pub const PADDED_SIZE: usize = 224;
+
+/// PID gain triplet.
+#[derive(Clone, Copy, Debug)]
+pub struct PidGains {
+    pub kp: f32,
+    pub ki: f32,
+    pub kd: f32,
+}
+
+/// Control gains for position, attitude, and rate loops.
+///
+/// All vector gains are dimension-major: `[roll/x, pitch/y, yaw/z]`.
+#[derive(Clone, Debug)]
+pub struct ControlGains {
+    /// Position proportional gains [x, y, z].
+    pub pos_kp: [f32; 3],
+    /// Position derivative (velocity) gains [x, y, z].
+    pub pos_kd: [f32; 3],
+    /// Attitude error to body-rate gains [roll, pitch, yaw].
+    pub att_k_rate: [f32; 3],
+    /// Rate PID proportional gains [roll, pitch, yaw].
+    pub rate_kp: [f32; 3],
+    /// Rate PID integral gains [roll, pitch, yaw].
+    pub rate_ki: [f32; 3],
+    /// Rate PID derivative gains [roll, pitch, yaw].
+    pub rate_kd: [f32; 3],
+}
+
+impl ControlGains {
+    /// Extract per-axis PID gains for the rate controller.
+    pub fn rate_pid(&self, axis: usize) -> PidGains {
+        PidGains {
+            kp: self.rate_kp[axis],
+            ki: self.rate_ki[axis],
+            kd: self.rate_kd[axis],
+        }
+    }
+}
 
 /// Full vehicle parameter set.
 #[derive(Clone, Debug)]
 pub struct VehicleParams {
     pub body: RigidBodyParams,
     pub motors: [MotorParams; 4],
+    pub control: ControlGains,
 }
 
 impl VehicleParams {
@@ -53,6 +93,24 @@ impl VehicleParams {
             );
             off = put_f32(&mut buf, off, m.max_thrust_n);
             off = put_f32(&mut buf, off, m.torque_coeff_m);
+        }
+        for &v in &self.control.pos_kp {
+            off = put_f32(&mut buf, off, v);
+        }
+        for &v in &self.control.pos_kd {
+            off = put_f32(&mut buf, off, v);
+        }
+        for &v in &self.control.att_k_rate {
+            off = put_f32(&mut buf, off, v);
+        }
+        for &v in &self.control.rate_kp {
+            off = put_f32(&mut buf, off, v);
+        }
+        for &v in &self.control.rate_ki {
+            off = put_f32(&mut buf, off, v);
+        }
+        for &v in &self.control.rate_kd {
+            off = put_f32(&mut buf, off, v);
         }
         debug_assert_eq!(off - HEADER_SIZE, PAYLOAD_SIZE);
 
@@ -122,7 +180,50 @@ impl VehicleParams {
             m.torque_coeff_m = torque_coeff;
         }
 
-        Some(VehicleParams { body, motors })
+        let mut pos_kp = [0.0f32; 3];
+        for slot in &mut pos_kp {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let mut pos_kd = [0.0f32; 3];
+        for slot in &mut pos_kd {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let mut att_k_rate = [0.0f32; 3];
+        for slot in &mut att_k_rate {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let mut rate_kp = [0.0f32; 3];
+        for slot in &mut rate_kp {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let mut rate_ki = [0.0f32; 3];
+        for slot in &mut rate_ki {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let mut rate_kd = [0.0f32; 3];
+        for slot in &mut rate_kd {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let control = ControlGains {
+            pos_kp,
+            pos_kd,
+            att_k_rate,
+            rate_kp,
+            rate_ki,
+            rate_kd,
+        };
+
+        Some(VehicleParams {
+            body,
+            motors,
+            control,
+        })
     }
 
     /// Get a parameter value by key.
@@ -158,6 +259,24 @@ impl VehicleParams {
             ParamKey::M3Spin => self.motors[3].spin_dir as i32 as f32,
             ParamKey::M3Thrust => self.motors[3].max_thrust_n,
             ParamKey::M3Torque => self.motors[3].torque_coeff_m,
+            ParamKey::PosKpX => self.control.pos_kp[0],
+            ParamKey::PosKpY => self.control.pos_kp[1],
+            ParamKey::PosKpZ => self.control.pos_kp[2],
+            ParamKey::PosKdX => self.control.pos_kd[0],
+            ParamKey::PosKdY => self.control.pos_kd[1],
+            ParamKey::PosKdZ => self.control.pos_kd[2],
+            ParamKey::AttKrX => self.control.att_k_rate[0],
+            ParamKey::AttKrY => self.control.att_k_rate[1],
+            ParamKey::AttKrZ => self.control.att_k_rate[2],
+            ParamKey::RateKpR => self.control.rate_kp[0],
+            ParamKey::RateKpP => self.control.rate_kp[1],
+            ParamKey::RateKpY => self.control.rate_kp[2],
+            ParamKey::RateKiR => self.control.rate_ki[0],
+            ParamKey::RateKiP => self.control.rate_ki[1],
+            ParamKey::RateKiY => self.control.rate_ki[2],
+            ParamKey::RateKdR => self.control.rate_kd[0],
+            ParamKey::RateKdP => self.control.rate_kd[1],
+            ParamKey::RateKdY => self.control.rate_kd[2],
         }
     }
 
@@ -218,6 +337,24 @@ impl VehicleParams {
             }
             ParamKey::M3Thrust => self.motors[3].max_thrust_n = val,
             ParamKey::M3Torque => self.motors[3].torque_coeff_m = val,
+            ParamKey::PosKpX => self.control.pos_kp[0] = val,
+            ParamKey::PosKpY => self.control.pos_kp[1] = val,
+            ParamKey::PosKpZ => self.control.pos_kp[2] = val,
+            ParamKey::PosKdX => self.control.pos_kd[0] = val,
+            ParamKey::PosKdY => self.control.pos_kd[1] = val,
+            ParamKey::PosKdZ => self.control.pos_kd[2] = val,
+            ParamKey::AttKrX => self.control.att_k_rate[0] = val,
+            ParamKey::AttKrY => self.control.att_k_rate[1] = val,
+            ParamKey::AttKrZ => self.control.att_k_rate[2] = val,
+            ParamKey::RateKpR => self.control.rate_kp[0] = val,
+            ParamKey::RateKpP => self.control.rate_kp[1] = val,
+            ParamKey::RateKpY => self.control.rate_kp[2] = val,
+            ParamKey::RateKiR => self.control.rate_ki[0] = val,
+            ParamKey::RateKiP => self.control.rate_ki[1] = val,
+            ParamKey::RateKiY => self.control.rate_ki[2] = val,
+            ParamKey::RateKdR => self.control.rate_kd[0] = val,
+            ParamKey::RateKdP => self.control.rate_kd[1] = val,
+            ParamKey::RateKdY => self.control.rate_kd[2] = val,
         }
     }
 }
@@ -255,6 +392,27 @@ pub enum ParamKey {
     M3Spin,
     M3Thrust,
     M3Torque,
+    // Position control gains
+    PosKpX,
+    PosKpY,
+    PosKpZ,
+    PosKdX,
+    PosKdY,
+    PosKdZ,
+    // Attitude control gains
+    AttKrX,
+    AttKrY,
+    AttKrZ,
+    // Rate PID gains (dimension-major)
+    RateKpR,
+    RateKpP,
+    RateKpY,
+    RateKiR,
+    RateKiP,
+    RateKiY,
+    RateKdR,
+    RateKdP,
+    RateKdY,
 }
 
 /// All parameter keys in order, for iteration.
@@ -289,6 +447,24 @@ pub const ALL_KEYS: &[ParamKey] = &[
     ParamKey::M3Spin,
     ParamKey::M3Thrust,
     ParamKey::M3Torque,
+    ParamKey::PosKpX,
+    ParamKey::PosKpY,
+    ParamKey::PosKpZ,
+    ParamKey::PosKdX,
+    ParamKey::PosKdY,
+    ParamKey::PosKdZ,
+    ParamKey::AttKrX,
+    ParamKey::AttKrY,
+    ParamKey::AttKrZ,
+    ParamKey::RateKpR,
+    ParamKey::RateKpP,
+    ParamKey::RateKpY,
+    ParamKey::RateKiR,
+    ParamKey::RateKiP,
+    ParamKey::RateKiY,
+    ParamKey::RateKdR,
+    ParamKey::RateKdP,
+    ParamKey::RateKdY,
 ];
 
 impl ParamKey {
@@ -325,6 +501,24 @@ impl ParamKey {
             "m3_spin" => Some(Self::M3Spin),
             "m3_thrust" => Some(Self::M3Thrust),
             "m3_torque" => Some(Self::M3Torque),
+            "pos_kp_x" => Some(Self::PosKpX),
+            "pos_kp_y" => Some(Self::PosKpY),
+            "pos_kp_z" => Some(Self::PosKpZ),
+            "pos_kd_x" => Some(Self::PosKdX),
+            "pos_kd_y" => Some(Self::PosKdY),
+            "pos_kd_z" => Some(Self::PosKdZ),
+            "att_kr_x" => Some(Self::AttKrX),
+            "att_kr_y" => Some(Self::AttKrY),
+            "att_kr_z" => Some(Self::AttKrZ),
+            "rate_kp_r" => Some(Self::RateKpR),
+            "rate_kp_p" => Some(Self::RateKpP),
+            "rate_kp_y" => Some(Self::RateKpY),
+            "rate_ki_r" => Some(Self::RateKiR),
+            "rate_ki_p" => Some(Self::RateKiP),
+            "rate_ki_y" => Some(Self::RateKiY),
+            "rate_kd_r" => Some(Self::RateKdR),
+            "rate_kd_p" => Some(Self::RateKdP),
+            "rate_kd_y" => Some(Self::RateKdY),
             _ => None,
         }
     }
@@ -362,6 +556,24 @@ impl ParamKey {
             Self::M3Spin => "m3_spin",
             Self::M3Thrust => "m3_thrust",
             Self::M3Torque => "m3_torque",
+            Self::PosKpX => "pos_kp_x",
+            Self::PosKpY => "pos_kp_y",
+            Self::PosKpZ => "pos_kp_z",
+            Self::PosKdX => "pos_kd_x",
+            Self::PosKdY => "pos_kd_y",
+            Self::PosKdZ => "pos_kd_z",
+            Self::AttKrX => "att_kr_x",
+            Self::AttKrY => "att_kr_y",
+            Self::AttKrZ => "att_kr_z",
+            Self::RateKpR => "rate_kp_r",
+            Self::RateKpP => "rate_kp_p",
+            Self::RateKpY => "rate_kp_y",
+            Self::RateKiR => "rate_ki_r",
+            Self::RateKiP => "rate_ki_p",
+            Self::RateKiY => "rate_ki_y",
+            Self::RateKdR => "rate_kd_r",
+            Self::RateKdP => "rate_kd_p",
+            Self::RateKdY => "rate_kd_y",
         }
     }
 }
@@ -423,6 +635,14 @@ mod tests {
                     torque_coeff_m: 0.022,
                 },
             ],
+            control: ControlGains {
+                pos_kp: [4.0, 4.0, 5.0],
+                pos_kd: [4.0, 4.0, 4.0],
+                att_k_rate: [3.0, 3.0, 1.0],
+                rate_kp: [0.1, 0.08, 0.05],
+                rate_ki: [0.0, 0.0, 0.0],
+                rate_kd: [0.0, 0.0, 0.0],
+            },
         }
     }
 

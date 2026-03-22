@@ -3,6 +3,7 @@ use core::time::Duration;
 use cybflight_core::{
     attitude_control::{self, geometric_controller, AttitudeControlOutput},
     mixer::LinearAllocator,
+    params::PidGains,
     position_control::{self, pd_ff_control},
 };
 use discrete_pid::{
@@ -16,7 +17,7 @@ use crate::{
     motors::ACTUATOR_MOTORS,
     msgs,
     sensors::VEHICLE_ODOMETRY,
-    vehicle::{quadrotor_allocator, QUADROTOR_BODY},
+    vehicle::quadrotor_allocator,
 };
 
 /// Extract yaw angle from a unit quaternion (ZYX Euler convention).
@@ -41,12 +42,6 @@ fn odom_is_valid(odom: &msgs::VehicleOdometry) -> bool {
 /// Nominal odometry loop period (~100 Hz from ESKF).
 const RATE_PID_SAMPLE_TIME: Duration = Duration::from_millis(2);
 
-struct Pids {
-    pub kp: f32,
-    pub ki: f32,
-    pub kd: f32,
-}
-
 struct RatePids {
     roll: PidController<Micros, f32>,
     pitch: PidController<Micros, f32>,
@@ -54,9 +49,9 @@ struct RatePids {
 }
 
 impl RatePids {
-    fn new(k_roll: Pids, k_pitch: Pids, k_yaw: Pids) -> Self {
-        let make = |k: Pids| {
-            let Pids { kp, ki, kd } = k;
+    fn new(k_roll: PidGains, k_pitch: PidGains, k_yaw: PidGains) -> Self {
+        let make = |k: PidGains| {
+            let PidGains { kp, ki, kd } = k;
             let config = PidConfigBuilder::<f32>::default()
                 .kp(kp)
                 .ki(ki)
@@ -92,35 +87,24 @@ pub struct InnerLoop<const N: usize> {
 
 impl<const N: usize> InnerLoop<N> {
     pub fn new(allocator: LinearAllocator<N>) -> Self {
+        let params = crate::params::get();
+        let g = &params.control;
+
         Self {
-            pc: pd_ff_control::PositionController::default().with_vehicle(
+            pc: pd_ff_control::PositionController::new(
+                Vector3::new(g.pos_kp[0], g.pos_kp[1], g.pos_kp[2]),
+                Vector3::new(g.pos_kd[0], g.pos_kd[1], g.pos_kd[2]),
                 position_control::VehicleParams {
-                    mass: QUADROTOR_BODY.mass_kg,
+                    mass: params.body.mass_kg,
                     gravity: 9.81,
                 },
             ),
             ac: geometric_controller::GeometricAttitudeController::new(
-                Vector3::new(3.0, 3.0, 1.0), // k_ang_rate  [roll, pitch, yaw]
+                Vector3::new(g.att_k_rate[0], g.att_k_rate[1], g.att_k_rate[2]),
                 Vector3::new(1.0, 1.0, 0.2), // k_ang_torque (unused — discarded below)
             )
-            .with_inertia(QUADROTOR_BODY.inertia_matrix()),
-            rate_pids: RatePids::new(
-                Pids {
-                    kp: 0.1,
-                    ki: 0.0,
-                    kd: 0.0,
-                },
-                Pids {
-                    kp: 0.08,
-                    ki: 0.0,
-                    kd: 0.0,
-                },
-                Pids {
-                    kp: 0.05,
-                    ki: 0.0,
-                    kd: 0.0,
-                },
-            ),
+            .with_inertia(params.body.inertia_matrix()),
+            rate_pids: RatePids::new(g.rate_pid(0), g.rate_pid(1), g.rate_pid(2)),
             allocator,
         }
     }

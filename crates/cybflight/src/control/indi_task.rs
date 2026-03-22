@@ -10,7 +10,11 @@
 
 use cybflight_core::{
     attitude_control::{self, geometric_controller, AttitudeControlOutput},
-    indi::effectiveness::IndiMotorParams,
+    indi::{
+        controller::{IndiConfig, IndiController, NU},
+        effectiveness::IndiMotorParams,
+        rpm_tracker::RpmInput,
+    },
     position_control::{self, pd_ff_control},
 };
 use embassy_time::Instant;
@@ -22,11 +26,6 @@ use crate::{
     sensors::{DSHOT_TELEMETRY, IMU_1, VEHICLE_ODOMETRY},
     vehicle::{QUADROTOR_BODY, QUADROTOR_MOTORS},
 };
-
-use super::indi::IndiController;
-
-const NU: usize = 4;
-const NV: usize = 6;
 
 /// Default INDI motor parameters.
 const INDI_MOTOR_PARAMS: [IndiMotorParams; NU] = [
@@ -56,7 +55,7 @@ fn odom_is_valid(odom: &msgs::VehicleOdometry) -> bool {
 #[embassy_executor::task]
 pub async fn indi_task() {
     // --- Build INDI controller ---
-    let config = super::indi::IndiConfig {
+    let config = IndiConfig {
         rate_gains: Vector3::new(20.0, 20.0, 20.0),
         sync_filter_hz: 15.0,
         motors: QUADROTOR_MOTORS,
@@ -111,6 +110,7 @@ pub async fn indi_task() {
     // armed is read from IS_ARMED atomic each frame (no channel subscription needed)
     let mut g2_valid = [false; NU];
     let mut gyro_bias = Vector3::<f32>::zeros();
+    let mut accel_bias = Vector3::<f32>::zeros();
 
     // Specific force setpoint from position controller (thrust / mass in body z)
     let mut spf_sp_z: f32 = 0.0;
@@ -148,7 +148,11 @@ pub async fn indi_task() {
         if let Some(bias) = crate::estimation::GYRO_BIAS.try_take() {
             gyro_bias = bias;
         }
+        if let Some(bias) = crate::estimation::ACCEL_BIAS.try_take() {
+            accel_bias = bias;
+        }
         let gyro_corrected = imu.gyro_rad_s - gyro_bias;
+        let accel_corrected = imu.accel_m_s2 - accel_bias;
 
         // 2. Non-blocking reads of other channels.
         // Arming state — read from atomic (set by DShot task, single source of truth)
@@ -156,13 +160,14 @@ pub async fn indi_task() {
 
         // DShot telemetry (RPM)
         if let Some(telem) = dshot_sub.try_next_message_pure() {
-            let values: [TelemetryValue; NU] = [
-                telem.motors[0].value,
-                telem.motors[1].value,
-                telem.motors[2].value,
-                telem.motors[3].value,
-            ];
-            let (valid, rpm_failsafe) = indi.update_rpm(&values);
+            let inputs: [RpmInput; NU] = core::array::from_fn(|i| {
+                match telem.motors[i].value {
+                    TelemetryValue::Erpm(erpm) => RpmInput::Erpm(erpm),
+                    TelemetryValue::Stopped => RpmInput::Stopped,
+                    TelemetryValue::Invalid | TelemetryValue::Edt(_) => RpmInput::Invalid,
+                }
+            });
+            let (valid, rpm_failsafe) = indi.update_rpm(&inputs);
             g2_valid = valid;
             if rpm_failsafe {
                 defmt::error!("INDI: all RPM telemetry lost — DISARMING");
@@ -221,7 +226,7 @@ pub async fn indi_task() {
         // 4. INDI step (8 kHz) — uses bias-corrected gyro.
         let output = indi.step(
             &gyro_corrected,
-            &imu.accel_m_s2,
+            &accel_corrected,
             &rate_ref,
             spf_sp_z,
             armed,

@@ -6,7 +6,7 @@ compile_error!("one of est_mahony or est_eskf must be selected");
 // attitude_control is folded into inner_loop — one unified control loop.
 // INDI controller (est_eskf) replaces rate PIDs + linear allocation.
 pub mod failsafe;
-pub mod indi;
+// indi module moved to cybflight_core::indi::controller
 #[cfg(feature = "est_eskf")]
 pub mod indi_task;
 pub mod inner_loop;

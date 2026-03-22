@@ -247,4 +247,109 @@ mod tests {
             }
         }
     }
+
+    fn test_indi_params_with_g2() -> [IndiMotorParams; 4] {
+        // CW motors (M0, M3): positive G2 yaw in FLU
+        // CCW motors (M1, M2): negative G2 yaw in FLU
+        [
+            IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw:  0.001 },
+            IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: -0.001 },
+            IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: -0.001 },
+            IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw:  0.001 },
+        ]
+    }
+
+    #[test]
+    fn g2_stored_correctly() {
+        let eff = IndiEffectiveness::new(&test_motors(), &test_body(), &test_indi_params_with_g2());
+        // G2 yaw row should match input signs
+        assert!(eff.g2[(2, 0)] > 0.0, "M0 CW → positive G2 yaw in FLU");
+        assert!(eff.g2[(2, 1)] < 0.0, "M1 CCW → negative G2 yaw");
+        assert!(eff.g2[(2, 2)] < 0.0, "M2 CCW → negative G2 yaw");
+        assert!(eff.g2[(2, 3)] > 0.0, "M3 CW → positive G2 yaw");
+        // Roll/pitch G2 should be zero (standard quad)
+        for i in 0..4 {
+            assert_eq!(eff.g2[(0, i)], 0.0, "G2 roll should be zero");
+            assert_eq!(eff.g2[(1, i)], 0.0, "G2 pitch should be zero");
+        }
+    }
+
+    #[test]
+    fn g2_scaler_positive() {
+        let eff = IndiEffectiveness::new(&test_motors(), &test_body(), &test_indi_params_with_g2());
+        // G2 scaler = ω_max² / (2·τ), always positive
+        for i in 0..4 {
+            assert!(eff.g2_scaler[i] > 0.0, "G2 scaler should be positive");
+        }
+        // Verify value: ω_max = 40000/60 * 2π ≈ 4188.8, τ = 0.025
+        // scaler = 4188.8² / (2 * 0.025) = 17546177 / 0.05 ≈ 350923540
+        assert!(eff.g2_scaler[0] > 1e8, "G2 scaler magnitude");
+    }
+
+    #[test]
+    fn combined_g1g2_with_g2_active() {
+        let eff = IndiEffectiveness::new(&test_motors(), &test_body(), &test_indi_params_with_g2());
+        let hover_omega = 20000.0f32 / 60.0 * core::f32::consts::TAU;
+        let omega_fs = SVector::<f32, 4>::from_element(hover_omega);
+        let g2_valid = [true; 4];
+
+        let combined = eff.combined_g1g2(&omega_fs, &g2_valid);
+
+        // Force rows (0-2) should be unchanged (G2 only affects torque rows)
+        for i in 0..4 {
+            for j in 0..3 {
+                assert!(
+                    (combined[(j, i)] - eff.g1[(j, i)]).abs() < 1e-6,
+                    "G2 should not affect force row {j}"
+                );
+            }
+        }
+
+        // Torque rows (3-5) should differ from G1 for yaw (row 5)
+        for i in 0..4 {
+            let yaw_diff = (combined[(5, i)] - eff.g1[(5, i)]).abs();
+            assert!(yaw_diff > 1e-6, "G2 should modify yaw row for motor {i}: diff={yaw_diff}");
+
+            // G2 contribution sign: same as G2 yaw sign (scaler and omega_inv are positive)
+            let g2_contribution = combined[(5, i)] - eff.g1[(5, i)];
+            let expected_sign = eff.g2[(2, i)].signum();
+            assert_eq!(
+                g2_contribution.signum(), expected_sign,
+                "G2 yaw contribution sign wrong for motor {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn combined_g1g2_partial_validity() {
+        let eff = IndiEffectiveness::new(&test_motors(), &test_body(), &test_indi_params_with_g2());
+        let hover_omega = 20000.0f32 / 60.0 * core::f32::consts::TAU;
+        let omega_fs = SVector::<f32, 4>::from_element(hover_omega);
+
+        // Only M0 and M1 have valid RPM
+        let g2_valid = [true, true, false, false];
+        let combined = eff.combined_g1g2(&omega_fs, &g2_valid);
+
+        // M0, M1: yaw should differ from G1
+        assert!((combined[(5, 0)] - eff.g1[(5, 0)]).abs() > 1e-6);
+        assert!((combined[(5, 1)] - eff.g1[(5, 1)]).abs() > 1e-6);
+        // M2, M3: yaw should equal G1 (G2 disabled)
+        assert!((combined[(5, 2)] - eff.g1[(5, 2)]).abs() < 1e-6);
+        assert!((combined[(5, 3)] - eff.g1[(5, 3)]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn combined_g1g2_omega_inv_threshold() {
+        let eff = IndiEffectiveness::new(&test_motors(), &test_body(), &test_indi_params_with_g2());
+        // Very low omega: should clamp to 1/inv_thresh, not divide by zero
+        let omega_fs = SVector::<f32, 4>::from_element(1.0); // near zero
+        let g2_valid = [true; 4];
+        let combined = eff.combined_g1g2(&omega_fs, &g2_valid);
+        // Should not panic and all values should be finite
+        for i in 0..4 {
+            for j in 0..6 {
+                assert!(combined[(j, i)].is_finite(), "non-finite at ({j},{i})");
+            }
+        }
+    }
 }

@@ -87,6 +87,8 @@ struct IndiTestState {
     d: [f32; NU],
     dv: [f32; NV],
     act_limit: [f32; NU],
+    // G1 matrix used for allocation (configurable: NED or FLU)
+    g1: SMatrix<f32, NV, NU>,
     // G2 support
     g2_yaw: [f32; NU],          // G2 yaw values per motor
     g2_scaler: [f32; NU],       // ω_max² / (2·τ)
@@ -103,10 +105,18 @@ struct StepOutput {
 
 impl IndiTestState {
     fn new() -> Self {
-        Self::with_limits([1.0; NU])
+        Self::with_g1_and_limits(ned_g1(), [1.0; NU])
+    }
+
+    fn with_g1(g1: SMatrix<f32, NV, NU>) -> Self {
+        Self::with_g1_and_limits(g1, [1.0; NU])
     }
 
     fn with_limits(act_limit: [f32; NU]) -> Self {
+        Self::with_g1_and_limits(ned_g1(), act_limit)
+    }
+
+    fn with_g1_and_limits(g1: SMatrix<f32, NV, NU>, act_limit: [f32; NU]) -> Self {
         let dt = 1.0 / LOOP_HZ;
         let tau = 0.025f32;
         let max_rpm = 40000.0f32;
@@ -126,6 +136,7 @@ impl IndiTestState {
             d: [0.0; NU],
             dv: [0.0; NV],
             act_limit,
+            g1,
             g2_yaw: [0.0; NU],
             g2_scaler: [0.5 * max_omega * max_omega / tau; NU],
             omega_fs: [0.0; NU],
@@ -214,7 +225,7 @@ impl IndiTestState {
         }
 
         // Build G1 + G2 combined effectiveness matrix
-        let mut g1g2 = ned_g1();
+        let mut g1g2 = self.g1;
         for i in 0..NU {
             if self.g2_yaw[i].abs() > 1e-10 && self.omega_fs[i].abs() > 1e-6 {
                 let inv_thresh = 0.1 * self.max_omega[i];
@@ -718,4 +729,394 @@ fn golden_ned_flu_transform() {
     }
 
     eprintln!("NED↔FLU frame transform: PASS");
+}
+
+// ---------------------------------------------------------------------------
+// IndiController integration tests: verify the real controller produces
+// the same output as the standalone IndiTestState with FLU G1.
+// ---------------------------------------------------------------------------
+
+use cybflight_core::indi::controller::{IndiConfig, IndiController};
+
+fn flu_controller_config() -> IndiConfig {
+    let motors = [
+        MotorParams { position_m: [-0.075, -0.1], spin_dir: SpinDir::Cw,  max_thrust_n: 8.5, torque_coeff_m: 0.022 },
+        MotorParams { position_m: [ 0.075, -0.1], spin_dir: SpinDir::Ccw, max_thrust_n: 8.5, torque_coeff_m: 0.022 },
+        MotorParams { position_m: [-0.075,  0.1], spin_dir: SpinDir::Ccw, max_thrust_n: 8.5, torque_coeff_m: 0.022 },
+        MotorParams { position_m: [ 0.075,  0.1], spin_dir: SpinDir::Cw,  max_thrust_n: 8.5, torque_coeff_m: 0.022 },
+    ];
+    IndiConfig {
+        rate_gains: nalgebra::Vector3::new(20.0, 20.0, 20.0),
+        sync_filter_hz: 15.0,
+        motors,
+        body: RigidBodyParams {
+            mass_kg: 0.55,
+            inertia_kg_m2: [0.0025, 0.0, 0.0, 0.0, 0.0021, 0.0, 0.0, 0.0, 0.0043],
+        },
+        indi_motors: [IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 }; 4],
+        nonlinearity: [0.5; 4],
+        act_limit: [1.0; 4],
+        wls_wv: [1.0, 1.0, 50.0, 50.0, 50.0, 5.0],
+        wls_wu: [1.0; 4],
+        wls_cond_bound: 3.2768e8,
+        wls_theta: 1e-4,
+        wls_imax: 1,
+        nan_limit: 20,
+        rpm_invalid_limit: 50,
+        rpm_all_invalid_limit: 50,
+        rpm_recovery_count: 10,
+        motor_pole_count: 14,
+    }
+}
+
+/// Build an IndiTestState that uses FLU G1 (from IndiEffectiveness).
+fn flu_test_state() -> IndiTestState {
+    let config = flu_controller_config();
+    let eff = IndiEffectiveness::new(&config.motors, &config.body, &config.indi_motors);
+    IndiTestState::with_g1(eff.g1)
+}
+
+/// Compare IndiController against itself across scenarios.
+/// Verifies that running the same scenario twice produces identical results
+/// (deterministic), and that the outputs match physical expectations.
+fn run_controller_scenario(
+    name: &str,
+    steps: usize,
+    input_fn: &dyn Fn(usize) -> (nalgebra::Vector3<f32>, nalgebra::Vector3<f32>, nalgebra::Vector3<f32>, f32, bool),
+) -> Vec<[f32; 4]> {
+    let mut ctrl = IndiController::new(&flu_controller_config(), LOOP_HZ);
+    let g2_valid = [false; 4];
+    let mut outputs = Vec::new();
+
+    for step in 0..steps {
+        let (gyro, accel, rate_sp, spf_z, armed) = input_fn(step);
+        let out = ctrl.step(&gyro, &accel, &rate_sp, spf_z, armed, &g2_valid);
+        outputs.push(out.motor_commands);
+
+        for (i, &c) in out.motor_commands.iter().enumerate() {
+            assert!(
+                c.is_finite() && c >= 0.0 && c <= 1.0,
+                "{name} step {step}: motor {i} = {c}"
+            );
+        }
+    }
+    outputs
+}
+
+#[test]
+fn controller_deterministic() {
+    // Run the same scenario twice — must produce identical results
+    let input = |_step: usize| {
+        (
+            nalgebra::Vector3::zeros(),
+            nalgebra::Vector3::new(0.0, 0.0, GRAVITY),
+            nalgebra::Vector3::zeros(),
+            GRAVITY,
+            true,
+        )
+    };
+
+    let run1 = run_controller_scenario("det_run1", 100, &input);
+    let run2 = run_controller_scenario("det_run2", 100, &input);
+
+    for (step, (a, b)) in run1.iter().zip(run2.iter()).enumerate() {
+        for i in 0..4 {
+            assert!(
+                (a[i] - b[i]).abs() < 1e-10,
+                "non-deterministic at step {step} motor {i}: {:.10} vs {:.10}",
+                a[i], b[i]
+            );
+        }
+    }
+    eprintln!("controller_deterministic: PASS (100 steps)");
+}
+
+#[test]
+fn controller_hover_flu() {
+    let outputs = run_controller_scenario("hover_flu", 200, &|_| {
+        (
+            nalgebra::Vector3::zeros(),
+            nalgebra::Vector3::new(0.0, 0.0, GRAVITY),
+            nalgebra::Vector3::zeros(),
+            GRAVITY,
+            true,
+        )
+    });
+
+    // After settling, all motors should be equal and in hover range
+    let last = outputs.last().unwrap();
+    let mean = last.iter().sum::<f32>() / 4.0;
+    for (i, &c) in last.iter().enumerate() {
+        assert!((c - mean).abs() < 0.05, "hover motor {i} = {c}, mean = {mean}");
+    }
+    assert!(mean > 0.1 && mean < 0.7, "hover mean = {mean}");
+    eprintln!("controller_hover_flu: PASS (mean={mean:.4})");
+}
+
+#[test]
+fn controller_roll_step_flu() {
+    let outputs = run_controller_scenario("roll_flu", 200, &|_| {
+        (
+            nalgebra::Vector3::zeros(),
+            nalgebra::Vector3::new(0.0, 0.0, GRAVITY),
+            nalgebra::Vector3::new(3.0, 0.0, 0.0), // positive roll = left up in FLU
+            GRAVITY,
+            true,
+        )
+    });
+
+    let last = outputs.last().unwrap();
+    // FLU positive roll: left motors (M2=RL, M3=FL) increase
+    let left = (last[2] + last[3]) / 2.0;
+    let right = (last[0] + last[1]) / 2.0;
+    assert!(left > right, "FLU roll: left={left:.4} should > right={right:.4}");
+    eprintln!("controller_roll_step_flu: PASS (left={left:.4}, right={right:.4})");
+}
+
+#[test]
+fn controller_spinning_flu() {
+    // Vehicle spinning at 100 deg/s roll, controller tries to stop
+    let outputs = run_controller_scenario("spin_flu", 200, &|_| {
+        (
+            nalgebra::Vector3::new(100.0f32.to_radians(), 0.0, 0.0),
+            nalgebra::Vector3::new(0.0, 0.0, GRAVITY),
+            nalgebra::Vector3::zeros(), // rate_sp = 0 = stop spinning
+            GRAVITY,
+            true,
+        )
+    });
+
+    let last = outputs.last().unwrap();
+    // To stop positive roll (left going up), right motors should increase
+    let left = (last[2] + last[3]) / 2.0;
+    let right = (last[0] + last[1]) / 2.0;
+    assert!(right > left, "stopping roll: right={right:.4} should > left={left:.4}");
+    eprintln!("controller_spinning_flu: PASS (right={right:.4}, left={left:.4})");
+}
+
+#[test]
+fn controller_ground_to_air_flu() {
+    let outputs = run_controller_scenario("ground_air_flu", 100, &|step| {
+        let armed = step >= 30;
+        let spf_z = if step < 30 { 2.0 } else { GRAVITY };
+        (
+            nalgebra::Vector3::zeros(),
+            nalgebra::Vector3::new(0.0, 0.0, GRAVITY),
+            nalgebra::Vector3::zeros(),
+            spf_z,
+            armed,
+        )
+    });
+
+    // Check no spike at transition (step 30)
+    if outputs.len() > 31 {
+        for i in 0..4 {
+            let diff = (outputs[30][i] - outputs[29][i]).abs();
+            assert!(diff < 0.5, "transition spike motor {i}: diff={diff}");
+        }
+    }
+    eprintln!("controller_ground_to_air_flu: PASS");
+}
+
+#[test]
+fn controller_combined_axes_flu() {
+    let outputs = run_controller_scenario("combined_flu", 200, &|_| {
+        (
+            nalgebra::Vector3::zeros(),
+            nalgebra::Vector3::new(0.0, 0.0, GRAVITY),
+            nalgebra::Vector3::new(3.0, -2.0, 1.5),
+            GRAVITY,
+            true,
+        )
+    });
+
+    // All motors should be in bounds and not all equal (combined command)
+    let last = outputs.last().unwrap();
+    let mean = last.iter().sum::<f32>() / 4.0;
+    let max_dev = last.iter().map(|c| (c - mean).abs()).fold(0.0f32, f32::max);
+    assert!(max_dev > 0.01, "combined command should produce differential thrust: max_dev={max_dev}");
+    eprintln!("controller_combined_axes_flu: PASS (max_dev={max_dev:.4})");
+}
+
+#[test]
+fn controller_setpoint_reversal_flu() {
+    let outputs = run_controller_scenario("reversal_flu", 200, &|step| {
+        let roll_sp = if step < 60 { 5.0 } else if step < 120 { -5.0 } else { 0.0 };
+        (
+            nalgebra::Vector3::zeros(),
+            nalgebra::Vector3::new(0.0, 0.0, GRAVITY),
+            nalgebra::Vector3::new(roll_sp, 0.0, 0.0),
+            GRAVITY,
+            true,
+        )
+    });
+
+    // After reversal at step 60, left/right relationship should flip
+    let at_50 = &outputs[50]; // positive roll phase
+    let at_100 = &outputs[100]; // negative roll phase
+
+    let left_50 = (at_50[2] + at_50[3]) / 2.0;
+    let right_50 = (at_50[0] + at_50[1]) / 2.0;
+    let left_100 = (at_100[2] + at_100[3]) / 2.0;
+    let right_100 = (at_100[0] + at_100[1]) / 2.0;
+
+    assert!(left_50 > right_50, "phase 1: left should > right");
+    assert!(right_100 > left_100, "phase 2: right should > left (reversed)");
+    eprintln!("controller_setpoint_reversal_flu: PASS");
+}
+
+// ---------------------------------------------------------------------------
+// Cross-validation: IndiController vs IndiTestState with FLU G1.
+// Verifies the controller's internal wiring (filters, WLS, linearization,
+// actuator state) matches the standalone reference implementation.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn controller_matches_test_state_flu() {
+    use nalgebra::Vector3;
+
+    let config = flu_controller_config();
+
+    // Get FLU G1 from IndiEffectiveness (same derivation as IndiController uses internally)
+    let eff = IndiEffectiveness::new(&config.motors, &config.body, &config.indi_motors);
+    let g1_flu = eff.g1;
+
+    // Create both: real controller and standalone reference with same FLU G1
+    let mut ctrl = IndiController::new(&config, LOOP_HZ);
+    let mut reference = IndiTestState::with_g1(g1_flu);
+
+    let g2_valid = [false; NU];
+
+    // FLU inputs: hover
+    let g2_valid = [false; NU];
+
+    // Test scenarios: (name, steps, gyro_dps, accel_g, rate_sp_rad_s, spf_sp_z, armed)
+    // IndiTestState takes gyro in deg/s and accel in g-units (converts internally).
+    // IndiController takes gyro in rad/s and accel in m/s².
+    let scenarios: &[(&str, usize, [f32;3], [f32;3], [f32;3], f32, bool)] = &[
+        ("hover",    100, [0.;3],           [0.,0.,1.],     [0.;3],             GRAVITY, true),
+        ("roll",     100, [0.;3],           [0.,0.,1.],     [3.0, 0., 0.],      GRAVITY, true),
+        ("combined", 100, [0.;3],           [0.,0.,1.],     [3.0, -2.0, 1.5],   GRAVITY, true),
+        ("ground",    50, [0.;3],           [0.,0.,1.],     [0.;3],             2.0,     false),
+    ];
+
+    for &(name, steps, gyro_dps, accel_g, rate_sp, spf_z, armed) in scenarios {
+        let mut ctrl = IndiController::new(&config, LOOP_HZ);
+        let mut reference = IndiTestState::with_g1(g1_flu);
+        let mut max_motor_diff = 0.0f32;
+
+        // Convert for IndiController: deg/s → rad/s, g → m/s²
+        let deg2rad = core::f32::consts::PI / 180.0;
+        let gyro_v = Vector3::new(gyro_dps[0] * deg2rad, gyro_dps[1] * deg2rad, gyro_dps[2] * deg2rad);
+        let accel_v = Vector3::new(accel_g[0] * GRAVITY, accel_g[1] * GRAVITY, accel_g[2] * GRAVITY);
+        let rate_sp_v = Vector3::new(rate_sp[0], rate_sp[1], rate_sp[2]);
+
+        for step in 0..steps {
+            let ref_out = reference.step(gyro_dps, accel_g, rate_sp, spf_z, armed);
+            let ctrl_out = ctrl.step(&gyro_v, &accel_v, &rate_sp_v, spf_z, armed, &g2_valid);
+
+            // Compare linearized motor commands (d, not u).
+            // IndiTestState.d = linearize(u), IndiController.motor_commands = linearize(u).
+            let motor_diff = ref_out.d.iter()
+                .zip(ctrl_out.motor_commands.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            max_motor_diff = max_motor_diff.max(motor_diff);
+
+            if motor_diff > 0.01 {
+                panic!(
+                    "{name} step {step}: motor diff {motor_diff:.6e}\n\
+                     ref d:  {:?}\n\
+                     ctrl d: {:?}\n\
+                     ref u:  {:?}\n\
+                     ref dv: {:?}",
+                    ref_out.d, ctrl_out.motor_commands, ref_out.u, ref_out.dv
+                );
+            }
+        }
+        eprintln!("{name}: controller vs reference max_motor_diff={max_motor_diff:.6e}");
+    }
+
+    eprintln!("controller_matches_test_state_flu: PASS");
+}
+
+#[test]
+fn controller_matches_test_state_flu_with_g2() {
+    use nalgebra::Vector3;
+
+    // Config with G2 active (FLU signs)
+    let config = IndiConfig {
+        indi_motors: [
+            IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw:  0.001 },
+            IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: -0.001 },
+            IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: -0.001 },
+            IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw:  0.001 },
+        ],
+        ..flu_controller_config()
+    };
+
+    let eff = IndiEffectiveness::new(&config.motors, &config.body, &config.indi_motors);
+    let g1_flu = eff.g1;
+
+    // Compute eRPM value that produces hover_omega (20000 RPM).
+    // eRPM = RPM * pole_pairs / 100. With 14 poles (7 pairs): eRPM = 20000 * 7 / 100 = 1400.
+    let pole_pairs = config.motor_pole_count as f32 / 2.0;
+    let hover_rpm = 20000.0f32;
+    let hover_erpm = (hover_rpm * pole_pairs / 100.0) as u32; // 1400
+    let hover_omega = hover_rpm / 60.0 * core::f32::consts::TAU;
+
+    let mut reference = IndiTestState::with_g1(g1_flu)
+        .with_g2([0.001, -0.001, -0.001, 0.001], [hover_omega; NU]);
+
+    let mut ctrl = IndiController::new(&config, LOOP_HZ);
+    ctrl.update_rpm(&[cybflight_core::indi::rpm_tracker::RpmInput::Erpm(hover_erpm); NU]);
+
+    let deg2rad = core::f32::consts::PI / 180.0;
+    let g2_valid = [true; NU];
+
+    // Yaw command to exercise G2 path
+    let gyro_dps = [0.0f32; 3];
+    let accel_g = [0.0, 0.0, 1.0];
+    let rate_sp = [0.0, 0.0, 3.0]; // yaw command
+    let spf_z = GRAVITY;
+
+    let gyro_v = Vector3::new(gyro_dps[0] * deg2rad, gyro_dps[1] * deg2rad, gyro_dps[2] * deg2rad);
+    let accel_v = Vector3::new(accel_g[0] * GRAVITY, accel_g[1] * GRAVITY, accel_g[2] * GRAVITY);
+    let rate_sp_v = Vector3::new(rate_sp[0], rate_sp[1], rate_sp[2]);
+
+    // Settle phase: run both for 200 steps to let all filters converge
+    // (omega biquad, u_state PT1+biquad). The IndiTestState has instant omega
+    // while IndiController filters it, so they diverge initially.
+    for _ in 0..2000 {
+        ctrl.update_rpm(&[cybflight_core::indi::rpm_tracker::RpmInput::Erpm(hover_erpm); NU]);
+        reference.step(gyro_dps, accel_g, rate_sp, spf_z, true);
+        ctrl.step(&gyro_v, &accel_v, &rate_sp_v, spf_z, true, &g2_valid);
+    }
+
+    // Compare after settling: outputs should match closely
+    let mut max_diff = 0.0f32;
+    for step in 0..50 {
+        ctrl.update_rpm(&[cybflight_core::indi::rpm_tracker::RpmInput::Erpm(hover_erpm); NU]);
+
+        let ref_out = reference.step(gyro_dps, accel_g, rate_sp, spf_z, true);
+        let ctrl_out = ctrl.step(&gyro_v, &accel_v, &rate_sp_v, spf_z, true, &g2_valid);
+
+        let diff = ref_out.d.iter()
+            .zip(ctrl_out.motor_commands.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        max_diff = max_diff.max(diff);
+
+        // G2 path has higher tolerance due to omega biquad filter difference
+        // between IndiTestState (instant omega) and IndiController (filtered omega).
+        if diff > 0.02 {
+            panic!(
+                "G2 cross-val step {step} (after settle): diff {diff:.6e}\n\
+                 ref d:  {:?}\n\
+                 ctrl d: {:?}",
+                ref_out.d, ctrl_out.motor_commands
+            );
+        }
+    }
+    eprintln!("controller_matches_test_state_flu_with_g2: PASS (max_diff={max_diff:.6e})");
 }

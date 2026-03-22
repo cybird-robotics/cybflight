@@ -50,3 +50,8 @@ pub static ESTIMATOR_READY: AtomicBool = AtomicBool::new(false);
 /// Written by estimation_task every predict step, read by INDI task to
 /// bias-correct raw gyro before rate control and angular acceleration estimation.
 pub static GYRO_BIAS: Signal<CriticalSectionRawMutex, Vector3<f32>> = Signal::new();
+
+/// Current ESKF accel bias estimate (m/s²).
+/// Written by estimation_task every predict step, read by INDI task to
+/// bias-correct raw accel for specific force feedback.
+pub static ACCEL_BIAS: Signal<CriticalSectionRawMutex, Vector3<f32>> = Signal::new();

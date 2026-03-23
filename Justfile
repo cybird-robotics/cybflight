@@ -1,9 +1,17 @@
+set dotenv-load := true
+
 BIN := "target/thumbv7em-none-eabihf/release/cybflight.bin"
 
 HOST := `rustc -vV | sed -n 's/^host: //p'`
 
+BOARD := env_var_or_default("BOARD", "sakurah743")
+
+RC_PROTOCOL := env_var_or_default("RC_PROTOCOL", "crsf")
+
+ESTIMATOR := env_var_or_default("ESTIMATOR", "eskf")
+
 build:
-    cargo build --release
+    cargo run --release --no-default-features --features board_{{BOARD}},rx_{{RC_PROTOCOL}},est_{{ESTIMATOR}}
 
 test:
     cargo test -p cybflight-core --target {{HOST}}

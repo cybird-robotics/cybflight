@@ -164,22 +164,22 @@ pub async fn indi_task() {
 
         // DShot telemetry (RPM)
         if let Some(telem) = dshot_sub.try_next_message_pure() {
-            let inputs: [RpmInput; NU] = core::array::from_fn(|i| {
-                match telem.motors[i].value {
-                    TelemetryValue::Erpm(erpm) => RpmInput::Erpm(erpm),
-                    TelemetryValue::Stopped => RpmInput::Stopped,
-                    TelemetryValue::Invalid | TelemetryValue::Edt(_) => RpmInput::Invalid,
-                }
+            let inputs: [RpmInput; NU] = core::array::from_fn(|i| match telem.motors[i].value {
+                TelemetryValue::Erpm(erpm) => RpmInput::Erpm(erpm),
+                TelemetryValue::Stopped => RpmInput::Stopped,
+                TelemetryValue::Invalid | TelemetryValue::Edt(_) => RpmInput::Invalid,
             });
-            let (valid, rpm_failsafe) = indi.update_rpm(&inputs);
+            let (valid, _rpm_failsafe) = indi.update_rpm(&inputs);
             g2_valid = valid;
-            if rpm_failsafe {
-                defmt::error!("INDI: all RPM telemetry lost — DISARMING");
-                super::failsafe::FAILSAFE_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
-                crate::motors::ARM_STATE.signal(
-                    msgs::ArmDisarm { timestamp: Instant::now(), armed: false },
-                );
-            }
+            // TODO: re-enable RPM failsafe once bidirectional DShot telemetry
+            // is validated. Currently disabled to avoid false trips.
+            // if armed && rpm_failsafe {
+            //     defmt::error!("INDI: all RPM telemetry lost — DISARMING");
+            //     super::failsafe::FAILSAFE_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
+            //     crate::motors::ARM_STATE.signal(
+            //         msgs::ArmDisarm { timestamp: Instant::now(), armed: false },
+            //     );
+            // }
         }
 
         // Latest odometry for position/attitude controllers
@@ -244,13 +244,15 @@ pub async fn indi_task() {
             continue;
         }
 
-        // 6. NaN failsafe check.
-        if output.nan_failsafe {
+        // 6. NaN failsafe check (only while armed — WLS with zero-state
+        //    filters at startup can produce transient NaN before arming).
+        if armed && output.nan_failsafe {
             defmt::error!("INDI: WLS NaN limit exceeded — DISARMING");
             super::failsafe::FAILSAFE_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
-            crate::motors::ARM_STATE.signal(
-                msgs::ArmDisarm { timestamp: Instant::now(), armed: false },
-            );
+            crate::motors::ARM_STATE.signal(msgs::ArmDisarm {
+                timestamp: Instant::now(),
+                armed: false,
+            });
         }
 
         // 7. Publish motor commands.

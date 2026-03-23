@@ -110,7 +110,10 @@ pub async fn rc_interpreter_task() {
     let roll_cal = ChannelCalibration::centered(0);
     let throttle_cal = ChannelCalibration::throttle(2);
 
-    // Phase 1: Wait for first odometry to establish arming origin.
+    // Phase 1: Wait for ESKF convergence, then capture origin from converged odometry.
+    while !crate::estimation::ESTIMATOR_READY.load(core::sync::atomic::Ordering::Acquire) {
+        embassy_time::Timer::after_millis(100).await;
+    }
     let odom = odom_sub.next_message_pure().await;
     let origin = odom.pose.position;
     let yaw = extract_yaw(&odom.pose.orientation);

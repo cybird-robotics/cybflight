@@ -7,6 +7,10 @@
 // Replaces inner_loop_task as the sole controller. The position controller and
 // geometric attitude controller still run here (decimated), but the rate PIDs
 // and linear allocator are replaced by INDI.
+//
+// Safety principle: when any input is stale or output is non-finite, the task
+// stops publishing ACTUATOR_MOTORS (goes silent). The failsafe controller
+// watchdog detects the silence and disarms — the same pattern as RC loss.
 
 use cybflight_core::{
     attitude_control::{self, geometric_controller, AttitudeControlOutput},
@@ -17,7 +21,7 @@ use cybflight_core::{
     },
     position_control::{self, pd_ff_control},
 };
-use embassy_time::Instant;
+use embassy_time::{Duration, Instant};
 use nalgebra::{UnitQuaternion, Vector3};
 
 use crate::{
@@ -119,6 +123,13 @@ pub async fn indi_task() {
     // Specific force setpoint from position controller (thrust / mass in body z)
     let mut spf_sp_z: f32 = 0.0;
 
+    // Latest valid odometry — persisted across inner loop iterations so the
+    // decimated outer loop always has a recent sample regardless of phase offset.
+    let mut latest_odom: Option<msgs::VehicleOdometry> = None;
+    let mut last_odom_time: Option<Instant> = None;
+    // Skip outer-loop control when odometry is older than this.
+    const ODOM_STALE_TIMEOUT: Duration = Duration::from_millis(100);
+
     // Decimation counter for position/attitude controller
     let mut outer_counter: u32 = 0;
     // Position controller runs at IMU_rate / OUTER_DECIMATION
@@ -171,26 +182,25 @@ pub async fn indi_task() {
             });
             let (valid, _rpm_failsafe) = indi.update_rpm(&inputs);
             g2_valid = valid;
-            // TODO: re-enable RPM failsafe once bidirectional DShot telemetry
-            // is validated. Currently disabled to avoid false trips.
-            // if armed && rpm_failsafe {
-            //     defmt::error!("INDI: all RPM telemetry lost — DISARMING");
-            //     super::failsafe::FAILSAFE_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
-            //     crate::motors::ARM_STATE.signal(
-            //         msgs::ArmDisarm { timestamp: Instant::now(), armed: false },
-            //     );
-            // }
+            // RPM failsafe (all motors lost) is tracked by the controller core
+            // but not acted on here — if RPM loss degrades output quality, the
+            // controller will produce bad output → go silent → watchdog disarms.
         }
 
-        // Latest odometry for position/attitude controllers
-        let odom = match odom_sub.try_next_message_pure() {
-            Some(o) if odom_is_valid(&o) => {
-                att_state.body_rate_rad_s = o.twist.angular;
+        // Latest odometry for position/attitude controllers.
+        // Persist across iterations so the decimated outer loop always has a
+        // recent sample regardless of phase offset between odom and outer tick.
+        // Drain all queued messages to get the most recent.
+        while let Some(o) = odom_sub.try_next_message_pure() {
+            if odom_is_valid(&o) {
                 att_state.attitude_quaternion = o.pose.orientation;
-                Some(o)
+                latest_odom = Some(o);
+                last_odom_time = Some(Instant::now());
             }
-            _ => None,
-        };
+        }
+
+        // Use bias-corrected gyro for body rate (8kHz, not 100Hz odom).
+        att_state.body_rate_rad_s = gyro_corrected;
 
         // New position setpoint
         if let Some(sp) = super::AUTO_SETPOINT.try_take() {
@@ -199,35 +209,53 @@ pub async fn indi_task() {
             pos_setpoint.yaw = extract_yaw(&sp.pose.orientation);
         }
 
-        // 3. Outer loop (position + attitude) — decimated to ~100 Hz.
+        // 3. Input recency — check all critical inputs before computing.
+        //    If any is stale, skip publishing (go silent). The failsafe
+        //    controller watchdog detects silence and disarms.
+        let now = Instant::now();
+        let odom_fresh = match last_odom_time {
+            Some(t) => now.duration_since(t) < ODOM_STALE_TIMEOUT,
+            None => false,
+        };
+
+        // 4. Outer loop (position + attitude) — decimated to ~100 Hz.
+        //    Skipped when odometry is stale (ESKF diverged or VICON lost).
         outer_counter += 1;
         if outer_counter >= OUTER_DECIMATION {
             outer_counter = 0;
 
-            if let Some(ref odom) = odom {
-                pos_state.position = odom.pose.position;
-                pos_state.velocity = odom.twist.linear;
-                pos_state.attitude = odom.pose.orientation;
+            if odom_fresh {
+                if let Some(ref odom) = latest_odom {
+                    pos_state.position = odom.pose.position;
+                    pos_state.velocity = odom.twist.linear;
+                    pos_state.attitude = odom.pose.orientation;
 
-                let pc_out = pc.compute(&pos_state, &pos_setpoint);
-                collective_thrust_n = pc_out.collective_thrust_n;
-                att_ref.attitude_quaternion = Some(pc_out.desired_attitude_quaternion);
-                att_ref.body_rate_rad_s = pc_out.desired_body_rate_rad_s;
+                    let pc_out = pc.compute(&pos_state, &pos_setpoint);
+                    collective_thrust_n = pc_out.collective_thrust_n;
+                    att_ref.attitude_quaternion = Some(pc_out.desired_attitude_quaternion);
+                    att_ref.body_rate_rad_s = pc_out.desired_body_rate_rad_s;
 
-                // Convert collective thrust to specific force in body z (m/s²)
-                // In FLU: positive = up. spf = thrust / mass.
-                spf_sp_z = collective_thrust_n / QUADROTOR_BODY.mass_kg;
+                    // Convert collective thrust to specific force in body z (m/s²)
+                    // In FLU: positive = up. spf = thrust / mass.
+                    spf_sp_z = collective_thrust_n / QUADROTOR_BODY.mass_kg;
+                }
+
+                // Attitude controller → rate reference
+                let AttitudeControlOutput {
+                    body_rate_rad_s,
+                    torque_n_m: _,
+                } = ac.compute(&att_state, &att_ref);
+                rate_ref = body_rate_rad_s;
             }
-
-            // Attitude controller → rate reference
-            let AttitudeControlOutput {
-                body_rate_rad_s,
-                torque_n_m: _,
-            } = ac.compute(&att_state, &att_ref);
-            rate_ref = body_rate_rad_s;
         }
 
-        // 4. INDI step (8 kHz) — uses bias-corrected gyro.
+        // 5. Stale odometry while armed — go silent, let watchdog handle it.
+        //    INDI can't produce meaningful output without recent state feedback.
+        if armed && !odom_fresh {
+            continue;
+        }
+
+        // 6. INDI step (8 kHz) — uses bias-corrected gyro.
         let output = indi.step(
             &gyro_corrected,
             &accel_corrected,
@@ -237,25 +265,16 @@ pub async fn indi_task() {
             &g2_valid,
         );
 
-        // 5. Non-finite guard.
-        let any_nan = output.motor_commands.iter().any(|v| !v.is_finite());
-        if any_nan {
-            defmt::warn!("INDI: non-finite motor output, skipping frame");
+        // 7. Non-finite guard — skip publishing, stay alive.
+        //    Transient NaN from WLS is recoverable; sustained NaN causes
+        //    the watchdog heartbeat to stop → failsafe disarm.
+        if !output.motor_commands.iter().all(|v| v.is_finite()) {
             continue;
         }
 
-        // 6. NaN failsafe check (only while armed — WLS with zero-state
-        //    filters at startup can produce transient NaN before arming).
-        if armed && output.nan_failsafe {
-            defmt::error!("INDI: WLS NaN limit exceeded — DISARMING");
-            super::failsafe::FAILSAFE_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
-            crate::motors::ARM_STATE.signal(msgs::ArmDisarm {
-                timestamp: Instant::now(),
-                armed: false,
-            });
-        }
-
-        // 7. Publish motor commands.
+        // 8. Publish motor commands + watchdog heartbeat.
+        //    Heartbeat is ONLY updated when a valid command is published.
+        //    Any failure path above that hits `continue` goes silent.
         let motor_commands = [
             msgs::NormalizedThrottle::new_saturating(output.motor_commands[0]),
             msgs::NormalizedThrottle::new_saturating(output.motor_commands[1]),
@@ -267,8 +286,6 @@ pub async fn indi_task() {
             timestamp: publish_time,
             motor_commands,
         });
-
-        // 8. Controller watchdog heartbeat.
         super::LAST_CONTROLLER_PUBLISH.lock(|c| c.set(Some(publish_time)));
 
         // 9. Publish telemetry (at reduced rate — every OUTER_DECIMATION frames).

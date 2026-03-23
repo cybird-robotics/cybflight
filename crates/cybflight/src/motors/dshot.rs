@@ -94,6 +94,14 @@ pub async fn dshot_task(
     let mut telem_motor: usize = 0;
     let mut dshot_throttle: [u16; 4] = [DSHOT_MIN_THROTTLE; 4];
     let mut armed = false;
+    let mut last_motor_cmd_time: Option<Instant> = None;
+
+    /// If no motor command arrives for this long while armed, the controller
+    /// has gone silent (stale odom, NaN, etc.). Drop to idle throttle so the
+    /// drone doesn't hold stale thrust while waiting for the failsafe watchdog
+    /// (500 ms) to disarm. Must be much shorter than the failsafe CTRL_TIMEOUT.
+    const MOTOR_CMD_STALE: embassy_time::Duration = embassy_time::Duration::from_millis(10);
+
     // --- Bidirectional DShot frame loop ---
     loop {
         // Check for arm state changes (non-blocking)
@@ -104,9 +112,11 @@ pub async fn dshot_task(
                 crate::motors::IS_ARMED.store(armed, core::sync::atomic::Ordering::Release);
                 if armed {
                     defmt::info!("DShot: ARMED — motors enabled");
+                    last_motor_cmd_time = None;
                 } else {
                     defmt::info!("DShot: DISARMED — motors stopped");
                     dshot_throttle = [DSHOT_CMD_MOTOR_STOP; 4];
+                    last_motor_cmd_time = None;
                 }
             }
         }
@@ -122,12 +132,22 @@ pub async fn dshot_task(
                         (nrm.value() * DSHOT_THROTTLE_RANGE as f32) as u16 + DSHOT_MIN_THROTTLE;
                     raw.max(DSHOT_IDLE_THROTTLE)
                 });
+                last_motor_cmd_time = Some(Instant::now());
             }
-        } else if !armed {
+
+            // Controller gone silent — drop to idle. The failsafe watchdog
+            // will disarm after CTRL_TIMEOUT (500 ms). This just ensures we
+            // don't hold stale throttle during the gap.
+            if let Some(t) = last_motor_cmd_time {
+                if Instant::now().duration_since(t) > MOTOR_CMD_STALE {
+                    dshot_throttle = [DSHOT_IDLE_THROTTLE; 4];
+                }
+            }
+        } else {
             // Send DSHOT_MIN_THROTTLE when disarmed — matches the known-good
             // behaviour where MOTOR_THROTTLE atomics were initialised to 48.
             // MOTOR_STOP (0) is only sent on the disarm *transition* above.
-            dshot_throttle = [0; 4];
+            dshot_throttle = [DSHOT_MIN_THROTTLE; 4];
         }
 
         // ======================== A: Output DShot frame ========================

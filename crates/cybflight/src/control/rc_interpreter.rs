@@ -135,8 +135,8 @@ pub async fn rc_interpreter_task() {
     loop {
         let rc = rc_sub.next_message_pure().await;
 
-        let _dx = pitch_cal.normalize(rc.channels[pitch_cal.index] as i16) * XY_HALF_RANGE;
-        let _dy = roll_cal.normalize(rc.channels[roll_cal.index] as i16) * XY_HALF_RANGE;
+        let dx = pitch_cal.normalize(rc.channels[pitch_cal.index] as i16) * XY_HALF_RANGE;
+        let dy = roll_cal.normalize(rc.channels[roll_cal.index] as i16) * XY_HALF_RANGE;
         let dz = throttle_cal.normalize(rc.channels[throttle_cal.index] as i16) * Z_RANGE;
 
         let target = origin + Vector3::new(dx, dy, dz);

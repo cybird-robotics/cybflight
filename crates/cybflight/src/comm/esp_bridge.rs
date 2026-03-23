@@ -122,6 +122,7 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
     let mut pos_ctrl_sub = control::POSITION_CONTROL_SETPOINT.subscriber().unwrap();
     let mut arm_sub = crate::ARM_DISARM.subscriber().unwrap();
     let mut odom_sub = sensors::VEHICLE_ODOMETRY.subscriber().unwrap();
+    #[cfg(feature = "est_eskf")]
     let mut motor_sub = control::ACTUATOR_MOTORS_TELEM.subscriber().unwrap();
 
     let mut seq: u8 = 0;
@@ -231,6 +232,7 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
             w.timestamp_us = utc_ts(m.timestamp);
             pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
+        #[cfg(feature = "est_eskf")]
         if let Some(m) = drain_latest(&mut motor_sub) {
             let mut w = wire::WireActuatorMotors::from_msg(&m);
             w.timestamp_us = utc_ts(m.timestamp);

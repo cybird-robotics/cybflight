@@ -79,15 +79,19 @@ pub async fn indi_task() {
     let loop_rate_hz = 8000.0f32;
     let mut indi = IndiController::new(&config, loop_rate_hz);
 
-    // --- Position + attitude controllers (same as inner_loop) ---
-    let pc = pd_ff_control::PositionController::default().with_vehicle(
+    // --- Position + attitude controllers (gains from params, same as inner_loop) ---
+    let params = crate::params::get();
+    let g = &params.control;
+    let pc = pd_ff_control::PositionController::new(
+        Vector3::new(g.pos_kp[0], g.pos_kp[1], g.pos_kp[2]),
+        Vector3::new(g.pos_kd[0], g.pos_kd[1], g.pos_kd[2]),
         position_control::VehicleParams {
             mass: QUADROTOR_BODY.mass_kg,
             gravity: 9.81,
         },
     );
     let ac = geometric_controller::GeometricAttitudeController::new(
-        Vector3::new(3.0, 3.0, 1.0),
+        Vector3::new(g.att_k_rate[0], g.att_k_rate[1], g.att_k_rate[2]),
         Vector3::new(1.0, 1.0, 0.2),
     )
     .with_inertia(QUADROTOR_BODY.inertia_matrix());

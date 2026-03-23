@@ -12,6 +12,37 @@ const GCR_DECODE: [u8; 32] = [
     0xFF, 0,    8,    1,    0xFF, 4,    12,   0xFF,
 ];
 
+/// Detect actual GCR ticks-per-bit from the minimum inter-edge gap.
+///
+/// In a valid GCR frame, the minimum gap between consecutive edges corresponds
+/// to exactly 1 bit period. This allows decoding frames from ESCs (e.g. AM32)
+/// whose GCR bit rate differs from the nominal DShot600 rate.
+///
+/// Returns `None` if fewer than 3 edges or the detected period is out of the
+/// plausible range `[nominal/2, nominal*2]`.
+pub fn detect_ticks_per_bit(
+    edge_timings: &[u32],
+    count: usize,
+    nominal: u32,
+) -> Option<u32> {
+    if count < 3 || edge_timings.len() < 3 {
+        return None;
+    }
+    let mut min_gap = u32::MAX;
+    let len = count.min(edge_timings.len());
+    for i in 1..len {
+        let gap = edge_timings[i].wrapping_sub(edge_timings[i - 1]);
+        if gap > 0 && gap < min_gap {
+            min_gap = gap;
+        }
+    }
+    if min_gap >= nominal / 2 && min_gap <= nominal * 2 {
+        Some(min_gap)
+    } else {
+        None
+    }
+}
+
 /// Decode a GCR telemetry packet from edge timings.
 ///
 /// `edge_timings` contains timer capture values for each edge transition.
@@ -190,5 +221,49 @@ mod tests {
         edges[3] = 999; // corrupt a timing
         let result = decode_telemetry_packet(&edges, edges.len(), 16);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn detect_ticks_from_edges() {
+        // Edges encoded at 19 ticks/bit (AM32 F421 @ 120MHz)
+        let edges = gcr_encode(0x064, 19);
+        let detected = detect_ticks_per_bit(&edges, edges.len(), 16);
+        assert_eq!(detected, Some(19));
+    }
+
+    #[test]
+    fn round_trip_am32_f421_timing() {
+        // AM32 F421: 120MHz CPU, PSC=1, ARR=95 → 60MHz timer → ~19 ticks/bit at 12MHz rx
+        let ticks = 19u32;
+        let test_values: &[u16] = &[0x000, 0x001, 0x064, 0x0C8, 0x100, 0x7FF, 0xFFF];
+        for &v in test_values {
+            let edges = gcr_encode(v, ticks);
+            let detected = detect_ticks_per_bit(&edges, edges.len(), 16).unwrap_or(16);
+            let decoded = decode_telemetry_packet(&edges, edges.len(), detected);
+            assert_eq!(decoded, Some(v), "F421 round-trip failed for 0x{:03X}", v);
+        }
+    }
+
+    #[test]
+    fn round_trip_various_esc_timings() {
+        // Test across all AM32 MCU variant bit periods (in 12MHz rx ticks)
+        let esc_ticks: &[u32] = &[15, 16, 17, 19, 20];
+        let mut rng: u32 = 0xCAFE_BABE;
+        for &ticks in esc_ticks {
+            for _ in 0..20 {
+                rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                let v = (rng >> 16) as u16 & 0xFFF;
+                let edges = gcr_encode(v, ticks);
+                let detected = detect_ticks_per_bit(&edges, edges.len(), 16).unwrap_or(16);
+                let decoded = decode_telemetry_packet(&edges, edges.len(), detected);
+                assert_eq!(
+                    decoded,
+                    Some(v),
+                    "round-trip failed for 0x{:03X} at {} ticks/bit",
+                    v,
+                    ticks
+                );
+            }
+        }
     }
 }

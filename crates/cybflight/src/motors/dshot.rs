@@ -456,10 +456,16 @@ pub async fn dshot_task(
                 let gcr_count = edge_counts[m] - gcr_start;
 
                 if gcr_count >= MIN_GCR_EDGES {
-                    if let Some(raw) = gcr::decode_telemetry_packet(
+                    let ticks = gcr::detect_ticks_per_bit(
                         gcr_edges,
                         gcr_count,
                         DSHOT600_GCR_TICKS_PER_BIT,
+                    )
+                    .unwrap_or(DSHOT600_GCR_TICKS_PER_BIT);
+                    if let Some(raw) = gcr::decode_telemetry_packet(
+                        gcr_edges,
+                        gcr_count,
+                        ticks,
                     ) {
                         telem.motors[m].raw = Some(raw);
                         telem.motors[m].value = telemetry::interpret(raw, false);

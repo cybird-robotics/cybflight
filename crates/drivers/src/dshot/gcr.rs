@@ -50,6 +50,7 @@ pub fn detect_ticks_per_bit(
 /// `ticks_per_bit` is the timer tick count for one GCR bit period (e.g. 16).
 ///
 /// Returns the decoded 12-bit telemetry value, or `None` if decoding fails.
+/// Matches BF `decodeTelemetryPacket` (pwm_output_dshot_shared.c:164-208) exactly.
 pub fn decode_telemetry_packet(
     edge_timings: &[u32],
     count: usize,
@@ -61,30 +62,23 @@ pub fn decode_telemetry_packet(
 
     let half = ticks_per_bit / 2;
     let mut value: u32 = 0;
-    let mut bits: u32 = 0;
+    let mut bits: i32 = 0;
     let mut old_value = edge_timings[0];
 
     for i in 1..=count.min(edge_timings.len()) {
-        let len = if i < count && i < edge_timings.len() {
+        let len: i32 = if i < count && i < edge_timings.len() {
             let diff = edge_timings[i].wrapping_sub(old_value);
             if bits >= 21 {
                 break;
             }
-            (diff + half) / ticks_per_bit
+            ((diff + half) / ticks_per_bit) as i32
         } else {
-            // Pad final gap to reach exactly 21 bits
             21 - bits
         };
 
-        if len == 0 || len > 21 {
-            return None;
-        }
-
         value <<= len;
         value |= 1 << (len - 1);
-        if i < edge_timings.len() {
-            old_value = edge_timings[i];
-        }
+        old_value = edge_timings[i.min(edge_timings.len() - 1)];
         bits += len;
     }
 

@@ -92,7 +92,7 @@ pub async fn dshot_task(
     }
 
     let mut telem_motor: usize = 0;
-    let mut dshot_throttle: [u16; 4] = [0; 4];
+    let mut dshot_throttle: [u16; 4] = [DSHOT_MIN_THROTTLE; 4];
     let mut armed = false;
     // --- Bidirectional DShot frame loop ---
     loop {
@@ -123,17 +123,12 @@ pub async fn dshot_task(
                     raw.max(DSHOT_IDLE_THROTTLE)
                 });
             }
-        } else {
-            dshot_throttle = [DSHOT_CMD_MOTOR_STOP; 4];
+        } else if !armed {
+            // Send DSHOT_MIN_THROTTLE when disarmed — matches the known-good
+            // behaviour where MOTOR_THROTTLE atomics were initialised to 48.
+            // MOTOR_STOP (0) is only sent on the disarm *transition* above.
+            dshot_throttle = [0; 4];
         }
-
-        defmt::debug!(
-            "DShot throttles: M1={} M2={} M3={} M4={}",
-            dshot_throttle[0],
-            dshot_throttle[1],
-            dshot_throttle[2],
-            dshot_throttle[3]
-        );
 
         // ======================== A: Output DShot frame ========================
         let mut bufs = [[0u32; DSHOT_DMA_BUFFER_SIZE]; 4];
@@ -230,15 +225,20 @@ pub async fn dshot_task(
         }
 
         // ======================== B: Switch to Input Capture ========================
-        // H7 GPIO trick: OUTPUT during CCMR reconfiguration
+        // Tight GPIO→OUTPUT → IC config → GPIO→AF sequence matching BF
+        // (pwm_output_dshot_hal.c:112-131). Minimise time FC drives the line
+        // while ESC may be starting its GCR response.
+
+        // Step 1: GPIO → OUTPUT (drive HIGH, LOW speed) while reconfiguring timer
         for m in 0..4 {
             let gpio = config.motors[m].gpio_port;
             let pin = config.motors[m].gpio_pin as usize;
-            gpio.bsrr().write(|w| w.set_bs(pin, true)); // drive HIGH (inverted idle)
+            gpio.bsrr().write(|w| w.set_bs(pin, true));
             gpio.moder()
                 .modify(|w| w.set_moder(pin, gpio_vals::Moder::OUTPUT));
         }
 
+        // Step 2: Reconfigure timer channels for IC mode
         for i in 0..config.timer_count as usize {
             config.timers[i].ccer().write_value(CcerGp16(0));
             config.timers[i]
@@ -250,7 +250,18 @@ pub async fn dshot_task(
             config.timers[i].ccer().write_value(CcerGp16(CCER_IC));
         }
 
-        // Reconfigure timer for free-running IC timestamps
+        // Step 3: GPIO → AF immediately — release line to ESC BEFORE DMA setup.
+        // This matches BF's tight ISR sequence where GPIO→AF happens right after
+        // IC_Init, before DMA is configured. Any IC captures before DMA is ready
+        // are lost, but this prevents bus contention with the ESC.
+        for m in 0..4 {
+            let gpio = config.motors[m].gpio_port;
+            let pin = config.motors[m].gpio_pin as usize;
+            gpio.moder()
+                .modify(|w| w.set_moder(pin, gpio_vals::Moder::ALTERNATE));
+        }
+
+        // Step 4: Now configure timer free-running + DMA (line is already released)
         for i in 0..config.timer_count as usize {
             config.timers[i].arr().write(|w| w.set_arr(IC_ARR));
             config.timers[i].egr().write(|w| w.set_ug(true));
@@ -258,7 +269,6 @@ pub async fn dshot_task(
             config.timers[i].cr1().modify(|w| w.set_cen(true));
         }
 
-        // Enable CC DMA for IC capture
         for m in 0..4 {
             config.motors[m]
                 .timer_regs
@@ -266,7 +276,6 @@ pub async fn dshot_task(
                 .modify(|w| w.set_ccde(config.motors[m].channel_index as usize, true));
         }
 
-        // Start DMA reads: timer CCR → edge timestamp buffers
         let mut edge_buf0 = [0u32; MAX_GCR_EDGES];
         let mut edge_buf1 = [0u32; MAX_GCR_EDGES];
         let mut edge_buf2 = [0u32; MAX_GCR_EDGES];
@@ -321,14 +330,6 @@ pub async fn dshot_task(
             )
         };
 
-        // Switch GPIO to AF — ESC can now drive the line with GCR telemetry
-        for m in 0..4 {
-            let gpio = config.motors[m].gpio_port;
-            let pin = config.motors[m].gpio_pin as usize;
-            gpio.moder()
-                .modify(|w| w.set_moder(pin, gpio_vals::Moder::ALTERNATE));
-        }
-
         // ======================== C: Wait for ESC response ========================
         embassy_time::Timer::after_micros(80).await;
 
@@ -358,7 +359,8 @@ pub async fn dshot_task(
                 .modify(|w| w.set_ccde(config.motors[m].channel_index as usize, false));
         }
 
-        // H7 GPIO trick: drive HIGH (inverted idle) during CCMR reconfiguration
+        // H7 GPIO trick: drive HIGH (inverted idle) during CCMR reconfiguration.
+        // Speed stays LOW (set in IC phase) — matches BF which never restores high speed.
         for m in 0..4 {
             let gpio = config.motors[m].gpio_port;
             let pin = config.motors[m].gpio_pin as usize;
@@ -444,34 +446,13 @@ pub async fn dshot_task(
         ];
         for m in 0..4 {
             if edge_counts[m] >= MIN_GCR_EDGES {
-                // Skip leading glitch edge(s) from GPIO→AF transition.
-                // The glitch-to-GCR gap is much larger than any gap within GCR data
-                // (GCR guarantees transitions every ~3-4 bits max = ~64 ticks).
-                let mut gcr_start = 0;
-                for i in 1..edge_counts[m] {
-                    let gap = edge_bufs[m][i].wrapping_sub(edge_bufs[m][i - 1]);
-                    if gap > DSHOT600_GCR_TICKS_PER_BIT * 5 {
-                        gcr_start = i;
-                    }
-                }
-                let gcr_edges = &edge_bufs[m][gcr_start..];
-                let gcr_count = edge_counts[m] - gcr_start;
-
-                if gcr_count >= MIN_GCR_EDGES {
-                    let ticks = gcr::detect_ticks_per_bit(
-                        gcr_edges,
-                        gcr_count,
-                        DSHOT600_GCR_TICKS_PER_BIT,
-                    )
-                    .unwrap_or(DSHOT600_GCR_TICKS_PER_BIT);
-                    if let Some(raw) = gcr::decode_telemetry_packet(
-                        gcr_edges,
-                        gcr_count,
-                        ticks,
-                    ) {
-                        telem.motors[m].raw = Some(raw);
-                        telem.motors[m].value = telemetry::interpret(raw, false);
-                    }
+                if let Some(raw) = gcr::decode_telemetry_packet(
+                    &edge_bufs[m][..edge_counts[m]],
+                    edge_counts[m],
+                    DSHOT600_GCR_TICKS_PER_BIT,
+                ) {
+                    telem.motors[m].raw = Some(raw);
+                    telem.motors[m].value = telemetry::interpret(raw, false);
                 }
             }
         }

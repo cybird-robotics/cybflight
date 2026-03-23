@@ -393,7 +393,7 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
     core::mem::forget(timer3);
 
     // Configure GPIO as timer AF (board-specific pins + AF numbers)
-    let af = AfType::output(OutputType::PushPull, Speed::VeryHigh);
+    let af = AfType::output(OutputType::PushPull, Speed::Low);
     macro_rules! pin_af {
         ($pin:expr, $af_num:expr) => {{
             let mut flex = Flex::new($pin);

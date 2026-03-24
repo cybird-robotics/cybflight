@@ -1,11 +1,12 @@
 use core::cell::Cell;
 use core::sync::atomic::AtomicBool;
 
-use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
+use embassy_sync::blocking_mutex::{raw::CriticalSectionRawMutex, Mutex};
 use embassy_sync::signal::Signal;
 use nalgebra::Vector3;
 
 pub mod eskf_imu_mocap;
+pub mod rpm_estimator;
 
 /// Estimator phase, exposed via `ESTIMATOR_STATUS` for shell queries.
 ///

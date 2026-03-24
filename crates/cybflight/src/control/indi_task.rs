@@ -22,7 +22,12 @@ use cybflight_core::{
     position_control::{self, pd_ff_control},
 };
 use embassy_time::{Duration, Instant};
-use nalgebra::{UnitQuaternion, Vector3};
+use nalgebra::{Matrix2, UnitQuaternion, Vector3};
+
+use crate::estimation::rpm_estimator::{
+    NormalizedThrottle as EstNormalizedThrottle, RpmEstimator, RpmEstimatorConfigBuilder,
+    StateAndCov,
+};
 
 use crate::{
     motors::ACTUATOR_MOTORS,
@@ -83,6 +88,23 @@ pub async fn indi_task() {
     let loop_rate_hz = 8000.0f32;
     let mut indi = IndiController::new(&config, loop_rate_hz);
 
+    // --- Per-motor RPM estimators (FOPDT EKF, one per motor) ---
+    let pole_pairs = config.motor_pole_count as f32 / 2.0;
+    let erpm_to_rads = core::f32::consts::TAU * 100.0 / (pole_pairs * 60.0);
+    let est_config = RpmEstimatorConfigBuilder::new()
+        .tau_m_up(INDI_MOTOR_PARAMS[0].time_const_s)
+        .tau_m_down(INDI_MOTOR_PARAMS[0].time_const_s)
+        .build()
+        .unwrap();
+    let max_omega = INDI_MOTOR_PARAMS[0].max_rpm * erpm_to_rads;
+    let init_state = StateAndCov::new(
+        0.0,
+        max_omega,
+        Matrix2::new(1000.0, 0.0, 0.0, max_omega * max_omega),
+    );
+    let mut rpm_estimators: [RpmEstimator; NU] =
+        core::array::from_fn(|_| RpmEstimator::new(est_config, init_state));
+
     // --- Position + attitude controllers (gains from params, same as inner_loop) ---
     let params = crate::params::get();
     let g = &params.control;
@@ -130,6 +152,10 @@ pub async fn indi_task() {
     // Skip outer-loop control when odometry is older than this.
     const ODOM_STALE_TIMEOUT: Duration = Duration::from_millis(100);
 
+    // RPM estimator timestamp tracking (seconds, f32 relative to task start)
+    let mut est_prev_ts: Option<Instant> = None;
+    let mut est_current_ts: f32 = 0.0;
+
     // Decimation counter for position/attitude controller
     let mut outer_counter: u32 = 0;
     // Position controller runs at IMU_rate / OUTER_DECIMATION
@@ -156,6 +182,13 @@ pub async fn indi_task() {
     loop {
         // 1. Await IMU sample — this drives the loop at ~8 kHz.
         let imu = imu_sub.next_message_pure().await;
+        let est_dt = if let Some(prev) = est_prev_ts {
+            imu.timestamp.duration_since(prev).as_micros() as f32 / 1_000_000.0
+        } else {
+            1.0 / loop_rate_hz
+        };
+        est_prev_ts = Some(imu.timestamp);
+        est_current_ts += est_dt;
 
         // Bias-correct raw gyro with latest ESKF estimate.
         // GYRO_BIAS is a Signal — try_take returns the latest value if updated,
@@ -174,18 +207,37 @@ pub async fn indi_task() {
         let armed = crate::motors::IS_ARMED.load(core::sync::atomic::Ordering::Acquire);
 
         // DShot telemetry (RPM)
+        // When a new DShot frame arrives, update the per-motor estimators with
+        // the measured omega.  On invalid frames the estimators coast on the
+        // FOPDT model instead of reporting Invalid to the RpmTracker.
+        let mut y_meas: [Option<f32>; NU] = [None; NU];
         if let Some(telem) = dshot_sub.try_next_message_pure() {
-            let inputs: [RpmInput; NU] = core::array::from_fn(|i| match telem.motors[i].value {
-                TelemetryValue::Erpm(erpm) => RpmInput::Erpm(erpm),
-                TelemetryValue::Stopped => RpmInput::Stopped,
-                TelemetryValue::Invalid | TelemetryValue::Edt(_) => RpmInput::Invalid,
-            });
-            let (valid, _rpm_failsafe) = indi.update_rpm(&inputs);
-            g2_valid = valid;
-            // RPM failsafe (all motors lost) is tracked by the controller core
-            // but not acted on here — if RPM loss degrades output quality, the
-            // controller will produce bad output → go silent → watchdog disarms.
+            for i in 0..NU {
+                y_meas[i] = match telem.motors[i].value {
+                    TelemetryValue::Erpm(erpm) => Some(erpm as f32 * erpm_to_rads),
+                    TelemetryValue::Stopped => Some(0.0),
+                    TelemetryValue::Invalid | TelemetryValue::Edt(_) => None,
+                };
+            }
         }
+
+        // Predict (and optionally update) every IMU tick.
+        for i in 0..NU {
+            rpm_estimators[i].step(est_current_ts, est_dt, y_meas[i]);
+        }
+
+        // Feed estimated omega to the RpmTracker.  The estimator coasts through
+        // invalid frames, so the tracker sees a smooth signal and its invalid
+        // counter only increments when the estimator itself is diverging.
+        let estimated_inputs: [RpmInput; NU] = core::array::from_fn(|i| {
+            let erpm = libm::roundf(rpm_estimators[i].state().omega() / erpm_to_rads) as u32;
+            RpmInput::Erpm(erpm)
+        });
+        let (valid, _rpm_failsafe) = indi.update_rpm(&estimated_inputs);
+        g2_valid = valid;
+        // RPM failsafe (all motors lost) is tracked by the controller core
+        // but not acted on here — if RPM loss degrades output quality, the
+        // controller will produce bad output → go silent → watchdog disarms.
 
         // Latest odometry for position/attitude controllers.
         // Persist across iterations so the decimated outer loop always has a
@@ -287,6 +339,15 @@ pub async fn indi_task() {
             motor_commands,
         });
         super::LAST_CONTROLLER_PUBLISH.lock(|c| c.set(Some(publish_time)));
+
+        // Feed this frame's throttle commands into the estimators so the
+        // FOPDT model can account for transport delay on the next decode.
+        for i in 0..NU {
+            rpm_estimators[i].push_throttle(
+                est_current_ts,
+                EstNormalizedThrottle::new_clamped(output.motor_commands[i]),
+            );
+        }
 
         // 9. Publish telemetry (at reduced rate — every OUTER_DECIMATION frames).
         if outer_counter == 1 {

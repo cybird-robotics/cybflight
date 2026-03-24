@@ -17,6 +17,7 @@ use cybflight_core::{
     indi::{
         controller::{IndiConfig, IndiController, NU},
         effectiveness::IndiMotorParams,
+        learner::{Learner, LearnerConfig, LearnerInput},
         rpm_tracker::RpmInput,
     },
     position_control::{self, pd_ff_control},
@@ -104,6 +105,10 @@ pub async fn indi_task() {
     );
     let mut rpm_estimators: [RpmEstimator; NU] =
         core::array::from_fn(|_| RpmEstimator::new(est_config, init_state));
+
+    // --- G1/G2 online learner (optional, activated via RC switch) ---
+    let learner_config = LearnerConfig::default();
+    let mut learner = Learner::new(&learner_config, loop_rate_hz);
 
     // --- Position + attitude controllers (gains from params, same as inner_loop) ---
     let params = crate::params::get();
@@ -308,7 +313,7 @@ pub async fn indi_task() {
         }
 
         // 6. INDI step (8 kHz) — uses bias-corrected gyro.
-        let (output, _step_state) = indi.step(
+        let (output, step_state) = indi.step(
             &gyro_corrected,
             &accel_corrected,
             &rate_ref,
@@ -316,6 +321,23 @@ pub async fn indi_task() {
             armed,
             &g2_valid,
         );
+
+        // 6b. Online learner (runs every frame, gated internally on armed+airborne).
+        //     Uses RPM estimator predicted omega and the INDI step state.
+        let omega_for_learner: [f32; NU] =
+            core::array::from_fn(|i| rpm_estimators[i].state().omega());
+        let learner_input = LearnerInput {
+            rate_rad_s: gyro_corrected,
+            rate_dot_rad_s2: step_state.rate_dot_raw,
+            spf_m_s2: accel_corrected,
+            omega_rad_s: omega_for_learner,
+            d_commands: output.motor_commands,
+            armed,
+            touching_ground: step_state.touching_ground,
+        };
+        let _learned = learner.update(&learner_input);
+        // TODO: apply learned params to INDI effectiveness when learning is
+        // enabled via RC switch and params are validated.
 
         // 7. Non-finite guard — skip publishing, stay alive.
         //    Transient NaN from WLS is recoverable; sustained NaN causes

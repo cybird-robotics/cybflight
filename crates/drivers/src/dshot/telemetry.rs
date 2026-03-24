@@ -12,7 +12,15 @@ pub use cybflight_msgs::dshot::{EdtType, EdtValue, TelemetryValue};
 /// Decode eRPM from a 12-bit raw telemetry value.
 ///
 /// Returns `Some(erpm_x100)` on success, `Some(0)` for stopped motor (0x0FFF),
-/// or `None` for invalid (period == 0).
+/// or `None` for invalid/stale (period == 0).
+///
+/// Convention: the ESC sends raw `thiszctime` — one 60° electrical step in
+/// 0.5 µs timer ticks. One electrical revolution = `period * 0.5µs * 6` =
+/// `period * 3µs`, so `eRPM = 60_000_000 / (period * 3) = 20_000_000 / period`.
+///
+/// `period == 0` means the ESC had no fresh commutation event since the last
+/// DShot frame (stale). Treated identically to a decode failure (returns None),
+/// which causes the RPM estimator to coast on its model prediction.
 pub const fn decode_erpm(raw: u16) -> Option<u32> {
     if raw == 0x0FFF {
         return Some(0);
@@ -27,8 +35,8 @@ pub const fn decode_erpm(raw: u16) -> Option<u32> {
         return None;
     }
 
-    // erpm_x100 = 60_000_000 / 100 / period = 600_000 / period (rounded)
-    Some((600_000 + period / 2) / period)
+    // erpm_x100 = 20_000_000 / 100 / period = 200_000 / period (rounded)
+    Some((200_000 + period / 2) / period)
 }
 
 /// Interpret a raw 12-bit telemetry value as eRPM or EDT.
@@ -85,16 +93,16 @@ mod tests {
 
     #[test]
     fn erpm_value_1() {
-        // raw=0x0001: mantissa=1, exp=0 → period=1 → erpm=(600000+0)/1=600000
-        assert_eq!(decode_erpm(0x0001), Some(600_000));
-        assert_eq!(interpret(0x0001, false), TelemetryValue::Erpm(600_000));
+        // raw=0x0001: mantissa=1, exp=0 → period=1 → erpm=(200000+0)/1=200000
+        assert_eq!(decode_erpm(0x0001), Some(200_000));
+        assert_eq!(interpret(0x0001, false), TelemetryValue::Erpm(200_000));
     }
 
     #[test]
     fn erpm_value_100() {
-        // raw=0x0064: mantissa=0x64=100, exp=0 → period=100 → erpm=(600000+50)/100=6000
-        assert_eq!(decode_erpm(0x0064), Some(6_000));
-        assert_eq!(interpret(0x0064, false), TelemetryValue::Erpm(6_000));
+        // raw=0x0064: mantissa=0x64=100, exp=0 → period=100 → erpm=(200000+50)/100=2000
+        assert_eq!(decode_erpm(0x0064), Some(2_000));
+        assert_eq!(interpret(0x0064, false), TelemetryValue::Erpm(2_000));
     }
 
     #[test]
@@ -126,16 +134,16 @@ mod tests {
     #[test]
     fn edt_disabled_returns_erpm() {
         // Same raw value but EDT disabled → treat as eRPM
-        // raw=0x0064 with edt_enabled=false → eRPM(6000)
-        assert_eq!(interpret(0x0064, false), TelemetryValue::Erpm(6_000));
+        // raw=0x0064 with edt_enabled=false → eRPM(2000)
+        assert_eq!(interpret(0x0064, false), TelemetryValue::Erpm(2_000));
     }
 
     #[test]
     fn edt_odd_type_field_is_erpm() {
         // type_field=1 (odd) → always eRPM even with EDT enabled
         // raw=0x0164: mantissa=0x164&0x1FF=0x164=356, exp=0 → period=356
-        // erpm = (600000+178)/356 = 1685
-        assert_eq!(interpret(0x0164, true), TelemetryValue::Erpm(1685));
+        // erpm = (200000+178)/356 = 562
+        assert_eq!(interpret(0x0164, true), TelemetryValue::Erpm(562));
     }
 
     #[test]

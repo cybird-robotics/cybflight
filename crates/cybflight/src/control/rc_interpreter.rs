@@ -135,8 +135,18 @@ pub async fn rc_interpreter_task() {
     // Yaw-independent: pitch → world +X, roll → world +Y.
     let mut last_target = origin;
 
+    /// RC channel index for the learning enable switch (0-indexed).
+    /// Channel 6 (7th channel). >1500 µs = learning enabled.
+    const LEARN_CHANNEL: usize = 6;
+    const LEARN_THRESHOLD: u16 = 1500;
+
     loop {
         let rc = rc_sub.next_message_pure().await;
+
+        // Learning switch: channel 6 > 1500 → enable parameter application
+        let learn_on = rc.channel_count > LEARN_CHANNEL as u8
+            && rc.channels[LEARN_CHANNEL] > LEARN_THRESHOLD;
+        super::LEARNING_ENABLED.store(learn_on, core::sync::atomic::Ordering::Release);
 
         let dx = pitch_cal.normalize(rc.channels[pitch_cal.index] as i16) * XY_HALF_RANGE;
         let dy = roll_cal.normalize(rc.channels[roll_cal.index] as i16) * XY_HALF_RANGE;

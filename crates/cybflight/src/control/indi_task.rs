@@ -335,9 +335,16 @@ pub async fn indi_task() {
             armed,
             touching_ground: step_state.touching_ground,
         };
-        let _learned = learner.update(&learner_input);
-        // TODO: apply learned params to INDI effectiveness when learning is
-        // enabled via RC switch and params are validated.
+        let learned = learner.update(&learner_input);
+
+        // Apply learned params when the RC learning switch is active and
+        // the learner has produced valid estimates. Applies at most once
+        // per outer-loop cycle (~100 Hz) to avoid redundant recomputation.
+        if outer_counter == 0
+            && super::LEARNING_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+        {
+            indi.apply_learned_params(&learned);
+        }
 
         // 7. Non-finite guard — skip publishing, stay alive.
         //    Transient NaN from WLS is recoverable; sustained NaN causes

@@ -146,6 +146,61 @@ impl<const N: usize> IndiEffectiveness<N> {
         g1g2
     }
 
+    /// Replace G1, G2, and motor parameters from learned values.
+    ///
+    /// Validates all values before applying. Returns `true` if the update was
+    /// applied, `false` if validation failed (effectiveness unchanged).
+    ///
+    /// Validation checks:
+    /// - All values must be finite
+    /// - max_omega must be > 0
+    /// - time_const_s must be in [0.005, 0.5]
+    pub fn update_from_learned(
+        &mut self,
+        g1: &SMatrix<f32, 6, N>,
+        g2: &SMatrix<f32, 3, N>,
+        max_omega: &[f32; N],
+        time_const_s: &[f32; N],
+    ) -> bool {
+        // Validate finiteness
+        for row in 0..6 {
+            for col in 0..N {
+                if !g1[(row, col)].is_finite() {
+                    return false;
+                }
+            }
+        }
+        for row in 0..3 {
+            for col in 0..N {
+                if !g2[(row, col)].is_finite() {
+                    return false;
+                }
+            }
+        }
+        for i in 0..N {
+            if !max_omega[i].is_finite() || max_omega[i] <= 0.0 {
+                return false;
+            }
+            if !time_const_s[i].is_finite()
+                || time_const_s[i] < 0.005
+                || time_const_s[i] > 0.5
+            {
+                return false;
+            }
+        }
+
+        // Apply
+        self.g1 = *g1;
+        self.g2 = *g2;
+        for i in 0..N {
+            self.max_omega[i] = max_omega[i];
+            // Recompute G2 scaler: ω_max² / (2 · τ)
+            self.g2_scaler[i] = 0.5 * max_omega[i] * max_omega[i] / time_const_s[i];
+        }
+
+        true
+    }
+
     /// Inertia-inverse helper: convert physical torque column to acceleration space.
     ///
     /// Useful if you need to add custom effectiveness rows not covered by

@@ -195,6 +195,44 @@ impl IndiController {
         }
     }
 
+    /// Apply learned parameters to the controller.
+    ///
+    /// Updates effectiveness (G1/G2), linearization (nonlinearity), PT1 time
+    /// constants, and rate gains. Validates all values before applying.
+    /// Returns `true` if applied, `false` if validation failed.
+    pub fn apply_learned_params(
+        &mut self,
+        learned: &super::learner::LearnedParams,
+    ) -> bool {
+        if !learned.valid {
+            return false;
+        }
+        // Validate and apply effectiveness
+        if !self.effectiveness.update_from_learned(
+            &learned.g1,
+            &learned.g2,
+            &learned.max_omega,
+            &learned.time_const_s,
+        ) {
+            return false;
+        }
+        // Update PT1 time constants for actuator state estimation
+        let dt = 1.0 / self.freq;
+        for i in 0..NU {
+            self.pt1_alpha[i] = dt / (learned.time_const_s[i] + dt);
+        }
+        // Update linearization
+        for i in 0..NU {
+            self.linearization[i] =
+                super::linearization::ThrustLinearization::new(learned.nonlinearity[i]);
+        }
+        // Update rate gains
+        if learned.rate_gain.is_finite() && learned.rate_gain > 0.0 {
+            self.rate_gains = Vector3::new(learned.rate_gain, learned.rate_gain, learned.rate_gain);
+        }
+        true
+    }
+
     /// Update actuator state estimation from last motor command.
     /// Must be called every loop even when INDI is not the active controller.
     pub fn update_actuator_state(&mut self, d: &[f32; NU]) {

@@ -20,7 +20,8 @@ use cybflight_core::indi::{
 };
 use cybflight_core::mixer::{MotorParams, RigidBodyParams, SpinDir};
 use nalgebra::{SMatrix, SVector};
-use wls_alloc::{setup_a, setup_b, solve};
+use flight_solver::cls::solve;
+use flight_solver::cls::setup::wls::{setup_a, setup_b};
 
 const NU: usize = 4;
 const NV: usize = 6;

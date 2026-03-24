@@ -9,7 +9,8 @@ use air_filters::iir::biquad::{
     BiquadFilter, BiquadFilterConfigBuilder, BiquadFilterType, DirectForm2,
 };
 use nalgebra::{SMatrix, SVector, Vector3};
-use wls_alloc::{ExitCode, setup_a, setup_b, solve};
+use flight_solver::cls::{ExitCode, solve};
+use flight_solver::cls::setup::wls::{setup_a, setup_b};
 
 use super::{
     effectiveness::{IndiEffectiveness, IndiMotorParams},

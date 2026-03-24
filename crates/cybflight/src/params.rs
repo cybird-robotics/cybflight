@@ -32,6 +32,14 @@ static VEHICLE_PARAMS: Mutex<RefCell<Option<VehicleParams>>> = Mutex::new(RefCel
 static FLASH_PERI: Mutex<RefCell<Option<hal::flash::Flash<'static, hal::flash::Blocking>>>> =
     Mutex::new(RefCell::new(None));
 
+/// Monotonic version counter — incremented every time params change
+/// (`set()`, `save_to_flash()`, `init_from_flash()`). Consumers cache
+/// a local copy and re-read params when the version changes.
+///
+/// Check this only when idle (disarmed) — never in the 8kHz control loop.
+pub static PARAM_VERSION: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 /// Initialize parameters from flash at boot. Falls back to compile-time defaults
 /// if flash is blank or corrupt.
 ///
@@ -56,6 +64,7 @@ pub fn init_from_flash(flash_peri: hal::Peri<'static, hal::peripherals::FLASH>) 
         VEHICLE_PARAMS.borrow_ref_mut(cs).replace(params);
         FLASH_PERI.borrow_ref_mut(cs).replace(flash);
     });
+    PARAM_VERSION.fetch_add(1, core::sync::atomic::Ordering::Release);
 }
 
 /// Get a copy of the current vehicle parameters.
@@ -70,10 +79,13 @@ pub fn get() -> VehicleParams {
 }
 
 /// Update the in-memory vehicle parameters.
+///
+/// Increments `PARAM_VERSION` so consumers know to re-read.
 pub fn set(params: VehicleParams) {
     critical_section::with(|cs| {
         VEHICLE_PARAMS.borrow_ref_mut(cs).replace(params);
     });
+    PARAM_VERSION.fetch_add(1, core::sync::atomic::Ordering::Release);
 }
 
 /// Erase sector 7 and write the current params to flash.
@@ -113,6 +125,10 @@ pub fn save_to_flash() -> Result<(), &'static str> {
     critical_section::with(|cs| {
         FLASH_PERI.borrow_ref_mut(cs).replace(flash);
     });
+
+    if result.is_ok() {
+        PARAM_VERSION.fetch_add(1, core::sync::atomic::Ordering::Release);
+    }
 
     result
 }

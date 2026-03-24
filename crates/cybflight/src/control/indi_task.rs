@@ -202,6 +202,8 @@ pub async fn indi_task() {
 
     // Track whether we need to save learned params on disarm
     let mut was_armed = false;
+    // Local param version — re-read params when global version changes.
+    let mut local_param_ver = crate::params::PARAM_VERSION.load(core::sync::atomic::Ordering::Acquire);
     // --- Position + attitude controllers (gains from params, same as inner_loop) ---
     let g = &params.control;
     let pc = pd_ff_control::PositionController::new(
@@ -448,10 +450,24 @@ pub async fn indi_task() {
                 Ok(()) => defmt::info!("INDI: auto-saved learned params to flash"),
                 Err(e) => defmt::warn!("INDI: flash save failed: {}", e),
             }
-            // Re-read params after save — picks up any `param set` changes
-            // the user made via shell alongside the learned values.
-            if let Some(saved) = learned_from_indi_params(&crate::params::get().indi_effectiveness) {
-                indi.apply_learned_params(&saved);
+            // save_to_flash() bumps PARAM_VERSION — the re-read below will
+            // pick it up on the next iteration.
+        }
+
+        // 5c. Re-read params when version changes (disarmed only).
+        //     Catches: learning auto-save, shell `param set` + `param save`,
+        //     `param defaults`, or any other param writer.
+        if !armed {
+            let current_ver =
+                crate::params::PARAM_VERSION.load(core::sync::atomic::Ordering::Acquire);
+            if current_ver != local_param_ver {
+                local_param_ver = current_ver;
+                if let Some(saved) =
+                    learned_from_indi_params(&crate::params::get().indi_effectiveness)
+                {
+                    indi.apply_learned_params(&saved);
+                }
+                defmt::info!("INDI: params reloaded (ver {})", current_ver);
             }
         }
 

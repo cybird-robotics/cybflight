@@ -38,6 +38,11 @@ use crate::{
     vehicle::{QUADROTOR_BODY, QUADROTOR_MOTORS},
 };
 
+/// Auto-save flag: set on disarm when learned params are committed,
+/// consumed in the disarmed idle path to write to flash.
+static LEARNED_SAVE_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Default INDI motor parameters.
 const INDI_MOTOR_PARAMS: [IndiMotorParams; NU] = [
     IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 },
@@ -297,10 +302,16 @@ pub async fn indi_task() {
         // Arming state — read from atomic (set by DShot task, single source of truth)
         let armed = crate::motors::IS_ARMED.load(core::sync::atomic::Ordering::Acquire);
 
-        // On disarm transition, snapshot learned params and write to in-memory
-        // vehicle params. The user can persist to flash via `param save` in the
-        // shell (no more automatic sector-6 writes).
+        // ── Arm/disarm transitions ──────────────────────────────────────
+        //
+        // On DISARM: snapshot learned params → write to VehicleParams → apply
+        //   to controller (takes effect this frame) → signal flash auto-save.
+        //
+        // On ARM: re-read VehicleParams (may have been updated by learning,
+        //   shell `param set`, or flash load) → apply to controller. This
+        //   picks up any changes made between flights.
         if was_armed && !armed && learner.samples() > 0 {
+            // Disarm transition: commit learned params
             let snap = learner.update(&LearnerInput {
                 rate_rad_s: gyro_corrected,
                 rate_dot_rad_s2: nalgebra::Vector3::zeros(),
@@ -312,7 +323,16 @@ pub async fn indi_task() {
             });
             if snap.valid {
                 write_learned_to_params(&snap);
-                defmt::info!("INDI: saved learned G1/G2 to params (use `param save` to persist)");
+                indi.apply_learned_params(&snap);
+                LEARNED_SAVE_PENDING.store(true, core::sync::atomic::Ordering::Release);
+                defmt::info!("INDI: learned G1/G2 committed — auto-saving to flash");
+            }
+        }
+        if !was_armed && armed {
+            // Arm transition: reload params (picks up learning, shell changes, etc.)
+            if let Some(saved) = learned_from_indi_params(&crate::params::get().indi_effectiveness) {
+                indi.apply_learned_params(&saved);
+                defmt::info!("INDI: applied G1/G2 from params on arm");
             }
         }
         was_armed = armed;
@@ -418,9 +438,24 @@ pub async fn indi_task() {
             continue;
         }
 
-        // 5b. (Learned params are now written to in-memory VehicleParams on
-        //     disarm — no separate flash sector needed. The user can `param save`
-        //     via the shell to persist to flash.)
+        // 5b. Auto-save learned params to flash when disarmed.
+        //     The flash erase stalls the CPU for ~1-2s — safe here because
+        //     motors are stopped and no control is needed.
+        if !armed
+            && LEARNED_SAVE_PENDING
+                .compare_exchange(
+                    true,
+                    false,
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            match crate::params::save_to_flash() {
+                Ok(()) => defmt::info!("INDI: auto-saved learned params to flash"),
+                Err(e) => defmt::warn!("INDI: flash save failed: {}", e),
+            }
+        }
 
         // 6. INDI step (8 kHz) — uses bias-corrected gyro.
         let (output, step_state) = indi.step(
@@ -433,28 +468,22 @@ pub async fn indi_task() {
         );
 
         // 6b. Online learner (runs every frame, gated internally on armed+airborne).
-        //     Uses RPM estimator predicted omega and the INDI step state.
+        //     Params are NOT applied mid-flight — only on disarm (see arm/disarm
+        //     transitions above). The RC learning switch controls whether RLS
+        //     updates happen (via the armed+airborne gate inside the learner).
         let omega_for_learner: [f32; NU] =
             core::array::from_fn(|i| rpm_estimators[i].state().omega());
+        let learning_on = super::LEARNING_ENABLED.load(core::sync::atomic::Ordering::Acquire);
         let learner_input = LearnerInput {
             rate_rad_s: gyro_corrected,
             rate_dot_rad_s2: step_state.rate_dot_raw,
             spf_m_s2: accel_corrected,
             omega_rad_s: omega_for_learner,
             d_commands: output.motor_commands,
-            armed,
+            armed: armed && learning_on, // RLS only updates when switch is on
             touching_ground: step_state.touching_ground,
         };
-        let learned = learner.update(&learner_input);
-
-        // Apply learned params when the RC learning switch is active and
-        // the learner has produced valid estimates. Applies at most once
-        // per outer-loop cycle (~100 Hz) to avoid redundant recomputation.
-        if outer_counter == 0
-            && super::LEARNING_ENABLED.load(core::sync::atomic::Ordering::Acquire)
-        {
-            indi.apply_learned_params(&learned);
-        }
+        let _learned = learner.update(&learner_input);
 
         // 7. Non-finite guard — skip publishing, stay alive.
         //    Transient NaN from WLS is recoverable; sustained NaN causes

@@ -73,6 +73,8 @@ pub fn default_params() -> cybflight_core::params::VehicleParams {
         motors: QUADROTOR_MOTORS,
         control: DEFAULT_CONTROL_GAINS,
         indi_effectiveness: cybflight_core::params::IndiEffectivenessParams::default(),
+        indi_controller: cybflight_core::params::IndiControllerParams::default(),
+        learner: cybflight_core::params::LearnerParams::default(),
     }
 }
 

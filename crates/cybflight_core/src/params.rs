@@ -1,29 +1,31 @@
 //! Persistent vehicle parameter container with manual serialization.
 //!
-//! On-flash layout (little-endian, 416 bytes, aligned to 32-byte flash words):
+//! On-flash layout (little-endian, 512 bytes, aligned to 32-byte flash words):
 //!
 //! ```text
 //! [0x00]  magic:   u32 = 0x43594250 ("CYBP")
-//! [0x04]  version: u32 = 4
-//! [0x08]  length:  u32 = PAYLOAD_SIZE (384)
+//! [0x04]  version: u32 = 5
+//! [0x08]  length:  u32 = PAYLOAD_SIZE (480)
 //! [0x0C]  crc32:   u32 (over payload only)
-//! [0x10]  payload: 384 bytes
-//! [0x190] padding: 16 bytes (zeros)
+//! [0x10]  payload: 480 bytes
+//!   Body:               mass(4) + inertia(36) = 40 bytes
+//!   Motors (x4):        px(4) + py(4) + spin_dir(4) + max_thrust(4) + torque_coeff(4) = 80 bytes
+//!   Control gains:      pos_kp(12) + pos_kd(12) + att_k_rate(12) + rate_kp(12) + rate_ki(12) + rate_kd(12) = 72 bytes
+//!   INDI effectiveness: g1_force(48) + g1_torque(48) + g2(48) + max_omega(16) + time_const(16) + nonlinearity(16) = 192 bytes
+//!   INDI controller:    rate_gains(12) + sync_filter_hz(4) + wls_wv(24) + wls_wu(16) + motor_pole_count(4 as f32) = 60 bytes
+//!   Learner:            fx_filt_hz(4) + motor_filt_hz(4) + acc_offset_m(12) + rls_gamma(4) + rls_t_char_s(4) + zeta_rate(4) + zeta_attitude(4) = 36 bytes
+//! [0x200] padding: 16 bytes (zeros)
 //! ```
 
 use crate::mixer::{MotorParams, RigidBodyParams, SpinDir};
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
-/// Body: mass(4) + inertia(9*4=36) = 40 bytes
-/// Motor: px(4) + py(4) + spin_dir(4) + max_thrust(4) + torque_coeff(4) = 20 bytes each
-/// Control: pos_kp(12) + pos_kd(12) + att_k_rate(12) + rate_kp(12) + rate_ki(12) + rate_kd(12) = 72 bytes
-/// INDI: g1_force(48) + g1_torque(48) + g2(48) + max_omega(16) + time_const(16) + nonlinearity(16) = 192 bytes
-/// Total payload: 40 + 4*20 + 72 + 192 = 384 bytes
-const PAYLOAD_SIZE: usize = 384;
-/// Padded to 32-byte flash word boundary: ceil((16+384)/32)*32 = 416
-pub const PADDED_SIZE: usize = 416;
+/// Total payload: 40 + 80 + 72 + 192 + 60 + 36 = 480 bytes
+const PAYLOAD_SIZE: usize = 480;
+/// Padded to 32-byte flash word boundary: ceil((16+480)/32)*32 = 512
+pub const PADDED_SIZE: usize = 512;
 
 /// PID gain triplet.
 #[derive(Clone, Copy, Debug)]
@@ -96,6 +98,66 @@ impl Default for IndiEffectivenessParams {
     }
 }
 
+/// INDI controller tuning parameters.
+#[derive(Clone, Debug)]
+pub struct IndiControllerParams {
+    /// Rate error -> angular acceleration gains [roll, pitch, yaw] (rad/s^2 per rad/s).
+    pub rate_gains: [f32; 3],
+    /// Biquad low-pass cutoff for synchronized filters (Hz).
+    pub sync_filter_hz: f32,
+    /// WLS pseudo-control weights [fx, fy, fz, roll, pitch, yaw].
+    pub wls_wv: [f32; 6],
+    /// WLS actuator penalty weights [m0, m1, m2, m3].
+    pub wls_wu: [f32; 4],
+    /// Motor pole count (for eRPM -> RPM conversion).
+    pub motor_pole_count: u8,
+}
+
+impl Default for IndiControllerParams {
+    fn default() -> Self {
+        Self {
+            rate_gains: [20.0, 20.0, 20.0],
+            sync_filter_hz: 15.0,
+            wls_wv: [1.0, 1.0, 50.0, 50.0, 50.0, 5.0],
+            wls_wu: [1.0, 1.0, 1.0, 1.0],
+            motor_pole_count: 14,
+        }
+    }
+}
+
+/// G1/G2 learner tuning parameters.
+#[derive(Clone, Debug)]
+pub struct LearnerParams {
+    /// Biquad cutoff for effectiveness learning filters (Hz).
+    pub fx_filt_hz: f32,
+    /// Biquad cutoff for motor dynamics learning filters (Hz).
+    pub motor_filt_hz: f32,
+    /// IMU offset from CoG [x, y, z] (metres).
+    pub acc_offset_m: [f32; 3],
+    /// RLS initial covariance diagonal.
+    pub rls_gamma: f32,
+    /// RLS characteristic forgetting time (seconds).
+    pub rls_t_char_s: f32,
+    /// Rate loop damping ratio for gain synthesis.
+    pub zeta_rate: f32,
+    /// Attitude loop damping ratio for gain synthesis.
+    pub zeta_attitude: f32,
+}
+
+impl Default for LearnerParams {
+    fn default() -> Self {
+        Self {
+            fx_filt_hz: 20.0,
+            motor_filt_hz: 40.0,
+            acc_offset_m: [0.0, 0.0, 0.0],
+            rls_gamma: 100.0,
+            rls_t_char_s: 0.25,
+            zeta_rate: 0.8,
+            zeta_attitude: 0.8,
+        }
+    }
+}
+
 /// Full vehicle parameter set.
 #[derive(Clone, Debug)]
 pub struct VehicleParams {
@@ -103,6 +165,8 @@ pub struct VehicleParams {
     pub motors: [MotorParams; 4],
     pub control: ControlGains,
     pub indi_effectiveness: IndiEffectivenessParams,
+    pub indi_controller: IndiControllerParams,
+    pub learner: LearnerParams,
 }
 
 impl VehicleParams {
@@ -172,6 +236,28 @@ impl VehicleParams {
         for &v in &self.indi_effectiveness.nonlinearity {
             off = put_f32(&mut buf, off, v);
         }
+        // INDI controller
+        for &v in &self.indi_controller.rate_gains {
+            off = put_f32(&mut buf, off, v);
+        }
+        off = put_f32(&mut buf, off, self.indi_controller.sync_filter_hz);
+        for &v in &self.indi_controller.wls_wv {
+            off = put_f32(&mut buf, off, v);
+        }
+        for &v in &self.indi_controller.wls_wu {
+            off = put_f32(&mut buf, off, v);
+        }
+        off = put_f32(&mut buf, off, self.indi_controller.motor_pole_count as f32);
+        // Learner
+        off = put_f32(&mut buf, off, self.learner.fx_filt_hz);
+        off = put_f32(&mut buf, off, self.learner.motor_filt_hz);
+        for &v in &self.learner.acc_offset_m {
+            off = put_f32(&mut buf, off, v);
+        }
+        off = put_f32(&mut buf, off, self.learner.rls_gamma);
+        off = put_f32(&mut buf, off, self.learner.rls_t_char_s);
+        off = put_f32(&mut buf, off, self.learner.zeta_rate);
+        off = put_f32(&mut buf, off, self.learner.zeta_attitude);
         debug_assert_eq!(off - HEADER_SIZE, PAYLOAD_SIZE);
 
         // Header
@@ -325,11 +411,71 @@ impl VehicleParams {
             nonlinearity,
         };
 
+        // INDI controller
+        let mut rate_gains = [0.0f32; 3];
+        for slot in &mut rate_gains {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let sync_filter_hz = get_f32(buf, off);
+        off += 4;
+        let mut wls_wv = [0.0f32; 6];
+        for slot in &mut wls_wv {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let mut wls_wu = [0.0f32; 4];
+        for slot in &mut wls_wu {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let motor_pole_count = get_f32(buf, off) as u8;
+        off += 4;
+        let indi_controller = IndiControllerParams {
+            rate_gains,
+            sync_filter_hz,
+            wls_wv,
+            wls_wu,
+            motor_pole_count,
+        };
+
+        // Learner
+        let fx_filt_hz = get_f32(buf, off);
+        off += 4;
+        let motor_filt_hz = get_f32(buf, off);
+        off += 4;
+        let mut acc_offset_m = [0.0f32; 3];
+        for slot in &mut acc_offset_m {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let rls_gamma = get_f32(buf, off);
+        off += 4;
+        let rls_t_char_s = get_f32(buf, off);
+        off += 4;
+        let zeta_rate = get_f32(buf, off);
+        off += 4;
+        let zeta_attitude = get_f32(buf, off);
+        off += 4;
+        let learner = LearnerParams {
+            fx_filt_hz,
+            motor_filt_hz,
+            acc_offset_m,
+            rls_gamma,
+            rls_t_char_s,
+            zeta_rate,
+            zeta_attitude,
+        };
+
+        let _ = off; // suppress unused warning
+
         Some(VehicleParams {
             body,
             motors,
             control,
             indi_effectiveness,
+            indi_controller,
+            learner,
         })
     }
 
@@ -436,6 +582,32 @@ impl VehicleParams {
             ParamKey::IndiNonlinM1 => self.indi_effectiveness.nonlinearity[1],
             ParamKey::IndiNonlinM2 => self.indi_effectiveness.nonlinearity[2],
             ParamKey::IndiNonlinM3 => self.indi_effectiveness.nonlinearity[3],
+            // INDI controller
+            ParamKey::IndiRateR => self.indi_controller.rate_gains[0],
+            ParamKey::IndiRateP => self.indi_controller.rate_gains[1],
+            ParamKey::IndiRateY => self.indi_controller.rate_gains[2],
+            ParamKey::IndiSyncHz => self.indi_controller.sync_filter_hz,
+            ParamKey::WlsWvFx => self.indi_controller.wls_wv[0],
+            ParamKey::WlsWvFy => self.indi_controller.wls_wv[1],
+            ParamKey::WlsWvFz => self.indi_controller.wls_wv[2],
+            ParamKey::WlsWvRr => self.indi_controller.wls_wv[3],
+            ParamKey::WlsWvRp => self.indi_controller.wls_wv[4],
+            ParamKey::WlsWvRy => self.indi_controller.wls_wv[5],
+            ParamKey::WlsWuM0 => self.indi_controller.wls_wu[0],
+            ParamKey::WlsWuM1 => self.indi_controller.wls_wu[1],
+            ParamKey::WlsWuM2 => self.indi_controller.wls_wu[2],
+            ParamKey::WlsWuM3 => self.indi_controller.wls_wu[3],
+            ParamKey::MotorPoles => self.indi_controller.motor_pole_count as f32,
+            // Learner
+            ParamKey::LearnFxHz => self.learner.fx_filt_hz,
+            ParamKey::LearnMotorHz => self.learner.motor_filt_hz,
+            ParamKey::LearnAccX => self.learner.acc_offset_m[0],
+            ParamKey::LearnAccY => self.learner.acc_offset_m[1],
+            ParamKey::LearnAccZ => self.learner.acc_offset_m[2],
+            ParamKey::LearnGamma => self.learner.rls_gamma,
+            ParamKey::LearnTchar => self.learner.rls_t_char_s,
+            ParamKey::LearnZetaRate => self.learner.zeta_rate,
+            ParamKey::LearnZetaAtt => self.learner.zeta_attitude,
         }
     }
 
@@ -566,6 +738,32 @@ impl VehicleParams {
             ParamKey::IndiNonlinM1 => self.indi_effectiveness.nonlinearity[1] = val,
             ParamKey::IndiNonlinM2 => self.indi_effectiveness.nonlinearity[2] = val,
             ParamKey::IndiNonlinM3 => self.indi_effectiveness.nonlinearity[3] = val,
+            // INDI controller
+            ParamKey::IndiRateR => self.indi_controller.rate_gains[0] = val,
+            ParamKey::IndiRateP => self.indi_controller.rate_gains[1] = val,
+            ParamKey::IndiRateY => self.indi_controller.rate_gains[2] = val,
+            ParamKey::IndiSyncHz => self.indi_controller.sync_filter_hz = val,
+            ParamKey::WlsWvFx => self.indi_controller.wls_wv[0] = val,
+            ParamKey::WlsWvFy => self.indi_controller.wls_wv[1] = val,
+            ParamKey::WlsWvFz => self.indi_controller.wls_wv[2] = val,
+            ParamKey::WlsWvRr => self.indi_controller.wls_wv[3] = val,
+            ParamKey::WlsWvRp => self.indi_controller.wls_wv[4] = val,
+            ParamKey::WlsWvRy => self.indi_controller.wls_wv[5] = val,
+            ParamKey::WlsWuM0 => self.indi_controller.wls_wu[0] = val,
+            ParamKey::WlsWuM1 => self.indi_controller.wls_wu[1] = val,
+            ParamKey::WlsWuM2 => self.indi_controller.wls_wu[2] = val,
+            ParamKey::WlsWuM3 => self.indi_controller.wls_wu[3] = val,
+            ParamKey::MotorPoles => self.indi_controller.motor_pole_count = val as u8,
+            // Learner
+            ParamKey::LearnFxHz => self.learner.fx_filt_hz = val,
+            ParamKey::LearnMotorHz => self.learner.motor_filt_hz = val,
+            ParamKey::LearnAccX => self.learner.acc_offset_m[0] = val,
+            ParamKey::LearnAccY => self.learner.acc_offset_m[1] = val,
+            ParamKey::LearnAccZ => self.learner.acc_offset_m[2] = val,
+            ParamKey::LearnGamma => self.learner.rls_gamma = val,
+            ParamKey::LearnTchar => self.learner.rls_t_char_s = val,
+            ParamKey::LearnZetaRate => self.learner.zeta_rate = val,
+            ParamKey::LearnZetaAtt => self.learner.zeta_attitude = val,
         }
     }
 }
@@ -676,6 +874,32 @@ pub enum ParamKey {
     IndiNonlinM1,
     IndiNonlinM2,
     IndiNonlinM3,
+    // INDI controller
+    IndiRateR,
+    IndiRateP,
+    IndiRateY,
+    IndiSyncHz,
+    WlsWvFx,
+    WlsWvFy,
+    WlsWvFz,
+    WlsWvRr,
+    WlsWvRp,
+    WlsWvRy,
+    WlsWuM0,
+    WlsWuM1,
+    WlsWuM2,
+    WlsWuM3,
+    MotorPoles,
+    // Learner
+    LearnFxHz,
+    LearnMotorHz,
+    LearnAccX,
+    LearnAccY,
+    LearnAccZ,
+    LearnGamma,
+    LearnTchar,
+    LearnZetaRate,
+    LearnZetaAtt,
 }
 
 /// All parameter keys in order, for iteration.
@@ -780,6 +1004,32 @@ pub const ALL_KEYS: &[ParamKey] = &[
     ParamKey::IndiNonlinM1,
     ParamKey::IndiNonlinM2,
     ParamKey::IndiNonlinM3,
+    // INDI controller
+    ParamKey::IndiRateR,
+    ParamKey::IndiRateP,
+    ParamKey::IndiRateY,
+    ParamKey::IndiSyncHz,
+    ParamKey::WlsWvFx,
+    ParamKey::WlsWvFy,
+    ParamKey::WlsWvFz,
+    ParamKey::WlsWvRr,
+    ParamKey::WlsWvRp,
+    ParamKey::WlsWvRy,
+    ParamKey::WlsWuM0,
+    ParamKey::WlsWuM1,
+    ParamKey::WlsWuM2,
+    ParamKey::WlsWuM3,
+    ParamKey::MotorPoles,
+    // Learner
+    ParamKey::LearnFxHz,
+    ParamKey::LearnMotorHz,
+    ParamKey::LearnAccX,
+    ParamKey::LearnAccY,
+    ParamKey::LearnAccZ,
+    ParamKey::LearnGamma,
+    ParamKey::LearnTchar,
+    ParamKey::LearnZetaRate,
+    ParamKey::LearnZetaAtt,
 ];
 
 impl ParamKey {
@@ -886,6 +1136,32 @@ impl ParamKey {
             "indi_nonlin_m1" => Some(Self::IndiNonlinM1),
             "indi_nonlin_m2" => Some(Self::IndiNonlinM2),
             "indi_nonlin_m3" => Some(Self::IndiNonlinM3),
+            // INDI controller
+            "indi_rate_r" => Some(Self::IndiRateR),
+            "indi_rate_p" => Some(Self::IndiRateP),
+            "indi_rate_y" => Some(Self::IndiRateY),
+            "indi_sync_hz" => Some(Self::IndiSyncHz),
+            "wls_wv_fx" => Some(Self::WlsWvFx),
+            "wls_wv_fy" => Some(Self::WlsWvFy),
+            "wls_wv_fz" => Some(Self::WlsWvFz),
+            "wls_wv_rr" => Some(Self::WlsWvRr),
+            "wls_wv_rp" => Some(Self::WlsWvRp),
+            "wls_wv_ry" => Some(Self::WlsWvRy),
+            "wls_wu_m0" => Some(Self::WlsWuM0),
+            "wls_wu_m1" => Some(Self::WlsWuM1),
+            "wls_wu_m2" => Some(Self::WlsWuM2),
+            "wls_wu_m3" => Some(Self::WlsWuM3),
+            "motor_poles" => Some(Self::MotorPoles),
+            // Learner
+            "learn_fx_hz" => Some(Self::LearnFxHz),
+            "learn_motor_hz" => Some(Self::LearnMotorHz),
+            "learn_acc_x" => Some(Self::LearnAccX),
+            "learn_acc_y" => Some(Self::LearnAccY),
+            "learn_acc_z" => Some(Self::LearnAccZ),
+            "learn_gamma" => Some(Self::LearnGamma),
+            "learn_tchar" => Some(Self::LearnTchar),
+            "learn_zeta_rate" => Some(Self::LearnZetaRate),
+            "learn_zeta_att" => Some(Self::LearnZetaAtt),
             _ => None,
         }
     }
@@ -993,6 +1269,32 @@ impl ParamKey {
             Self::IndiNonlinM1 => "indi_nonlin_m1",
             Self::IndiNonlinM2 => "indi_nonlin_m2",
             Self::IndiNonlinM3 => "indi_nonlin_m3",
+            // INDI controller
+            Self::IndiRateR => "indi_rate_r",
+            Self::IndiRateP => "indi_rate_p",
+            Self::IndiRateY => "indi_rate_y",
+            Self::IndiSyncHz => "indi_sync_hz",
+            Self::WlsWvFx => "wls_wv_fx",
+            Self::WlsWvFy => "wls_wv_fy",
+            Self::WlsWvFz => "wls_wv_fz",
+            Self::WlsWvRr => "wls_wv_rr",
+            Self::WlsWvRp => "wls_wv_rp",
+            Self::WlsWvRy => "wls_wv_ry",
+            Self::WlsWuM0 => "wls_wu_m0",
+            Self::WlsWuM1 => "wls_wu_m1",
+            Self::WlsWuM2 => "wls_wu_m2",
+            Self::WlsWuM3 => "wls_wu_m3",
+            Self::MotorPoles => "motor_poles",
+            // Learner
+            Self::LearnFxHz => "learn_fx_hz",
+            Self::LearnMotorHz => "learn_motor_hz",
+            Self::LearnAccX => "learn_acc_x",
+            Self::LearnAccY => "learn_acc_y",
+            Self::LearnAccZ => "learn_acc_z",
+            Self::LearnGamma => "learn_gamma",
+            Self::LearnTchar => "learn_tchar",
+            Self::LearnZetaRate => "learn_zeta_rate",
+            Self::LearnZetaAtt => "learn_zeta_att",
         }
     }
 }
@@ -1063,6 +1365,8 @@ mod tests {
                 rate_kd: [0.0, 0.0, 0.0],
             },
             indi_effectiveness: IndiEffectivenessParams::default(),
+            indi_controller: IndiControllerParams::default(),
+            learner: LearnerParams::default(),
         }
     }
 
@@ -1156,6 +1460,80 @@ mod tests {
         assert_eq!(ParamKey::from_str("indi_omega_m2"), Some(ParamKey::IndiOmegaM2));
         assert_eq!(ParamKey::from_str("indi_tau_m1"), Some(ParamKey::IndiTauM1));
         assert_eq!(ParamKey::from_str("indi_nonlin_m0"), Some(ParamKey::IndiNonlinM0));
+        assert_eq!(ParamKey::from_str("indi_rate_r"), Some(ParamKey::IndiRateR));
+        assert_eq!(ParamKey::from_str("indi_sync_hz"), Some(ParamKey::IndiSyncHz));
+        assert_eq!(ParamKey::from_str("wls_wv_fz"), Some(ParamKey::WlsWvFz));
+        assert_eq!(ParamKey::from_str("wls_wu_m2"), Some(ParamKey::WlsWuM2));
+        assert_eq!(ParamKey::from_str("motor_poles"), Some(ParamKey::MotorPoles));
+        assert_eq!(ParamKey::from_str("learn_fx_hz"), Some(ParamKey::LearnFxHz));
+        assert_eq!(ParamKey::from_str("learn_gamma"), Some(ParamKey::LearnGamma));
+        assert_eq!(ParamKey::from_str("learn_zeta_att"), Some(ParamKey::LearnZetaAtt));
         assert_eq!(ParamKey::from_str("invalid"), None);
+    }
+
+    #[test]
+    fn round_trip_with_indi_controller_and_learner() {
+        let mut params = test_params();
+        params.indi_controller.rate_gains = [25.0, 30.0, 10.0];
+        params.indi_controller.sync_filter_hz = 20.0;
+        params.indi_controller.wls_wv = [2.0, 2.0, 100.0, 100.0, 100.0, 10.0];
+        params.indi_controller.wls_wu = [1.5, 1.5, 1.5, 1.5];
+        params.indi_controller.motor_pole_count = 12;
+        params.learner.fx_filt_hz = 25.0;
+        params.learner.motor_filt_hz = 50.0;
+        params.learner.acc_offset_m = [0.01, -0.02, 0.03];
+        params.learner.rls_gamma = 200.0;
+        params.learner.rls_t_char_s = 0.5;
+        params.learner.zeta_rate = 0.7;
+        params.learner.zeta_attitude = 0.9;
+
+        let bytes = params.to_bytes();
+        let restored = VehicleParams::from_bytes(&bytes).expect("from_bytes failed");
+
+        // INDI controller
+        assert_eq!(restored.indi_controller.rate_gains, params.indi_controller.rate_gains);
+        assert_eq!(restored.indi_controller.sync_filter_hz, params.indi_controller.sync_filter_hz);
+        assert_eq!(restored.indi_controller.wls_wv, params.indi_controller.wls_wv);
+        assert_eq!(restored.indi_controller.wls_wu, params.indi_controller.wls_wu);
+        assert_eq!(restored.indi_controller.motor_pole_count, params.indi_controller.motor_pole_count);
+
+        // Learner
+        assert_eq!(restored.learner.fx_filt_hz, params.learner.fx_filt_hz);
+        assert_eq!(restored.learner.motor_filt_hz, params.learner.motor_filt_hz);
+        assert_eq!(restored.learner.acc_offset_m, params.learner.acc_offset_m);
+        assert_eq!(restored.learner.rls_gamma, params.learner.rls_gamma);
+        assert_eq!(restored.learner.rls_t_char_s, params.learner.rls_t_char_s);
+        assert_eq!(restored.learner.zeta_rate, params.learner.zeta_rate);
+        assert_eq!(restored.learner.zeta_attitude, params.learner.zeta_attitude);
+
+        // Existing fields still intact
+        assert_eq!(restored.body.mass_kg, params.body.mass_kg);
+    }
+
+    #[test]
+    fn get_set_indi_controller_and_learner() {
+        let mut params = test_params();
+        params.set(ParamKey::IndiRateR, 25.0);
+        assert_eq!(params.get(ParamKey::IndiRateR), 25.0);
+        params.set(ParamKey::IndiSyncHz, 20.0);
+        assert_eq!(params.get(ParamKey::IndiSyncHz), 20.0);
+        params.set(ParamKey::WlsWvFz, 100.0);
+        assert_eq!(params.get(ParamKey::WlsWvFz), 100.0);
+        params.set(ParamKey::WlsWuM2, 2.0);
+        assert_eq!(params.get(ParamKey::WlsWuM2), 2.0);
+        params.set(ParamKey::MotorPoles, 12.0);
+        assert_eq!(params.get(ParamKey::MotorPoles), 12.0);
+        params.set(ParamKey::LearnFxHz, 25.0);
+        assert_eq!(params.get(ParamKey::LearnFxHz), 25.0);
+        params.set(ParamKey::LearnGamma, 200.0);
+        assert_eq!(params.get(ParamKey::LearnGamma), 200.0);
+        params.set(ParamKey::LearnTchar, 0.5);
+        assert_eq!(params.get(ParamKey::LearnTchar), 0.5);
+        params.set(ParamKey::LearnZetaRate, 0.7);
+        assert_eq!(params.get(ParamKey::LearnZetaRate), 0.7);
+        params.set(ParamKey::LearnZetaAtt, 0.9);
+        assert_eq!(params.get(ParamKey::LearnZetaAtt), 0.9);
+        params.set(ParamKey::LearnAccX, 0.01);
+        assert_eq!(params.get(ParamKey::LearnAccX), 0.01);
     }
 }

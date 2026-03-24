@@ -129,17 +129,22 @@ fn odom_is_valid(odom: &msgs::VehicleOdometry) -> bool {
 
 #[embassy_executor::task]
 pub async fn indi_task() {
+    // --- Load params for INDI controller and learner ---
+    let params = crate::params::get();
+    let ic = &params.indi_controller;
+    let lp = &params.learner;
+
     // --- Build INDI controller ---
     let config = IndiConfig {
-        rate_gains: Vector3::new(20.0, 20.0, 20.0),
-        sync_filter_hz: 15.0,
+        rate_gains: Vector3::new(ic.rate_gains[0], ic.rate_gains[1], ic.rate_gains[2]),
+        sync_filter_hz: ic.sync_filter_hz,
         motors: QUADROTOR_MOTORS,
         body: QUADROTOR_BODY,
         indi_motors: INDI_MOTOR_PARAMS,
         nonlinearity: [0.5; NU],
         act_limit: [1.0; NU],
-        wls_wv: [1.0, 1.0, 50.0, 50.0, 50.0, 5.0],
-        wls_wu: [1.0; NU],
+        wls_wv: ic.wls_wv,
+        wls_wu: ic.wls_wu,
         wls_cond_bound: 3.2768e8,  // (1<<15) * 1e4
         wls_theta: 1e-4,
         wls_imax: 1,
@@ -147,7 +152,7 @@ pub async fn indi_task() {
         rpm_invalid_limit: 50,
         rpm_all_invalid_limit: 50,
         rpm_recovery_count: 10,
-        motor_pole_count: 14,
+        motor_pole_count: ic.motor_pole_count,
     };
 
     // IMU sample rate — nominal 8 kHz
@@ -172,11 +177,16 @@ pub async fn indi_task() {
         core::array::from_fn(|_| RpmEstimator::new(est_config, init_state));
 
     // --- G1/G2 online learner (optional, activated via RC switch) ---
-    let learner_config = LearnerConfig::default();
+    let learner_config = LearnerConfig {
+        fx_filt_hz: lp.fx_filt_hz,
+        motor_filt_hz: lp.motor_filt_hz,
+        acc_offset_m: lp.acc_offset_m,
+        rls_gamma: lp.rls_gamma,
+        rls_t_char_s: lp.rls_t_char_s,
+        zeta_rate: lp.zeta_rate,
+        zeta_attitude: lp.zeta_attitude,
+    };
     let mut learner = Learner::new(&learner_config, loop_rate_hz);
-
-    // --- Position + attitude controllers (gains from params, same as inner_loop) ---
-    let params = crate::params::get();
 
     // Load previously saved INDI effectiveness from vehicle params (if non-zero).
     if let Some(saved_learned) = learned_from_indi_params(&params.indi_effectiveness) {
@@ -187,6 +197,7 @@ pub async fn indi_task() {
 
     // Track whether we need to save learned params on disarm
     let mut was_armed = false;
+    // --- Position + attitude controllers (gains from params, same as inner_loop) ---
     let g = &params.control;
     let pc = pd_ff_control::PositionController::new(
         Vector3::new(g.pos_kp[0], g.pos_kp[1], g.pos_kp[2]),

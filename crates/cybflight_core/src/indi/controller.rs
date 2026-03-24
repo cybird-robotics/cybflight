@@ -10,7 +10,7 @@ use air_filters::iir::biquad::{
 use air_filters::Filter;
 use flight_solver::cls::setup::wls::{setup_a, setup_b};
 use flight_solver::cls::{solve, ExitCode};
-use nalgebra::{SMatrix, SVector, Vector3};
+use nalgebra::{stack, SMatrix, SVector, Vector3};
 
 use super::{
     effectiveness::{IndiEffectiveness, IndiMotorParams},
@@ -320,14 +320,11 @@ impl IndiController {
         let rate_dot_raw = self.rate_dot_estimator.raw();
         let rate_dot_fs = self.rate_dot_estimator.filtered();
 
-        let spf_fs = Vector3::new(
-            self.spf_filter[0].apply(accel_m_s2[0]),
-            self.spf_filter[1].apply(accel_m_s2[1]),
-            self.spf_filter[2].apply(accel_m_s2[2]),
-        );
+        let spf_fs = Vector3::from(self.spf_filter.apply((*accel_m_s2).into()));
 
         // Motor acceleration via du-based fallback (matches C when no dshot RPM derivative).
-        let mut omega_dot_fs = SVector::<f32, NU>::from_element(0.0);
+        let mut omega_dot_fs = SVector::<f32, NU>::zeros();
+
         for i in 0..NU {
             let inv_thresh = 0.1 * self.effectiveness.max_omega[i];
             let omega_inv = if self.prev_omega_fs[i].abs() > inv_thresh {
@@ -339,10 +336,11 @@ impl IndiController {
         }
 
         // Actuator state filtering
-        for i in 0..NU {
-            self.u_state_fs[i] = self.u_state_filter[i].apply(self.u_state[i]);
-            self.u_state_fs[i] = self.u_state_fs[i].clamp(0.0, 1.0);
-        }
+        self.u_state_fs = self
+            .u_state_filter
+            .apply(self.u_state.into())
+            .map(|w| w.clamp(0.0, 1.0))
+            .into();
 
         // --- 2. Takeoff detection ---
         let gyro_mag_sq = gyro_rad_s.norm_squared();
@@ -353,28 +351,17 @@ impl IndiController {
         let thrust_low = spf_sp_z < 3.0;
         let touching_ground = gyro_low && accel_high && thrust_low;
         let do_indi = !touching_ground && armed;
-        let do_indi_f = if do_indi { 1.0f32 } else { 0.0 };
+        let do_indi_f = do_indi as u32 as f32;
 
         // --- 3. Rate controller ---
         let rate_err = *rate_sp - *gyro_rad_s;
-        let rate_dot_sp = Vector3::new(
-            self.rate_gains[0] * rate_err[0],
-            self.rate_gains[1] * rate_err[1],
-            self.rate_gains[2] * rate_err[2],
-        );
+        let rate_dot_sp = self.rate_gains.component_mul(&rate_err);
 
         // --- 4. Pseudo-control ---
-        let mut dv = SVector::<f32, NV>::zeros();
-        dv[2] = spf_sp_z - do_indi_f * spf_fs[2];
-        dv[3] = rate_dot_sp[0] - do_indi_f * rate_dot_fs[0];
-        dv[4] = rate_dot_sp[1] - do_indi_f * rate_dot_fs[1];
-        dv[5] = rate_dot_sp[2] - do_indi_f * rate_dot_fs[2];
-
-        for j in 0..3 {
-            for i in 0..NU {
-                dv[j + 3] += do_indi_f * self.effectiveness.g2[(j, i)] * omega_dot_fs[i];
-            }
-        }
+        let dv = stack![
+            Vector3::new(0.0, 0.0, spf_sp_z - do_indi_f * spf_fs.z);
+            rate_dot_sp - do_indi_f * rate_dot_fs + do_indi_f * self.effectiveness.g2 * omega_dot_fs
+        ];
 
         // --- 5. Combined effectiveness matrix ---
         let omega_fs_vec = self.prev_omega_fs;
@@ -383,26 +370,17 @@ impl IndiController {
         // --- 6. WLS allocation ---
         let wv = self.wls_wv;
         let mut wu = self.wls_wu;
-        let v = dv;
 
         let (a_mat, gamma) =
             setup_a::<NU, NV, NC>(&g1g2, &wv, &mut wu, self.wls_theta, self.wls_cond_bound);
 
-        let mut du_min = SVector::<f32, NU>::zeros();
-        let mut du_max = SVector::<f32, NU>::zeros();
-        let mut du_pref = SVector::<f32, NU>::zeros();
-        for i in 0..NU {
-            du_min[i] = -do_indi_f * self.u_state_fs[i];
-            du_max[i] = self.act_limit[i] - do_indi_f * self.u_state_fs[i];
-            du_pref[i] = -do_indi_f * self.u_state_fs[i];
-        }
+        let du_min = -do_indi_f * self.u_state_fs;
+        let du_max = self.act_limit - do_indi_f * self.u_state_fs;
+        let du_pref = -do_indi_f * self.u_state_fs;
 
-        let b_vec = setup_b::<NU, NV, NC>(&v, &du_pref, &wv, &wu, gamma);
+        let b_vec = setup_b::<NU, NV, NC>(&dv, &du_pref, &wv, &wu, gamma);
 
-        let mut du = SVector::<f32, NU>::zeros();
-        for i in 0..NU {
-            du[i] = (du_min[i] + du_max[i]) * 0.5;
-        }
+        let mut du = (du_min + du_max) / 2.0;
 
         let stats = solve::<NU, NV, NC>(
             &a_mat,
@@ -426,17 +404,17 @@ impl IndiController {
         let nan_failsafe = self.nan_counter > self.nan_limit;
 
         // --- 8. Motor commands ---
-        let mut motor_commands = SVector::<f32, NU>::zeros();
-
-        for i in 0..NU {
-            let u = if !nan_exit {
-                (do_indi_f * self.u_state_fs[i] + du[i]).clamp(0.0, self.act_limit[i])
-            } else {
-                (self.u_state_fs[i] * 0.95).clamp(0.0, self.act_limit[i])
-            };
-            motor_commands[i] = self.linearization[i].linearize(u);
-            self.prev_du[i] = u - self.u_state[i];
+        let u = if !nan_exit {
+            self.u_state_fs
+                .zip_map(&du, |u_fs, du| (do_indi_f * u_fs + du).max(0.0))
+        } else {
+            self.u_state_fs.map(|u_fs| (u_fs * 0.95).max(0.0))
         }
+        .inf(&self.act_limit);
+
+        let motor_commands =
+            SVector::<_, NU>::from_fn(|i, _| self.linearization[i].linearize(u[i]));
+        self.prev_du = u - self.u_state;
 
         if motor_commands.iter().all(|v| v.is_finite()) {
             self.update_actuator_state(&motor_commands);

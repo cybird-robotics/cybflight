@@ -838,4 +838,202 @@ mod tests {
             }
         }
     }
+
+    // ── Review finding #19: Coriolis correction analytical verification ──
+
+    #[test]
+    fn coriolis_correction_analytical() {
+        // Pure rotation at ω = [0, 0, 10] rad/s, offset r = [0.01, 0, 0] (1cm forward).
+        // Centrifugal: r × (ω × ω) — for z-axis rotation with x-offset:
+        //   centrifugal_x = -rx * wz² = -0.01 * 100 = -1.0 m/s²
+        //   centrifugal_y = 0
+        //   centrifugal_z = 0
+        // Euler term: dω × r = 0 (no angular acceleration)
+        // So corrected = raw - correction = raw - (-1.0, 0, 0) = raw + (1.0, 0, 0)
+        let mut cfg = default_config();
+        cfg.acc_offset_m = [0.01, 0.0, 0.0];
+        let learner = Learner::new(&cfg, LOOP_HZ);
+        let input = LearnerInput {
+            rate_rad_s: Vector3::new(0.0, 0.0, 10.0),
+            rate_dot_rad_s2: Vector3::zeros(),
+            spf_m_s2: Vector3::new(0.0, 0.0, 9.81),
+            omega_rad_s: [0.0; NU],
+            d_commands: [0.0; NU],
+            armed: false,
+            touching_ground: true,
+        };
+        let corrected = learner.correct_accel(&input);
+        // correction_x = rx * (-(wy²+wz²)) = 0.01 * (-100) = -1.0
+        // corrected_x = ax - correction_x = 0.0 - (-1.0) = 1.0
+        assert!((corrected[0] - 1.0).abs() < 1e-5, "cx={}", corrected[0]);
+        assert!((corrected[1] - 0.0).abs() < 1e-5, "cy={}", corrected[1]);
+        assert!((corrected[2] - 9.81).abs() < 1e-5, "cz={}", corrected[2]);
+    }
+
+    // ── Review finding #20: Scaling round-trip verification ──────────────
+
+    #[test]
+    fn scaling_roundtrip_motor_params() {
+        // Set motor RLS X directly to known values and verify extract_params
+        // produces correct physical parameters.
+        //
+        // Motor model: omega = X[0]*D + X[1]*sqrt(D) + X[2] + X[3]*(-1e-4*omega_dot)
+        // Observation: omega * 1e-3, so X values are in 1e-3 * omega units.
+        //
+        // Set X[0]=1.5, X[1]=0.5 → maxOmega = 1e3*(1.5+0.5) = 2000 rad/s
+        // X[3]=0.25 → time_const = 0.1 * 0.25 = 0.025 s
+        // nonlinearity = 1.5 / (1.5+0.5) = 0.75
+        let cfg = default_config();
+        let mut learner = Learner::new(&cfg, LOOP_HZ);
+        learner.samples = 200; // force valid
+
+        // Set motor RLS params directly
+        for i in 0..NU {
+            let x = learner.motor_rls[i].params_mut();
+            x[(0, 0)] = 1.5;   // D coefficient
+            x[(1, 0)] = 0.5;   // sqrt(D) coefficient
+            x[(2, 0)] = 0.0;   // bias
+            x[(3, 0)] = 0.25;  // omega_dot coefficient → tau = 0.1 * 0.25 = 0.025
+        }
+
+        let params = learner.extract_params();
+        assert!(params.valid);
+        for i in 0..NU {
+            assert!(
+                (params.max_omega[i] - 2000.0).abs() < 1.0,
+                "motor {} max_omega={}, expected 2000",
+                i, params.max_omega[i]
+            );
+            assert!(
+                (params.time_const_s[i] - 0.025).abs() < 1e-4,
+                "motor {} tau={}, expected 0.025",
+                i, params.time_const_s[i]
+            );
+            assert!(
+                (params.nonlinearity[i] - 0.75).abs() < 1e-4,
+                "motor {} nonlin={}, expected 0.75",
+                i, params.nonlinearity[i]
+            );
+        }
+    }
+
+    // ── Review finding #21: Gain synthesis formula ───────────────────────
+
+    #[test]
+    fn gain_synthesis_correctness() {
+        let mut cfg = default_config();
+        cfg.zeta_rate = 0.8;
+        cfg.zeta_attitude = 0.8;
+        let mut learner = Learner::new(&cfg, LOOP_HZ);
+        learner.samples = 200;
+
+        // Set tau = 0.025 for all motors → maxTau = 0.025
+        for i in 0..NU {
+            let x = learner.motor_rls[i].params_mut();
+            x[(3, 0)] = 0.25; // tau = 0.1 * 0.25 = 0.025
+            x[(0, 0)] = 1.0;
+            x[(1, 0)] = 1.0;
+        }
+
+        let params = learner.extract_params();
+        // rate_gain = 0.25 / (0.8² * 0.025) = 0.25 / 0.016 = 15.625
+        let expected_rate = 0.25 / (0.64 * 0.025);
+        assert!(
+            (params.rate_gain - expected_rate).abs() < 1e-3,
+            "rate_gain={}, expected={}",
+            params.rate_gain, expected_rate
+        );
+        // attitude_gain = 0.25 * rate_gain / 0.64
+        let expected_att = 0.25 * expected_rate / 0.64;
+        assert!(
+            (params.attitude_gain - expected_att).abs() < 1e-2,
+            "att_gain={}, expected={}",
+            params.attitude_gain, expected_att
+        );
+    }
+
+    // ── Review finding #22: Motor RLS nonlinearity and tau ───────────────
+
+    #[test]
+    fn motor_rls_learns_nonlinear_motor() {
+        // Simulate a motor with quadratic characteristic: omega = 2000 * d²
+        // (pure quadratic, nonlinearity should converge toward 1.0)
+        let cfg = default_config();
+        let mut learner = Learner::new(&cfg, LOOP_HZ);
+
+        for step in 0..4000 {
+            let t = step as f32 / LOOP_HZ;
+            let d = (0.3 + 0.3 * libm::sinf(2.0 * core::f32::consts::PI * 30.0 * t))
+                .clamp(0.05, 0.95);
+            let omega = 2000.0 * d * d; // quadratic motor
+            let input = LearnerInput {
+                rate_rad_s: Vector3::zeros(),
+                rate_dot_rad_s2: Vector3::zeros(),
+                spf_m_s2: Vector3::new(0.0, 0.0, 9.81),
+                omega_rad_s: [omega; NU],
+                d_commands: [d; NU],
+                armed: true,
+                touching_ground: false,
+            };
+            learner.update(&input);
+        }
+
+        let params = learner.extract_params();
+        assert!(params.valid);
+        // max_omega should be close to 2000 (omega at d=1)
+        for i in 0..NU {
+            assert!(
+                params.max_omega[i] > 500.0 && params.max_omega[i] < 5000.0,
+                "motor {} max_omega={} out of range",
+                i, params.max_omega[i]
+            );
+            // time_const should be reasonable (> 0, < 0.2)
+            assert!(
+                params.time_const_s[i] >= 0.01 && params.time_const_s[i] <= 0.2,
+                "motor {} tau={} out of range",
+                i, params.time_const_s[i]
+            );
+        }
+    }
+
+    // ── Serialization round-trip ─────────────────────────────────────────
+
+    #[test]
+    fn learned_params_serialize_roundtrip() {
+        let mut params = LearnedParams::default();
+        params.valid = true;
+        params.rate_gain = 15.625;
+        params.attitude_gain = 6.1;
+        params.max_omega = [2000.0, 1900.0, 2100.0, 1950.0];
+        params.time_const_s = [0.025, 0.030, 0.022, 0.028];
+        params.nonlinearity = [0.5, 0.6, 0.45, 0.55];
+        // Set some G1/G2 values
+        params.g1[(2, 0)] = 15.0;  // fz motor 0
+        params.g1[(3, 1)] = -300.0; // roll motor 1
+        params.g2[(2, 0)] = 0.001;  // yaw G2 motor 0
+
+        let bytes = params.to_bytes();
+        let recovered = LearnedParams::from_bytes(&bytes).expect("deserialize failed");
+
+        assert!(recovered.valid);
+        assert!((recovered.rate_gain - 15.625).abs() < 1e-5);
+        assert!((recovered.attitude_gain - 6.1).abs() < 1e-5);
+        for i in 0..NU {
+            assert!((recovered.max_omega[i] - params.max_omega[i]).abs() < 1e-5);
+            assert!((recovered.time_const_s[i] - params.time_const_s[i]).abs() < 1e-5);
+            assert!((recovered.nonlinearity[i] - params.nonlinearity[i]).abs() < 1e-5);
+        }
+        assert!((recovered.g1[(2, 0)] - 15.0).abs() < 1e-5);
+        assert!((recovered.g1[(3, 1)] - (-300.0)).abs() < 1e-3);
+        assert!((recovered.g2[(2, 0)] - 0.001).abs() < 1e-7);
+    }
+
+    #[test]
+    fn learned_params_corrupt_bytes_returns_none() {
+        let params = LearnedParams::default();
+        let mut bytes = params.to_bytes();
+        // Corrupt the CRC
+        bytes[12] ^= 0xFF;
+        assert!(LearnedParams::from_bytes(&bytes).is_none());
+    }
 }

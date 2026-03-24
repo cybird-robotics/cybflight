@@ -122,6 +122,19 @@ pub struct IndiOutput {
     pub nan_failsafe: bool,
 }
 
+/// Intermediate signals from the INDI step, exposed for the learner.
+///
+/// These are the raw (pre-INDI-sync-filter) signals that the learner needs
+/// for its own matched filtering. The learner applies its own filters at
+/// a different cutoff frequency.
+#[derive(Clone, Copy)]
+pub struct IndiStepState {
+    /// Unfiltered angular acceleration (rad/s²), from gyro finite difference.
+    pub rate_dot_raw: Vector3<f32>,
+    /// True if the ground-detection heuristic thinks the vehicle is on the ground.
+    pub touching_ground: bool,
+}
+
 impl IndiController {
     pub fn new(config: &IndiConfig, loop_rate_hz: f32) -> Self {
         let dt = 1.0 / loop_rate_hz;
@@ -212,6 +225,10 @@ impl IndiController {
     }
 
     /// Run one INDI iteration.
+    ///
+    /// Returns `(IndiOutput, IndiStepState)`. The `IndiStepState` exposes
+    /// intermediate signals needed by the learner (raw rate_dot, ground
+    /// detection). The learner applies its own matched filters.
     pub fn step(
         &mut self,
         gyro_rad_s: &Vector3<f32>,
@@ -220,7 +237,7 @@ impl IndiController {
         spf_sp_z: f32,
         armed: bool,
         g2_valid: &[bool; NU],
-    ) -> IndiOutput {
+    ) -> (IndiOutput, IndiStepState) {
         // --- 1. Sensor processing ---
         let rate_dot_raw = (*gyro_rad_s - self.prev_rate) * self.freq;
         self.prev_rate = *gyro_rad_s;
@@ -353,10 +370,15 @@ impl IndiController {
             self.update_actuator_state(&motor_commands);
         }
 
-        IndiOutput {
+        let output = IndiOutput {
             motor_commands,
             nan_failsafe,
-        }
+        };
+        let step_state = IndiStepState {
+            rate_dot_raw,
+            touching_ground,
+        };
+        (output, step_state)
     }
 }
 
@@ -412,8 +434,8 @@ mod tests {
         let mut ctrl = IndiController::new(&test_config(), LOOP_HZ);
         let (gyro, accel, rate_sp, spf_sp_z) = hover_inputs();
         let g2 = [false; NU];
-        let mut out = ctrl.step(&gyro, &accel, &rate_sp, spf_sp_z, true, &g2);
-        for _ in 0..200 { out = ctrl.step(&gyro, &accel, &rate_sp, spf_sp_z, true, &g2); }
+        let mut out = ctrl.step(&gyro, &accel, &rate_sp, spf_sp_z, true, &g2).0;
+        for _ in 0..200 { out = ctrl.step(&gyro, &accel, &rate_sp, spf_sp_z, true, &g2).0; }
         let mean = out.motor_commands.iter().sum::<f32>() / NU as f32;
         for (i, &c) in out.motor_commands.iter().enumerate() {
             assert!(c >= 0.0 && c <= 1.0, "motor {i} out of bounds: {c}");
@@ -436,7 +458,7 @@ mod tests {
         ];
         for (gyro, rate_sp, spf) in cases {
             for _ in 0..50 {
-                let out = ctrl.step(gyro, &accel, rate_sp, *spf, true, &g2);
+                let out = ctrl.step(gyro, &accel, rate_sp, *spf, true, &g2).0;
                 for (i, &c) in out.motor_commands.iter().enumerate() {
                     assert!(c >= 0.0 && c <= 1.0, "motor {i} = {c}");
                 }
@@ -449,10 +471,10 @@ mod tests {
         let mut ctrl = IndiController::new(&test_config(), LOOP_HZ);
         let accel = Vector3::new(0.0, 0.0, GRAVITY);
         let g2 = [false; NU];
-        for _ in 0..100 { ctrl.step(&Vector3::zeros(), &accel, &Vector3::zeros(), GRAVITY, true, &g2); }
+        for _ in 0..100 { ctrl.step(&Vector3::zeros(), &accel, &Vector3::zeros(), GRAVITY, true, &g2).0; }
         let rate_sp = Vector3::new(3.0, 0.0, 0.0);
-        let mut out = ctrl.step(&Vector3::zeros(), &accel, &rate_sp, GRAVITY, true, &g2);
-        for _ in 0..50 { out = ctrl.step(&Vector3::zeros(), &accel, &rate_sp, GRAVITY, true, &g2); }
+        let mut out = ctrl.step(&Vector3::zeros(), &accel, &rate_sp, GRAVITY, true, &g2).0;
+        for _ in 0..50 { out = ctrl.step(&Vector3::zeros(), &accel, &rate_sp, GRAVITY, true, &g2).0; }
         let left = (out.motor_commands[2] + out.motor_commands[3]) / 2.0;
         let right = (out.motor_commands[0] + out.motor_commands[1]) / 2.0;
         assert!(left > right, "roll: left={left} should > right={right}");
@@ -463,7 +485,7 @@ mod tests {
         let mut ctrl = IndiController::new(&test_config(), LOOP_HZ);
         let (g, a, r, s) = hover_inputs();
         for _ in 0..50 {
-            let out = ctrl.step(&g, &a, &r, s, false, &[false; NU]);
+            let out = ctrl.step(&g, &a, &r, s, false, &[false; NU]).0;
             assert!(!out.nan_failsafe);
             for &c in &out.motor_commands { assert!(c.is_finite() && c >= 0.0 && c <= 1.0); }
         }
@@ -475,8 +497,8 @@ mod tests {
         let gyro = Vector3::zeros();
         let accel = Vector3::new(0.0, 0.0, GRAVITY);
         let g2 = [false; NU];
-        let out1 = ctrl.step(&gyro, &accel, &Vector3::zeros(), 2.0, false, &g2);
-        let out2 = ctrl.step(&gyro, &accel, &Vector3::zeros(), 2.0, false, &g2);
+        let out1 = ctrl.step(&gyro, &accel, &Vector3::zeros(), 2.0, false, &g2).0;
+        let out2 = ctrl.step(&gyro, &accel, &Vector3::zeros(), 2.0, false, &g2).0;
         for &c in &out1.motor_commands { assert!(c.is_finite() && c >= 0.0 && c <= 1.0); }
         for i in 0..NU {
             assert!((out1.motor_commands[i] - out2.motor_commands[i]).abs() < 0.1);
@@ -490,9 +512,9 @@ mod tests {
         let a = Vector3::new(0.0, 0.0, GRAVITY);
         let r = Vector3::zeros();
         let g2 = [false; NU];
-        for _ in 0..50 { ctrl.step(&g, &a, &r, 2.0, false, &g2); }
-        let ground = ctrl.step(&g, &a, &r, 2.0, false, &g2);
-        let air = ctrl.step(&g, &a, &r, GRAVITY, true, &g2);
+        for _ in 0..50 { ctrl.step(&g, &a, &r, 2.0, false, &g2).0; }
+        let ground = ctrl.step(&g, &a, &r, 2.0, false, &g2).0;
+        let air = ctrl.step(&g, &a, &r, GRAVITY, true, &g2).0;
         for i in 0..NU {
             assert!((air.motor_commands[i] - ground.motor_commands[i]).abs() < 0.5,
                 "takeoff spike motor {i}");
@@ -538,7 +560,7 @@ mod tests {
         let rate_sp = Vector3::new(10.0, 10.0, 0.0);
         let g2 = [false; NU];
         for _ in 0..100 {
-            let out = ctrl.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &g2);
+            let out = ctrl.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &g2).0;
             assert!(out.motor_commands[0] <= 0.8 + 1e-6, "M0 exceeded: {}", out.motor_commands[0]);
         }
     }
@@ -550,7 +572,7 @@ mod tests {
         let g2 = [false; NU];
         let mut prev = [0.0f32; NU];
         for step in 0..500 {
-            let out = ctrl.step(&g, &a, &r, s, true, &g2);
+            let out = ctrl.step(&g, &a, &r, s, true, &g2).0;
             let max_change = out.motor_commands.iter().zip(prev.iter())
                 .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
             if step > 100 && max_change < 1e-5 { return; }
@@ -564,11 +586,11 @@ mod tests {
         let mut ctrl = IndiController::new(&test_config(), LOOP_HZ);
         let a = Vector3::new(0.0, 0.0, GRAVITY);
         let g2 = [false; NU];
-        for _ in 0..100 { ctrl.step(&Vector3::zeros(), &a, &Vector3::zeros(), GRAVITY, true, &g2); }
-        let hover = ctrl.step(&Vector3::zeros(), &a, &Vector3::zeros(), GRAVITY, true, &g2);
+        for _ in 0..100 { ctrl.step(&Vector3::zeros(), &a, &Vector3::zeros(), GRAVITY, true, &g2).0; }
+        let hover = ctrl.step(&Vector3::zeros(), &a, &Vector3::zeros(), GRAVITY, true, &g2).0;
         let gyro = Vector3::new(100.0f32.to_radians(), 0.0, 0.0);
         let mut spin = hover;
-        for _ in 0..20 { spin = ctrl.step(&gyro, &a, &Vector3::zeros(), GRAVITY, true, &g2); }
+        for _ in 0..20 { spin = ctrl.step(&gyro, &a, &Vector3::zeros(), GRAVITY, true, &g2).0; }
         let diff = spin.motor_commands.iter().zip(hover.motor_commands.iter())
             .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(diff > 0.01, "gyro should change allocation: diff={diff}");
@@ -582,7 +604,7 @@ mod tests {
         // Settle until converged (filters + actuator state)
         let mut prev = [0.0f32; NU];
         for step in 0..1000 {
-            let out = ctrl.step(&g, &a, &r, s, true, &g2);
+            let out = ctrl.step(&g, &a, &r, s, true, &g2).0;
             let max_change = out.motor_commands.iter().zip(prev.iter())
                 .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
             prev = out.motor_commands;
@@ -594,7 +616,7 @@ mod tests {
         // Now check 10 subsequent outputs are nearly identical
         let mut outputs = Vec::new();
         for _ in 0..10 {
-            outputs.push(ctrl.step(&g, &a, &r, s, true, &g2).motor_commands);
+            outputs.push(ctrl.step(&g, &a, &r, s, true, &g2).0.motor_commands);
         }
         for i in 1..10 {
             let diff = outputs[i].iter().zip(outputs[i-1].iter())
@@ -620,7 +642,7 @@ mod tests {
         ];
         for (gyro, rate_sp, spf, armed) in cases {
             for _ in 0..50 {
-                let out = ctrl.step(gyro, &a, rate_sp, *spf, *armed, &g2);
+                let out = ctrl.step(gyro, &a, rate_sp, *spf, *armed, &g2).0;
                 for (i, &c) in out.motor_commands.iter().enumerate() {
                     assert!(c.is_finite() && c >= 0.0 && c <= 1.0, "motor {i} = {c}");
                 }
@@ -640,11 +662,11 @@ mod tests {
         let rate_sp = Vector3::new(0.0, 0.0, 3.0);
         for _ in 0..100 {
             ctrl_g2.update_rpm(&[RpmInput::Erpm(20000); NU]);
-            ctrl_g2.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]);
-            ctrl_no.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU]);
+            ctrl_g2.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]).0;
+            ctrl_no.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU]).0;
         }
-        let out_g2 = ctrl_g2.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]);
-        let out_no = ctrl_no.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU]);
+        let out_g2 = ctrl_g2.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]).0;
+        let out_no = ctrl_no.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU]).0;
         let diff = out_g2.motor_commands.iter().zip(out_no.motor_commands.iter())
             .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(diff > 1e-6, "G2 should affect allocation: diff={diff}");
@@ -674,12 +696,12 @@ mod tests {
         // Feed RPM to enable G2
         for _ in 0..100 {
             ctrl_g2.update_rpm(&[RpmInput::Erpm(20000); NU]);
-            ctrl_g2.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]);
-            ctrl_no.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU]);
+            ctrl_g2.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]).0;
+            ctrl_no.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU]).0;
         }
 
-        let out_g2 = ctrl_g2.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]);
-        let out_no = ctrl_no.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU]);
+        let out_g2 = ctrl_g2.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]).0;
+        let out_no = ctrl_no.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU]).0;
 
         // G2 should modify the allocation but not invert it.
         // CW motors (M0, M3) should still be higher than CCW for positive yaw.
@@ -703,7 +725,7 @@ mod tests {
         ctrl.update_rpm(&[RpmInput::Erpm(20000); NU]);
 
         // First step: establishes prev_du
-        ctrl.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]);
+        ctrl.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]).0;
 
         // Second step with G2 vs without G2: the omegaDot contribution to dv
         // should cause different outputs
@@ -714,12 +736,12 @@ mod tests {
 
         // Run both for enough steps to have meaningful prev_du
         for _ in 0..50 {
-            ctrl2_g2.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]);
-            ctrl2_no.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU]);
+            ctrl2_g2.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]).0;
+            ctrl2_no.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU]).0;
         }
 
-        let out_g2 = ctrl2_g2.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]);
-        let out_no = ctrl2_no.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU]);
+        let out_g2 = ctrl2_g2.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]).0;
+        let out_no = ctrl2_no.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU]).0;
 
         let diff = out_g2.motor_commands.iter().zip(out_no.motor_commands.iter())
             .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -738,9 +760,9 @@ mod tests {
 
         // All G2 active
         for _ in 0..100 {
-            ctrl.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]);
+            ctrl.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]).0;
         }
-        let out_all = ctrl.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]);
+        let out_all = ctrl.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU]).0;
 
         // Reset and run with M0 G2 disabled
         let mut ctrl2 = IndiController::new(&g2_config(), LOOP_HZ);
@@ -749,9 +771,9 @@ mod tests {
         g2_partial[0] = false;
 
         for _ in 0..100 {
-            ctrl2.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &g2_partial);
+            ctrl2.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &g2_partial).0;
         }
-        let out_partial = ctrl2.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &g2_partial);
+        let out_partial = ctrl2.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &g2_partial).0;
 
         // Outputs should differ (M0's G2 column removed changes allocation)
         let diff = out_all.motor_commands.iter().zip(out_partial.motor_commands.iter())

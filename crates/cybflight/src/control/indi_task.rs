@@ -308,7 +308,7 @@ pub async fn indi_task() {
         }
 
         // 6. INDI step (8 kHz) — uses bias-corrected gyro.
-        let output = indi.step(
+        let (output, _step_state) = indi.step(
             &gyro_corrected,
             &accel_corrected,
             &rate_ref,

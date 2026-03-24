@@ -17,7 +17,7 @@ use cybflight_core::{
     indi::{
         controller::{IndiConfig, IndiController, NU},
         effectiveness::IndiMotorParams,
-        learner::{Learner, LearnerConfig, LearnerInput},
+        learner::{Learner, LearnerConfig, LearnerInput, LearnedParams},
         rpm_tracker::RpmInput,
     },
     position_control::{self, pd_ff_control},
@@ -36,6 +36,13 @@ use crate::{
     sensors::{DSHOT_TELEMETRY, IMU_1, VEHICLE_ODOMETRY},
     vehicle::{QUADROTOR_BODY, QUADROTOR_MOTORS},
 };
+
+/// Pending learned params to save to flash. Signaled on disarm, consumed
+/// when the task has idle time (disarmed, not in the 8kHz critical loop).
+static LEARNED_PARAMS_PENDING: embassy_sync::signal::Signal<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    LearnedParams,
+> = embassy_sync::signal::Signal::new();
 
 /// Default INDI motor parameters.
 const INDI_MOTOR_PARAMS: [IndiMotorParams; NU] = [
@@ -221,9 +228,11 @@ pub async fn indi_task() {
         // Arming state — read from atomic (set by DShot task, single source of truth)
         let armed = crate::motors::IS_ARMED.load(core::sync::atomic::Ordering::Acquire);
 
-        // Save learned params to flash on disarm transition (if learning was active).
+        // On disarm transition, snapshot learned params for deferred flash save.
+        // The actual flash write is deferred to avoid stalling the 8kHz loop
+        // (flash erase blocks the CPU for ~1-2 seconds on same-bank STM32H7).
         if was_armed && !armed && learner.samples() > 0 {
-            let learned = learner.update(&LearnerInput {
+            let snap = learner.update(&LearnerInput {
                 rate_rad_s: gyro_corrected,
                 rate_dot_rad_s2: nalgebra::Vector3::zeros(),
                 spf_m_s2: accel_corrected,
@@ -232,11 +241,11 @@ pub async fn indi_task() {
                 armed: false,
                 touching_ground: true,
             });
-            if learned.valid {
-                match crate::params::save_learned_to_flash(&learned) {
-                    Ok(()) => defmt::info!("INDI: saved learned G1/G2 to flash"),
-                    Err(e) => defmt::warn!("INDI: failed to save learned params: {}", e),
-                }
+            if snap.valid {
+                // Signal the deferred save. The flash write happens outside the
+                // control loop — either via a low-priority task or the next time
+                // the INDI task is idle (waiting for ESKF convergence on rearm).
+                LEARNED_PARAMS_PENDING.signal(snap);
             }
         }
         was_armed = armed;
@@ -340,6 +349,18 @@ pub async fn indi_task() {
         //    INDI can't produce meaningful output without recent state feedback.
         if armed && !odom_fresh {
             continue;
+        }
+
+        // 5b. Deferred flash save: write learned params when disarmed.
+        //     The flash erase blocks the CPU for ~1-2s (same-bank STM32H7).
+        //     Safe here because motors are stopped and no control is needed.
+        if !armed {
+            if let Some(pending) = LEARNED_PARAMS_PENDING.try_take() {
+                match crate::params::save_learned_to_flash(&pending) {
+                    Ok(()) => defmt::info!("INDI: saved learned G1/G2 to flash"),
+                    Err(e) => defmt::warn!("INDI: failed to save learned params: {}", e),
+                }
+            }
         }
 
         // 6. INDI step (8 kHz) — uses bias-corrected gyro.

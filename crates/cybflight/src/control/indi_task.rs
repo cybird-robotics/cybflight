@@ -110,6 +110,16 @@ pub async fn indi_task() {
     let learner_config = LearnerConfig::default();
     let mut learner = Learner::new(&learner_config, loop_rate_hz);
 
+    // Load previously learned params from flash (if available) and apply.
+    if let Some(saved_learned) = crate::params::load_learned_from_flash() {
+        if indi.apply_learned_params(&saved_learned) {
+            defmt::info!("INDI: loaded learned G1/G2 from flash");
+        }
+    }
+
+    // Track whether we need to save learned params on disarm
+    let mut was_armed = false;
+
     // --- Position + attitude controllers (gains from params, same as inner_loop) ---
     let params = crate::params::get();
     let g = &params.control;
@@ -210,6 +220,26 @@ pub async fn indi_task() {
         // 2. Non-blocking reads of other channels.
         // Arming state — read from atomic (set by DShot task, single source of truth)
         let armed = crate::motors::IS_ARMED.load(core::sync::atomic::Ordering::Acquire);
+
+        // Save learned params to flash on disarm transition (if learning was active).
+        if was_armed && !armed && learner.samples() > 0 {
+            let learned = learner.update(&LearnerInput {
+                rate_rad_s: gyro_corrected,
+                rate_dot_rad_s2: nalgebra::Vector3::zeros(),
+                spf_m_s2: accel_corrected,
+                omega_rad_s: [0.0; NU],
+                d_commands: [0.0; NU],
+                armed: false,
+                touching_ground: true,
+            });
+            if learned.valid {
+                match crate::params::save_learned_to_flash(&learned) {
+                    Ok(()) => defmt::info!("INDI: saved learned G1/G2 to flash"),
+                    Err(e) => defmt::warn!("INDI: failed to save learned params: {}", e),
+                }
+            }
+        }
+        was_armed = armed;
 
         // DShot telemetry (RPM)
         // When a new DShot frame arrives, update the per-motor estimators with

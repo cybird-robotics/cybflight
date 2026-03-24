@@ -20,10 +20,11 @@ use cybflight_core::{
         learner::{Learner, LearnerConfig, LearnerInput, LearnedParams},
         rpm_tracker::RpmInput,
     },
+    params::IndiEffectivenessParams,
     position_control::{self, pd_ff_control},
 };
 use embassy_time::{Duration, Instant};
-use nalgebra::{Matrix2, UnitQuaternion, Vector3};
+use nalgebra::{Matrix2, SMatrix, UnitQuaternion, Vector3};
 
 use crate::estimation::rpm_estimator::{
     NormalizedThrottle as EstNormalizedThrottle, RpmEstimator, RpmEstimatorConfigBuilder,
@@ -37,13 +38,6 @@ use crate::{
     vehicle::{QUADROTOR_BODY, QUADROTOR_MOTORS},
 };
 
-/// Pending learned params to save to flash. Signaled on disarm, consumed
-/// when the task has idle time (disarmed, not in the 8kHz critical loop).
-static LEARNED_PARAMS_PENDING: embassy_sync::signal::Signal<
-    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
-    LearnedParams,
-> = embassy_sync::signal::Signal::new();
-
 /// Default INDI motor parameters.
 const INDI_MOTOR_PARAMS: [IndiMotorParams; NU] = [
     IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 },
@@ -51,6 +45,70 @@ const INDI_MOTOR_PARAMS: [IndiMotorParams; NU] = [
     IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 },
     IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 },
 ];
+
+/// Convert `IndiEffectivenessParams` to a `LearnedParams` that the INDI
+/// controller can consume. Returns `None` if all values are zero (meaning
+/// "use geometric fallback").
+fn learned_from_indi_params(p: &IndiEffectivenessParams) -> Option<LearnedParams> {
+    // All-zero check: if nothing is configured, signal "no saved params".
+    let all_zero = p.g1_force.iter().flatten().chain(p.g1_torque.iter().flatten())
+        .chain(p.g2.iter().flatten())
+        .chain(p.max_omega.iter())
+        .chain(p.time_const_s.iter())
+        .chain(p.nonlinearity.iter())
+        .all(|&v| v == 0.0);
+    if all_zero {
+        return None;
+    }
+
+    let mut g1 = SMatrix::<f32, 6, NU>::zeros();
+    for col in 0..NU {
+        g1[(0, col)] = p.g1_force[col][0]; // fx
+        g1[(1, col)] = p.g1_force[col][1]; // fy
+        g1[(2, col)] = p.g1_force[col][2]; // fz
+        g1[(3, col)] = p.g1_torque[col][0]; // roll
+        g1[(4, col)] = p.g1_torque[col][1]; // pitch
+        g1[(5, col)] = p.g1_torque[col][2]; // yaw
+    }
+    let mut g2 = SMatrix::<f32, 3, NU>::zeros();
+    for col in 0..NU {
+        g2[(0, col)] = p.g2[col][0]; // roll
+        g2[(1, col)] = p.g2[col][1]; // pitch
+        g2[(2, col)] = p.g2[col][2]; // yaw
+    }
+
+    Some(LearnedParams {
+        g1,
+        g2,
+        max_omega: p.max_omega,
+        time_const_s: p.time_const_s,
+        nonlinearity: p.nonlinearity,
+        rate_gain: 0.0, // will be recomputed by controller if needed
+        attitude_gain: 0.0,
+        valid: true,
+    })
+}
+
+/// Write learned parameters back into the in-memory vehicle params.
+fn write_learned_to_params(learned: &LearnedParams) {
+    let mut params = crate::params::get();
+    let ie = &mut params.indi_effectiveness;
+    for col in 0..NU {
+        ie.g1_force[col][0] = learned.g1[(0, col)];
+        ie.g1_force[col][1] = learned.g1[(1, col)];
+        ie.g1_force[col][2] = learned.g1[(2, col)];
+        ie.g1_torque[col][0] = learned.g1[(3, col)];
+        ie.g1_torque[col][1] = learned.g1[(4, col)];
+        ie.g1_torque[col][2] = learned.g1[(5, col)];
+        ie.g2[col][0] = learned.g2[(0, col)];
+        ie.g2[col][1] = learned.g2[(1, col)];
+        ie.g2[col][2] = learned.g2[(2, col)];
+    }
+    ie.max_omega = learned.max_omega;
+    ie.time_const_s = learned.time_const_s;
+    ie.nonlinearity = learned.nonlinearity;
+    crate::params::set(params);
+}
 
 fn extract_yaw(q: &UnitQuaternion<f32>) -> f32 {
     let (_roll, _pitch, yaw) = q.euler_angles();
@@ -117,18 +175,18 @@ pub async fn indi_task() {
     let learner_config = LearnerConfig::default();
     let mut learner = Learner::new(&learner_config, loop_rate_hz);
 
-    // Load previously learned params from flash (if available) and apply.
-    if let Some(saved_learned) = crate::params::load_learned_from_flash() {
+    // --- Position + attitude controllers (gains from params, same as inner_loop) ---
+    let params = crate::params::get();
+
+    // Load previously saved INDI effectiveness from vehicle params (if non-zero).
+    if let Some(saved_learned) = learned_from_indi_params(&params.indi_effectiveness) {
         if indi.apply_learned_params(&saved_learned) {
-            defmt::info!("INDI: loaded learned G1/G2 from flash");
+            defmt::info!("INDI: loaded learned G1/G2 from params");
         }
     }
 
     // Track whether we need to save learned params on disarm
     let mut was_armed = false;
-
-    // --- Position + attitude controllers (gains from params, same as inner_loop) ---
-    let params = crate::params::get();
     let g = &params.control;
     let pc = pd_ff_control::PositionController::new(
         Vector3::new(g.pos_kp[0], g.pos_kp[1], g.pos_kp[2]),
@@ -228,9 +286,9 @@ pub async fn indi_task() {
         // Arming state — read from atomic (set by DShot task, single source of truth)
         let armed = crate::motors::IS_ARMED.load(core::sync::atomic::Ordering::Acquire);
 
-        // On disarm transition, snapshot learned params for deferred flash save.
-        // The actual flash write is deferred to avoid stalling the 8kHz loop
-        // (flash erase blocks the CPU for ~1-2 seconds on same-bank STM32H7).
+        // On disarm transition, snapshot learned params and write to in-memory
+        // vehicle params. The user can persist to flash via `param save` in the
+        // shell (no more automatic sector-6 writes).
         if was_armed && !armed && learner.samples() > 0 {
             let snap = learner.update(&LearnerInput {
                 rate_rad_s: gyro_corrected,
@@ -242,10 +300,8 @@ pub async fn indi_task() {
                 touching_ground: true,
             });
             if snap.valid {
-                // Signal the deferred save. The flash write happens outside the
-                // control loop — either via a low-priority task or the next time
-                // the INDI task is idle (waiting for ESKF convergence on rearm).
-                LEARNED_PARAMS_PENDING.signal(snap);
+                write_learned_to_params(&snap);
+                defmt::info!("INDI: saved learned G1/G2 to params (use `param save` to persist)");
             }
         }
         was_armed = armed;
@@ -351,17 +407,9 @@ pub async fn indi_task() {
             continue;
         }
 
-        // 5b. Deferred flash save: write learned params when disarmed.
-        //     The flash erase blocks the CPU for ~1-2s (same-bank STM32H7).
-        //     Safe here because motors are stopped and no control is needed.
-        if !armed {
-            if let Some(pending) = LEARNED_PARAMS_PENDING.try_take() {
-                match crate::params::save_learned_to_flash(&pending) {
-                    Ok(()) => defmt::info!("INDI: saved learned G1/G2 to flash"),
-                    Err(e) => defmt::warn!("INDI: failed to save learned params: {}", e),
-                }
-            }
-        }
+        // 5b. (Learned params are now written to in-memory VehicleParams on
+        //     disarm — no separate flash sector needed. The user can `param save`
+        //     via the shell to persist to flash.)
 
         // 6. INDI step (8 kHz) — uses bias-corrected gyro.
         let (output, step_state) = indi.step(

@@ -26,9 +26,6 @@ use crate::hal;
 /// Absolute address of the parameter sector in flash (sector 7, 0x0E0000).
 const PARAM_FLASH_ADDR: u32 = 0x0800_0000 + 0x0E_0000;
 
-/// Learned params stored in sector 6 (0x0C0000), separate from vehicle params.
-const LEARNED_FLASH_ADDR: u32 = 0x0800_0000 + 0x0C_0000;
-
 static VEHICLE_PARAMS: Mutex<RefCell<Option<VehicleParams>>> = Mutex::new(RefCell::new(None));
 
 /// Flash peripheral stored for later save operations (blocking mode).
@@ -113,53 +110,6 @@ pub fn save_to_flash() -> Result<(), &'static str> {
     crate::watchdog::restore_timeout();
 
     // Return flash peripheral to the static (short critical section).
-    critical_section::with(|cs| {
-        FLASH_PERI.borrow_ref_mut(cs).replace(flash);
-    });
-
-    result
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Learned parameters persistence (sector 6)
-// ═══════════════════════════════════════════════════════════════════════════
-
-use cybflight_core::indi::learner::{LearnedParams, LEARNED_PADDED_SIZE};
-
-/// Load learned parameters from flash sector 6. Returns `None` if not present
-/// or corrupt.
-pub fn load_learned_from_flash() -> Option<LearnedParams> {
-    let buf: &[u8; LEARNED_PADDED_SIZE] =
-        unsafe { &*(LEARNED_FLASH_ADDR as *const [u8; LEARNED_PADDED_SIZE]) };
-    LearnedParams::from_bytes(buf)
-}
-
-/// Save learned parameters to flash sector 6.
-///
-/// Same watchdog considerations as `save_to_flash` — extends IWDG timeout
-/// for the duration of the erase.
-pub fn save_learned_to_flash(learned: &LearnedParams) -> Result<(), &'static str> {
-    let data = learned.to_bytes();
-
-    let mut flash = critical_section::with(|cs| FLASH_PERI.borrow_ref_mut(cs).take())
-        .ok_or("flash not initialized")?;
-
-    let sector_offset = LEARNED_FLASH_ADDR - 0x0800_0000;
-    let sector_end = sector_offset + 128 * 1024;
-
-    crate::watchdog::extend_timeout();
-
-    let result = flash
-        .blocking_erase(sector_offset, sector_end)
-        .map_err(|_| "learned flash erase failed")
-        .and_then(|()| {
-            flash
-                .blocking_write(sector_offset, &data)
-                .map_err(|_| "learned flash write failed")
-        });
-
-    crate::watchdog::restore_timeout();
-
     critical_section::with(|cs| {
         FLASH_PERI.borrow_ref_mut(cs).replace(flash);
     });

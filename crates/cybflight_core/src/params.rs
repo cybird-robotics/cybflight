@@ -1,28 +1,29 @@
 //! Persistent vehicle parameter container with manual serialization.
 //!
-//! On-flash layout (little-endian, 160 bytes, aligned to 32-byte flash words):
+//! On-flash layout (little-endian, 416 bytes, aligned to 32-byte flash words):
 //!
 //! ```text
-//! [0x00] magic:   u32 = 0x43594250 ("CYBP")
-//! [0x04] version: u32 = 1
-//! [0x08] length:  u32 = PAYLOAD_SIZE (136)
-//! [0x0C] crc32:   u32 (over payload only)
-//! [0x10] payload: 136 bytes
-//! [0x98] padding: 8 bytes (zeros)
+//! [0x00]  magic:   u32 = 0x43594250 ("CYBP")
+//! [0x04]  version: u32 = 4
+//! [0x08]  length:  u32 = PAYLOAD_SIZE (384)
+//! [0x0C]  crc32:   u32 (over payload only)
+//! [0x10]  payload: 384 bytes
+//! [0x190] padding: 16 bytes (zeros)
 //! ```
 
 use crate::mixer::{MotorParams, RigidBodyParams, SpinDir};
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
 /// Body: mass(4) + inertia(9*4=36) = 40 bytes
 /// Motor: px(4) + py(4) + spin_dir(4) + max_thrust(4) + torque_coeff(4) = 20 bytes each
-/// Control: pos_kp(12) + pos_kd(12) + att_k_rate(12) + rate_roll(12) + rate_pitch(12) + rate_yaw(12) = 72 bytes
-/// Total payload: 40 + 4*20 + 72 = 192 bytes
-const PAYLOAD_SIZE: usize = 192;
-/// Padded to 32-byte flash word boundary: ceil((16+192)/32)*32 = 224
-pub const PADDED_SIZE: usize = 224;
+/// Control: pos_kp(12) + pos_kd(12) + att_k_rate(12) + rate_kp(12) + rate_ki(12) + rate_kd(12) = 72 bytes
+/// INDI: g1_force(48) + g1_torque(48) + g2(48) + max_omega(16) + time_const(16) + nonlinearity(16) = 192 bytes
+/// Total payload: 40 + 4*20 + 72 + 192 = 384 bytes
+const PAYLOAD_SIZE: usize = 384;
+/// Padded to 32-byte flash word boundary: ceil((16+384)/32)*32 = 416
+pub const PADDED_SIZE: usize = 416;
 
 /// PID gain triplet.
 #[derive(Clone, Copy, Debug)]
@@ -62,12 +63,46 @@ impl ControlGains {
     }
 }
 
+/// INDI effectiveness parameters (learned or manually configured).
+/// G1 is stored per-motor, per-axis. G2 is per-motor, torque-axes only.
+///
+/// Default is all zeros, meaning "not configured / use geometric fallback".
+#[derive(Clone, Debug)]
+pub struct IndiEffectivenessParams {
+    /// G1 force effectiveness per motor [fx, fy, fz] -- 4 motors x 3 axes = 12 values
+    pub g1_force: [[f32; 3]; 4],
+    /// G1 torque effectiveness per motor [roll, pitch, yaw] -- 4 motors x 3 axes = 12 values
+    pub g1_torque: [[f32; 3]; 4],
+    /// G2 gyroscopic coupling per motor [roll, pitch, yaw] -- 4 motors x 3 axes = 12 values
+    pub g2: [[f32; 3]; 4],
+    /// Motor max speed per motor (rad/s) -- 4 values
+    pub max_omega: [f32; 4],
+    /// Motor time constant per motor (seconds) -- 4 values
+    pub time_const_s: [f32; 4],
+    /// Motor nonlinearity per motor [0,1] -- 4 values
+    pub nonlinearity: [f32; 4],
+}
+
+impl Default for IndiEffectivenessParams {
+    fn default() -> Self {
+        Self {
+            g1_force: [[0.0; 3]; 4],
+            g1_torque: [[0.0; 3]; 4],
+            g2: [[0.0; 3]; 4],
+            max_omega: [0.0; 4],
+            time_const_s: [0.0; 4],
+            nonlinearity: [0.0; 4],
+        }
+    }
+}
+
 /// Full vehicle parameter set.
 #[derive(Clone, Debug)]
 pub struct VehicleParams {
     pub body: RigidBodyParams,
     pub motors: [MotorParams; 4],
     pub control: ControlGains,
+    pub indi_effectiveness: IndiEffectivenessParams,
 }
 
 impl VehicleParams {
@@ -110,6 +145,31 @@ impl VehicleParams {
             off = put_f32(&mut buf, off, v);
         }
         for &v in &self.control.rate_kd {
+            off = put_f32(&mut buf, off, v);
+        }
+        // INDI effectiveness
+        for m in &self.indi_effectiveness.g1_force {
+            for &v in m {
+                off = put_f32(&mut buf, off, v);
+            }
+        }
+        for m in &self.indi_effectiveness.g1_torque {
+            for &v in m {
+                off = put_f32(&mut buf, off, v);
+            }
+        }
+        for m in &self.indi_effectiveness.g2 {
+            for &v in m {
+                off = put_f32(&mut buf, off, v);
+            }
+        }
+        for &v in &self.indi_effectiveness.max_omega {
+            off = put_f32(&mut buf, off, v);
+        }
+        for &v in &self.indi_effectiveness.time_const_s {
+            off = put_f32(&mut buf, off, v);
+        }
+        for &v in &self.indi_effectiveness.nonlinearity {
             off = put_f32(&mut buf, off, v);
         }
         debug_assert_eq!(off - HEADER_SIZE, PAYLOAD_SIZE);
@@ -219,10 +279,57 @@ impl VehicleParams {
             rate_kd,
         };
 
+        // INDI effectiveness
+        let mut g1_force = [[0.0f32; 3]; 4];
+        for m in &mut g1_force {
+            for slot in m.iter_mut() {
+                *slot = get_f32(buf, off);
+                off += 4;
+            }
+        }
+        let mut g1_torque = [[0.0f32; 3]; 4];
+        for m in &mut g1_torque {
+            for slot in m.iter_mut() {
+                *slot = get_f32(buf, off);
+                off += 4;
+            }
+        }
+        let mut g2 = [[0.0f32; 3]; 4];
+        for m in &mut g2 {
+            for slot in m.iter_mut() {
+                *slot = get_f32(buf, off);
+                off += 4;
+            }
+        }
+        let mut max_omega = [0.0f32; 4];
+        for slot in &mut max_omega {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let mut time_const_s = [0.0f32; 4];
+        for slot in &mut time_const_s {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let mut nonlinearity = [0.0f32; 4];
+        for slot in &mut nonlinearity {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let indi_effectiveness = IndiEffectivenessParams {
+            g1_force,
+            g1_torque,
+            g2,
+            max_omega,
+            time_const_s,
+            nonlinearity,
+        };
+
         Some(VehicleParams {
             body,
             motors,
             control,
+            indi_effectiveness,
         })
     }
 
@@ -277,6 +384,58 @@ impl VehicleParams {
             ParamKey::RateKdR => self.control.rate_kd[0],
             ParamKey::RateKdP => self.control.rate_kd[1],
             ParamKey::RateKdY => self.control.rate_kd[2],
+            // INDI effectiveness — G1 force
+            ParamKey::G1FxM0 => self.indi_effectiveness.g1_force[0][0],
+            ParamKey::G1FxM1 => self.indi_effectiveness.g1_force[1][0],
+            ParamKey::G1FxM2 => self.indi_effectiveness.g1_force[2][0],
+            ParamKey::G1FxM3 => self.indi_effectiveness.g1_force[3][0],
+            ParamKey::G1FyM0 => self.indi_effectiveness.g1_force[0][1],
+            ParamKey::G1FyM1 => self.indi_effectiveness.g1_force[1][1],
+            ParamKey::G1FyM2 => self.indi_effectiveness.g1_force[2][1],
+            ParamKey::G1FyM3 => self.indi_effectiveness.g1_force[3][1],
+            ParamKey::G1FzM0 => self.indi_effectiveness.g1_force[0][2],
+            ParamKey::G1FzM1 => self.indi_effectiveness.g1_force[1][2],
+            ParamKey::G1FzM2 => self.indi_effectiveness.g1_force[2][2],
+            ParamKey::G1FzM3 => self.indi_effectiveness.g1_force[3][2],
+            // INDI effectiveness — G1 torque
+            ParamKey::G1RrM0 => self.indi_effectiveness.g1_torque[0][0],
+            ParamKey::G1RrM1 => self.indi_effectiveness.g1_torque[1][0],
+            ParamKey::G1RrM2 => self.indi_effectiveness.g1_torque[2][0],
+            ParamKey::G1RrM3 => self.indi_effectiveness.g1_torque[3][0],
+            ParamKey::G1RpM0 => self.indi_effectiveness.g1_torque[0][1],
+            ParamKey::G1RpM1 => self.indi_effectiveness.g1_torque[1][1],
+            ParamKey::G1RpM2 => self.indi_effectiveness.g1_torque[2][1],
+            ParamKey::G1RpM3 => self.indi_effectiveness.g1_torque[3][1],
+            ParamKey::G1RyM0 => self.indi_effectiveness.g1_torque[0][2],
+            ParamKey::G1RyM1 => self.indi_effectiveness.g1_torque[1][2],
+            ParamKey::G1RyM2 => self.indi_effectiveness.g1_torque[2][2],
+            ParamKey::G1RyM3 => self.indi_effectiveness.g1_torque[3][2],
+            // INDI effectiveness — G2
+            ParamKey::G2RrM0 => self.indi_effectiveness.g2[0][0],
+            ParamKey::G2RrM1 => self.indi_effectiveness.g2[1][0],
+            ParamKey::G2RrM2 => self.indi_effectiveness.g2[2][0],
+            ParamKey::G2RrM3 => self.indi_effectiveness.g2[3][0],
+            ParamKey::G2RpM0 => self.indi_effectiveness.g2[0][1],
+            ParamKey::G2RpM1 => self.indi_effectiveness.g2[1][1],
+            ParamKey::G2RpM2 => self.indi_effectiveness.g2[2][1],
+            ParamKey::G2RpM3 => self.indi_effectiveness.g2[3][1],
+            ParamKey::G2RyM0 => self.indi_effectiveness.g2[0][2],
+            ParamKey::G2RyM1 => self.indi_effectiveness.g2[1][2],
+            ParamKey::G2RyM2 => self.indi_effectiveness.g2[2][2],
+            ParamKey::G2RyM3 => self.indi_effectiveness.g2[3][2],
+            // INDI motor dynamics
+            ParamKey::IndiOmegaM0 => self.indi_effectiveness.max_omega[0],
+            ParamKey::IndiOmegaM1 => self.indi_effectiveness.max_omega[1],
+            ParamKey::IndiOmegaM2 => self.indi_effectiveness.max_omega[2],
+            ParamKey::IndiOmegaM3 => self.indi_effectiveness.max_omega[3],
+            ParamKey::IndiTauM0 => self.indi_effectiveness.time_const_s[0],
+            ParamKey::IndiTauM1 => self.indi_effectiveness.time_const_s[1],
+            ParamKey::IndiTauM2 => self.indi_effectiveness.time_const_s[2],
+            ParamKey::IndiTauM3 => self.indi_effectiveness.time_const_s[3],
+            ParamKey::IndiNonlinM0 => self.indi_effectiveness.nonlinearity[0],
+            ParamKey::IndiNonlinM1 => self.indi_effectiveness.nonlinearity[1],
+            ParamKey::IndiNonlinM2 => self.indi_effectiveness.nonlinearity[2],
+            ParamKey::IndiNonlinM3 => self.indi_effectiveness.nonlinearity[3],
         }
     }
 
@@ -355,6 +514,58 @@ impl VehicleParams {
             ParamKey::RateKdR => self.control.rate_kd[0] = val,
             ParamKey::RateKdP => self.control.rate_kd[1] = val,
             ParamKey::RateKdY => self.control.rate_kd[2] = val,
+            // INDI effectiveness — G1 force
+            ParamKey::G1FxM0 => self.indi_effectiveness.g1_force[0][0] = val,
+            ParamKey::G1FxM1 => self.indi_effectiveness.g1_force[1][0] = val,
+            ParamKey::G1FxM2 => self.indi_effectiveness.g1_force[2][0] = val,
+            ParamKey::G1FxM3 => self.indi_effectiveness.g1_force[3][0] = val,
+            ParamKey::G1FyM0 => self.indi_effectiveness.g1_force[0][1] = val,
+            ParamKey::G1FyM1 => self.indi_effectiveness.g1_force[1][1] = val,
+            ParamKey::G1FyM2 => self.indi_effectiveness.g1_force[2][1] = val,
+            ParamKey::G1FyM3 => self.indi_effectiveness.g1_force[3][1] = val,
+            ParamKey::G1FzM0 => self.indi_effectiveness.g1_force[0][2] = val,
+            ParamKey::G1FzM1 => self.indi_effectiveness.g1_force[1][2] = val,
+            ParamKey::G1FzM2 => self.indi_effectiveness.g1_force[2][2] = val,
+            ParamKey::G1FzM3 => self.indi_effectiveness.g1_force[3][2] = val,
+            // INDI effectiveness — G1 torque
+            ParamKey::G1RrM0 => self.indi_effectiveness.g1_torque[0][0] = val,
+            ParamKey::G1RrM1 => self.indi_effectiveness.g1_torque[1][0] = val,
+            ParamKey::G1RrM2 => self.indi_effectiveness.g1_torque[2][0] = val,
+            ParamKey::G1RrM3 => self.indi_effectiveness.g1_torque[3][0] = val,
+            ParamKey::G1RpM0 => self.indi_effectiveness.g1_torque[0][1] = val,
+            ParamKey::G1RpM1 => self.indi_effectiveness.g1_torque[1][1] = val,
+            ParamKey::G1RpM2 => self.indi_effectiveness.g1_torque[2][1] = val,
+            ParamKey::G1RpM3 => self.indi_effectiveness.g1_torque[3][1] = val,
+            ParamKey::G1RyM0 => self.indi_effectiveness.g1_torque[0][2] = val,
+            ParamKey::G1RyM1 => self.indi_effectiveness.g1_torque[1][2] = val,
+            ParamKey::G1RyM2 => self.indi_effectiveness.g1_torque[2][2] = val,
+            ParamKey::G1RyM3 => self.indi_effectiveness.g1_torque[3][2] = val,
+            // INDI effectiveness — G2
+            ParamKey::G2RrM0 => self.indi_effectiveness.g2[0][0] = val,
+            ParamKey::G2RrM1 => self.indi_effectiveness.g2[1][0] = val,
+            ParamKey::G2RrM2 => self.indi_effectiveness.g2[2][0] = val,
+            ParamKey::G2RrM3 => self.indi_effectiveness.g2[3][0] = val,
+            ParamKey::G2RpM0 => self.indi_effectiveness.g2[0][1] = val,
+            ParamKey::G2RpM1 => self.indi_effectiveness.g2[1][1] = val,
+            ParamKey::G2RpM2 => self.indi_effectiveness.g2[2][1] = val,
+            ParamKey::G2RpM3 => self.indi_effectiveness.g2[3][1] = val,
+            ParamKey::G2RyM0 => self.indi_effectiveness.g2[0][2] = val,
+            ParamKey::G2RyM1 => self.indi_effectiveness.g2[1][2] = val,
+            ParamKey::G2RyM2 => self.indi_effectiveness.g2[2][2] = val,
+            ParamKey::G2RyM3 => self.indi_effectiveness.g2[3][2] = val,
+            // INDI motor dynamics
+            ParamKey::IndiOmegaM0 => self.indi_effectiveness.max_omega[0] = val,
+            ParamKey::IndiOmegaM1 => self.indi_effectiveness.max_omega[1] = val,
+            ParamKey::IndiOmegaM2 => self.indi_effectiveness.max_omega[2] = val,
+            ParamKey::IndiOmegaM3 => self.indi_effectiveness.max_omega[3] = val,
+            ParamKey::IndiTauM0 => self.indi_effectiveness.time_const_s[0] = val,
+            ParamKey::IndiTauM1 => self.indi_effectiveness.time_const_s[1] = val,
+            ParamKey::IndiTauM2 => self.indi_effectiveness.time_const_s[2] = val,
+            ParamKey::IndiTauM3 => self.indi_effectiveness.time_const_s[3] = val,
+            ParamKey::IndiNonlinM0 => self.indi_effectiveness.nonlinearity[0] = val,
+            ParamKey::IndiNonlinM1 => self.indi_effectiveness.nonlinearity[1] = val,
+            ParamKey::IndiNonlinM2 => self.indi_effectiveness.nonlinearity[2] = val,
+            ParamKey::IndiNonlinM3 => self.indi_effectiveness.nonlinearity[3] = val,
         }
     }
 }
@@ -413,6 +624,58 @@ pub enum ParamKey {
     RateKdR,
     RateKdP,
     RateKdY,
+    // INDI effectiveness — G1 force [fx, fy, fz] per motor
+    G1FxM0,
+    G1FxM1,
+    G1FxM2,
+    G1FxM3,
+    G1FyM0,
+    G1FyM1,
+    G1FyM2,
+    G1FyM3,
+    G1FzM0,
+    G1FzM1,
+    G1FzM2,
+    G1FzM3,
+    // INDI effectiveness — G1 torque [roll, pitch, yaw] per motor
+    G1RrM0,
+    G1RrM1,
+    G1RrM2,
+    G1RrM3,
+    G1RpM0,
+    G1RpM1,
+    G1RpM2,
+    G1RpM3,
+    G1RyM0,
+    G1RyM1,
+    G1RyM2,
+    G1RyM3,
+    // INDI effectiveness — G2 [roll, pitch, yaw] per motor
+    G2RrM0,
+    G2RrM1,
+    G2RrM2,
+    G2RrM3,
+    G2RpM0,
+    G2RpM1,
+    G2RpM2,
+    G2RpM3,
+    G2RyM0,
+    G2RyM1,
+    G2RyM2,
+    G2RyM3,
+    // INDI motor dynamics
+    IndiOmegaM0,
+    IndiOmegaM1,
+    IndiOmegaM2,
+    IndiOmegaM3,
+    IndiTauM0,
+    IndiTauM1,
+    IndiTauM2,
+    IndiTauM3,
+    IndiNonlinM0,
+    IndiNonlinM1,
+    IndiNonlinM2,
+    IndiNonlinM3,
 }
 
 /// All parameter keys in order, for iteration.
@@ -465,6 +728,58 @@ pub const ALL_KEYS: &[ParamKey] = &[
     ParamKey::RateKdR,
     ParamKey::RateKdP,
     ParamKey::RateKdY,
+    // INDI effectiveness — G1 force
+    ParamKey::G1FxM0,
+    ParamKey::G1FxM1,
+    ParamKey::G1FxM2,
+    ParamKey::G1FxM3,
+    ParamKey::G1FyM0,
+    ParamKey::G1FyM1,
+    ParamKey::G1FyM2,
+    ParamKey::G1FyM3,
+    ParamKey::G1FzM0,
+    ParamKey::G1FzM1,
+    ParamKey::G1FzM2,
+    ParamKey::G1FzM3,
+    // INDI effectiveness — G1 torque
+    ParamKey::G1RrM0,
+    ParamKey::G1RrM1,
+    ParamKey::G1RrM2,
+    ParamKey::G1RrM3,
+    ParamKey::G1RpM0,
+    ParamKey::G1RpM1,
+    ParamKey::G1RpM2,
+    ParamKey::G1RpM3,
+    ParamKey::G1RyM0,
+    ParamKey::G1RyM1,
+    ParamKey::G1RyM2,
+    ParamKey::G1RyM3,
+    // INDI effectiveness — G2
+    ParamKey::G2RrM0,
+    ParamKey::G2RrM1,
+    ParamKey::G2RrM2,
+    ParamKey::G2RrM3,
+    ParamKey::G2RpM0,
+    ParamKey::G2RpM1,
+    ParamKey::G2RpM2,
+    ParamKey::G2RpM3,
+    ParamKey::G2RyM0,
+    ParamKey::G2RyM1,
+    ParamKey::G2RyM2,
+    ParamKey::G2RyM3,
+    // INDI motor dynamics
+    ParamKey::IndiOmegaM0,
+    ParamKey::IndiOmegaM1,
+    ParamKey::IndiOmegaM2,
+    ParamKey::IndiOmegaM3,
+    ParamKey::IndiTauM0,
+    ParamKey::IndiTauM1,
+    ParamKey::IndiTauM2,
+    ParamKey::IndiTauM3,
+    ParamKey::IndiNonlinM0,
+    ParamKey::IndiNonlinM1,
+    ParamKey::IndiNonlinM2,
+    ParamKey::IndiNonlinM3,
 ];
 
 impl ParamKey {
@@ -519,6 +834,58 @@ impl ParamKey {
             "rate_kd_r" => Some(Self::RateKdR),
             "rate_kd_p" => Some(Self::RateKdP),
             "rate_kd_y" => Some(Self::RateKdY),
+            // INDI effectiveness — G1 force
+            "g1_fx_m0" => Some(Self::G1FxM0),
+            "g1_fx_m1" => Some(Self::G1FxM1),
+            "g1_fx_m2" => Some(Self::G1FxM2),
+            "g1_fx_m3" => Some(Self::G1FxM3),
+            "g1_fy_m0" => Some(Self::G1FyM0),
+            "g1_fy_m1" => Some(Self::G1FyM1),
+            "g1_fy_m2" => Some(Self::G1FyM2),
+            "g1_fy_m3" => Some(Self::G1FyM3),
+            "g1_fz_m0" => Some(Self::G1FzM0),
+            "g1_fz_m1" => Some(Self::G1FzM1),
+            "g1_fz_m2" => Some(Self::G1FzM2),
+            "g1_fz_m3" => Some(Self::G1FzM3),
+            // INDI effectiveness — G1 torque
+            "g1_rr_m0" => Some(Self::G1RrM0),
+            "g1_rr_m1" => Some(Self::G1RrM1),
+            "g1_rr_m2" => Some(Self::G1RrM2),
+            "g1_rr_m3" => Some(Self::G1RrM3),
+            "g1_rp_m0" => Some(Self::G1RpM0),
+            "g1_rp_m1" => Some(Self::G1RpM1),
+            "g1_rp_m2" => Some(Self::G1RpM2),
+            "g1_rp_m3" => Some(Self::G1RpM3),
+            "g1_ry_m0" => Some(Self::G1RyM0),
+            "g1_ry_m1" => Some(Self::G1RyM1),
+            "g1_ry_m2" => Some(Self::G1RyM2),
+            "g1_ry_m3" => Some(Self::G1RyM3),
+            // INDI effectiveness — G2
+            "g2_rr_m0" => Some(Self::G2RrM0),
+            "g2_rr_m1" => Some(Self::G2RrM1),
+            "g2_rr_m2" => Some(Self::G2RrM2),
+            "g2_rr_m3" => Some(Self::G2RrM3),
+            "g2_rp_m0" => Some(Self::G2RpM0),
+            "g2_rp_m1" => Some(Self::G2RpM1),
+            "g2_rp_m2" => Some(Self::G2RpM2),
+            "g2_rp_m3" => Some(Self::G2RpM3),
+            "g2_ry_m0" => Some(Self::G2RyM0),
+            "g2_ry_m1" => Some(Self::G2RyM1),
+            "g2_ry_m2" => Some(Self::G2RyM2),
+            "g2_ry_m3" => Some(Self::G2RyM3),
+            // INDI motor dynamics
+            "indi_omega_m0" => Some(Self::IndiOmegaM0),
+            "indi_omega_m1" => Some(Self::IndiOmegaM1),
+            "indi_omega_m2" => Some(Self::IndiOmegaM2),
+            "indi_omega_m3" => Some(Self::IndiOmegaM3),
+            "indi_tau_m0" => Some(Self::IndiTauM0),
+            "indi_tau_m1" => Some(Self::IndiTauM1),
+            "indi_tau_m2" => Some(Self::IndiTauM2),
+            "indi_tau_m3" => Some(Self::IndiTauM3),
+            "indi_nonlin_m0" => Some(Self::IndiNonlinM0),
+            "indi_nonlin_m1" => Some(Self::IndiNonlinM1),
+            "indi_nonlin_m2" => Some(Self::IndiNonlinM2),
+            "indi_nonlin_m3" => Some(Self::IndiNonlinM3),
             _ => None,
         }
     }
@@ -574,6 +941,58 @@ impl ParamKey {
             Self::RateKdR => "rate_kd_r",
             Self::RateKdP => "rate_kd_p",
             Self::RateKdY => "rate_kd_y",
+            // INDI effectiveness — G1 force
+            Self::G1FxM0 => "g1_fx_m0",
+            Self::G1FxM1 => "g1_fx_m1",
+            Self::G1FxM2 => "g1_fx_m2",
+            Self::G1FxM3 => "g1_fx_m3",
+            Self::G1FyM0 => "g1_fy_m0",
+            Self::G1FyM1 => "g1_fy_m1",
+            Self::G1FyM2 => "g1_fy_m2",
+            Self::G1FyM3 => "g1_fy_m3",
+            Self::G1FzM0 => "g1_fz_m0",
+            Self::G1FzM1 => "g1_fz_m1",
+            Self::G1FzM2 => "g1_fz_m2",
+            Self::G1FzM3 => "g1_fz_m3",
+            // INDI effectiveness — G1 torque
+            Self::G1RrM0 => "g1_rr_m0",
+            Self::G1RrM1 => "g1_rr_m1",
+            Self::G1RrM2 => "g1_rr_m2",
+            Self::G1RrM3 => "g1_rr_m3",
+            Self::G1RpM0 => "g1_rp_m0",
+            Self::G1RpM1 => "g1_rp_m1",
+            Self::G1RpM2 => "g1_rp_m2",
+            Self::G1RpM3 => "g1_rp_m3",
+            Self::G1RyM0 => "g1_ry_m0",
+            Self::G1RyM1 => "g1_ry_m1",
+            Self::G1RyM2 => "g1_ry_m2",
+            Self::G1RyM3 => "g1_ry_m3",
+            // INDI effectiveness — G2
+            Self::G2RrM0 => "g2_rr_m0",
+            Self::G2RrM1 => "g2_rr_m1",
+            Self::G2RrM2 => "g2_rr_m2",
+            Self::G2RrM3 => "g2_rr_m3",
+            Self::G2RpM0 => "g2_rp_m0",
+            Self::G2RpM1 => "g2_rp_m1",
+            Self::G2RpM2 => "g2_rp_m2",
+            Self::G2RpM3 => "g2_rp_m3",
+            Self::G2RyM0 => "g2_ry_m0",
+            Self::G2RyM1 => "g2_ry_m1",
+            Self::G2RyM2 => "g2_ry_m2",
+            Self::G2RyM3 => "g2_ry_m3",
+            // INDI motor dynamics
+            Self::IndiOmegaM0 => "indi_omega_m0",
+            Self::IndiOmegaM1 => "indi_omega_m1",
+            Self::IndiOmegaM2 => "indi_omega_m2",
+            Self::IndiOmegaM3 => "indi_omega_m3",
+            Self::IndiTauM0 => "indi_tau_m0",
+            Self::IndiTauM1 => "indi_tau_m1",
+            Self::IndiTauM2 => "indi_tau_m2",
+            Self::IndiTauM3 => "indi_tau_m3",
+            Self::IndiNonlinM0 => "indi_nonlin_m0",
+            Self::IndiNonlinM1 => "indi_nonlin_m1",
+            Self::IndiNonlinM2 => "indi_nonlin_m2",
+            Self::IndiNonlinM3 => "indi_nonlin_m3",
         }
     }
 }
@@ -643,6 +1062,7 @@ mod tests {
                 rate_ki: [0.0, 0.0, 0.0],
                 rate_kd: [0.0, 0.0, 0.0],
             },
+            indi_effectiveness: IndiEffectivenessParams::default(),
         }
     }
 
@@ -659,6 +1079,26 @@ mod tests {
             assert_eq!(a.max_thrust_n, b.max_thrust_n);
             assert_eq!(a.torque_coeff_m, b.torque_coeff_m);
         }
+    }
+
+    #[test]
+    fn round_trip_with_indi() {
+        let mut params = test_params();
+        params.indi_effectiveness.g1_force[0] = [1.0, 2.0, 3.0];
+        params.indi_effectiveness.g1_torque[1] = [4.0, 5.0, 6.0];
+        params.indi_effectiveness.g2[2] = [7.0, 8.0, 9.0];
+        params.indi_effectiveness.max_omega = [2000.0, 1900.0, 2100.0, 1950.0];
+        params.indi_effectiveness.time_const_s = [0.025, 0.030, 0.022, 0.028];
+        params.indi_effectiveness.nonlinearity = [0.5, 0.6, 0.45, 0.55];
+
+        let bytes = params.to_bytes();
+        let restored = VehicleParams::from_bytes(&bytes).expect("from_bytes failed");
+        assert_eq!(restored.indi_effectiveness.g1_force, params.indi_effectiveness.g1_force);
+        assert_eq!(restored.indi_effectiveness.g1_torque, params.indi_effectiveness.g1_torque);
+        assert_eq!(restored.indi_effectiveness.g2, params.indi_effectiveness.g2);
+        assert_eq!(restored.indi_effectiveness.max_omega, params.indi_effectiveness.max_omega);
+        assert_eq!(restored.indi_effectiveness.time_const_s, params.indi_effectiveness.time_const_s);
+        assert_eq!(restored.indi_effectiveness.nonlinearity, params.indi_effectiveness.nonlinearity);
     }
 
     #[test]
@@ -693,9 +1133,29 @@ mod tests {
     }
 
     #[test]
+    fn get_set_indi_round_trip() {
+        let mut params = test_params();
+        params.set(ParamKey::G1FxM0, 1.5);
+        assert_eq!(params.get(ParamKey::G1FxM0), 1.5);
+        params.set(ParamKey::G2RyM3, -0.001);
+        assert_eq!(params.get(ParamKey::G2RyM3), -0.001);
+        params.set(ParamKey::IndiOmegaM2, 2100.0);
+        assert_eq!(params.get(ParamKey::IndiOmegaM2), 2100.0);
+        params.set(ParamKey::IndiTauM1, 0.03);
+        assert_eq!(params.get(ParamKey::IndiTauM1), 0.03);
+        params.set(ParamKey::IndiNonlinM0, 0.7);
+        assert_eq!(params.get(ParamKey::IndiNonlinM0), 0.7);
+    }
+
+    #[test]
     fn param_key_from_str() {
         assert_eq!(ParamKey::from_str("mass"), Some(ParamKey::Mass));
         assert_eq!(ParamKey::from_str("m3_torque"), Some(ParamKey::M3Torque));
+        assert_eq!(ParamKey::from_str("g1_fx_m0"), Some(ParamKey::G1FxM0));
+        assert_eq!(ParamKey::from_str("g2_ry_m3"), Some(ParamKey::G2RyM3));
+        assert_eq!(ParamKey::from_str("indi_omega_m2"), Some(ParamKey::IndiOmegaM2));
+        assert_eq!(ParamKey::from_str("indi_tau_m1"), Some(ParamKey::IndiTauM1));
+        assert_eq!(ParamKey::from_str("indi_nonlin_m0"), Some(ParamKey::IndiNonlinM0));
         assert_eq!(ParamKey::from_str("invalid"), None);
     }
 }

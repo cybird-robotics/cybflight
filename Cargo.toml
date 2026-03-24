@@ -11,3 +11,10 @@ members = [
   "crates/bsp/types",
   "crates/drivers",
 ]
+
+[profile.release]
+debug = 2
+lto = true
+codegen-units = 1
+panic = "abort"
+overflow-checks = false

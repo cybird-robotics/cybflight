@@ -61,7 +61,3 @@ discrete_pid = { version = "0.1.0", default-features = false }
 libm = "0.2"
 wls-alloc = { version = "0.1.2" }
 
-[profile.release]
-debug = 2
-lto = "thin"
-codegen-units = 1

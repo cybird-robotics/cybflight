@@ -328,13 +328,6 @@ pub async fn indi_task() {
                 defmt::info!("INDI: learned G1/G2 committed — auto-saving to flash");
             }
         }
-        if !was_armed && armed {
-            // Arm transition: reload params (picks up learning, shell changes, etc.)
-            if let Some(saved) = learned_from_indi_params(&crate::params::get().indi_effectiveness) {
-                indi.apply_learned_params(&saved);
-                defmt::info!("INDI: applied G1/G2 from params on arm");
-            }
-        }
         was_armed = armed;
 
         // DShot telemetry (RPM)
@@ -454,6 +447,11 @@ pub async fn indi_task() {
             match crate::params::save_to_flash() {
                 Ok(()) => defmt::info!("INDI: auto-saved learned params to flash"),
                 Err(e) => defmt::warn!("INDI: flash save failed: {}", e),
+            }
+            // Re-read params after save — picks up any `param set` changes
+            // the user made via shell alongside the learned values.
+            if let Some(saved) = learned_from_indi_params(&crate::params::get().indi_effectiveness) {
+                indi.apply_learned_params(&saved);
             }
         }
 

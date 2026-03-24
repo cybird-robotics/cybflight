@@ -13,4 +13,6 @@ float-cmp = { version = "0.10.0", default-features = false }
 nalgebra = { version = "0.34.1", default-features = false, features = ["libm"] }
 num-traits = { version = "0.2.19", default-features = false, features = ["libm"] }
 wls-alloc = { version = "0.1.2" }
+flight-solver = { path = "../../../flight-solver" }
 air-filters = { version = "0.0.3", default-features = false, features = ["libm"] }
+libm = "0.2"

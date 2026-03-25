@@ -92,7 +92,7 @@ pub async fn dshot_task(
     }
 
     let mut telem_motor: usize = 0;
-    let mut dshot_throttle: [u16; 4] = [DSHOT_MIN_THROTTLE; 4];
+    let mut dshot_throttle: [u16; 4] = [DSHOT_CMD_MOTOR_STOP; 4];
     let mut armed = false;
     let mut last_motor_cmd_time: Option<Instant> = None;
 
@@ -144,10 +144,10 @@ pub async fn dshot_task(
                 }
             }
         } else {
-            // Send DSHOT_MIN_THROTTLE when disarmed — matches the known-good
-            // behaviour where MOTOR_THROTTLE atomics were initialised to 48.
-            // MOTOR_STOP (0) is only sent on the disarm *transition* above.
-            dshot_throttle = [DSHOT_MIN_THROTTLE; 4];
+            // Send MOTOR_STOP while disarmed. ESC firmware (BLHeli_32, AM32)
+            // requires seeing zero-throttle after power-on before it will
+            // accept throttle commands — skipping this blocks ESC arming.
+            dshot_throttle = [DSHOT_CMD_MOTOR_STOP; 4];
         }
 
         // ======================== A: Output DShot frame ========================

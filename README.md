@@ -52,7 +52,7 @@ cargo run --release -p cybflight --no-default-features --features board_sakurah7
 
 # Production build (no UART logging overhead):
 # Set `DEFMT_LOG=off` in '.cargo/config.toml`
-cargo run --release -p cybflight --release --no-default-features --features board_sakurah743,rx_crsf
+cargo run --release -p cybflight --no-default-features --features board_sakurah743,rx_crsf,est_eskf
 ```
 
 ### Cargo Features

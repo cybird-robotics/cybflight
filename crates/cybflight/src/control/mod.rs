@@ -10,7 +10,7 @@ pub mod failsafe;
 #[cfg(feature = "est_eskf")]
 pub mod indi_task;
 pub mod inner_loop;
-pub mod nmpc_driver;
+// pub mod nmpc_driver;
 pub mod rc_interpreter;
 
 #[cfg(feature = "est_eskf")]

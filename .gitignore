@@ -1,4 +1,6 @@
 Cargo.lock
 target
 output
+tmp
+.claude
 tests/indi_golden/gen_golden

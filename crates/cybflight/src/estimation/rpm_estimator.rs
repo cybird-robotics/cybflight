@@ -214,6 +214,37 @@ impl RpmEstimator {
         self.posterior
     }
 
+    /// Reconfigure motor dynamics from learned parameters.
+    ///
+    /// Updates `tau_m` (motor time constant) and `c_m` (max omega at full
+    /// throttle) to match values learned by the RLS effectiveness learner.
+    /// Resets covariance wide so the filter re-converges quickly on the next
+    /// arm cycle.
+    pub fn reconfigure(&mut self, tau_m: f32, c_m: f32) {
+        self.config.tau_m_up = tau_m;
+        self.config.tau_m_down = tau_m;
+        let omega = self.posterior.omega();
+        self.posterior = StateAndCov::new(
+            omega,
+            c_m,
+            Matrix2::new(1000.0, 0.0, 0.0, c_m * c_m),
+        );
+    }
+
+    /// Reset state for a new flight.
+    ///
+    /// Zeros omega and sets wide covariance so the filter converges from
+    /// whatever telemetry arrives after arming.
+    pub fn reset_state(&mut self) {
+        let c_m = self.posterior.c_m();
+        self.posterior = StateAndCov::new(
+            0.0,
+            c_m,
+            Matrix2::new(1000.0, 0.0, 0.0, c_m * c_m),
+        );
+        self.u_history.clear();
+    }
+
     fn inv_tau_m(&self, is_accelerating: bool) -> f32 {
         // Branchless selection of the appropriate time constant based on acceleration direction
         [1.0 / self.config.tau_m_down, 1.0 / self.config.tau_m_up][is_accelerating as usize]

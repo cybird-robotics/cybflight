@@ -61,12 +61,18 @@ pub static POSITION_CONTROL_SETPOINT: PubSubChannel<
     1,
 > = PubSubChannel::new();
 
-/// When `true`, the INDI learner applies learned G1/G2 parameters to the
-/// controller. Set by the RC interpreter when the learning switch is active.
-/// The learner runs its filters continuously (to keep them primed) but only
-/// applies parameters when this flag is set.
+/// In-flight learning toggle. When `true` AND learner prearm is latched,
+/// the RLS learner collects data from raw ESC telemetry. Set by the RC
+/// interpreter from the learning switch channel.
 #[cfg(feature = "est_eskf")]
 pub static LEARNING_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Learner prearm switch. When `true` at arm time, the flight is configured
+/// for data collection: KF off, G2 zeroed, geometric G1 only. Latched at
+/// arm — mid-flight changes are ignored by the INDI task.
+#[cfg(feature = "est_eskf")]
+pub static LEARNER_PREARM: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 // Last time the control loop published a motor command.

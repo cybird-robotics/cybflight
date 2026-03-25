@@ -234,6 +234,20 @@ impl IndiController {
         true
     }
 
+    /// Reset effectiveness to geometric G1 with zero G2.
+    ///
+    /// Used when entering learner-prearm mode: reverts to the physics-based
+    /// effectiveness derived from motor geometry, ensuring no learned G2 or
+    /// G1 is active during a data-collection flight.
+    pub fn reset_to_geometric(
+        &mut self,
+        motors: &[crate::mixer::MotorParams; NU],
+        body: &crate::mixer::RigidBodyParams,
+        indi_params: &[IndiMotorParams; NU],
+    ) {
+        self.effectiveness = IndiEffectiveness::new(motors, body, indi_params);
+    }
+
     /// Update actuator state estimation from last motor command.
     /// Must be called every loop even when INDI is not the active controller.
     pub fn update_actuator_state(&mut self, d: &[f32; NU]) {

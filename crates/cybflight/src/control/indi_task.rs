@@ -165,21 +165,29 @@ pub async fn indi_task() {
     let mut indi = IndiController::new(&config, loop_rate_hz);
 
     // --- Per-motor RPM estimators (FOPDT EKF, one per motor) ---
+    // If learned motor dynamics exist in flash, use them; otherwise fall back
+    // to the hardcoded INDI_MOTOR_PARAMS defaults.
     let pole_pairs = config.motor_pole_count as f32 / 2.0;
     let erpm_to_rads = core::f32::consts::TAU * 100.0 / (pole_pairs * 60.0);
-    let est_config = RpmEstimatorConfigBuilder::new()
-        .tau_m_up(INDI_MOTOR_PARAMS[0].time_const_s)
-        .tau_m_down(INDI_MOTOR_PARAMS[0].time_const_s)
-        .build()
-        .unwrap();
-    let max_omega = INDI_MOTOR_PARAMS[0].max_rpm * erpm_to_rads;
-    let init_state = StateAndCov::new(
-        0.0,
-        max_omega,
-        Matrix2::new(1000.0, 0.0, 0.0, max_omega * max_omega),
-    );
-    let mut rpm_estimators: [RpmEstimator; NU] =
-        core::array::from_fn(|_| RpmEstimator::new(est_config, init_state));
+    let saved_learned = learned_from_indi_params(&params.indi_effectiveness);
+    let mut rpm_estimators: [RpmEstimator; NU] = core::array::from_fn(|i| {
+        let (tau_m, c_m) = if let Some(ref saved) = saved_learned {
+            (saved.time_const_s[i], saved.max_omega[i])
+        } else {
+            (INDI_MOTOR_PARAMS[i].time_const_s, INDI_MOTOR_PARAMS[i].max_rpm * erpm_to_rads)
+        };
+        let est_config = RpmEstimatorConfigBuilder::new()
+            .tau_m_up(tau_m)
+            .tau_m_down(tau_m)
+            .build()
+            .unwrap();
+        let init_state = StateAndCov::new(
+            0.0,
+            c_m,
+            Matrix2::new(1000.0, 0.0, 0.0, c_m * c_m),
+        );
+        RpmEstimator::new(est_config, init_state)
+    });
 
     // --- G1/G2 online learner (optional, activated via RC switch) ---
     let learner_config = LearnerConfig {
@@ -194,14 +202,32 @@ pub async fn indi_task() {
     let mut learner = Learner::new(&learner_config, loop_rate_hz);
 
     // Load previously saved INDI effectiveness from vehicle params (if non-zero).
-    if let Some(saved_learned) = learned_from_indi_params(&params.indi_effectiveness) {
-        if indi.apply_learned_params(&saved_learned) {
+    if let Some(ref saved) = saved_learned {
+        if indi.apply_learned_params(saved) {
             defmt::info!("INDI: loaded learned G1/G2 from params");
         }
     }
 
     // Track whether we need to save learned params on disarm
     let mut was_armed = false;
+
+    // --- Learner prearm state ---
+    let mut learner_prearm_latched: bool = false;
+    // Per-motor sample-and-hold for raw eRPM (rad/s) — used when KF is off
+    let mut raw_omega_hold: [f32; NU] = [0.0; NU];
+
+    // --- Slew rate limiter state (always on, protects both KF and raw path) ---
+    // Max omega bound from configured motor params (use learned if available)
+    let max_omega_bound: f32 = if let Some(ref saved) = saved_learned {
+        saved.max_omega.iter().cloned().fold(0.0f32, f32::max)
+    } else {
+        INDI_MOTOR_PARAMS[0].max_rpm * erpm_to_rads
+    };
+    // Minimum plausible motor time constant (conservative lower bound)
+    const TAU_MIN_BOUND: f32 = 0.005;
+    let slew_max_rate: f32 = max_omega_bound / TAU_MIN_BOUND; // rad/s²
+    let mut slew_prev_omega: [f32; NU] = [0.0; NU];
+    let mut slew_prev_time: [Option<Instant>; NU] = [None; NU];
     // Local param version — re-read params when global version changes.
     let mut local_param_ver = crate::params::PARAM_VERSION.load(core::sync::atomic::Ordering::Acquire);
     // --- Position + attitude controllers (gains from params, same as inner_loop) ---
@@ -306,64 +332,119 @@ pub async fn indi_task() {
 
         // ── Arm/disarm transitions ──────────────────────────────────────
         //
-        // On DISARM: snapshot learned params → write to VehicleParams → apply
-        //   to controller (takes effect this frame) → signal flash auto-save.
+        // On ARM: latch learner prearm, reset KF state for fresh convergence.
+        //   If prearm latched: reset to geometric G1, zero G2, reset learner.
         //
-        // On ARM: re-read VehicleParams (may have been updated by learning,
-        //   shell `param set`, or flash load) → apply to controller. This
-        //   picks up any changes made between flights.
-        if was_armed && !armed && learner.samples() > 0 {
-            // Disarm transition: commit learned params
-            let snap = learner.update(&LearnerInput {
-                rate_rad_s: gyro_corrected,
-                rate_dot_rad_s2: nalgebra::Vector3::zeros(),
-                spf_m_s2: accel_corrected,
-                omega_rad_s: [0.0; NU],
-                d_commands: [0.0; NU],
-                armed: false,
-                touching_ground: true,
-            });
-            if snap.valid {
-                write_learned_to_params(&snap);
-                indi.apply_learned_params(&snap);
-                LEARNED_SAVE_PENDING.store(true, core::sync::atomic::Ordering::Release);
-                defmt::info!("INDI: learned G1/G2 committed — auto-saving to flash");
+        // On DISARM: if learner was active, commit learned params → write to
+        //   VehicleParams → signal flash auto-save. PARAM_VERSION re-read
+        //   (below) handles applying to INDI + KF on next iteration.
+        if !was_armed && armed {
+            // ARM transition
+            learner_prearm_latched =
+                super::LEARNER_PREARM.load(core::sync::atomic::Ordering::Acquire);
+
+            // Always reset KF state — fresh start every flight
+            for est in rpm_estimators.iter_mut() {
+                est.reset_state();
             }
+
+            if learner_prearm_latched {
+                // Learner prearm: geometric G1, zero G2, reset learner
+                indi.reset_to_geometric(&QUADROTOR_MOTORS, &QUADROTOR_BODY, &INDI_MOTOR_PARAMS);
+                learner.reset();
+                raw_omega_hold = [0.0; NU];
+                slew_prev_omega = [0.0; NU];
+                slew_prev_time = [None; NU];
+                defmt::info!("INDI: learner prearm LATCHED — KF off, G2 zeroed");
+            }
+        }
+        if was_armed && !armed {
+            // DISARM transition
+            if learner_prearm_latched && learner.samples() > 0 {
+                let snap = learner.update(&LearnerInput {
+                    rate_rad_s: gyro_corrected,
+                    rate_dot_rad_s2: nalgebra::Vector3::zeros(),
+                    spf_m_s2: accel_corrected,
+                    omega_rad_s: [0.0; NU],
+                    d_commands: [0.0; NU],
+                    armed: false,
+                    touching_ground: true,
+                });
+                if snap.valid {
+                    write_learned_to_params(&snap);
+                    LEARNED_SAVE_PENDING.store(true, core::sync::atomic::Ordering::Release);
+                    defmt::info!("INDI: learned G1/G2 committed — auto-saving to flash");
+                }
+            }
+            learner_prearm_latched = false;
         }
         was_armed = armed;
 
-        // DShot telemetry (RPM)
-        // When a new DShot frame arrives, update the per-motor estimators with
-        // the measured omega.  On invalid frames the estimators coast on the
-        // FOPDT model instead of reporting Invalid to the RpmTracker.
+        // ── DShot telemetry + slew rate limiter ────────────────────────
+        //
+        // Decode eRPM → rad/s, then apply a physics-based slew rate limiter
+        // to reject GCR decode errors. The limiter runs always, protecting
+        // both the KF path and the raw-hold path.
         let mut y_meas: [Option<f32>; NU] = [None; NU];
         if let Some(telem) = dshot_sub.try_next_message_pure() {
+            let now = imu.timestamp;
             for i in 0..NU {
-                y_meas[i] = match telem.motors[i].value {
+                let raw_omega = match telem.motors[i].value {
                     TelemetryValue::Erpm(erpm) => Some(erpm as f32 * erpm_to_rads),
                     TelemetryValue::Stopped => Some(0.0),
                     TelemetryValue::Invalid | TelemetryValue::Edt(_) => None,
                 };
+
+                // Slew rate limiter: reject if change exceeds physical limit
+                if let Some(omega) = raw_omega {
+                    // Hard range gate
+                    if omega < 0.0 || omega > max_omega_bound * 1.2 {
+                        continue;
+                    }
+                    // Rate gate
+                    if let Some(prev_t) = slew_prev_time[i] {
+                        let dt_slew = now.duration_since(prev_t).as_micros() as f32 / 1_000_000.0;
+                        let max_delta = slew_max_rate * dt_slew;
+                        if (omega - slew_prev_omega[i]).abs() > max_delta {
+                            continue;
+                        }
+                    }
+                    slew_prev_omega[i] = omega;
+                    slew_prev_time[i] = Some(now);
+                    y_meas[i] = Some(omega);
+                }
             }
         }
 
-        // Predict (and optionally update) every IMU tick.
-        for i in 0..NU {
-            rpm_estimators[i].step(est_current_ts, est_dt, y_meas[i]);
+        // ── Conditional KF / raw-hold ────────────────────────────────
+        //
+        // KF only runs when armed AND not in learner-prearm mode.
+        // Disarmed: KF idle (avoids divergence without corrections).
+        // Learner prearm: raw eRPM with sample-and-hold (no KF).
+        if armed && !learner_prearm_latched {
+            // Normal flight: run KF, feed smoothed omega to RpmTracker
+            for i in 0..NU {
+                rpm_estimators[i].step(est_current_ts, est_dt, y_meas[i]);
+            }
+            let estimated_inputs: [RpmInput; NU] = core::array::from_fn(|i| {
+                let erpm =
+                    libm::roundf(rpm_estimators[i].state().omega() / erpm_to_rads) as u32;
+                RpmInput::Erpm(erpm)
+            });
+            let (valid, _rpm_failsafe) = indi.update_rpm(&estimated_inputs);
+            g2_valid = valid;
+        } else if armed && learner_prearm_latched {
+            // Learner prearm: KF off, sample-and-hold raw eRPM
+            for i in 0..NU {
+                if let Some(y) = y_meas[i] {
+                    raw_omega_hold[i] = y;
+                }
+            }
+            g2_valid = [false; NU];
+        } else {
+            // Disarmed: KF idle, G2 inactive
+            g2_valid = [false; NU];
         }
-
-        // Feed estimated omega to the RpmTracker.  The estimator coasts through
-        // invalid frames, so the tracker sees a smooth signal and its invalid
-        // counter only increments when the estimator itself is diverging.
-        let estimated_inputs: [RpmInput; NU] = core::array::from_fn(|i| {
-            let erpm = libm::roundf(rpm_estimators[i].state().omega() / erpm_to_rads) as u32;
-            RpmInput::Erpm(erpm)
-        });
-        let (valid, _rpm_failsafe) = indi.update_rpm(&estimated_inputs);
-        g2_valid = valid;
-        // RPM failsafe (all motors lost) is tracked by the controller core
-        // but not acted on here — if RPM loss degrades output quality, the
-        // controller will produce bad output → go silent → watchdog disarms.
 
         // Latest odometry for position/attitude controllers.
         // Persist across iterations so the decimated outer loop always has a
@@ -457,6 +538,8 @@ pub async fn indi_task() {
         // 5c. Re-read params when version changes (disarmed only).
         //     Catches: learning auto-save, shell `param set` + `param save`,
         //     `param defaults`, or any other param writer.
+        //     Updates INDI effectiveness AND KF motor dynamics from the same
+        //     persistent params — single source of truth.
         if !armed {
             let current_ver =
                 crate::params::PARAM_VERSION.load(core::sync::atomic::Ordering::Acquire);
@@ -466,6 +549,9 @@ pub async fn indi_task() {
                     learned_from_indi_params(&crate::params::get().indi_effectiveness)
                 {
                     indi.apply_learned_params(&saved);
+                    for i in 0..NU {
+                        rpm_estimators[i].reconfigure(saved.time_const_s[i], saved.max_omega[i]);
+                    }
                 }
                 defmt::info!("INDI: params reloaded (ver {})", current_ver);
             }
@@ -481,20 +567,26 @@ pub async fn indi_task() {
             &g2_valid,
         );
 
-        // 6b. Online learner (runs every frame, gated internally on armed+airborne).
-        //     Params are NOT applied mid-flight — only on disarm (see arm/disarm
-        //     transitions above). The RC learning switch controls whether RLS
-        //     updates happen (via the armed+airborne gate inside the learner).
-        let omega_for_learner: [f32; NU] =
-            core::array::from_fn(|i| rpm_estimators[i].state().omega());
+        // 6b. Online learner.
+        //     Omega source depends on mode:
+        //       - Learner prearm: raw ESC eRPM (sample-and-hold), no KF
+        //       - Normal: KF-smoothed omega (existing)
+        //     RLS only updates when: prearm latched + toggle on + armed.
+        //     Toggle alone without prearm does nothing.
+        let omega_for_learner: [f32; NU] = if learner_prearm_latched {
+            raw_omega_hold
+        } else {
+            core::array::from_fn(|i| rpm_estimators[i].state().omega())
+        };
         let learning_on = super::LEARNING_ENABLED.load(core::sync::atomic::Ordering::Acquire);
+        let learn_active = learner_prearm_latched && learning_on && armed;
         let learner_input = LearnerInput {
             rate_rad_s: gyro_corrected,
             rate_dot_rad_s2: step_state.rate_dot_raw,
             spf_m_s2: accel_corrected,
             omega_rad_s: omega_for_learner,
             d_commands: output.motor_commands,
-            armed: armed && learning_on, // RLS only updates when switch is on
+            armed: learn_active,
             touching_ground: step_state.touching_ground,
         };
         let _learned = learner.update(&learner_input);
@@ -524,11 +616,14 @@ pub async fn indi_task() {
 
         // Feed this frame's throttle commands into the estimators so the
         // FOPDT model can account for transport delay on the next decode.
-        for i in 0..NU {
-            rpm_estimators[i].push_throttle(
-                est_current_ts,
-                EstNormalizedThrottle::new_clamped(output.motor_commands[i]),
-            );
+        // Only when KF is active (armed + not learner prearm).
+        if armed && !learner_prearm_latched {
+            for i in 0..NU {
+                rpm_estimators[i].push_throttle(
+                    est_current_ts,
+                    EstNormalizedThrottle::new_clamped(output.motor_commands[i]),
+                );
+            }
         }
 
         // 9. Publish telemetry (at reduced rate — every OUTER_DECIMATION frames).

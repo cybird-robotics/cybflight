@@ -230,6 +230,15 @@ impl Eskf {
 
     /// Attitude measurement update. `att_std` is std-dev in radians.
     pub fn update_att(&mut self, q: UnitQuaternion<f32>, att_std: f32) {
+        // Canonicalize q
+        let q = if self.state.orientation.coords.dot(&q.coords) < 0.0 {
+            UnitQuaternion::from_quaternion(-q.into_inner())
+        } else {
+            q
+        };
+
+        let e = q.euler_angles();
+
         if !self.initialized {
             return;
         }

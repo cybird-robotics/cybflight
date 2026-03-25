@@ -117,7 +117,7 @@ impl Default for IndiControllerParams {
     fn default() -> Self {
         Self {
             rate_gains: [20.0, 20.0, 20.0],
-            sync_filter_hz: 15.0,
+            sync_filter_hz: 5.0,
             wls_wv: [1.0, 1.0, 50.0, 50.0, 50.0, 5.0],
             wls_wu: [1.0, 1.0, 1.0, 1.0],
             motor_pole_count: 14,

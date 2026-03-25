@@ -99,6 +99,8 @@ fn extract_yaw(q: &UnitQuaternion<f32>) -> f32 {
 #[cfg(feature = "est_eskf")]
 #[embassy_executor::task]
 pub async fn rc_interpreter_task() {
+    use nalgebra::UnitQuaternion;
+
     let mut rc_sub = RC_INPUT
         .subscriber()
         .expect("rc_interpreter: RC_INPUT subscriber");
@@ -116,14 +118,12 @@ pub async fn rc_interpreter_task() {
     }
     let odom = odom_sub.next_message_pure().await;
     let origin = odom.pose.position;
-    let yaw = extract_yaw(&odom.pose.orientation);
-    let yaw_quat = UnitQuaternion::from_euler_angles(0.0, 0.0, yaw);
 
     super::AUTO_SETPOINT.signal(msgs::VehicleOdometry {
         timestamp: Instant::now(),
         pose: msgs::Pose {
             position: origin,
-            orientation: yaw_quat,
+            orientation: UnitQuaternion::identity(),
         },
         twist: msgs::Twist {
             linear: Vector3::zeros(),
@@ -163,7 +163,7 @@ pub async fn rc_interpreter_task() {
             timestamp: Instant::now(),
             pose: msgs::Pose {
                 position: target,
-                orientation: yaw_quat,
+                orientation: UnitQuaternion::identity(),
             },
             twist: msgs::Twist {
                 linear: Vector3::zeros(),

@@ -152,8 +152,8 @@ impl<const N: usize> IndiEffectiveness<N> {
     /// applied, `false` if validation failed (effectiveness unchanged).
     ///
     /// Validation checks:
-    /// - All values must be finite
-    /// - max_omega must be > 0
+    /// - All G1/G2 values must be finite and |value| ≤ 1e4
+    /// - max_omega must be in (0, 20000] rad/s
     /// - time_const_s must be in [0.005, 0.5]
     pub fn update_from_learned(
         &mut self,
@@ -162,23 +162,30 @@ impl<const N: usize> IndiEffectiveness<N> {
         max_omega: &[f32; N],
         time_const_s: &[f32; N],
     ) -> bool {
-        // Validate finiteness
+        // Magnitude bound: ~30× the largest geometric G1 entry for a typical
+        // micro-quad. Anything beyond this is a diverged RLS, not a real vehicle.
+        const G_MAG_MAX: f32 = 1e4;
+        // Max plausible motor speed: ~191k RPM mechanical.
+        const OMEGA_MAX: f32 = 20_000.0;
+
         for row in 0..6 {
             for col in 0..N {
-                if !g1[(row, col)].is_finite() {
+                let v = g1[(row, col)];
+                if !v.is_finite() || v > G_MAG_MAX || v < -G_MAG_MAX {
                     return false;
                 }
             }
         }
         for row in 0..3 {
             for col in 0..N {
-                if !g2[(row, col)].is_finite() {
+                let v = g2[(row, col)];
+                if !v.is_finite() || v > G_MAG_MAX || v < -G_MAG_MAX {
                     return false;
                 }
             }
         }
         for i in 0..N {
-            if !max_omega[i].is_finite() || max_omega[i] <= 0.0 {
+            if !max_omega[i].is_finite() || max_omega[i] <= 0.0 || max_omega[i] > OMEGA_MAX {
                 return false;
             }
             if !time_const_s[i].is_finite()

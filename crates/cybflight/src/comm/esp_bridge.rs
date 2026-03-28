@@ -110,6 +110,11 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
     let mut att_sub = sensors::VEHICLE_ATTITUDE.subscriber().unwrap();
     let mut rc_sub = sensors::RC_INPUT.subscriber().unwrap();
     let mut rc_link_sub = sensors::RC_LINK_STATUS.subscriber().unwrap();
+    // Under ESKF: use INDI-processed RPM (post-slew or post-KF).
+    // Without ESKF: use raw DShot telemetry (no INDI task running).
+    #[cfg(feature = "est_eskf")]
+    let mut dshot_sub = control::PROCESSED_DSHOT_TELEM.subscriber().unwrap();
+    #[cfg(not(feature = "est_eskf"))]
     let mut dshot_sub = sensors::DSHOT_TELEMETRY.subscriber().unwrap();
     let mut ocp_sub = control::OCP_SOLVER_OUTPUT.subscriber().unwrap();
     let mut gps_sub = sensors::GPS_FIX.subscriber().unwrap();

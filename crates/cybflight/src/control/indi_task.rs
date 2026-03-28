@@ -174,7 +174,7 @@ pub async fn indi_task() {
         let (tau_m, c_m) = if let Some(ref saved) = saved_learned {
             (saved.time_const_s[i], saved.max_omega[i])
         } else {
-            (INDI_MOTOR_PARAMS[i].time_const_s, INDI_MOTOR_PARAMS[i].max_rpm * erpm_to_rads)
+            (INDI_MOTOR_PARAMS[i].time_const_s, INDI_MOTOR_PARAMS[i].max_rpm / 60.0 * core::f32::consts::TAU)
         };
         let est_config = RpmEstimatorConfigBuilder::new()
             .tau_m_up(tau_m)
@@ -221,7 +221,7 @@ pub async fn indi_task() {
     let max_omega_bound: f32 = if let Some(ref saved) = saved_learned {
         saved.max_omega.iter().cloned().fold(0.0f32, f32::max)
     } else {
-        INDI_MOTOR_PARAMS[0].max_rpm * erpm_to_rads
+        INDI_MOTOR_PARAMS[0].max_rpm / 60.0 * core::f32::consts::TAU
     };
     // Minimum plausible motor time constant (conservative lower bound)
     const TAU_MIN_BOUND: f32 = 0.005;
@@ -254,6 +254,7 @@ pub async fn indi_task() {
     let att_pub = super::ATTITUDE_CONTROL_SETPOINT.immediate_publisher();
     let pos_pub = super::POSITION_CONTROL_SETPOINT.immediate_publisher();
     let motor_telem_pub = super::ACTUATOR_MOTORS_TELEM.immediate_publisher();
+    let processed_dshot_pub = super::PROCESSED_DSHOT_TELEM.immediate_publisher();
 
     // --- State ---
     let mut pos_state = position_control::PositionControlState::<f32>::default();
@@ -647,6 +648,33 @@ pub async fn indi_task() {
             motor_telem_pub.publish_immediate(msgs::ActuatorMotors {
                 timestamp: publish_time,
                 motor_commands,
+            });
+            // Processed motor RPM: post-slew (learner prearm) or post-KF (normal).
+            let processed_motors: [msgs::DshotMotorTelemetry; 4] = core::array::from_fn(|i| {
+                let omega = if armed && learner_prearm_latched {
+                    raw_omega_hold[i]
+                } else if armed {
+                    rpm_estimators[i].state().omega()
+                } else {
+                    0.0
+                };
+                let erpm = if omega > 0.0 {
+                    libm::roundf(omega / erpm_to_rads) as u32
+                } else {
+                    0
+                };
+                msgs::DshotMotorTelemetry {
+                    value: if erpm > 0 {
+                        TelemetryValue::Erpm(erpm)
+                    } else {
+                        TelemetryValue::Stopped
+                    },
+                    raw: None,
+                }
+            });
+            processed_dshot_pub.publish_immediate(msgs::DshotTelemetry {
+                timestamp: publish_time,
+                motors: processed_motors,
             });
         }
     }

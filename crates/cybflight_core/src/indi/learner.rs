@@ -419,7 +419,12 @@ impl Learner {
     /// Scaling factors reverse the regressor/observation scaling applied above.
     /// Matches indiflight learner.c updateLearnedParameters() lines 548-578.
     fn extract_params(&self) -> LearnedParams {
-        let valid = self.samples > 100; // need some data before trusting
+        let enough_samples = self.samples > 100;
+
+        // Magnitude bounds matching update_from_learned() — prevents saving
+        // diverged RLS output to flash.
+        const G_MAG_MAX: f32 = 1e4;
+        const OMEGA_MAX: f32 = 20_000.0;
 
         let mut max_omega = [0.0f32; NU];
         let mut time_const_s = [0.025f32; NU];
@@ -431,17 +436,19 @@ impl Learner {
             // maxOmega = inv_y_scale * (X[0] + X[1])
             // inv_y_scale = 1e3 (observation was omega * 1e-3)
             let mo = 1e3 * (x[(0, 0)] + x[(1, 0)]);
-            max_omega[i] = if mo > 100.0 { mo } else { 100.0 };
+            // NaN-safe: is_finite gates clamp (NaN.clamp() returns NaN in Rust)
+            max_omega[i] = if mo.is_finite() && mo > 100.0 { mo } else { 100.0 };
 
             // time_const = inv_y_scale * a_scale * X[3]
             // a_scale for omega_dot regressor = 1e-4, inv_y_scale = 1e3
             // So: tau = 1e3 * 1e-4 * X[3] = 0.1 * X[3]
             let tau = 0.1 * x[(3, 0)];
-            time_const_s[i] = tau.clamp(0.01, 0.2);
+            time_const_s[i] = if tau.is_finite() { tau.clamp(0.01, 0.2) } else { 0.025 };
 
             // nonlinearity = X[0] / (X[0] + X[1])
             if x[(0, 0)] > 0.0 && x[(1, 0)] > 0.0 {
-                nonlinearity[i] = (x[(0, 0)] / (x[(0, 0)] + x[(1, 0)])).clamp(0.0, 1.0);
+                let nl = x[(0, 0)] / (x[(0, 0)] + x[(1, 0)]);
+                nonlinearity[i] = if nl.is_finite() { nl.clamp(0.0, 1.0) } else { 0.5 };
             }
         }
 
@@ -487,6 +494,35 @@ impl Learner {
         let rate_gain = 0.25 / (self.config.zeta_rate * self.config.zeta_rate * max_tau);
         let attitude_gain = 0.25 * rate_gain / (self.config.zeta_attitude * self.config.zeta_attitude);
 
+        // Validate all extracted parameters — reject entire set if any entry
+        // is NaN, infinite, or has diverged beyond physical bounds.  G1/G2 are
+        // interconnected; applying a mix of good and bad columns is unsafe.
+        let mut sane = true;
+        for row in 0..6 {
+            for col in 0..NU {
+                let v = g1[(row, col)];
+                if !v.is_finite() || v > G_MAG_MAX || v < -G_MAG_MAX {
+                    sane = false;
+                }
+            }
+        }
+        for row in 0..3 {
+            for col in 0..NU {
+                let v = g2[(row, col)];
+                if !v.is_finite() || v > G_MAG_MAX || v < -G_MAG_MAX {
+                    sane = false;
+                }
+            }
+        }
+        for i in 0..NU {
+            if !max_omega[i].is_finite() || max_omega[i] <= 0.0 || max_omega[i] > OMEGA_MAX {
+                sane = false;
+            }
+            if !time_const_s[i].is_finite() || time_const_s[i] < 0.005 || time_const_s[i] > 0.5 {
+                sane = false;
+            }
+        }
+
         LearnedParams {
             g1,
             g2,
@@ -495,7 +531,7 @@ impl Learner {
             nonlinearity,
             rate_gain,
             attitude_gain,
-            valid,
+            valid: enough_samples && sane,
         }
     }
 

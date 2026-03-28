@@ -93,3 +93,15 @@ pub static ACTUATOR_MOTORS_TELEM: PubSubChannel<
     2,
     1,
 > = PubSubChannel::new();
+
+// Processed motor RPM telemetry: post-slew-limiter (learner prearm) or post-KF (normal).
+// Published by INDI task at ~100 Hz, subscribed by ESP bridge for ground telemetry.
+// CAP=2 (latest only), SUBS=2 (esp_bridge + spare), PUBS=1 (indi_task).
+#[cfg(feature = "est_eskf")]
+pub static PROCESSED_DSHOT_TELEM: PubSubChannel<
+    CriticalSectionRawMutex,
+    msgs::DshotTelemetry,
+    2,
+    2,
+    1,
+> = PubSubChannel::new();

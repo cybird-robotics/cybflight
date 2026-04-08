@@ -2,6 +2,8 @@
 compile_error!("features est_mahony and est_eskf are mutually exclusive");
 #[cfg(not(any(feature = "est_mahony", feature = "est_eskf")))]
 compile_error!("one of est_mahony or est_eskf must be selected");
+#[cfg(all(feature = "outer_mpc", not(feature = "est_eskf")))]
+compile_error!("feature `outer_mpc` requires `est_eskf`");
 
 // attitude_control is folded into inner_loop — one unified control loop.
 // INDI controller (est_eskf) replaces rate PIDs + linear allocation.
@@ -11,6 +13,8 @@ pub mod failsafe;
 pub mod indi_task;
 pub mod inner_loop;
 // pub mod nmpc_driver;
+#[cfg(all(feature = "est_eskf", feature = "outer_mpc"))]
+pub mod outer_loop;
 pub mod rc_interpreter;
 
 #[cfg(feature = "est_eskf")]
@@ -50,6 +54,16 @@ pub static ATTITUDE_CONTROL_SETPOINT: PubSubChannel<
 
 #[cfg(feature = "est_eskf")]
 pub static AUTO_SETPOINT: Signal<CriticalSectionRawMutex, msgs::VehicleOdometry> = Signal::new();
+
+/// MPC outer-loop command from `outer_loop::control_loop_task` to `indi_task`:
+/// body-rate setpoint + collective thrust + a yaw-only reference attitude
+/// (for telemetry display only — the MPC commands rates directly).
+///
+/// Single producer (`outer_loop::control_loop_task`), single consumer
+/// (`indi_task`). Latest-value semantics → `Signal` rather than `PubSubChannel`.
+#[cfg(all(feature = "est_eskf", feature = "outer_mpc"))]
+pub static MPC_RATE_COMMAND: Signal<CriticalSectionRawMutex, msgs::AttitudeControlSetpoint> =
+    Signal::new();
 
 // Position control setpoint telemetry: CAP=2, SUBS=3 (esp_bridge + shell + spare), PUBS=1.
 #[cfg(feature = "est_eskf")]

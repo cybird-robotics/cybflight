@@ -88,6 +88,15 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::control::indi_task::indi_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn INDI task"));
+    // MPC outer-loop task: replaces the cascade controller embedded in
+    // indi_task with an SQP/MPC running at 100 Hz in its own task. The
+    // inner INDI step then consumes a `MPC_RATE_COMMAND` Signal instead
+    // of computing rate setpoints locally. Default-off; opt-in for the
+    // MPC flight-test build.
+    #[cfg(all(feature = "est_eskf", feature = "outer_mpc"))]
+    spawner
+        .spawn(cybflight::control::outer_loop::control_loop_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn MPC outer loop task"));
     spawner
         .spawn(cybflight::usb_serial::att_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude stream task"));

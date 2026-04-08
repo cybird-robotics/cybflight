@@ -226,6 +226,7 @@ mod tests {
         RigidBodyParams {
             mass_kg: 0.55,
             inertia_kg_m2: [0.0025, 0.0, 0.0, 0.0, 0.0021, 0.0, 0.0, 0.0, 0.0043],
+            max_rate_rad_s: [10.0, 10.0, 6.0],
         }
     }
 

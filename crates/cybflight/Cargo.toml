@@ -21,6 +21,11 @@ defmt_uart = []
 # Exactly one must be selected.
 est_mahony = []
 est_eskf = []
+# outer_mpc: replace the in-task cascade position+attitude controller with
+# a separate `outer_loop::control_loop_task` driving an SQP/MPC at 100 Hz.
+# Requires `est_eskf`. Default-off; the cascade controller (verified in
+# real-world flight) remains the default.
+outer_mpc = []
 
 [dependencies]
 bsp-sakurah743 = { path = "../bsp/sakurah743", optional = true }

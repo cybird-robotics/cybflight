@@ -1,31 +1,69 @@
 //! Persistent vehicle parameter container with manual serialization.
 //!
-//! On-flash layout (little-endian, 512 bytes, aligned to 32-byte flash words):
+//! On-flash layout (little-endian, 576 bytes, aligned to 32-byte flash words):
 //!
 //! ```text
 //! [0x00]  magic:   u32 = 0x43594250 ("CYBP")
-//! [0x04]  version: u32 = 5
-//! [0x08]  length:  u32 = PAYLOAD_SIZE (480)
+//! [0x04]  version: u32 = 6
+//! [0x08]  length:  u32 = PAYLOAD_SIZE (552)
 //! [0x0C]  crc32:   u32 (over payload only)
-//! [0x10]  payload: 480 bytes
-//!   Body:               mass(4) + inertia(36) = 40 bytes
+//! [0x10]  payload: 552 bytes
+//!   Body:               mass(4) + inertia(36) + max_rate(12) = 52 bytes
 //!   Motors (x4):        px(4) + py(4) + spin_dir(4) + max_thrust(4) + torque_coeff(4) = 80 bytes
 //!   Control gains:      pos_kp(12) + pos_kd(12) + att_k_rate(12) + rate_kp(12) + rate_ki(12) + rate_kd(12) = 72 bytes
 //!   INDI effectiveness: g1_force(48) + g1_torque(48) + g2(48) + max_omega(16) + time_const(16) + nonlinearity(16) = 192 bytes
 //!   INDI controller:    rate_gains(12) + sync_filter_hz(4) + wls_wv(24) + wls_wu(16) + motor_pole_count(4 as f32) = 60 bytes
 //!   Learner:            fx_filt_hz(4) + motor_filt_hz(4) + acc_offset_m(12) + rls_gamma(4) + rls_t_char_s(4) + zeta_rate(4) + zeta_attitude(4) = 36 bytes
-//! [0x200] padding: 16 bytes (zeros)
+//!   MpcParams:          pos(12) + vel(12) + att(12) + rate(12) + thrust(4) + dt(4) + rho(4) = 60 bytes
+//! [0x238] padding: 8 bytes (zeros)
 //! ```
 
 use crate::mixer::{MotorParams, RigidBodyParams, SpinDir};
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
-/// Total payload: 40 + 80 + 72 + 192 + 60 + 36 = 480 bytes
-const PAYLOAD_SIZE: usize = 480;
-/// Padded to 32-byte flash word boundary: ceil((16+480)/32)*32 = 512
-pub const PADDED_SIZE: usize = 512;
+/// Total payload: 52 + 80 + 72 + 192 + 60 + 36 + 60 = 552 bytes
+const PAYLOAD_SIZE: usize = 552;
+/// Padded to 32-byte flash word boundary: ceil((16+552)/32)*32 = 576
+pub const PADDED_SIZE: usize = 576;
+
+/// MPC tuning parameters: cost weights, discretization, and constraint penalty.
+///
+/// Bundles the entire MPC tuning surface into one struct, mirroring the
+/// `IndiControllerParams` precedent (which similarly groups gains, filter
+/// cutoffs, and cost weights).
+#[derive(Clone, Debug)]
+pub struct MpcParams {
+    /// Position tracking weights [x, y, z].
+    pub pos_weight: [f32; 3],
+    /// Velocity tracking weights [x, y, z].
+    pub vel_weight: [f32; 3],
+    /// Attitude tracking weights [roll, pitch, yaw].
+    pub att_weight: [f32; 3],
+    /// Body-rate tracking weights [roll, pitch, yaw].
+    pub rate_weight: [f32; 3],
+    /// Control effort weight (uniform across motors).
+    pub thrust_weight: f32,
+    /// Integration timestep [s] for the prediction horizon.
+    pub dt: f32,
+    /// Cubic constraint penalty weight (input bound enforcement).
+    pub rho: f32,
+}
+
+impl Default for MpcParams {
+    fn default() -> Self {
+        Self {
+            pos_weight: [200.0, 200.0, 200.0],
+            vel_weight: [1.0, 1.0, 1.0],
+            att_weight: [5.0, 5.0, 200.0],
+            rate_weight: [1.0, 1.0, 1.0],
+            thrust_weight: 6.0,
+            dt: 0.05,
+            rho: 1e4,
+        }
+    }
+}
 
 /// PID gain triplet.
 #[derive(Clone, Copy, Debug)]
@@ -167,6 +205,7 @@ pub struct VehicleParams {
     pub indi_effectiveness: IndiEffectivenessParams,
     pub indi_controller: IndiControllerParams,
     pub learner: LearnerParams,
+    pub mpc: MpcParams,
 }
 
 impl VehicleParams {
@@ -177,6 +216,9 @@ impl VehicleParams {
         let mut off = HEADER_SIZE;
         off = put_f32(&mut buf, off, self.body.mass_kg);
         for &v in &self.body.inertia_kg_m2 {
+            off = put_f32(&mut buf, off, v);
+        }
+        for &v in &self.body.max_rate_rad_s {
             off = put_f32(&mut buf, off, v);
         }
         for m in &self.motors {
@@ -258,6 +300,22 @@ impl VehicleParams {
         off = put_f32(&mut buf, off, self.learner.rls_t_char_s);
         off = put_f32(&mut buf, off, self.learner.zeta_rate);
         off = put_f32(&mut buf, off, self.learner.zeta_attitude);
+        // MpcParams
+        for &v in &self.mpc.pos_weight {
+            off = put_f32(&mut buf, off, v);
+        }
+        for &v in &self.mpc.vel_weight {
+            off = put_f32(&mut buf, off, v);
+        }
+        for &v in &self.mpc.att_weight {
+            off = put_f32(&mut buf, off, v);
+        }
+        for &v in &self.mpc.rate_weight {
+            off = put_f32(&mut buf, off, v);
+        }
+        off = put_f32(&mut buf, off, self.mpc.thrust_weight);
+        off = put_f32(&mut buf, off, self.mpc.dt);
+        off = put_f32(&mut buf, off, self.mpc.rho);
         debug_assert_eq!(off - HEADER_SIZE, PAYLOAD_SIZE);
 
         // Header
@@ -294,9 +352,15 @@ impl VehicleParams {
             *slot = get_f32(buf, off);
             off += 4;
         }
+        let mut max_rate_rad_s = [0.0f32; 3];
+        for slot in &mut max_rate_rad_s {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
         let body = RigidBodyParams {
             mass_kg,
             inertia_kg_m2,
+            max_rate_rad_s,
         };
 
         let mut motors = [MotorParams {
@@ -467,6 +531,43 @@ impl VehicleParams {
             zeta_attitude,
         };
 
+        // MpcParams
+        let mut pos_weight = [0.0f32; 3];
+        for slot in &mut pos_weight {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let mut vel_weight = [0.0f32; 3];
+        for slot in &mut vel_weight {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let mut att_weight = [0.0f32; 3];
+        for slot in &mut att_weight {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let mut rate_weight = [0.0f32; 3];
+        for slot in &mut rate_weight {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let thrust_weight = get_f32(buf, off);
+        off += 4;
+        let dt = get_f32(buf, off);
+        off += 4;
+        let rho = get_f32(buf, off);
+        off += 4;
+        let mpc = MpcParams {
+            pos_weight,
+            vel_weight,
+            att_weight,
+            rate_weight,
+            thrust_weight,
+            dt,
+            rho,
+        };
+
         let _ = off; // suppress unused warning
 
         Some(VehicleParams {
@@ -476,6 +577,7 @@ impl VehicleParams {
             indi_effectiveness,
             indi_controller,
             learner,
+            mpc,
         })
     }
 
@@ -627,44 +729,28 @@ impl VehicleParams {
             ParamKey::M0Px => self.motors[0].position_m[0] = val,
             ParamKey::M0Py => self.motors[0].position_m[1] = val,
             ParamKey::M0Spin => {
-                self.motors[0].spin_dir = if val > 0.0 {
-                    SpinDir::Cw
-                } else {
-                    SpinDir::Ccw
-                }
+                self.motors[0].spin_dir = if val > 0.0 { SpinDir::Cw } else { SpinDir::Ccw }
             }
             ParamKey::M0Thrust => self.motors[0].max_thrust_n = val,
             ParamKey::M0Torque => self.motors[0].torque_coeff_m = val,
             ParamKey::M1Px => self.motors[1].position_m[0] = val,
             ParamKey::M1Py => self.motors[1].position_m[1] = val,
             ParamKey::M1Spin => {
-                self.motors[1].spin_dir = if val > 0.0 {
-                    SpinDir::Cw
-                } else {
-                    SpinDir::Ccw
-                }
+                self.motors[1].spin_dir = if val > 0.0 { SpinDir::Cw } else { SpinDir::Ccw }
             }
             ParamKey::M1Thrust => self.motors[1].max_thrust_n = val,
             ParamKey::M1Torque => self.motors[1].torque_coeff_m = val,
             ParamKey::M2Px => self.motors[2].position_m[0] = val,
             ParamKey::M2Py => self.motors[2].position_m[1] = val,
             ParamKey::M2Spin => {
-                self.motors[2].spin_dir = if val > 0.0 {
-                    SpinDir::Cw
-                } else {
-                    SpinDir::Ccw
-                }
+                self.motors[2].spin_dir = if val > 0.0 { SpinDir::Cw } else { SpinDir::Ccw }
             }
             ParamKey::M2Thrust => self.motors[2].max_thrust_n = val,
             ParamKey::M2Torque => self.motors[2].torque_coeff_m = val,
             ParamKey::M3Px => self.motors[3].position_m[0] = val,
             ParamKey::M3Py => self.motors[3].position_m[1] = val,
             ParamKey::M3Spin => {
-                self.motors[3].spin_dir = if val > 0.0 {
-                    SpinDir::Cw
-                } else {
-                    SpinDir::Ccw
-                }
+                self.motors[3].spin_dir = if val > 0.0 { SpinDir::Cw } else { SpinDir::Ccw }
             }
             ParamKey::M3Thrust => self.motors[3].max_thrust_n = val,
             ParamKey::M3Torque => self.motors[3].torque_coeff_m = val,
@@ -1329,6 +1415,7 @@ mod tests {
             body: RigidBodyParams {
                 mass_kg: 0.5,
                 inertia_kg_m2: [0.0025, 0.0, 0.0, 0.0, 0.0021, 0.0, 0.0, 0.0, 0.0043],
+                max_rate_rad_s: [10.0, 10.0, 6.0],
             },
             motors: [
                 MotorParams {
@@ -1367,6 +1454,7 @@ mod tests {
             indi_effectiveness: IndiEffectivenessParams::default(),
             indi_controller: IndiControllerParams::default(),
             learner: LearnerParams::default(),
+            mpc: MpcParams::default(),
         }
     }
 
@@ -1397,12 +1485,27 @@ mod tests {
 
         let bytes = params.to_bytes();
         let restored = VehicleParams::from_bytes(&bytes).expect("from_bytes failed");
-        assert_eq!(restored.indi_effectiveness.g1_force, params.indi_effectiveness.g1_force);
-        assert_eq!(restored.indi_effectiveness.g1_torque, params.indi_effectiveness.g1_torque);
+        assert_eq!(
+            restored.indi_effectiveness.g1_force,
+            params.indi_effectiveness.g1_force
+        );
+        assert_eq!(
+            restored.indi_effectiveness.g1_torque,
+            params.indi_effectiveness.g1_torque
+        );
         assert_eq!(restored.indi_effectiveness.g2, params.indi_effectiveness.g2);
-        assert_eq!(restored.indi_effectiveness.max_omega, params.indi_effectiveness.max_omega);
-        assert_eq!(restored.indi_effectiveness.time_const_s, params.indi_effectiveness.time_const_s);
-        assert_eq!(restored.indi_effectiveness.nonlinearity, params.indi_effectiveness.nonlinearity);
+        assert_eq!(
+            restored.indi_effectiveness.max_omega,
+            params.indi_effectiveness.max_omega
+        );
+        assert_eq!(
+            restored.indi_effectiveness.time_const_s,
+            params.indi_effectiveness.time_const_s
+        );
+        assert_eq!(
+            restored.indi_effectiveness.nonlinearity,
+            params.indi_effectiveness.nonlinearity
+        );
     }
 
     #[test]
@@ -1457,17 +1560,35 @@ mod tests {
         assert_eq!(ParamKey::from_str("m3_torque"), Some(ParamKey::M3Torque));
         assert_eq!(ParamKey::from_str("g1_fx_m0"), Some(ParamKey::G1FxM0));
         assert_eq!(ParamKey::from_str("g2_ry_m3"), Some(ParamKey::G2RyM3));
-        assert_eq!(ParamKey::from_str("indi_omega_m2"), Some(ParamKey::IndiOmegaM2));
+        assert_eq!(
+            ParamKey::from_str("indi_omega_m2"),
+            Some(ParamKey::IndiOmegaM2)
+        );
         assert_eq!(ParamKey::from_str("indi_tau_m1"), Some(ParamKey::IndiTauM1));
-        assert_eq!(ParamKey::from_str("indi_nonlin_m0"), Some(ParamKey::IndiNonlinM0));
+        assert_eq!(
+            ParamKey::from_str("indi_nonlin_m0"),
+            Some(ParamKey::IndiNonlinM0)
+        );
         assert_eq!(ParamKey::from_str("indi_rate_r"), Some(ParamKey::IndiRateR));
-        assert_eq!(ParamKey::from_str("indi_sync_hz"), Some(ParamKey::IndiSyncHz));
+        assert_eq!(
+            ParamKey::from_str("indi_sync_hz"),
+            Some(ParamKey::IndiSyncHz)
+        );
         assert_eq!(ParamKey::from_str("wls_wv_fz"), Some(ParamKey::WlsWvFz));
         assert_eq!(ParamKey::from_str("wls_wu_m2"), Some(ParamKey::WlsWuM2));
-        assert_eq!(ParamKey::from_str("motor_poles"), Some(ParamKey::MotorPoles));
+        assert_eq!(
+            ParamKey::from_str("motor_poles"),
+            Some(ParamKey::MotorPoles)
+        );
         assert_eq!(ParamKey::from_str("learn_fx_hz"), Some(ParamKey::LearnFxHz));
-        assert_eq!(ParamKey::from_str("learn_gamma"), Some(ParamKey::LearnGamma));
-        assert_eq!(ParamKey::from_str("learn_zeta_att"), Some(ParamKey::LearnZetaAtt));
+        assert_eq!(
+            ParamKey::from_str("learn_gamma"),
+            Some(ParamKey::LearnGamma)
+        );
+        assert_eq!(
+            ParamKey::from_str("learn_zeta_att"),
+            Some(ParamKey::LearnZetaAtt)
+        );
         assert_eq!(ParamKey::from_str("invalid"), None);
     }
 
@@ -1491,11 +1612,26 @@ mod tests {
         let restored = VehicleParams::from_bytes(&bytes).expect("from_bytes failed");
 
         // INDI controller
-        assert_eq!(restored.indi_controller.rate_gains, params.indi_controller.rate_gains);
-        assert_eq!(restored.indi_controller.sync_filter_hz, params.indi_controller.sync_filter_hz);
-        assert_eq!(restored.indi_controller.wls_wv, params.indi_controller.wls_wv);
-        assert_eq!(restored.indi_controller.wls_wu, params.indi_controller.wls_wu);
-        assert_eq!(restored.indi_controller.motor_pole_count, params.indi_controller.motor_pole_count);
+        assert_eq!(
+            restored.indi_controller.rate_gains,
+            params.indi_controller.rate_gains
+        );
+        assert_eq!(
+            restored.indi_controller.sync_filter_hz,
+            params.indi_controller.sync_filter_hz
+        );
+        assert_eq!(
+            restored.indi_controller.wls_wv,
+            params.indi_controller.wls_wv
+        );
+        assert_eq!(
+            restored.indi_controller.wls_wu,
+            params.indi_controller.wls_wu
+        );
+        assert_eq!(
+            restored.indi_controller.motor_pole_count,
+            params.indi_controller.motor_pole_count
+        );
 
         // Learner
         assert_eq!(restored.learner.fx_filt_hz, params.learner.fx_filt_hz);

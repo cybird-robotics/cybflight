@@ -456,6 +456,7 @@ mod tests {
             body: RigidBodyParams {
                 mass_kg: 0.55,
                 inertia_kg_m2: [0.0025, 0.0, 0.0, 0.0, 0.0021, 0.0, 0.0, 0.0, 0.0043],
+                max_rate_rad_s: [10.0, 10.0, 6.0],
             },
             indi_motors: [IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 }; NU],
             nonlinearity: [0.5; NU],

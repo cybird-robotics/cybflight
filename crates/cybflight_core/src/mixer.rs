@@ -107,6 +107,7 @@ pub struct RigidBodyParams {
     /// For a symmetric body, off-diagonal terms are zero.
     /// Stored as a flat array for `const`-compatible initialization.
     pub inertia_kg_m2: [f32; 9],
+    pub max_rate_rad_s: [f32; 3],
 }
 
 impl RigidBodyParams {
@@ -331,6 +332,7 @@ mod tests {
         let body = RigidBodyParams {
             mass_kg: 1.5,
             inertia_kg_m2: [0.02, 0.0, 0.0, 0.0, 0.02, 0.0, 0.0, 0.0, 0.04],
+            max_rate_rad_s: [10.0, 10.0, 6.0],
         };
         let mat = body.inertia_matrix();
         assert_eq!(mat[(0, 0)], 0.02);

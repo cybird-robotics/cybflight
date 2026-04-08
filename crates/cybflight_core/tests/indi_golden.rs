@@ -579,6 +579,7 @@ fn golden_flu_frame_convention() {
     let body = RigidBodyParams {
         mass_kg: 0.55,
         inertia_kg_m2: [0.0025, 0.0, 0.0, 0.0, 0.0021, 0.0, 0.0, 0.0, 0.0043],
+        max_rate_rad_s: [10.0, 10.0, 6.0],
     };
     let indi_params = [IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 }; 4];
     let eff = IndiEffectiveness::new(&motors, &body, &indi_params);
@@ -648,6 +649,7 @@ fn golden_ned_flu_transform() {
     let body = RigidBodyParams {
         mass_kg: 0.55,
         inertia_kg_m2: [0.0025, 0.0, 0.0, 0.0, 0.0021, 0.0, 0.0, 0.0, 0.0043],
+        max_rate_rad_s: [10.0, 10.0, 6.0],
     };
     let indi_params = [IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 }; 4];
 
@@ -753,6 +755,7 @@ fn flu_controller_config() -> IndiConfig {
         body: RigidBodyParams {
             mass_kg: 0.55,
             inertia_kg_m2: [0.0025, 0.0, 0.0, 0.0, 0.0021, 0.0, 0.0, 0.0, 0.0043],
+            max_rate_rad_s: [10.0, 10.0, 6.0],
         },
         indi_motors: [IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 }; 4],
         nonlinearity: [0.5; 4],

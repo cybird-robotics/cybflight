@@ -4,7 +4,7 @@ pub mod eskf;
 pub mod indi;
 pub mod mahony;
 pub mod mixer;
-// pub mod nmpc;
+pub mod mpc;
 pub mod params;
 pub mod position_control;
 pub mod rc;

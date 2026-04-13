@@ -56,6 +56,7 @@ pub const CRSF_FRAME_LENGTH_TYPE_CRC: usize = 2;
 // Subset RC channel constants
 const SUBSET_RC_STARTING_CHANNEL_BITS: u8 = 5;
 const SUBSET_RC_STARTING_CHANNEL_MASK: u8 = 0x1F;
+#[allow(unused)]
 const SUBSET_RC_RES_CONFIGURATION_BITS: u8 = 2;
 const SUBSET_RC_RES_CONFIGURATION_MASK: u8 = 0x03;
 
@@ -64,6 +65,7 @@ const RC_CHANNEL_SCALE_LEGACY: f32 = 0.62477120195241;
 
 // Subset RC resolution configs
 const SUBSET_RC_RES_CONF_10B: u8 = 0;
+#[allow(unused)]
 const SUBSET_RC_RES_CONF_11B: u8 = 1;
 const SUBSET_RC_RES_CONF_12B: u8 = 2;
 const SUBSET_RC_RES_CONF_13B: u8 = 3;

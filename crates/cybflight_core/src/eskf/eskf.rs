@@ -237,8 +237,6 @@ impl Eskf {
             q
         };
 
-        let e = q.euler_angles();
-
         if !self.initialized {
             return;
         }

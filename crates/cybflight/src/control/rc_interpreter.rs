@@ -77,8 +77,6 @@ pub async fn rc_interpreter_task() {
 use crate::sensors::VEHICLE_ODOMETRY;
 #[cfg(feature = "est_eskf")]
 use cybflight_core::rc::rc_mapping::ChannelCalibration;
-#[cfg(feature = "est_eskf")]
-use nalgebra::{UnitQuaternion, Vector3};
 
 /// Lateral half-range: centered stick ±1 → ±XY_HALF_RANGE m from origin.
 #[cfg(feature = "est_eskf")]
@@ -91,15 +89,9 @@ const Z_RANGE: f32 = 1.0;
 const POSITION_THRESHOLD: f32 = 0.01;
 
 #[cfg(feature = "est_eskf")]
-fn extract_yaw(q: &UnitQuaternion<f32>) -> f32 {
-    let (_roll, _pitch, yaw) = q.euler_angles();
-    yaw
-}
-
-#[cfg(feature = "est_eskf")]
 #[embassy_executor::task]
 pub async fn rc_interpreter_task() {
-    use nalgebra::UnitQuaternion;
+    use nalgebra::{UnitQuaternion, Vector3};
 
     let mut rc_sub = RC_INPUT
         .subscriber()

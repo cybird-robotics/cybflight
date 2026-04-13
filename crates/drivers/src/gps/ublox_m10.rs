@@ -164,7 +164,10 @@ where
     /// - NAV-PVT on UART1 at rate 1 (every measurement)
     /// - 5 Hz measurement rate (200 ms)
     /// - All constellations enabled (GPS, Galileo, GLONASS, BeiDou)
-    pub async fn new(mut rw: RW, delay: &mut impl embedded_hal_async::delay::DelayNs) -> Result<Self, Error<RW::Error>> {
+    pub async fn new(
+        rw: RW,
+        delay: &mut impl embedded_hal_async::delay::DelayNs,
+    ) -> Result<Self, Error<RW::Error>> {
         delay.delay_ms(500).await;
 
         let mut driver = Self { rw };

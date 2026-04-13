@@ -23,10 +23,10 @@
 // Motor regressors: [D, √D, 1, -1e-4 * ω̇]
 // Motor observation: ω * 1e-3
 
-use air_filters::Filter;
 use air_filters::iir::biquad::{
     BiquadFilter, BiquadFilterConfigBuilder, BiquadFilterType, DirectForm2,
 };
+use air_filters::Filter;
 use flight_solver::rls::{CovarianceGuards, RlsParallel};
 use nalgebra::{SMatrix, SVector, Vector3};
 
@@ -94,9 +94,9 @@ pub struct LearnerInput {
     /// Specific force (m/s²), from INDI (bias-corrected accel).
     pub spf_m_s2: Vector3<f32>,
     /// Motor speed per motor (rad/s), from RPM tracker (unfiltered).
-    pub omega_rad_s: [f32; NU],
+    pub omega_rad_s: SVector<f32, NU>,
     /// Motor commands per motor [0,1], from INDI output (after linearization).
-    pub d_commands: [f32; NU],
+    pub d_commands: SVector<f32, NU>,
     /// True if the vehicle is armed.
     pub armed: bool,
     /// True if the vehicle is on the ground.
@@ -112,11 +112,11 @@ pub struct LearnedParams {
     /// G2 gyroscopic coupling (3×NU): [roll, pitch, yaw] per motor.
     pub g2: SMatrix<f32, 3, NU>,
     /// Learned max motor speed per motor (rad/s).
-    pub max_omega: [f32; NU],
+    pub max_omega: SVector<f32, NU>,
     /// Learned motor time constant per motor (seconds).
-    pub time_const_s: [f32; NU],
+    pub time_const_s: SVector<f32, NU>,
     /// Learned motor nonlinearity per motor [0, 1].
-    pub nonlinearity: [f32; NU],
+    pub nonlinearity: SVector<f32, NU>,
     /// Synthesized rate gain (shared across axes).
     pub rate_gain: f32,
     /// Synthesized attitude gain (shared across axes).
@@ -130,9 +130,9 @@ impl Default for LearnedParams {
         Self {
             g1: SMatrix::zeros(),
             g2: SMatrix::zeros(),
-            max_omega: [0.0; NU],
-            time_const_s: [0.025; NU],
-            nonlinearity: [0.5; NU],
+            max_omega: SVector::zeros(),
+            time_const_s: SVector::from_element(0.025),
+            nonlinearity: SVector::from_element(0.5),
             rate_gain: 0.0,
             attitude_gain: 0.0,
             valid: false,
@@ -159,8 +159,8 @@ pub struct Learner {
     fx_spf_filter: [Biquad; 3],
 
     // ── FX differencing state ──────────────────────────────────────────
-    prev_fx_omega: [f32; NU],
-    prev_fx_omega_dot: [f32; NU],
+    prev_fx_omega: SVector<f32, NU>,
+    prev_fx_omega_dot: SVector<f32, NU>,
     prev_fx_rate_dot: [f32; 3],
     prev_fx_spf: [f32; 3],
 
@@ -170,7 +170,7 @@ pub struct Learner {
     motor_sqrt_d_filter: [Biquad; NU],
 
     // ── Motor differencing state ───────────────────────────────────────
-    prev_motor_omega: [f32; NU],
+    prev_motor_omega: SVector<f32, NU>,
 
     // ── RLS instances ──────────────────────────────────────────────────
     /// Force effectiveness: regressors = NU G1 terms only.
@@ -206,14 +206,26 @@ impl Learner {
 
         let guards = CovarianceGuards::default();
 
-        let fx_spf_rls =
-            RlsParallel::<NU, 3>::from_time_constant(config.rls_gamma, ts, config.rls_t_char_s, guards);
-        let fx_rate_dot_rls =
-            RlsParallel::<FX_N, 3>::from_time_constant(config.rls_gamma, ts, config.rls_t_char_s, guards);
-        let motor_rls: [RlsParallel<MOTOR_N, 1>; NU] =
-            core::array::from_fn(|_| {
-                RlsParallel::<MOTOR_N, 1>::from_time_constant(config.rls_gamma, ts, config.rls_t_char_s, guards)
-            });
+        let fx_spf_rls = RlsParallel::<NU, 3>::from_time_constant(
+            config.rls_gamma,
+            ts,
+            config.rls_t_char_s,
+            guards,
+        );
+        let fx_rate_dot_rls = RlsParallel::<FX_N, 3>::from_time_constant(
+            config.rls_gamma,
+            ts,
+            config.rls_t_char_s,
+            guards,
+        );
+        let motor_rls: [RlsParallel<MOTOR_N, 1>; NU] = core::array::from_fn(|_| {
+            RlsParallel::<MOTOR_N, 1>::from_time_constant(
+                config.rls_gamma,
+                ts,
+                config.rls_t_char_s,
+                guards,
+            )
+        });
 
         Self {
             config: *config,
@@ -221,14 +233,14 @@ impl Learner {
             fx_omega_filter: core::array::from_fn(|_| make_biquad(config.fx_filt_hz)),
             fx_rate_filter: core::array::from_fn(|_| make_biquad(config.fx_filt_hz)),
             fx_spf_filter: core::array::from_fn(|_| make_biquad(config.fx_filt_hz)),
-            prev_fx_omega: [0.0; NU],
-            prev_fx_omega_dot: [0.0; NU],
+            prev_fx_omega: SVector::zeros(),
+            prev_fx_omega_dot: SVector::zeros(),
             prev_fx_rate_dot: [0.0; 3],
             prev_fx_spf: [0.0; 3],
             motor_omega_filter: core::array::from_fn(|_| make_biquad(config.motor_filt_hz)),
             motor_d_filter: core::array::from_fn(|_| make_biquad(config.motor_filt_hz)),
             motor_sqrt_d_filter: core::array::from_fn(|_| make_biquad(config.motor_filt_hz)),
-            prev_motor_omega: [0.0; NU],
+            prev_motor_omega: SVector::zeros(),
             fx_spf_rls,
             fx_rate_dot_rls,
             motor_rls,
@@ -254,7 +266,12 @@ impl Learner {
             self.samples = self.samples.saturating_add(1);
 
             // ── 3. FX effectiveness RLS ────────────────────────────────
-            self.update_fx_rls(&fx_omega_diff, &fx_omega_dot_diff, &fx_rate_dot_diff, &fx_spf_diff);
+            self.update_fx_rls(
+                &fx_omega_diff,
+                &fx_omega_dot_diff,
+                &fx_rate_dot_diff,
+                &fx_spf_diff,
+            );
 
             // ── 4. Motor dynamics RLS ──────────────────────────────────
             self.update_motor_rls(&motor_omega, &motor_d, &motor_sqrt_d, &motor_omega_dot);
@@ -271,13 +288,13 @@ impl Learner {
     fn update_fx_filters(
         &mut self,
         input: &LearnerInput,
-    ) -> ([f32; NU], [f32; NU], [f32; 3], [f32; 3]) {
+    ) -> (SVector<f32, NU>, SVector<f32, NU>, [f32; 3], [f32; 3]) {
         // Coriolis/centrifugal correction on accelerometer
         let spf_corrected = self.correct_accel(input);
 
         // Filter and difference omega
-        let mut omega_diff = [0.0f32; NU];
-        let mut omega_dot_diff = [0.0f32; NU];
+        let mut omega_diff = SVector::<f32, NU>::zeros();
+        let mut omega_dot_diff = SVector::<f32, NU>::zeros();
         for i in 0..NU {
             let fx_omega = self.fx_omega_filter[i].apply(input.omega_rad_s[i]);
             omega_diff[i] = fx_omega - self.prev_fx_omega[i];
@@ -333,11 +350,16 @@ impl Learner {
     fn update_motor_filters(
         &mut self,
         input: &LearnerInput,
-    ) -> ([f32; NU], [f32; NU], [f32; NU], [f32; NU]) {
-        let mut omega = [0.0f32; NU];
-        let mut d = [0.0f32; NU];
-        let mut sqrt_d = [0.0f32; NU];
-        let mut omega_dot = [0.0f32; NU];
+    ) -> (
+        SVector<f32, NU>,
+        SVector<f32, NU>,
+        SVector<f32, NU>,
+        SVector<f32, NU>,
+    ) {
+        let mut omega = SVector::<f32, NU>::zeros();
+        let mut d = SVector::<f32, NU>::zeros();
+        let mut sqrt_d = SVector::<f32, NU>::zeros();
+        let mut omega_dot = SVector::<f32, NU>::zeros();
 
         for i in 0..NU {
             omega[i] = self.motor_omega_filter[i].apply(input.omega_rad_s[i]);
@@ -357,8 +379,8 @@ impl Learner {
     /// Update FX effectiveness RLS (G1 force + G1/G2 torque).
     fn update_fx_rls(
         &mut self,
-        omega_diff: &[f32; NU],
-        omega_dot_diff: &[f32; NU],
+        omega_diff: &SVector<f32, NU>,
+        omega_dot_diff: &SVector<f32, NU>,
         rate_dot_diff: &[f32; 3],
         spf_diff: &[f32; 3],
     ) {
@@ -373,21 +395,15 @@ impl Learner {
         let a_fx_vec = SVector::<f32, FX_N>::from_column_slice(&a_fx);
 
         // SPF RLS uses only the first NU regressors (G1 only, no G2 for forces)
-        let mut a_spf = [0.0f32; NU];
+        let mut a_spf = SVector::<f32, NU>::zeros();
         a_spf.copy_from_slice(&a_fx[..NU]);
-        let a_spf_vec = SVector::<f32, NU>::from_column_slice(&a_spf);
+        let a_spf_vec = &a_spf;
 
         // Observations
-        let y_spf = SVector::<f32, 3>::new(
-            spf_diff[0] * 10.0,
-            spf_diff[1] * 10.0,
-            spf_diff[2] * 10.0,
-        );
-        let y_rate_dot = SVector::<f32, 3>::new(
-            rate_dot_diff[0],
-            rate_dot_diff[1],
-            rate_dot_diff[2],
-        );
+        let y_spf =
+            SVector::<f32, 3>::new(spf_diff[0] * 10.0, spf_diff[1] * 10.0, spf_diff[2] * 10.0);
+        let y_rate_dot =
+            SVector::<f32, 3>::new(rate_dot_diff[0], rate_dot_diff[1], rate_dot_diff[2]);
 
         self.fx_spf_rls.update(&a_spf_vec, &y_spf);
         self.fx_rate_dot_rls.update(&a_fx_vec, &y_rate_dot);
@@ -396,18 +412,13 @@ impl Learner {
     /// Update per-motor dynamics RLS.
     fn update_motor_rls(
         &mut self,
-        omega: &[f32; NU],
-        d: &[f32; NU],
-        sqrt_d: &[f32; NU],
-        omega_dot: &[f32; NU],
+        omega: &SVector<f32, NU>,
+        d: &SVector<f32, NU>,
+        sqrt_d: &SVector<f32, NU>,
+        omega_dot: &SVector<f32, NU>,
     ) {
         for i in 0..NU {
-            let a = SVector::<f32, MOTOR_N>::new(
-                d[i],
-                sqrt_d[i],
-                1.0,
-                -1e-4 * omega_dot[i],
-            );
+            let a = SVector::<f32, MOTOR_N>::new(d[i], sqrt_d[i], 1.0, -1e-4 * omega_dot[i]);
             let y = SVector::<f32, 1>::new(omega[i] * 1e-3);
             self.motor_rls[i].update(&a, &y);
         }
@@ -426,9 +437,9 @@ impl Learner {
         const G_MAG_MAX: f32 = 1e4;
         const OMEGA_MAX: f32 = 20_000.0;
 
-        let mut max_omega = [0.0f32; NU];
-        let mut time_const_s = [0.025f32; NU];
-        let mut nonlinearity = [0.5f32; NU];
+        let mut max_omega = SVector::<f32, NU>::zeros();
+        let mut time_const_s = SVector::<f32, NU>::from_element(0.025);
+        let mut nonlinearity = SVector::<f32, NU>::from_element(0.5);
 
         // Motor parameters (from motor RLS)
         for i in 0..NU {
@@ -437,18 +448,30 @@ impl Learner {
             // inv_y_scale = 1e3 (observation was omega * 1e-3)
             let mo = 1e3 * (x[(0, 0)] + x[(1, 0)]);
             // NaN-safe: is_finite gates clamp (NaN.clamp() returns NaN in Rust)
-            max_omega[i] = if mo.is_finite() && mo > 100.0 { mo } else { 100.0 };
+            max_omega[i] = if mo.is_finite() && mo > 100.0 {
+                mo
+            } else {
+                100.0
+            };
 
             // time_const = inv_y_scale * a_scale * X[3]
             // a_scale for omega_dot regressor = 1e-4, inv_y_scale = 1e3
             // So: tau = 1e3 * 1e-4 * X[3] = 0.1 * X[3]
             let tau = 0.1 * x[(3, 0)];
-            time_const_s[i] = if tau.is_finite() { tau.clamp(0.01, 0.2) } else { 0.025 };
+            time_const_s[i] = if tau.is_finite() {
+                tau.clamp(0.01, 0.2)
+            } else {
+                0.025
+            };
 
             // nonlinearity = X[0] / (X[0] + X[1])
             if x[(0, 0)] > 0.0 && x[(1, 0)] > 0.0 {
                 let nl = x[(0, 0)] / (x[(0, 0)] + x[(1, 0)]);
-                nonlinearity[i] = if nl.is_finite() { nl.clamp(0.0, 1.0) } else { 0.5 };
+                nonlinearity[i] = if nl.is_finite() {
+                    nl.clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
             }
         }
 
@@ -487,12 +510,17 @@ impl Learner {
         // Gain synthesis (from learned motor time constants)
         let mut max_tau = 0.0f32;
         for i in 0..NU {
-            max_tau = if time_const_s[i] > max_tau { time_const_s[i] } else { max_tau };
+            max_tau = if time_const_s[i] > max_tau {
+                time_const_s[i]
+            } else {
+                max_tau
+            };
         }
         max_tau = max_tau.clamp(0.01, 0.2);
 
         let rate_gain = 0.25 / (self.config.zeta_rate * self.config.zeta_rate * max_tau);
-        let attitude_gain = 0.25 * rate_gain / (self.config.zeta_attitude * self.config.zeta_attitude);
+        let attitude_gain =
+            0.25 * rate_gain / (self.config.zeta_attitude * self.config.zeta_attitude);
 
         // Validate all extracted parameters — reject entire set if any entry
         // is NaN, infinite, or has diverged beyond physical bounds.  G1/G2 are
@@ -565,8 +593,8 @@ mod tests {
             rate_rad_s: Vector3::zeros(),
             rate_dot_rad_s2: Vector3::zeros(),
             spf_m_s2: Vector3::new(0.0, 0.0, 9.81),
-            omega_rad_s: [0.0; NU],
-            d_commands: [0.0; NU],
+            omega_rad_s: SVector::zeros(),
+            d_commands: SVector::zeros(),
             armed: false,
             touching_ground: true,
         }
@@ -673,8 +701,8 @@ mod tests {
                 rate_rad_s: Vector3::zeros(),
                 rate_dot_rad_s2: Vector3::zeros(),
                 spf_m_s2: Vector3::new(0.0, 0.0, 9.81),
-                omega_rad_s: [omega; NU],
-                d_commands: [d; NU],
+                omega_rad_s: SVector::from_element(omega),
+                d_commands: SVector::from_element(d),
                 armed: true,
                 touching_ground: false,
             };
@@ -716,8 +744,8 @@ mod tests {
                     0.0,
                 ),
                 spf_m_s2: Vector3::new(0.5 * d, -0.3 * d, 9.81 + 2.0 * d),
-                omega_rad_s: [omega; NU],
-                d_commands: [d; NU],
+                omega_rad_s: SVector::from_element(omega),
+                d_commands: SVector::from_element(d),
                 armed: true,
                 touching_ground: false,
             };
@@ -728,20 +756,42 @@ mod tests {
         assert!(params.valid);
         // Check everything is finite
         for i in 0..NU {
-            assert!(params.max_omega[i].is_finite(), "max_omega[{}] not finite", i);
-            assert!(params.time_const_s[i].is_finite(), "time_const_s[{}] not finite", i);
-            assert!(params.nonlinearity[i].is_finite(), "nonlinearity[{}] not finite", i);
+            assert!(
+                params.max_omega[i].is_finite(),
+                "max_omega[{}] not finite",
+                i
+            );
+            assert!(
+                params.time_const_s[i].is_finite(),
+                "time_const_s[{}] not finite",
+                i
+            );
+            assert!(
+                params.nonlinearity[i].is_finite(),
+                "nonlinearity[{}] not finite",
+                i
+            );
             assert!(params.rate_gain.is_finite());
             assert!(params.attitude_gain.is_finite());
         }
         for row in 0..6 {
             for col in 0..NU {
-                assert!(params.g1[(row, col)].is_finite(), "G1[{},{}] not finite", row, col);
+                assert!(
+                    params.g1[(row, col)].is_finite(),
+                    "G1[{},{}] not finite",
+                    row,
+                    col
+                );
             }
         }
         for row in 0..3 {
             for col in 0..NU {
-                assert!(params.g2[(row, col)].is_finite(), "G2[{},{}] not finite", row, col);
+                assert!(
+                    params.g2[(row, col)].is_finite(),
+                    "G2[{},{}] not finite",
+                    row,
+                    col
+                );
             }
         }
     }
@@ -764,8 +814,8 @@ mod tests {
             rate_rad_s: Vector3::new(0.0, 0.0, 10.0),
             rate_dot_rad_s2: Vector3::zeros(),
             spf_m_s2: Vector3::new(0.0, 0.0, 9.81),
-            omega_rad_s: [0.0; NU],
-            d_commands: [0.0; NU],
+            omega_rad_s: SVector::zeros(),
+            d_commands: SVector::zeros(),
             armed: false,
             touching_ground: true,
         };
@@ -797,10 +847,10 @@ mod tests {
         // Set motor RLS params directly
         for i in 0..NU {
             let x = learner.motor_rls[i].params_mut();
-            x[(0, 0)] = 1.5;   // D coefficient
-            x[(1, 0)] = 0.5;   // sqrt(D) coefficient
-            x[(2, 0)] = 0.0;   // bias
-            x[(3, 0)] = 0.25;  // omega_dot coefficient → tau = 0.1 * 0.25 = 0.025
+            x[(0, 0)] = 1.5; // D coefficient
+            x[(1, 0)] = 0.5; // sqrt(D) coefficient
+            x[(2, 0)] = 0.0; // bias
+            x[(3, 0)] = 0.25; // omega_dot coefficient → tau = 0.1 * 0.25 = 0.025
         }
 
         let params = learner.extract_params();
@@ -809,17 +859,20 @@ mod tests {
             assert!(
                 (params.max_omega[i] - 2000.0).abs() < 1.0,
                 "motor {} max_omega={}, expected 2000",
-                i, params.max_omega[i]
+                i,
+                params.max_omega[i]
             );
             assert!(
                 (params.time_const_s[i] - 0.025).abs() < 1e-4,
                 "motor {} tau={}, expected 0.025",
-                i, params.time_const_s[i]
+                i,
+                params.time_const_s[i]
             );
             assert!(
                 (params.nonlinearity[i] - 0.75).abs() < 1e-4,
                 "motor {} nonlin={}, expected 0.75",
-                i, params.nonlinearity[i]
+                i,
+                params.nonlinearity[i]
             );
         }
     }
@@ -848,14 +901,16 @@ mod tests {
         assert!(
             (params.rate_gain - expected_rate).abs() < 1e-3,
             "rate_gain={}, expected={}",
-            params.rate_gain, expected_rate
+            params.rate_gain,
+            expected_rate
         );
         // attitude_gain = 0.25 * rate_gain / 0.64
         let expected_att = 0.25 * expected_rate / 0.64;
         assert!(
             (params.attitude_gain - expected_att).abs() < 1e-2,
             "att_gain={}, expected={}",
-            params.attitude_gain, expected_att
+            params.attitude_gain,
+            expected_att
         );
     }
 
@@ -870,15 +925,15 @@ mod tests {
 
         for step in 0..4000 {
             let t = step as f32 / LOOP_HZ;
-            let d = (0.3 + 0.3 * libm::sinf(2.0 * core::f32::consts::PI * 30.0 * t))
-                .clamp(0.05, 0.95);
+            let d =
+                (0.3 + 0.3 * libm::sinf(2.0 * core::f32::consts::PI * 30.0 * t)).clamp(0.05, 0.95);
             let omega = 2000.0 * d * d; // quadratic motor
             let input = LearnerInput {
                 rate_rad_s: Vector3::zeros(),
                 rate_dot_rad_s2: Vector3::zeros(),
                 spf_m_s2: Vector3::new(0.0, 0.0, 9.81),
-                omega_rad_s: [omega; NU],
-                d_commands: [d; NU],
+                omega_rad_s: SVector::from_element(omega),
+                d_commands: SVector::from_element(d),
                 armed: true,
                 touching_ground: false,
             };
@@ -892,15 +947,16 @@ mod tests {
             assert!(
                 params.max_omega[i] > 500.0 && params.max_omega[i] < 5000.0,
                 "motor {} max_omega={} out of range",
-                i, params.max_omega[i]
+                i,
+                params.max_omega[i]
             );
             // time_const should be reasonable (> 0, < 0.2)
             assert!(
                 params.time_const_s[i] >= 0.01 && params.time_const_s[i] <= 0.2,
                 "motor {} tau={} out of range",
-                i, params.time_const_s[i]
+                i,
+                params.time_const_s[i]
             );
         }
     }
-
 }

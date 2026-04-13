@@ -61,6 +61,10 @@ See [docs/architecture.md](docs/architecture.md) "How to Add a New Sensor Type" 
 - Drivers in `crates/drivers/` are generic over `embedded-hal-async` traits,
   never import `embassy-stm32` directly
 - Use `defmt` for all logging, never `println` or `log` crate
+- Prefer `nalgebra` for vector math; language arrays (and nested arrays) for
+  vector math is acceptable only in the initial commit porting code from C/C++.
+  In this case, claude must clearly annotate TODO comments to replace with
+  nalgebra in a future refactor.
 
 ## Tooling
 

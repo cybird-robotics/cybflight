@@ -89,7 +89,7 @@ impl<const N: usize> IndiEffectiveness<N> {
             let torque = Vector3::new(
                 py * t,                           // roll torque (N·m)
                 -px * t,                          // pitch torque (N·m)
-                spin_sign * m.torque_coeff_m * t,  // yaw torque (N·m)
+                spin_sign * m.torque_coeff_m * t, // yaw torque (N·m)
             );
 
             // Angular acceleration = I⁻¹ · τ
@@ -108,7 +108,12 @@ impl<const N: usize> IndiEffectiveness<N> {
             g2_scaler[i] = 0.5 * omega_max * omega_max / ip.time_const_s;
         }
 
-        Self { g1, g2, g2_scaler, max_omega }
+        Self {
+            g1,
+            g2,
+            g2_scaler,
+            max_omega,
+        }
     }
 
     /// Build the combined G1+G2 effectiveness matrix for the current timestep.
@@ -159,8 +164,8 @@ impl<const N: usize> IndiEffectiveness<N> {
         &mut self,
         g1: &SMatrix<f32, 6, N>,
         g2: &SMatrix<f32, 3, N>,
-        max_omega: &[f32; N],
-        time_const_s: &[f32; N],
+        max_omega: &SVector<f32, N>,
+        time_const_s: &SVector<f32, N>,
     ) -> bool {
         // Magnitude bound: ~30× the largest geometric G1 entry for a typical
         // micro-quad. Anything beyond this is a diverged RLS, not a real vehicle.
@@ -188,10 +193,7 @@ impl<const N: usize> IndiEffectiveness<N> {
             if !max_omega[i].is_finite() || max_omega[i] <= 0.0 || max_omega[i] > OMEGA_MAX {
                 return false;
             }
-            if !time_const_s[i].is_finite()
-                || time_const_s[i] < 0.005
-                || time_const_s[i] > 0.5
-            {
+            if !time_const_s[i].is_finite() || time_const_s[i] < 0.005 || time_const_s[i] > 0.5 {
                 return false;
             }
         }
@@ -232,22 +234,49 @@ mod tests {
 
     fn test_motors() -> [MotorParams; 4] {
         [
-            MotorParams { position_m: [-0.075, -0.1], spin_dir: SpinDir::Cw,  max_thrust_n: 8.5, torque_coeff_m: 0.022 },
-            MotorParams { position_m: [ 0.075, -0.1], spin_dir: SpinDir::Ccw, max_thrust_n: 8.5, torque_coeff_m: 0.022 },
-            MotorParams { position_m: [-0.075,  0.1], spin_dir: SpinDir::Ccw, max_thrust_n: 8.5, torque_coeff_m: 0.022 },
-            MotorParams { position_m: [ 0.075,  0.1], spin_dir: SpinDir::Cw,  max_thrust_n: 8.5, torque_coeff_m: 0.022 },
+            MotorParams {
+                position_m: [-0.075, -0.1],
+                spin_dir: SpinDir::Cw,
+                max_thrust_n: 8.5,
+                torque_coeff_m: 0.022,
+            },
+            MotorParams {
+                position_m: [0.075, -0.1],
+                spin_dir: SpinDir::Ccw,
+                max_thrust_n: 8.5,
+                torque_coeff_m: 0.022,
+            },
+            MotorParams {
+                position_m: [-0.075, 0.1],
+                spin_dir: SpinDir::Ccw,
+                max_thrust_n: 8.5,
+                torque_coeff_m: 0.022,
+            },
+            MotorParams {
+                position_m: [0.075, 0.1],
+                spin_dir: SpinDir::Cw,
+                max_thrust_n: 8.5,
+                torque_coeff_m: 0.022,
+            },
         ]
     }
 
     fn test_indi_params() -> [IndiMotorParams; 4] {
-        [IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 }; 4]
+        [IndiMotorParams {
+            time_const_s: 0.025,
+            max_rpm: 40000.0,
+            g2_yaw: 0.0,
+        }; 4]
     }
 
     #[test]
     fn g1_fz_positive() {
         let eff = IndiEffectiveness::new(&test_motors(), &test_body(), &test_indi_params());
         for i in 0..4 {
-            assert!(eff.g1[(2, i)] > 0.0, "fz should be positive (upward) in FLU");
+            assert!(
+                eff.g1[(2, i)] > 0.0,
+                "fz should be positive (upward) in FLU"
+            );
         }
         let expected_fz = 8.5 / 0.55;
         assert!((eff.g1[(2, 0)] - expected_fz).abs() < 1e-4);
@@ -315,10 +344,26 @@ mod tests {
         // CW motors (M0, M3): positive G2 yaw in FLU
         // CCW motors (M1, M2): negative G2 yaw in FLU
         [
-            IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw:  0.001 },
-            IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: -0.001 },
-            IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: -0.001 },
-            IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw:  0.001 },
+            IndiMotorParams {
+                time_const_s: 0.025,
+                max_rpm: 40000.0,
+                g2_yaw: 0.001,
+            },
+            IndiMotorParams {
+                time_const_s: 0.025,
+                max_rpm: 40000.0,
+                g2_yaw: -0.001,
+            },
+            IndiMotorParams {
+                time_const_s: 0.025,
+                max_rpm: 40000.0,
+                g2_yaw: -0.001,
+            },
+            IndiMotorParams {
+                time_const_s: 0.025,
+                max_rpm: 40000.0,
+                g2_yaw: 0.001,
+            },
         ]
     }
 
@@ -371,13 +416,17 @@ mod tests {
         // Torque rows (3-5) should differ from G1 for yaw (row 5)
         for i in 0..4 {
             let yaw_diff = (combined[(5, i)] - eff.g1[(5, i)]).abs();
-            assert!(yaw_diff > 1e-6, "G2 should modify yaw row for motor {i}: diff={yaw_diff}");
+            assert!(
+                yaw_diff > 1e-6,
+                "G2 should modify yaw row for motor {i}: diff={yaw_diff}"
+            );
 
             // G2 contribution sign: same as G2 yaw sign (scaler and omega_inv are positive)
             let g2_contribution = combined[(5, i)] - eff.g1[(5, i)];
             let expected_sign = eff.g2[(2, i)].signum();
             assert_eq!(
-                g2_contribution.signum(), expected_sign,
+                g2_contribution.signum(),
+                expected_sign,
                 "G2 yaw contribution sign wrong for motor {i}"
             );
         }

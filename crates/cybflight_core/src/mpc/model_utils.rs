@@ -22,7 +22,7 @@
 //! Each helper carries a `const { assert!(NX >= 7) }` (or 10 / 13 as needed)
 //! so calling it with an incompatible state size is a compile-time error.
 
-use num_traits::Float;
+use nalgebra::{SMatrix, SVector};
 
 // ───────────────────────────────────────────────────────────────────────────
 // Quaternion projection
@@ -35,11 +35,11 @@ use num_traits::Float;
 /// const-generic `NX` lets the same function serve both `FullQuadModel`
 /// (NX=13) and `QuadModel` (NX=10).
 #[inline]
-pub fn normalize_quat<const NX: usize>(x: &mut [f32; NX]) {
+pub fn normalize_quat<const NX: usize>(x: &mut SVector<f32, NX>) {
     const { assert!(NX >= 7, "normalize_quat requires NX >= 7") };
     let qnorm_sq = x[3] * x[3] + x[4] * x[4] + x[5] * x[5] + x[6] * x[6];
     if qnorm_sq > 1e-12 {
-        let inv = 1.0 / qnorm_sq.sqrt();
+        let inv = 1.0 / libm::sqrtf(qnorm_sq);
         x[3] *= inv;
         x[4] *= inv;
         x[5] *= inv;
@@ -66,8 +66,8 @@ pub fn normalize_quat<const NX: usize>(x: &mut [f32; NX]) {
 /// comments there for the math derivation.
 #[inline]
 pub fn attitude_error<const NX: usize>(
-    x: &[f32; NX],
-    xref: &[f32; NX],
+    x: &SVector<f32, NX>,
+    xref: &SVector<f32, NX>,
 ) -> ([f32; 3], [[f32; 4]; 3], [[f32; 4]; 4]) {
     const { assert!(NX >= 7, "attitude_error requires NX >= 7") };
     let (qx, qy, qz, qw) = (x[3], x[4], x[5], x[6]);
@@ -89,7 +89,7 @@ pub fn attitude_error<const NX: usize>(
     }
 
     const EPS: f32 = 1e-3;
-    let denom = (qa[3] * qa[3] + qa[2] * qa[2] + EPS).sqrt();
+    let denom = libm::sqrtf(qa[3] * qa[3] + qa[2] * qa[2] + EPS);
     let inv_d = 1.0 / denom;
     let nr = qa[3] * qa[0] - qa[1] * qa[2];
     let np_ = qa[3] * qa[1] + qa[0] * qa[2];
@@ -142,12 +142,12 @@ pub fn attitude_error<const NX: usize>(
 /// can accumulate it.
 #[inline]
 pub fn write_pos_vel_cost_grad<const NX: usize>(
-    x: &[f32; NX],
-    xref: &[f32; NX],
+    x: &SVector<f32, NX>,
+    xref: &SVector<f32, NX>,
     w_pos: &[f32; 3],
     w_vel: &[f32; 3],
     dt: f32,
-    grad_x: &mut [f32; NX],
+    grad_x: &mut SVector<f32, NX>,
 ) -> f32 {
     const { assert!(NX >= 10, "write_pos_vel_cost_grad requires NX >= 10") };
     let mut cost = 0.0;
@@ -171,12 +171,12 @@ pub fn write_pos_vel_hess<const NX: usize>(
     w_pos: &[f32; 3],
     w_vel: &[f32; 3],
     dt: f32,
-    hess_xx: &mut [[f32; NX]; NX],
+    hess_xx: &mut SMatrix<f32, NX, NX>,
 ) {
     const { assert!(NX >= 10, "write_pos_vel_hess requires NX >= 10") };
     for i in 0..3 {
-        hess_xx[i][i] = 2.0 * dt * w_pos[i];
-        hess_xx[7 + i][7 + i] = 2.0 * dt * w_vel[i];
+        hess_xx[(i, i)] = 2.0 * dt * w_pos[i];
+        hess_xx[(7 + i, 7 + i)] = 2.0 * dt * w_vel[i];
     }
 }
 
@@ -194,7 +194,7 @@ pub fn write_quat_cost_grad<const NX: usize>(
     dqa_dq: &[[f32; 4]; 4],
     w_att: &[f32; 3],
     dt: f32,
-    grad_x: &mut [f32; NX],
+    grad_x: &mut SVector<f32, NX>,
 ) -> f32 {
     const { assert!(NX >= 7, "write_quat_cost_grad requires NX >= 7") };
     let mut cost = 0.0;
@@ -230,7 +230,7 @@ pub fn write_quat_hess<const NX: usize>(
     dqa_dq: &[[f32; 4]; 4],
     w_att: &[f32; 3],
     dt: f32,
-    hess_xx: &mut [[f32; NX]; NX],
+    hess_xx: &mut SMatrix<f32, NX, NX>,
 ) {
     const { assert!(NX >= 7, "write_quat_hess requires NX >= 7") };
     // J_att (3×4) = de @ dqa_dq
@@ -249,7 +249,7 @@ pub fn write_quat_hess<const NX: usize>(
             for k in 0..3 {
                 s += j_att[k][i] * w_att[k] * j_att[k][j];
             }
-            hess_xx[3 + i][3 + j] = 2.0 * dt * s;
+            hess_xx[(3 + i, 3 + j)] = 2.0 * dt * s;
         }
     }
 }
@@ -260,7 +260,10 @@ pub fn write_quat_hess<const NX: usize>(
 
 /// Clamp each component of `u` to its per-channel `[lower, upper]` bound.
 #[inline]
-pub fn clamp_control<const NU: usize>(u: &[f32; NU], bounds: &[[f32; 2]; NU]) -> [f32; NU] {
+pub fn clamp_control<const NU: usize>(
+    u: &SVector<f32, NU>,
+    bounds: &[[f32; 2]; NU],
+) -> SVector<f32, NU> {
     let mut result = *u;
     for i in 0..NU {
         result[i] = result[i].clamp(bounds[i][0], bounds[i][1]);
@@ -274,11 +277,11 @@ pub fn clamp_control<const NU: usize>(u: &[f32; NU], bounds: &[[f32; 2]; NU]) ->
 /// the penalty cost contribution.
 #[inline]
 pub fn constraint_hess_grad<const NU: usize>(
-    u: &[f32; NU],
+    u: &SVector<f32, NU>,
     bounds: &[[f32; 2]; NU],
     rho: f32,
-    grad_u: &mut [f32; NU],
-    r_diag: &mut [f32; NU],
+    grad_u: &mut SVector<f32, NU>,
+    r_diag: &mut SVector<f32, NU>,
 ) -> f32 {
     let mut penalty = 0.0;
     for i in 0..NU {

@@ -16,12 +16,13 @@
 //! Thrust direction: +body z (upward in FLU).
 //! Gravity        : −g along world z  (subtracted, so `grav` field is positive 9.81).
 //!
-//! Conventions match `full_quad_model.rs` exactly: plain `[f32; NX]` arrays,
+//! Conventions match `full_quad_model.rs` exactly: plain `SVector<f32, NX>` arrays,
 //! Default + from_vehicle_params + new constructors, owned cost weights pulled
 //! from `VehicleParams.mpc`, projection-method RK4 with quaternion normalization
 //! between every stage, and a public `normalize_quat` boundary helper.
 
 use super::model_utils;
+use nalgebra::{SMatrix, SVector, Vector4};
 
 pub const NX: usize = 10;
 pub const NU: usize = 4;
@@ -35,7 +36,7 @@ pub const N: usize = 20;
 /// not need to invoke it themselves. Public so external boundary code can
 /// normalize once before handing data into the solver.
 #[inline]
-pub fn normalize_quat(x: &mut [f32; NX]) {
+pub fn normalize_quat(x: &mut SVector<f32, NX>) {
     model_utils::normalize_quat(x);
 }
 
@@ -56,7 +57,7 @@ pub struct QuadModel {
     /// `w_input[1..4]` weight body-rate commands [(rad/s)²]. Per-element
     /// (rather than scalar) because the four control channels are physically
     /// heterogeneous (one force, three angular rates).
-    pub w_input: [f32; NU],
+    pub w_input: SVector<f32, NU>,
     /// Cubic constraint penalty weight (input bound enforcement).
     pub rho: f32,
 }
@@ -89,7 +90,7 @@ impl Default for QuadModel {
             w_pos: [200.0, 200.0, 200.0],
             w_vel: [1.0, 1.0, 1.0],
             w_att: [5.0, 5.0, 200.0],
-            w_input: [1.0, 1.0, 1.0, 1.0],
+            w_input: Vector4::from_element(1.0),
             rho: 1e4,
         }
     }
@@ -132,7 +133,7 @@ impl QuadModel {
             // so we replicate `vp.mpc.thrust_weight` (a scalar) across all four
             // channels. Override the struct field directly if asymmetric tuning
             // is needed.
-            w_input: [vp.mpc.thrust_weight; NU],
+            w_input: SVector::from_element(vp.mpc.thrust_weight),
             rho: vp.mpc.rho,
         }
     }
@@ -164,7 +165,7 @@ impl QuadModel {
     ///
     /// Thrust acts along +body z (FLU), rotated to ENU via R(q).
     /// Gravity is subtracted: `a = R[:,2] * c/m − [0, 0, grav]`.
-    pub fn dynamics(&self, x: &[f32; NX], u: &[f32; NU]) -> [f32; NX] {
+    pub fn dynamics(&self, x: &SVector<f32, NX>, u: &SVector<f32, NU>) -> SVector<f32, NX> {
         let (qx, qy, qz, qw) = (x[3], x[4], x[5], x[6]);
         let (vx, vy, vz) = (x[7], x[8], x[9]);
         let (c, wx, wy, wz) = (u[0], u[1], u[2], u[3]);
@@ -172,7 +173,7 @@ impl QuadModel {
 
         let ct_m = c * m_inv;
 
-        let mut xdot = [0.0f32; NX];
+        let mut xdot = SVector::<f32, NX>::zeros();
         xdot[0] = vx;
         xdot[1] = vy;
         xdot[2] = vz;
@@ -191,9 +192,13 @@ impl QuadModel {
     /// Compute xdot, df/dx (NX x NX), df/du (NX x NU).
     pub fn dynamics_jac(
         &self,
-        x: &[f32; NX],
-        u: &[f32; NU],
-    ) -> ([f32; NX], [[f32; NX]; NX], [[f32; NU]; NX]) {
+        x: &SVector<f32, NX>,
+        u: &SVector<f32, NU>,
+    ) -> (
+        SVector<f32, NX>,
+        SMatrix<f32, NX, NX>,
+        SMatrix<f32, NX, NU>,
+    ) {
         let (qx, qy, qz, qw) = (x[3], x[4], x[5], x[6]);
         let (vx, vy, vz) = (x[7], x[8], x[9]);
         let (c, wx, wy, wz) = (u[0], u[1], u[2], u[3]);
@@ -201,7 +206,7 @@ impl QuadModel {
 
         let ct_m = c * m_inv;
 
-        let xdot = [
+        let xdot: SVector<_, NX> = [
             vx,
             vy,
             vz,
@@ -212,34 +217,35 @@ impl QuadModel {
             2.0 * (qw * qy + qx * qz) * ct_m,
             2.0 * (qy * qz - qw * qx) * ct_m,
             (1.0 - 2.0 * qx * qx - 2.0 * qy * qy) * ct_m - self.grav,
-        ];
+        ]
+        .into();
 
         // df/dx (10 × 10)
-        let mut jx = [[0.0f32; NX]; NX];
+        let mut jx = SMatrix::<f32, NX, NX>::zeros();
         // Rows 0-2: dp/dt = v
-        jx[0][7] = 1.0;
-        jx[1][8] = 1.0;
-        jx[2][9] = 1.0;
+        jx[(0, 7)] = 1.0;
+        jx[(1, 8)] = 1.0;
+        jx[(2, 9)] = 1.0;
 
         // Rows 3-6: quaternion kinematics (only ∂/∂q; ∂/∂ω is in df/du since
         // ω is an input here, not a state)
         let (hw_x, hw_y, hw_z) = (0.5 * wx, 0.5 * wy, 0.5 * wz);
 
-        jx[3][4] = hw_z;
-        jx[3][5] = -hw_y;
-        jx[3][6] = hw_x;
+        jx[(3, 4)] = hw_z;
+        jx[(3, 5)] = -hw_y;
+        jx[(3, 6)] = hw_x;
 
-        jx[4][3] = -hw_z;
-        jx[4][5] = hw_x;
-        jx[4][6] = hw_y;
+        jx[(4, 3)] = -hw_z;
+        jx[(4, 5)] = hw_x;
+        jx[(4, 6)] = hw_y;
 
-        jx[5][3] = hw_y;
-        jx[5][4] = -hw_x;
-        jx[5][6] = hw_z;
+        jx[(5, 3)] = hw_y;
+        jx[(5, 4)] = -hw_x;
+        jx[(5, 6)] = hw_z;
 
-        jx[6][3] = -hw_x;
-        jx[6][4] = -hw_y;
-        jx[6][5] = -hw_z;
+        jx[(6, 3)] = -hw_x;
+        jx[(6, 4)] = -hw_y;
+        jx[(6, 5)] = -hw_z;
 
         // Rows 7-9: d(accel)/d(quaternion)  (thrust rotation Jacobian)
         let dc_qw = 2.0 * ct_m * qw;
@@ -247,41 +253,41 @@ impl QuadModel {
         let dc_qy = 2.0 * ct_m * qy;
         let dc_qz = 2.0 * ct_m * qz;
 
-        jx[7][3] = dc_qz;
-        jx[7][4] = dc_qw;
-        jx[7][5] = dc_qx;
-        jx[7][6] = dc_qy;
-        jx[8][3] = -dc_qw;
-        jx[8][4] = dc_qz;
-        jx[8][5] = dc_qy;
-        jx[8][6] = -dc_qx;
-        jx[9][3] = -2.0 * dc_qx;
-        jx[9][4] = -2.0 * dc_qy;
+        jx[(7, 3)] = dc_qz;
+        jx[(7, 4)] = dc_qw;
+        jx[(7, 5)] = dc_qx;
+        jx[(7, 6)] = dc_qy;
+        jx[(8, 3)] = -dc_qw;
+        jx[(8, 4)] = dc_qz;
+        jx[(8, 5)] = dc_qy;
+        jx[(8, 6)] = -dc_qx;
+        jx[(9, 3)] = -2.0 * dc_qx;
+        jx[(9, 4)] = -2.0 * dc_qy;
 
         // df/du (10 × 4)
         // Column 0 (collective thrust c) drives only translational accel (rows 7-9).
         // Columns 1-3 (ωx, ωy, ωz) drive quaternion kinematics (rows 3-6).
-        let mut ju = [[0.0f32; NU]; NX];
+        let mut ju = SMatrix::<f32, NX, NU>::zeros();
         let a1_m = 2.0 * (qw * qy + qx * qz) * m_inv;
         let a2_m = 2.0 * (qy * qz - qw * qx) * m_inv;
         let a3_m = (1.0 - 2.0 * qx * qx - 2.0 * qy * qy) * m_inv;
-        ju[7][0] = a1_m;
-        ju[8][0] = a2_m;
-        ju[9][0] = a3_m;
+        ju[(7, 0)] = a1_m;
+        ju[(8, 0)] = a2_m;
+        ju[(9, 0)] = a3_m;
 
         let (hq_w, hq_x, hq_y, hq_z) = (0.5 * qw, 0.5 * qx, 0.5 * qy, 0.5 * qz);
-        ju[3][1] = hq_w;
-        ju[3][2] = -hq_z;
-        ju[3][3] = hq_y;
-        ju[4][1] = hq_z;
-        ju[4][2] = hq_w;
-        ju[4][3] = -hq_x;
-        ju[5][1] = -hq_y;
-        ju[5][2] = hq_x;
-        ju[5][3] = hq_w;
-        ju[6][1] = -hq_x;
-        ju[6][2] = -hq_y;
-        ju[6][3] = -hq_z;
+        ju[(3, 1)] = hq_w;
+        ju[(3, 2)] = -hq_z;
+        ju[(3, 3)] = hq_y;
+        ju[(4, 1)] = hq_z;
+        ju[(4, 2)] = hq_w;
+        ju[(4, 3)] = -hq_x;
+        ju[(5, 1)] = -hq_y;
+        ju[(5, 2)] = hq_x;
+        ju[(5, 3)] = hq_w;
+        ju[(6, 1)] = -hq_x;
+        ju[(6, 2)] = -hq_y;
+        ju[(6, 3)] = -hq_z;
 
         (xdot, jx, ju)
     }
@@ -293,11 +299,11 @@ impl QuadModel {
     /// result is also projected. This bounds intermediate-stage drift to
     /// one normalization's worth of error per stage instead of letting it
     /// compound across the four sub-steps.
-    pub fn propagate_rk4(&self, xk: &[f32; NX], uk: &[f32; NU]) -> [f32; NX] {
+    pub fn propagate_rk4(&self, xk: &SVector<f32, NX>, uk: &SVector<f32, NU>) -> SVector<f32, NX> {
         let dt = self.dt;
         let k0 = self.dynamics(xk, uk);
 
-        let mut x1 = [0.0; NX];
+        let mut x1 = SVector::<f32, NX>::zeros();
         for i in 0..NX {
             x1[i] = xk[i] + k0[i] * (dt * 0.5);
         }
@@ -316,7 +322,7 @@ impl QuadModel {
         normalize_quat(&mut x1);
         let k3 = self.dynamics(&x1, uk);
 
-        let mut result = [0.0; NX];
+        let mut result = SVector::<f32, NX>::zeros();
         let s = dt / 6.0;
         for i in 0..NX {
             result[i] = xk[i] + (k0[i] + 2.0 * k1[i] + 2.0 * k2[i] + k3[i]) * s;
@@ -326,9 +332,13 @@ impl QuadModel {
     }
 
     /// Forward Euler integration with quaternion projection.
-    pub fn propagate_euler(&self, xk: &[f32; NX], uk: &[f32; NU]) -> [f32; NX] {
+    pub fn propagate_euler(
+        &self,
+        xk: &SVector<f32, NX>,
+        uk: &SVector<f32, NU>,
+    ) -> SVector<f32, NX> {
         let xdot = self.dynamics(xk, uk);
-        let mut result = [0.0; NX];
+        let mut result = SVector::<f32, NX>::zeros();
         for i in 0..NX {
             result[i] = xk[i] + self.dt * xdot[i];
         }
@@ -339,26 +349,16 @@ impl QuadModel {
     /// Euler sensitivity: F_x = I + dt*df/dx,  F_u = dt*df/du.
     pub fn propagate_euler_grad(
         &self,
-        xk: &[f32; NX],
-        uk: &[f32; NU],
-    ) -> ([[f32; NX]; NX], [[f32; NU]; NX]) {
+        xk: &SVector<f32, NX>,
+        uk: &SVector<f32, NU>,
+    ) -> (SMatrix<f32, NX, NX>, SMatrix<f32, NX, NU>) {
         let (_, jac_x, jac_u) = self.dynamics_jac(xk, uk);
         let dt = self.dt;
-
-        let mut fx = [[0.0f32; NX]; NX];
+        let mut fx = jac_x * dt;
         for i in 0..NX {
-            for j in 0..NX {
-                fx[i][j] = jac_x[i][j] * dt;
-            }
-            fx[i][i] += 1.0; // I + dt*Jx
+            fx[(i, i)] += 1.0; // I + dt*Jx
         }
-
-        let mut fu = [[0.0f32; NU]; NX];
-        for i in 0..NX {
-            for j in 0..NU {
-                fu[i][j] = jac_u[i][j] * dt;
-            }
-        }
+        let fu = jac_u * dt;
         (fx, fu)
     }
 
@@ -369,7 +369,12 @@ impl QuadModel {
     // state, so there is no body-rate cost block to inline locally.
 
     /// Stage state cost + gradient. Returns cost, writes grad_x.
-    pub fn state_cost_grad(&self, x: &[f32; NX], xref: &[f32; NX], grad_x: &mut [f32; NX]) -> f32 {
+    pub fn state_cost_grad(
+        &self,
+        x: &SVector<f32, NX>,
+        xref: &SVector<f32, NX>,
+        grad_x: &mut SVector<f32, NX>,
+    ) -> f32 {
         let dt = self.dt;
         let mut cost =
             model_utils::write_pos_vel_cost_grad(x, xref, &self.w_pos, &self.w_vel, dt, grad_x);
@@ -381,10 +386,10 @@ impl QuadModel {
     /// Gauss-Newton Hessian + gradient in a single pass.
     pub fn state_cost_hess_grad(
         &self,
-        x: &[f32; NX],
-        xref: &[f32; NX],
-        grad_x: &mut [f32; NX],
-        hess_xx: &mut [[f32; NX]; NX],
+        x: &SVector<f32, NX>,
+        xref: &SVector<f32, NX>,
+        grad_x: &mut SVector<f32, NX>,
+        hess_xx: &mut SMatrix<f32, NX, NX>,
     ) -> f32 {
         let dt = self.dt;
 
@@ -397,9 +402,7 @@ impl QuadModel {
         cost += model_utils::write_quat_cost_grad(&ea, &de, &dqa_dq, &self.w_att, dt, grad_x);
 
         // ── Hessian ──
-        for row in hess_xx.iter_mut() {
-            row.fill(0.0);
-        }
+        hess_xx.fill(0.0);
         model_utils::write_pos_vel_hess(&self.w_pos, &self.w_vel, dt, hess_xx);
         model_utils::write_quat_hess(&de, &dqa_dq, &self.w_att, dt, hess_xx);
 
@@ -407,7 +410,12 @@ impl QuadModel {
     }
 
     /// Input cost + gradient.
-    pub fn input_cost_grad(&self, u: &[f32; NU], uref: &[f32; NU], grad_u: &mut [f32; NU]) -> f32 {
+    pub fn input_cost_grad(
+        &self,
+        u: &SVector<f32, NU>,
+        uref: &SVector<f32, NU>,
+        grad_u: &mut SVector<f32, NU>,
+    ) -> f32 {
         let dt = self.dt;
         let mut cost = 0.0;
         for i in 0..NU {
@@ -421,9 +429,9 @@ impl QuadModel {
     /// Cubic box-constraint penalty.
     pub fn constraint_hess_grad(
         &self,
-        u: &[f32; NU],
-        grad_u: &mut [f32; NU],
-        r_diag: &mut [f32; NU],
+        u: &SVector<f32, NU>,
+        grad_u: &mut SVector<f32, NU>,
+        r_diag: &mut SVector<f32, NU>,
     ) -> f32 {
         model_utils::constraint_hess_grad(u, &self.u_bounds, self.rho, grad_u, r_diag)
     }
@@ -431,14 +439,14 @@ impl QuadModel {
     /// Full stage cost = state cost + input cost + constraint penalty.
     pub fn stage_cost_hess_grad(
         &self,
-        x: &[f32; NX],
-        u: &[f32; NU],
-        xref: &[f32; NX],
-        uref: &[f32; NU],
-        hess_xx: &mut [[f32; NX]; NX],
-        r_diag: &mut [f32; NU],
-        grad_x: &mut [f32; NX],
-        grad_u: &mut [f32; NU],
+        x: &SVector<f32, NX>,
+        u: &SVector<f32, NU>,
+        xref: &SVector<f32, NX>,
+        uref: &SVector<f32, NU>,
+        hess_xx: &mut SMatrix<f32, NX, NX>,
+        r_diag: &mut SVector<f32, NU>,
+        grad_x: &mut SVector<f32, NX>,
+        grad_u: &mut SVector<f32, NU>,
     ) -> f32 {
         let dt = self.dt;
         let mut cost = self.state_cost_hess_grad(x, xref, grad_x, hess_xx);
@@ -455,7 +463,7 @@ impl QuadModel {
     }
 
     /// Clamp control to bounds.
-    pub fn clamp_control(&self, u: &[f32; NU]) -> [f32; NU] {
+    pub fn clamp_control(&self, u: &SVector<f32, NU>) -> SVector<f32, NU> {
         model_utils::clamp_control(u, &self.u_bounds)
     }
 }

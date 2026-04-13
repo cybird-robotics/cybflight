@@ -6,7 +6,7 @@
 
 use embedded_io_async::{Read, Write};
 
-use super::{LinkStatistics, RcChannels, MAX_CHANNELS, crc8_dvb_s2_buf, crc8_poly_0xba_buf};
+use super::{crc8_dvb_s2_buf, crc8_poly_0xba_buf, LinkStatistics, RcChannels, MAX_CHANNELS};
 
 // ---------------------------------------------------------------------------
 // Protocol constants (from crsf_protocol.h)
@@ -114,7 +114,6 @@ impl<E: defmt::Format> defmt::Format for Error<E> {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
@@ -185,8 +184,8 @@ impl<RW> Crsf<RW> {
 
         let config_byte = payload[0];
         let start_channel = (config_byte & SUBSET_RC_STARTING_CHANNEL_MASK) as usize;
-        let channel_res = (config_byte >> SUBSET_RC_STARTING_CHANNEL_BITS)
-            & SUBSET_RC_RES_CONFIGURATION_MASK;
+        let channel_res =
+            (config_byte >> SUBSET_RC_STARTING_CHANNEL_BITS) & SUBSET_RC_RES_CONFIGURATION_MASK;
 
         let (channel_bits, channel_mask, scale): (usize, u32, f32) = match channel_res {
             SUBSET_RC_RES_CONF_10B => (10, 0x03FF, 1.0),
@@ -385,9 +384,9 @@ where
                     if payload.len() < CRSF_FRAME_LINK_STATISTICS_TX_PAYLOAD_SIZE {
                         continue;
                     }
-                    return Ok(CrsfEvent::LinkStatisticsTx(
-                        Self::parse_link_stats_tx(payload),
-                    ));
+                    return Ok(CrsfEvent::LinkStatisticsTx(Self::parse_link_stats_tx(
+                        payload,
+                    )));
                 }
                 CRSF_FRAMETYPE_COMMAND => {
                     if let Some(evt) = self.parse_command(&buf, frame_len, addr) {
@@ -649,10 +648,7 @@ where
     }
 
     /// Send device info response (type 0x29).
-    pub async fn write_device_info(
-        &mut self,
-        name: &[u8],
-    ) -> Result<(), Error<RW::Error>> {
+    pub async fn write_device_info(&mut self, name: &[u8]) -> Result<(), Error<RW::Error>> {
         // Frame: [dest, origin, name..., 0x00, 12 zero bytes, param_count, version]
         let name_len = name.len().min(30);
         let payload_len = 2 + name_len + 1 + 12 + 2;
@@ -661,7 +657,7 @@ where
         payload[1] = CRSF_ADDRESS_FLIGHT_CONTROLLER;
         payload[2..2 + name_len].copy_from_slice(&name[..name_len]);
         payload[2 + name_len] = 0; // null terminator
-        // 12 zero bytes already set
+                                   // 12 zero bytes already set
         payload[2 + name_len + 1 + 12] = 0; // parameter count
         payload[2 + name_len + 1 + 12 + 1] = 0x01; // version
         self.write_frame(CRSF_FRAMETYPE_DEVICE_INFO, &payload[..payload_len])

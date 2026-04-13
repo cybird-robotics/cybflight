@@ -18,6 +18,7 @@ use super::full_quad_model;
 use super::mpc_problem::MpcProblem;
 use super::quad_model;
 use super::QuadDynamicsModel;
+use nalgebra::{SMatrix, SVector};
 use num_traits::Float;
 
 /// Result metadata from the SQP solver.
@@ -37,80 +38,81 @@ pub struct SolverResult {
 // solver, but the body assumes `NU == 4`. The compile-time `assert!` makes
 // instantiating it with any other dimension a build-time error, and after
 // monomorphisation with NU=4 the body's literal indices `[0..3]` produce
-// the same machine code as a non-generic `[[f32; 4]; 4]` implementation.
+// the same machine code as a non-generic 4x4 implementation.
 
-fn cholesky_inv_4x4<const NU: usize>(m: &[[f32; NU]; NU]) -> [[f32; NU]; NU] {
+fn cholesky_inv_4x4<const NU: usize>(m: &SMatrix<f32, NU, NU>) -> SMatrix<f32, NU, NU> {
     const { assert!(NU == 4, "cholesky_inv_4x4 only supports NU=4") };
 
     for &reg in &[1e-4, 1e-3, 1e-2] {
         let mut mr = *m;
         for i in 0..4 {
-            mr[i][i] += reg;
+            mr[(i, i)] += reg;
         }
 
-        let mut l = [[0.0f32; NU]; NU];
-        let d0 = mr[0][0];
+        let mut l = SMatrix::<f32, NU, NU>::zeros();
+        let d0 = mr[(0, 0)];
         if d0 <= 0.0 {
             continue;
         }
-        l[0][0] = d0.sqrt();
-        let l00i = 1.0 / l[0][0];
-        l[1][0] = mr[1][0] * l00i;
-        l[2][0] = mr[2][0] * l00i;
-        l[3][0] = mr[3][0] * l00i;
+        l[(0, 0)] = d0.sqrt();
+        let l00i = 1.0 / l[(0, 0)];
+        l[(1, 0)] = mr[(1, 0)] * l00i;
+        l[(2, 0)] = mr[(2, 0)] * l00i;
+        l[(3, 0)] = mr[(3, 0)] * l00i;
 
-        let d1 = mr[1][1] - l[1][0] * l[1][0];
+        let d1 = mr[(1, 1)] - l[(1, 0)] * l[(1, 0)];
         if d1 <= 0.0 {
             continue;
         }
-        l[1][1] = d1.sqrt();
-        let l11i = 1.0 / l[1][1];
-        l[2][1] = (mr[2][1] - l[2][0] * l[1][0]) * l11i;
-        l[3][1] = (mr[3][1] - l[3][0] * l[1][0]) * l11i;
+        l[(1, 1)] = d1.sqrt();
+        let l11i = 1.0 / l[(1, 1)];
+        l[(2, 1)] = (mr[(2, 1)] - l[(2, 0)] * l[(1, 0)]) * l11i;
+        l[(3, 1)] = (mr[(3, 1)] - l[(3, 0)] * l[(1, 0)]) * l11i;
 
-        let d2 = mr[2][2] - l[2][0] * l[2][0] - l[2][1] * l[2][1];
+        let d2 = mr[(2, 2)] - l[(2, 0)] * l[(2, 0)] - l[(2, 1)] * l[(2, 1)];
         if d2 <= 0.0 {
             continue;
         }
-        l[2][2] = d2.sqrt();
-        let l22i = 1.0 / l[2][2];
-        l[3][2] = (mr[3][2] - l[3][0] * l[2][0] - l[3][1] * l[2][1]) * l22i;
+        l[(2, 2)] = d2.sqrt();
+        let l22i = 1.0 / l[(2, 2)];
+        l[(3, 2)] = (mr[(3, 2)] - l[(3, 0)] * l[(2, 0)] - l[(3, 1)] * l[(2, 1)]) * l22i;
 
-        let d3 = mr[3][3] - l[3][0] * l[3][0] - l[3][1] * l[3][1] - l[3][2] * l[3][2];
+        let d3 = mr[(3, 3)] - l[(3, 0)] * l[(3, 0)] - l[(3, 1)] * l[(3, 1)] - l[(3, 2)] * l[(3, 2)];
         if d3 <= 0.0 {
             continue;
         }
-        l[3][3] = d3.sqrt();
+        l[(3, 3)] = d3.sqrt();
 
         // Triangular inverse
-        let mut li = [[0.0f32; NU]; NU];
-        li[0][0] = 1.0 / l[0][0];
-        li[1][1] = 1.0 / l[1][1];
-        li[2][2] = 1.0 / l[2][2];
-        li[3][3] = 1.0 / l[3][3];
-        li[1][0] = -l[1][0] * li[0][0] * li[1][1];
-        li[2][0] = -(l[2][0] * li[0][0] + l[2][1] * li[1][0]) * li[2][2];
-        li[2][1] = -l[2][1] * li[1][1] * li[2][2];
-        li[3][0] = -(l[3][0] * li[0][0] + l[3][1] * li[1][0] + l[3][2] * li[2][0]) * li[3][3];
-        li[3][1] = -(l[3][1] * li[1][1] + l[3][2] * li[2][1]) * li[3][3];
-        li[3][2] = -l[3][2] * li[2][2] * li[3][3];
+        let mut li = SMatrix::<f32, NU, NU>::zeros();
+        li[(0, 0)] = 1.0 / l[(0, 0)];
+        li[(1, 1)] = 1.0 / l[(1, 1)];
+        li[(2, 2)] = 1.0 / l[(2, 2)];
+        li[(3, 3)] = 1.0 / l[(3, 3)];
+        li[(1, 0)] = -l[(1, 0)] * li[(0, 0)] * li[(1, 1)];
+        li[(2, 0)] = -(l[(2, 0)] * li[(0, 0)] + l[(2, 1)] * li[(1, 0)]) * li[(2, 2)];
+        li[(2, 1)] = -l[(2, 1)] * li[(1, 1)] * li[(2, 2)];
+        li[(3, 0)] = -(l[(3, 0)] * li[(0, 0)] + l[(3, 1)] * li[(1, 0)] + l[(3, 2)] * li[(2, 0)])
+            * li[(3, 3)];
+        li[(3, 1)] = -(l[(3, 1)] * li[(1, 1)] + l[(3, 2)] * li[(2, 1)]) * li[(3, 3)];
+        li[(3, 2)] = -l[(3, 2)] * li[(2, 2)] * li[(3, 3)];
 
         // result = li^T @ li
-        let mut result = [[0.0f32; NU]; NU];
+        let mut result = SMatrix::<f32, NU, NU>::zeros();
         for i in 0..4 {
             for j in 0..4 {
                 let mut s = 0.0;
                 for k in 0..4 {
-                    s += li[k][i] * li[k][j];
+                    s += li[(k, i)] * li[(k, j)];
                 }
-                result[i][j] = s;
+                result[(i, j)] = s;
             }
         }
         // Check finite
         let mut ok = true;
         'check: for i in 0..4 {
             for j in 0..4 {
-                if !result[i][j].is_finite() {
+                if !result[(i, j)].is_finite() {
                     ok = false;
                     break 'check;
                 }
@@ -124,12 +126,12 @@ fn cholesky_inv_4x4<const NU: usize>(m: &[[f32; NU]; NU]) -> [[f32; NU]; NU] {
     // Fallback: scaled identity
     let mut diag_max = 1.0f32;
     for i in 0..4 {
-        diag_max = diag_max.max(m[i][i].abs());
+        diag_max = diag_max.max(m[(i, i)].abs());
     }
     let s = 1.0 / diag_max;
-    let mut r = [[0.0f32; NU]; NU];
+    let mut r = SMatrix::<f32, NU, NU>::zeros();
     for i in 0..4 {
-        r[i][i] = s;
+        r[(i, i)] = s;
     }
     r
 }
@@ -137,37 +139,37 @@ fn cholesky_inv_4x4<const NU: usize>(m: &[[f32; NU]; NU]) -> [[f32; NU]; NU] {
 // ── QP Workspace ────────────────────────────────────────────────────────
 
 struct QpWorkspace<const NX: usize, const NU: usize, const N: usize, const NP1: usize> {
-    a: [[[f32; NX]; NX]; N],
-    b: [[[f32; NU]; NX]; N],
-    q: [[f32; NX]; NP1],
-    r: [[f32; NU]; N],
-    qm: [[[f32; NX]; NX]; NP1],
-    rm: [[f32; NU]; N],
-    gain_k: [[[f32; NX]; NU]; N],
-    gain_kk: [[f32; NU]; N],
-    pp: [[[f32; NX]; NX]; NP1],
-    pv: [[f32; NX]; NP1],
-    pub x_bar: [[f32; NX]; NP1],
-    pub u_bar: [[f32; NU]; N],
+    a: [SMatrix<f32, NX, NX>; N],
+    b: [SMatrix<f32, NX, NU>; N],
+    q: [SVector<f32, NX>; NP1],
+    r: [SVector<f32, NU>; N],
+    qm: [SMatrix<f32, NX, NX>; NP1],
+    rm: [SVector<f32, NU>; N],
+    gain_k: [SMatrix<f32, NU, NX>; N],
+    gain_kk: [SVector<f32, NU>; N],
+    pp: [SMatrix<f32, NX, NX>; NP1],
+    pv: [SVector<f32, NX>; NP1],
+    pub x_bar: [SVector<f32, NX>; NP1],
+    pub u_bar: [SVector<f32, NU>; N],
 }
 
 impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
     QpWorkspace<NX, NU, N, NP1>
 {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
-            a: [[[0.0; NX]; NX]; N],
-            b: [[[0.0; NU]; NX]; N],
-            q: [[0.0; NX]; NP1],
-            r: [[0.0; NU]; N],
-            qm: [[[0.0; NX]; NX]; NP1],
-            rm: [[0.0; NU]; N],
-            gain_k: [[[0.0; NX]; NU]; N],
-            gain_kk: [[0.0; NU]; N],
-            pp: [[[0.0; NX]; NX]; NP1],
-            pv: [[0.0; NX]; NP1],
-            x_bar: [[0.0; NX]; NP1],
-            u_bar: [[0.0; NU]; N],
+            a: [SMatrix::<f32, NX, NX>::zeros(); N],
+            b: [SMatrix::<f32, NX, NU>::zeros(); N],
+            q: [SVector::<f32, NX>::zeros(); NP1],
+            r: [SVector::<f32, NU>::zeros(); N],
+            qm: [SMatrix::<f32, NX, NX>::zeros(); NP1],
+            rm: [SVector::<f32, NU>::zeros(); N],
+            gain_k: [SMatrix::<f32, NU, NX>::zeros(); N],
+            gain_kk: [SVector::<f32, NU>::zeros(); N],
+            pp: [SMatrix::<f32, NX, NX>::zeros(); NP1],
+            pv: [SVector::<f32, NX>::zeros(); NP1],
+            x_bar: [SVector::<f32, NX>::zeros(); NP1],
+            u_bar: [SVector::<f32, NU>::zeros(); N],
         }
     }
 
@@ -196,10 +198,7 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
             let bk = &self.b[k];
 
             // H_uu = diag(rm[k]) + bk_nz^T @ psi_nz @ bk_nz  (NU x NU)
-            let mut h_uu = [[0.0f32; NU]; NU];
-            for i in 0..NU {
-                h_uu[i][i] = self.rm[k][i];
-            }
+            let mut h_uu = SMatrix::<f32, NU, NU>::from_diagonal(&self.rm[k]);
             for i in 0..NU {
                 for j in 0..NU {
                     let mut s = 0.0;
@@ -207,55 +206,55 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
                         let ri = bnz_start + r;
                         for c in 0..bnz_len {
                             let ci = bnz_start + c;
-                            s += bk[ri][i] * psi[ri][ci] * bk[ci][j];
+                            s += bk[(ri, i)] * psi[(ri, ci)] * bk[(ci, j)];
                         }
                     }
-                    h_uu[i][j] += s;
+                    h_uu[(i, j)] += s;
                 }
             }
 
             // at_psi = A^T @ psi  (NX x NX)
             let ak = &self.a[k];
-            let mut at_psi = [[0.0f32; NX]; NX];
+            let mut at_psi = SMatrix::<f32, NX, NX>::zeros();
             for i in 0..NX {
                 for j in 0..NX {
                     let mut s = 0.0;
                     for m in 0..NX {
-                        s += ak[m][i] * psi[m][j];
+                        s += ak[(m, i)] * psi[(m, j)];
                     }
-                    at_psi[i][j] = s;
+                    at_psi[(i, j)] = s;
                 }
             }
 
             // h_xu = at_psi[:, BNZ] @ bk_nz  (NX x NU)
-            let mut h_xu = [[0.0f32; NU]; NX];
+            let mut h_xu = SMatrix::<f32, NX, NU>::zeros();
             for i in 0..NX {
                 for j in 0..NU {
                     let mut s = 0.0;
                     for c in 0..bnz_len {
                         let ci = bnz_start + c;
-                        s += at_psi[i][ci] * bk[ci][j];
+                        s += at_psi[(i, ci)] * bk[(ci, j)];
                     }
-                    h_xu[i][j] = s;
+                    h_xu[(i, j)] = s;
                 }
             }
 
             // h_u = r[k] + bk_nz^T @ pv_nz
-            let mut h_u = [0.0f32; NU];
+            let mut h_u = SVector::<f32, NU>::zeros();
             for i in 0..NU {
                 let mut s = self.r[k][i];
                 for r in 0..bnz_len {
-                    s += bk[bnz_start + r][i] * pv[bnz_start + r];
+                    s += bk[(bnz_start + r, i)] * pv[bnz_start + r];
                 }
                 h_u[i] = s;
             }
 
             // h_x = q[k] + A^T @ pv
-            let mut h_x = [0.0f32; NX];
+            let mut h_x = SVector::<f32, NX>::zeros();
             for i in 0..NX {
                 let mut s = self.q[k][i];
                 for m in 0..NX {
-                    s += ak[m][i] * pv[m];
+                    s += ak[(m, i)] * pv[m];
                 }
                 h_x[i] = s;
             }
@@ -267,9 +266,9 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
                 for j in 0..NX {
                     let mut s = 0.0;
                     for m in 0..NU {
-                        s += h_uu_inv[i][m] * h_xu[j][m];
+                        s += h_uu_inv[(i, m)] * h_xu[(j, m)];
                     }
-                    self.gain_k[k][i][j] = -s;
+                    self.gain_k[k][(i, j)] = -s;
                 }
             }
 
@@ -277,35 +276,35 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
             for i in 0..NU {
                 let mut s = 0.0;
                 for m in 0..NU {
-                    s += h_uu_inv[i][m] * h_u[m];
+                    s += h_uu_inv[(i, m)] * h_u[m];
                 }
                 self.gain_kk[k][i] = -s;
             }
 
             // pp[k] = qm[k] + at_psi @ A[k] + h_xu @ gain_k[k]
-            let mut at_psi_a = [[0.0f32; NX]; NX];
+            let mut at_psi_a = SMatrix::<f32, NX, NX>::zeros();
             for i in 0..NX {
                 for j in 0..NX {
                     let mut s = 0.0;
                     for m in 0..NX {
-                        s += at_psi[i][m] * ak[m][j];
+                        s += at_psi[(i, m)] * ak[(m, j)];
                     }
-                    at_psi_a[i][j] = s;
+                    at_psi_a[(i, j)] = s;
                 }
             }
-            let mut hxu_gk = [[0.0f32; NX]; NX];
+            let mut hxu_gk = SMatrix::<f32, NX, NX>::zeros();
             for i in 0..NX {
                 for j in 0..NX {
                     let mut s = 0.0;
                     for m in 0..NU {
-                        s += h_xu[i][m] * self.gain_k[k][m][j];
+                        s += h_xu[(i, m)] * self.gain_k[k][(m, j)];
                     }
-                    hxu_gk[i][j] = s;
+                    hxu_gk[(i, j)] = s;
                 }
             }
             for i in 0..NX {
                 for j in 0..NX {
-                    self.pp[k][i][j] = self.qm[k][i][j] + at_psi_a[i][j] + hxu_gk[i][j];
+                    self.pp[k][(i, j)] = self.qm[k][(i, j)] + at_psi_a[(i, j)] + hxu_gk[(i, j)];
                 }
             }
 
@@ -313,7 +312,7 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
             for i in 0..NX {
                 let mut s = h_x[i];
                 for m in 0..NU {
-                    s += h_xu[i][m] * self.gain_kk[k][m];
+                    s += h_xu[(i, m)] * self.gain_kk[k][m];
                 }
                 self.pv[k][i] = s;
             }
@@ -321,47 +320,51 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
     }
 
     /// Forward sweep: Newton step + update.
-    fn forward_sweep<M>(&mut self, x_init: &[f32; NX], alpha: f32, problem: &MpcProblem<M, NX, NU>)
-    where
+    fn forward_sweep<M>(
+        &mut self,
+        x_init: &SVector<f32, NX>,
+        alpha: f32,
+        problem: &MpcProblem<M, NX, NU>,
+    ) where
         M: QuadDynamicsModel<NX, NU>,
     {
-        let mut dx = [0.0f32; NX];
+        let mut dx = SVector::<f32, NX>::zeros();
         for i in 0..NX {
             dx[i] = x_init[i] - self.x_bar[0][i];
         }
 
         for k in 0..N {
             // du = gain_k[k] @ dx + alpha * gain_kk[k]
-            let mut du = [0.0f32; NU];
+            let mut du = SVector::<f32, NU>::zeros();
             for i in 0..NU {
                 let mut s = alpha * self.gain_kk[k][i];
                 for j in 0..NX {
-                    s += self.gain_k[k][i][j] * dx[j];
+                    s += self.gain_k[k][(i, j)] * dx[j];
                 }
                 du[i] = s;
             }
 
             let u_old = self.u_bar[k];
-            let mut u_new = [0.0f32; NU];
+            let mut u_new = SVector::<f32, NU>::zeros();
             for i in 0..NU {
                 u_new[i] = u_old[i] + du[i];
             }
             self.u_bar[k] = problem.clamp(&u_new);
 
-            let mut du_actual = [0.0f32; NU];
+            let mut du_actual = SVector::<f32, NU>::zeros();
             for i in 0..NU {
                 du_actual[i] = self.u_bar[k][i] - u_old[i];
             }
 
             // dx = A[k] @ dx + B[k] @ du_actual
-            let mut dx_new = [0.0f32; NX];
+            let mut dx_new = SVector::<f32, NX>::zeros();
             for i in 0..NX {
                 let mut s = 0.0;
                 for j in 0..NX {
-                    s += self.a[k][i][j] * dx[j];
+                    s += self.a[k][(i, j)] * dx[j];
                 }
                 for j in 0..NU {
-                    s += self.b[k][i][j] * du_actual[j];
+                    s += self.b[k][(i, j)] * du_actual[j];
                 }
                 dx_new[i] = s;
             }
@@ -376,22 +379,20 @@ pub struct SqpSolver<const NX: usize, const NU: usize, const N: usize, const NP1
     qp: QpWorkspace<NX, NU, N, NP1>,
 }
 
-impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
-    SqpSolver<NX, NU, N, NP1>
-{
-    pub const fn new() -> Self {
+impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize> SqpSolver<NX, NU, N, NP1> {
+    pub fn new() -> Self {
         Self {
             qp: QpWorkspace::new(),
         }
     }
 
     /// Access the optimal control trajectory after [`solve`].
-    pub fn u_bar(&self) -> &[[f32; NU]; N] {
+    pub fn u_bar(&self) -> &[SVector<f32, NU>; N] {
         &self.qp.u_bar
     }
 
     /// Access the optimal state trajectory after [`solve`].
-    pub fn x_bar(&self) -> &[[f32; NX]; NP1] {
+    pub fn x_bar(&self) -> &[SVector<f32, NX>; NP1] {
         &self.qp.x_bar
     }
 
@@ -399,10 +400,10 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
     pub fn solve<M>(
         &mut self,
         problem: &MpcProblem<M, NX, NU>,
-        x0: &[f32; NX],
-        x_refs: &[[f32; NX]; NP1],
-        u_refs: &[[f32; NU]; N],
-        u_init: &[[f32; NU]; N],
+        x0: &SVector<f32, NX>,
+        x_refs: &[SVector<f32, NX>; NP1],
+        u_refs: &[SVector<f32, NU>; N],
+        u_init: &[SVector<f32, NU>; N],
         max_iters: usize,
         kkt_tol: f32,
     ) -> SolverResult
@@ -411,10 +412,10 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
     {
         self.qp.u_bar = *u_init;
 
-        let mut hess_xx = [[0.0f32; NX]; NX];
-        let mut r_diag = [0.0f32; NU];
-        let mut grad_x = [0.0f32; NX];
-        let mut grad_u = [0.0f32; NU];
+        let mut hess_xx = SMatrix::<f32, NX, NX>::zeros();
+        let mut r_diag = SVector::<f32, NU>::zeros();
+        let mut grad_x = SVector::<f32, NX>::zeros();
+        let mut grad_u = SVector::<f32, NU>::zeros();
 
         let mut converged = false;
         let mut sqp_iter = 0usize;
@@ -514,7 +515,8 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
 const N_FULL: usize = full_quad_model::N;
 const NP1_FULL: usize = N_FULL + 1;
 /// `SqpSolver` instantiated for `FullQuadModel` (NX=13, NU=4, N=20).
-pub type FullSqpSolver = SqpSolver<{ full_quad_model::NX }, { full_quad_model::NU }, N_FULL, NP1_FULL>;
+pub type FullSqpSolver =
+    SqpSolver<{ full_quad_model::NX }, { full_quad_model::NU }, N_FULL, NP1_FULL>;
 
 const N_SIMPLE: usize = quad_model::N;
 const NP1_SIMPLE: usize = N_SIMPLE + 1;

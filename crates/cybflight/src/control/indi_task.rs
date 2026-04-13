@@ -12,19 +12,25 @@
 // stops publishing ACTUATOR_MOTORS (goes silent). The failsafe controller
 // watchdog detects the silence and disarms — the same pattern as RC loss.
 
+#[cfg(not(feature = "outer_mpc"))]
+use cybflight_core::position_control::{self, pd_ff_control};
+
+#[cfg(not(feature = "outer_mpc"))]
+use crate::sensors::VEHICLE_ODOMETRY;
+
+#[cfg(not(feature = "outer_mpc"))]
+use cybflight_core::attitude_control::{self, geometric_controller, AttitudeControlOutput};
 use cybflight_core::{
-    attitude_control::{self, geometric_controller, AttitudeControlOutput},
     indi::{
         controller::{IndiConfig, IndiController, NU},
         effectiveness::IndiMotorParams,
-        learner::{Learner, LearnerConfig, LearnerInput, LearnedParams},
+        learner::{LearnedParams, Learner, LearnerConfig, LearnerInput},
         rpm_tracker::RpmInput,
     },
     params::IndiEffectivenessParams,
-    position_control::{self, pd_ff_control},
 };
 use embassy_time::{Duration, Instant};
-use nalgebra::{Matrix2, SMatrix, UnitQuaternion, Vector3};
+use nalgebra::{Matrix2, SMatrix, SVector, UnitQuaternion, Vector3};
 
 use crate::estimation::rpm_estimator::{
     NormalizedThrottle as EstNormalizedThrottle, RpmEstimator, RpmEstimatorConfigBuilder,
@@ -34,7 +40,7 @@ use crate::estimation::rpm_estimator::{
 use crate::{
     motors::ACTUATOR_MOTORS,
     msgs::{self, dshot::TelemetryValue},
-    sensors::{DSHOT_TELEMETRY, IMU_1, VEHICLE_ODOMETRY},
+    sensors::{DSHOT_TELEMETRY, IMU_1},
     vehicle::{QUADROTOR_BODY, QUADROTOR_MOTORS},
 };
 
@@ -45,10 +51,26 @@ static LEARNED_SAVE_PENDING: core::sync::atomic::AtomicBool =
 
 /// Default INDI motor parameters.
 const INDI_MOTOR_PARAMS: [IndiMotorParams; NU] = [
-    IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 },
-    IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 },
-    IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 },
-    IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 },
+    IndiMotorParams {
+        time_const_s: 0.025,
+        max_rpm: 40000.0,
+        g2_yaw: 0.0,
+    },
+    IndiMotorParams {
+        time_const_s: 0.025,
+        max_rpm: 40000.0,
+        g2_yaw: 0.0,
+    },
+    IndiMotorParams {
+        time_const_s: 0.025,
+        max_rpm: 40000.0,
+        g2_yaw: 0.0,
+    },
+    IndiMotorParams {
+        time_const_s: 0.025,
+        max_rpm: 40000.0,
+        g2_yaw: 0.0,
+    },
 ];
 
 /// Convert `IndiEffectivenessParams` to a `LearnedParams` that the INDI
@@ -56,7 +78,11 @@ const INDI_MOTOR_PARAMS: [IndiMotorParams; NU] = [
 /// "use geometric fallback").
 fn learned_from_indi_params(p: &IndiEffectivenessParams) -> Option<LearnedParams> {
     // All-zero check: if nothing is configured, signal "no saved params".
-    let all_zero = p.g1_force.iter().flatten().chain(p.g1_torque.iter().flatten())
+    let all_zero = p
+        .g1_force
+        .iter()
+        .flatten()
+        .chain(p.g1_torque.iter().flatten())
         .chain(p.g2.iter().flatten())
         .chain(p.max_omega.iter())
         .chain(p.time_const_s.iter())
@@ -85,9 +111,9 @@ fn learned_from_indi_params(p: &IndiEffectivenessParams) -> Option<LearnedParams
     Some(LearnedParams {
         g1,
         g2,
-        max_omega: p.max_omega,
-        time_const_s: p.time_const_s,
-        nonlinearity: p.nonlinearity,
+        max_omega: p.max_omega.into(),
+        time_const_s: p.time_const_s.into(),
+        nonlinearity: p.nonlinearity.into(),
         rate_gain: 0.0, // will be recomputed by controller if needed
         attitude_gain: 0.0,
         valid: true,
@@ -109,9 +135,9 @@ fn write_learned_to_params(learned: &LearnedParams) {
         ie.g2[col][1] = learned.g2[(1, col)];
         ie.g2[col][2] = learned.g2[(2, col)];
     }
-    ie.max_omega = learned.max_omega;
-    ie.time_const_s = learned.time_const_s;
-    ie.nonlinearity = learned.nonlinearity;
+    ie.max_omega = learned.max_omega.into();
+    ie.time_const_s = learned.time_const_s.into();
+    ie.nonlinearity = learned.nonlinearity.into();
     crate::params::set(params);
 }
 
@@ -145,16 +171,16 @@ pub async fn indi_task() {
 
     // --- Build INDI controller ---
     let config = IndiConfig {
-        rate_gains: Vector3::new(ic.rate_gains[0], ic.rate_gains[1], ic.rate_gains[2]),
+        rate_gains: ic.rate_gains.into(),
         sync_filter_hz: ic.sync_filter_hz,
         motors: QUADROTOR_MOTORS,
         body: QUADROTOR_BODY,
         indi_motors: INDI_MOTOR_PARAMS,
-        nonlinearity: [0.5; NU],
-        act_limit: [1.0; NU],
-        wls_wv: ic.wls_wv,
-        wls_wu: ic.wls_wu,
-        wls_cond_bound: 3.2768e8,  // (1<<15) * 1e4
+        nonlinearity: SVector::from_element(0.5),
+        act_limit: SVector::from_element(1.0),
+        wls_wv: ic.wls_wv.into(),
+        wls_wu: ic.wls_wu.into(),
+        wls_cond_bound: 3.2768e8, // (1<<15) * 1e4
         wls_theta: 1e-4,
         wls_imax: 1,
         nan_limit: 20,
@@ -178,18 +204,17 @@ pub async fn indi_task() {
         let (tau_m, c_m) = if let Some(ref saved) = saved_learned {
             (saved.time_const_s[i], saved.max_omega[i])
         } else {
-            (INDI_MOTOR_PARAMS[i].time_const_s, INDI_MOTOR_PARAMS[i].max_rpm / 60.0 * core::f32::consts::TAU)
+            (
+                INDI_MOTOR_PARAMS[i].time_const_s,
+                INDI_MOTOR_PARAMS[i].max_rpm / 60.0 * core::f32::consts::TAU,
+            )
         };
         let est_config = RpmEstimatorConfigBuilder::new()
             .tau_m_up(tau_m)
             .tau_m_down(tau_m)
             .build()
             .unwrap();
-        let init_state = StateAndCov::new(
-            0.0,
-            c_m,
-            Matrix2::new(1000.0, 0.0, 0.0, c_m * c_m),
-        );
+        let init_state = StateAndCov::new(0.0, c_m, Matrix2::new(1000.0, 0.0, 0.0, c_m * c_m));
         RpmEstimator::new(est_config, init_state)
     });
 
@@ -206,11 +231,10 @@ pub async fn indi_task() {
     let mut learner = Learner::new(&learner_config, loop_rate_hz);
 
     // Load previously saved INDI effectiveness from vehicle params (if non-zero).
-    if let Some(ref saved) = saved_learned {
-        if indi.apply_learned_params(saved) {
+    if let Some(ref saved) = saved_learned
+        && indi.apply_learned_params(saved) {
             defmt::info!("INDI: loaded learned G1/G2 from params");
         }
-    }
 
     // Track whether we need to save learned params on disarm
     let mut was_armed = false;
@@ -218,7 +242,7 @@ pub async fn indi_task() {
     // --- Learner prearm state ---
     let mut learner_prearm_latched: bool = false;
     // Per-motor sample-and-hold for raw eRPM (rad/s) — used when KF is off
-    let mut raw_omega_hold: [f32; NU] = [0.0; NU];
+    let mut raw_omega_hold = SVector::<f32, NU>::zeros();
 
     // --- Slew rate limiter state (always on, protects both KF and raw path) ---
     // Max omega bound from configured motor params (use learned if available)
@@ -230,10 +254,11 @@ pub async fn indi_task() {
     // Minimum plausible motor time constant (conservative lower bound)
     const TAU_MIN_BOUND: f32 = 0.005;
     let slew_max_rate: f32 = max_omega_bound / TAU_MIN_BOUND; // rad/s²
-    let mut slew_prev_omega: [f32; NU] = [0.0; NU];
+    let mut slew_prev_omega = SVector::<f32, NU>::zeros();
     let mut slew_prev_time: [Option<Instant>; NU] = [None; NU];
     // Local param version — re-read params when global version changes.
-    let mut local_param_ver = crate::params::PARAM_VERSION.load(core::sync::atomic::Ordering::Acquire);
+    let mut local_param_ver =
+        crate::params::PARAM_VERSION.load(core::sync::atomic::Ordering::Acquire);
     // --- Position + attitude controllers (gains from params, same as inner_loop) ---
     //
     // When `outer_mpc` is enabled, the cascade controllers are replaced by an
@@ -292,7 +317,6 @@ pub async fn indi_task() {
     let mut spf_sp_z: f32 = 0.0; // thrust / mass in body z
 
     // armed is read from IS_ARMED atomic each frame (no channel subscription needed)
-    let mut g2_valid = [false; NU];
     let mut gyro_bias = Vector3::<f32>::zeros();
     let mut accel_bias = Vector3::<f32>::zeros();
 
@@ -404,8 +428,8 @@ pub async fn indi_task() {
                 // Learner prearm: geometric G1, zero G2, reset learner
                 indi.reset_to_geometric(&QUADROTOR_MOTORS, &QUADROTOR_BODY, &INDI_MOTOR_PARAMS);
                 learner.reset();
-                raw_omega_hold = [0.0; NU];
-                slew_prev_omega = [0.0; NU];
+                raw_omega_hold = SVector::zeros();
+                slew_prev_omega = SVector::zeros();
                 slew_prev_time = [None; NU];
                 defmt::info!("INDI: learner prearm LATCHED — KF off, G2 zeroed");
             }
@@ -417,8 +441,8 @@ pub async fn indi_task() {
                     rate_rad_s: gyro_corrected,
                     rate_dot_rad_s2: nalgebra::Vector3::zeros(),
                     spf_m_s2: accel_corrected,
-                    omega_rad_s: [0.0; NU],
-                    d_commands: [0.0; NU],
+                    omega_rad_s: SVector::zeros(),
+                    d_commands: SVector::zeros(),
                     armed: false,
                     touching_ground: true,
                 });
@@ -473,18 +497,17 @@ pub async fn indi_task() {
         // KF only runs when armed AND not in learner-prearm mode.
         // Disarmed: KF idle (avoids divergence without corrections).
         // Learner prearm: raw eRPM with sample-and-hold (no KF).
-        if armed && !learner_prearm_latched {
+        let g2_valid = if armed && !learner_prearm_latched {
             // Normal flight: run KF, feed smoothed omega to RpmTracker
             for i in 0..NU {
                 rpm_estimators[i].step(est_current_ts, est_dt, y_meas[i]);
             }
             let estimated_inputs: [RpmInput; NU] = core::array::from_fn(|i| {
-                let erpm =
-                    libm::roundf(rpm_estimators[i].state().omega() / erpm_to_rads) as u32;
+                let erpm = libm::roundf(rpm_estimators[i].state().omega() / erpm_to_rads) as u32;
                 RpmInput::Erpm(erpm)
             });
             let (valid, _rpm_failsafe) = indi.update_rpm(&estimated_inputs);
-            g2_valid = valid;
+            valid
         } else if armed && learner_prearm_latched {
             // Learner prearm: KF off, sample-and-hold raw eRPM
             for i in 0..NU {
@@ -492,11 +515,11 @@ pub async fn indi_task() {
                     raw_omega_hold[i] = y;
                 }
             }
-            g2_valid = [false; NU];
+            [false; NU]
         } else {
             // Disarmed: KF idle, G2 inactive
-            g2_valid = [false; NU];
-        }
+            [false; NU]
+        };
 
         // Latest odometry for position/attitude controllers (cascade only).
         // Persist across iterations so the decimated outer loop always has a
@@ -640,8 +663,8 @@ pub async fn indi_task() {
                     learned_from_indi_params(&crate::params::get().indi_effectiveness)
                 {
                     indi.apply_learned_params(&saved);
-                    for i in 0..NU {
-                        rpm_estimators[i].reconfigure(saved.time_const_s[i], saved.max_omega[i]);
+                    for (i, est) in rpm_estimators.iter_mut().enumerate() {
+                        est.reconfigure(saved.time_const_s[i], saved.max_omega[i]);
                     }
                 }
                 defmt::info!("INDI: params reloaded (ver {})", current_ver);
@@ -664,10 +687,10 @@ pub async fn indi_task() {
         //       - Normal: KF-smoothed omega (existing)
         //     RLS only updates when: prearm latched + toggle on + armed.
         //     Toggle alone without prearm does nothing.
-        let omega_for_learner: [f32; NU] = if learner_prearm_latched {
+        let omega_for_learner = if learner_prearm_latched {
             raw_omega_hold
         } else {
-            core::array::from_fn(|i| rpm_estimators[i].state().omega())
+            SVector::from_fn(|i, _| rpm_estimators[i].state().omega())
         };
         let learning_on = super::LEARNING_ENABLED.load(core::sync::atomic::Ordering::Acquire);
         let learn_active = learner_prearm_latched && learning_on && armed;
@@ -709,8 +732,8 @@ pub async fn indi_task() {
         // FOPDT model can account for transport delay on the next decode.
         // Only when KF is active (armed + not learner prearm).
         if armed && !learner_prearm_latched {
-            for i in 0..NU {
-                rpm_estimators[i].push_throttle(
+            for (i, est) in rpm_estimators.iter_mut().enumerate() {
+                est.push_throttle(
                     est_current_ts,
                     EstNormalizedThrottle::new_clamped(output.motor_commands[i]),
                 );

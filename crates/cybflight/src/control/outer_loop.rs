@@ -17,8 +17,11 @@ use cybflight_core::mpc::quad_model::{N as MPC_N, NU as MPC_NU, NX as MPC_NX};
 use cybflight_core::mpc::{QuadModel, SimpleQuadProblem, SimpleSqpSolver};
 use cybflight_core::rotation::quaternion_to_yaw;
 use embassy_time::{Duration, Instant, Ticker};
-use nalgebra::Vector3;
+use nalgebra::{SVector, Vector3};
 use static_cell::StaticCell;
+
+type MpcStateVec = SVector<f32, MPC_NX>;
+type MpcInputVec = SVector<f32, MPC_NU>;
 
 use crate::msgs;
 use crate::sensors::VEHICLE_ODOMETRY;
@@ -56,7 +59,7 @@ fn odom_is_valid(odom: &msgs::VehicleOdometry) -> bool {
 }
 
 /// Clamp each component of `u0` into the model's per-channel control bounds.
-fn clamp_mpc_output(u0: &mut [f32; MPC_NU], u_bounds: &[[f32; 2]; MPC_NU]) {
+fn clamp_mpc_output(u0: &mut MpcInputVec, u_bounds: &[[f32; 2]; MPC_NU]) {
     for i in 0..MPC_NU {
         u0[i] = u0[i].clamp(u_bounds[i][0], u_bounds[i][1]);
     }
@@ -72,12 +75,15 @@ pub async fn control_loop_task() {
 
     // ── Reference + warm-start trajectories ────────────────────────────
     let mut hover_thrust = QUADROTOR_BODY.mass_kg * 9.81;
-    let mut x_refs: [[f32; MPC_NX]; MPC_N + 1] = [[0.0; MPC_NX]; MPC_N + 1];
-    for k in 0..=MPC_N {
-        x_refs[k][6] = 1.0; // qw = 1 (identity quaternion in xyzw layout)
-    }
-    let mut u_refs: [[f32; MPC_NU]; MPC_N] = [[hover_thrust, 0.0, 0.0, 0.0]; MPC_N];
-    let mut u_warm: [[f32; MPC_NU]; MPC_N] = u_refs;
+    let identity_x = {
+        let mut x = MpcStateVec::zeros();
+        x[6] = 1.0; // qw = 1 (identity quaternion in xyzw layout)
+        x
+    };
+    let mut x_refs: [MpcStateVec; MPC_N + 1] = [identity_x; MPC_N + 1];
+    let hover_u = MpcInputVec::from_row_slice(&[hover_thrust, 0.0, 0.0, 0.0]);
+    let mut u_refs: [MpcInputVec; MPC_N] = [hover_u; MPC_N];
+    let mut u_warm: [MpcInputVec; MPC_N] = u_refs;
 
     // ── Publishers / Subscribers ──────────────────────────────────────
     let pos_ctrl_pub = super::POSITION_CONTROL_SETPOINT.immediate_publisher();
@@ -121,7 +127,8 @@ pub async fn control_loop_task() {
                 mpc_problem =
                     SimpleQuadProblem::with_rk4(QuadModel::from_vehicle_params(&np), MPC_N);
                 hover_thrust = np.body.mass_kg * 9.81;
-                u_refs = [[hover_thrust, 0.0, 0.0, 0.0]; MPC_N];
+                let hover_u = MpcInputVec::from_row_slice(&[hover_thrust, 0.0, 0.0, 0.0]);
+                u_refs = [hover_u; MPC_N];
                 u_warm = u_refs;
                 defmt::info!("MPC outer loop: params reloaded (ver {})", cur);
             }
@@ -155,7 +162,7 @@ pub async fn control_loop_task() {
         // 4. Build MPC initial state from odometry.
         // QuadModel state = [px, py, pz, qx, qy, qz, qw, vx, vy, vz].
         let q = odom.pose.orientation;
-        let mpc_x0: [f32; MPC_NX] = [
+        let mpc_x0 = MpcStateVec::from_row_slice(&[
             odom.pose.position.x,
             odom.pose.position.y,
             odom.pose.position.z,
@@ -166,14 +173,14 @@ pub async fn control_loop_task() {
             odom.twist.linear.x,
             odom.twist.linear.y,
             odom.twist.linear.z,
-        ];
+        ]);
 
         // 5. Refresh reference position (identity quat + zero velocity were
         //    set at task init).
-        for k in 0..=MPC_N {
-            x_refs[k][0] = pos_setpoint.x;
-            x_refs[k][1] = pos_setpoint.y;
-            x_refs[k][2] = pos_setpoint.z;
+        for x_ref in x_refs.iter_mut() {
+            x_ref[0] = pos_setpoint.x;
+            x_ref[1] = pos_setpoint.y;
+            x_ref[2] = pos_setpoint.z;
         }
 
         // 6. Solve one SQP iteration (max_iters = 1, matches host benchmark).

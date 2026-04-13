@@ -192,7 +192,11 @@ where
 
             let mut frame = [0u8; 80];
             let frame_len = build_frame(&mut frame, UBX_CLASS_CFG, UBX_CFG_VALSET, &payload[..off]);
-            driver.rw.write_all(&frame[..frame_len]).await.map_err(Error::Io)?;
+            driver
+                .rw
+                .write_all(&frame[..frame_len])
+                .await
+                .map_err(Error::Io)?;
             driver.wait_ack(UBX_CLASS_CFG, UBX_CFG_VALSET).await?;
             defmt::info!("UBX: essential config ACKed");
         }
@@ -216,7 +220,11 @@ where
 
             let mut frame = [0u8; 32];
             let frame_len = build_frame(&mut frame, UBX_CLASS_CFG, UBX_CFG_VALSET, &payload[..off]);
-            driver.rw.write_all(&frame[..frame_len]).await.map_err(Error::Io)?;
+            driver
+                .rw
+                .write_all(&frame[..frame_len])
+                .await
+                .map_err(Error::Io)?;
             match driver.wait_ack(UBX_CLASS_CFG, UBX_CFG_VALSET).await {
                 Ok(()) => defmt::info!("UBX: {} enabled", name),
                 Err(Error::Nak) => defmt::warn!("UBX: {} not supported (NAK)", name),
@@ -228,17 +236,27 @@ where
     }
 
     /// Wait for an ACK-ACK matching the given class/id. Discards other messages.
-    async fn wait_ack(&mut self, expected_class: u8, expected_id: u8) -> Result<(), Error<RW::Error>> {
+    async fn wait_ack(
+        &mut self,
+        expected_class: u8,
+        expected_id: u8,
+    ) -> Result<(), Error<RW::Error>> {
         for _ in 0..20u8 {
             let (class, id, payload_len) = self.read_header().await?;
 
             if class == UBX_CLASS_ACK && payload_len == 2 {
                 let mut ack_payload = [0u8; 2];
                 self.read_payload(&mut ack_payload, 2).await?;
-                if id == UBX_ACK_ACK && ack_payload[0] == expected_class && ack_payload[1] == expected_id {
+                if id == UBX_ACK_ACK
+                    && ack_payload[0] == expected_class
+                    && ack_payload[1] == expected_id
+                {
                     return Ok(());
                 }
-                if id == UBX_ACK_NAK && ack_payload[0] == expected_class && ack_payload[1] == expected_id {
+                if id == UBX_ACK_NAK
+                    && ack_payload[0] == expected_class
+                    && ack_payload[1] == expected_id
+                {
                     return Err(Error::Nak);
                 }
             } else {
@@ -288,7 +306,10 @@ where
     /// Read payload + checksum, validate Fletcher-16.
     async fn read_payload(&mut self, buf: &mut [u8], len: u16) -> Result<(), Error<RW::Error>> {
         let len = len as usize;
-        self.rw.read_exact(&mut buf[..len]).await.map_err(map_read_err)?;
+        self.rw
+            .read_exact(&mut buf[..len])
+            .await
+            .map_err(map_read_err)?;
 
         let mut ck = [0u8; 2];
         self.rw.read_exact(&mut ck).await.map_err(map_read_err)?;
@@ -308,7 +329,10 @@ where
         let mut remaining = total;
         while remaining > 0 {
             let chunk = remaining.min(discard.len());
-            self.rw.read_exact(&mut discard[..chunk]).await.map_err(map_read_err)?;
+            self.rw
+                .read_exact(&mut discard[..chunk])
+                .await
+                .map_err(map_read_err)?;
             remaining -= chunk;
         }
         Ok(())

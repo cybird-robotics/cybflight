@@ -11,6 +11,7 @@
 use super::full_quad_model::{self, FullQuadModel};
 use super::quad_model::{self, QuadModel};
 use super::QuadDynamicsModel;
+use nalgebra::{SMatrix, SVector};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Propagation {
@@ -49,7 +50,7 @@ where
     }
 
     /// One-step nonlinear propagation, dispatched on the configured integrator.
-    pub fn propagate(&self, x: &[f32; NX], u: &[f32; NU]) -> [f32; NX] {
+    pub fn propagate(&self, x: &SVector<f32, NX>, u: &SVector<f32, NU>) -> SVector<f32, NX> {
         match self.prop {
             Propagation::Euler => self.model.propagate_euler(x, u),
             Propagation::Rk4 => self.model.propagate_rk4(x, u),
@@ -59,23 +60,23 @@ where
     /// Returns `(F_x, F_u) = (I + dt·∂f/∂x, dt·∂f/∂u)` (Euler sensitivity).
     pub fn linearize(
         &self,
-        x: &[f32; NX],
-        u: &[f32; NU],
-    ) -> ([[f32; NX]; NX], [[f32; NU]; NX]) {
+        x: &SVector<f32, NX>,
+        u: &SVector<f32, NU>,
+    ) -> (SMatrix<f32, NX, NX>, SMatrix<f32, NX, NU>) {
         self.model.propagate_euler_grad(x, u)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn stage_cost_hess_grad(
         &self,
-        x: &[f32; NX],
-        u: &[f32; NU],
-        x_ref: &[f32; NX],
-        u_ref: &[f32; NU],
-        hess_xx: &mut [[f32; NX]; NX],
-        r_diag: &mut [f32; NU],
-        grad_x: &mut [f32; NX],
-        grad_u: &mut [f32; NU],
+        x: &SVector<f32, NX>,
+        u: &SVector<f32, NU>,
+        x_ref: &SVector<f32, NX>,
+        u_ref: &SVector<f32, NU>,
+        hess_xx: &mut SMatrix<f32, NX, NX>,
+        r_diag: &mut SVector<f32, NU>,
+        grad_x: &mut SVector<f32, NX>,
+        grad_u: &mut SVector<f32, NU>,
     ) -> f32 {
         self.model
             .stage_cost_hess_grad(x, u, x_ref, u_ref, hess_xx, r_diag, grad_x, grad_u)
@@ -84,10 +85,10 @@ where
     /// Terminal cost = stage state cost (no input, no constraint penalty at N).
     pub fn terminal_cost_hess_grad(
         &self,
-        x: &[f32; NX],
-        x_ref: &[f32; NX],
-        grad_x: &mut [f32; NX],
-        hess_xx: &mut [[f32; NX]; NX],
+        x: &SVector<f32, NX>,
+        x_ref: &SVector<f32, NX>,
+        grad_x: &mut SVector<f32, NX>,
+        hess_xx: &mut SMatrix<f32, NX, NX>,
     ) -> f32 {
         self.model.state_cost_hess_grad(x, x_ref, grad_x, hess_xx)
     }
@@ -99,16 +100,16 @@ where
     #[allow(dead_code)]
     pub fn eval_cost(
         &self,
-        x_bar: &[[f32; NX]],
-        u_bar: &[[f32; NU]],
-        x_refs: &[[f32; NX]],
-        u_refs: &[[f32; NU]],
+        x_bar: &[SVector<f32, NX>],
+        u_bar: &[SVector<f32, NU>],
+        x_refs: &[SVector<f32, NX>],
+        u_refs: &[SVector<f32, NU>],
     ) -> f32 {
         let n = self.n;
-        let mut gx = [0.0f32; NX];
-        let mut gu = [0.0f32; NU];
-        let mut gu_con = [0.0f32; NU];
-        let mut r_tmp = [0.0f32; NU];
+        let mut gx = SVector::<f32, NX>::zeros();
+        let mut gu = SVector::<f32, NU>::zeros();
+        let mut gu_con = SVector::<f32, NU>::zeros();
+        let mut r_tmp = SVector::<f32, NU>::zeros();
         let mut cost = 0.0;
         for k in 0..n {
             cost += self.model.state_cost_grad(&x_bar[k], &x_refs[k], &mut gx);
@@ -123,7 +124,7 @@ where
         cost
     }
 
-    pub fn clamp(&self, u: &[f32; NU]) -> [f32; NU] {
+    pub fn clamp(&self, u: &SVector<f32, NU>) -> SVector<f32, NU> {
         self.model.clamp_control(u)
     }
 }

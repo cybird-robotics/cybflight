@@ -4,10 +4,12 @@ pub mod mpc_problem;
 pub mod quad_model;
 pub mod sqp_solver;
 
-pub use full_quad_model::{FullQuadModel, N, NU, NX, normalize_quat};
+pub use full_quad_model::{normalize_quat, FullQuadModel, N, NU, NX};
 pub use mpc_problem::{FullQuadProblem, MpcProblem, Propagation, SimpleQuadProblem};
 pub use quad_model::QuadModel;
 pub use sqp_solver::{FullSqpSolver, SimpleSqpSolver, SolverResult, SqpSolver};
+
+use nalgebra::{SMatrix, SVector};
 
 // ───────────────────────────────────────────────────────────────────────────
 // Model abstraction trait
@@ -37,43 +39,53 @@ pub trait QuadDynamicsModel<const NX: usize, const NU: usize> {
     const BNZ_LEN: usize;
 
     /// Project the quaternion components of `x` back onto the unit 3-sphere.
-    fn normalize_quat(x: &mut [f32; NX]);
+    fn normalize_quat(x: &mut SVector<f32, NX>);
 
-    fn propagate_rk4(&self, x: &[f32; NX], u: &[f32; NU]) -> [f32; NX];
-    fn propagate_euler(&self, x: &[f32; NX], u: &[f32; NU]) -> [f32; NX];
+    fn propagate_rk4(&self, x: &SVector<f32, NX>, u: &SVector<f32, NU>) -> SVector<f32, NX>;
+    fn propagate_euler(&self, x: &SVector<f32, NX>, u: &SVector<f32, NU>) -> SVector<f32, NX>;
     fn propagate_euler_grad(
         &self,
-        x: &[f32; NX],
-        u: &[f32; NU],
-    ) -> ([[f32; NX]; NX], [[f32; NU]; NX]);
-    fn state_cost_grad(&self, x: &[f32; NX], xref: &[f32; NX], grad_x: &mut [f32; NX]) -> f32;
+        x: &SVector<f32, NX>,
+        u: &SVector<f32, NU>,
+    ) -> (SMatrix<f32, NX, NX>, SMatrix<f32, NX, NU>);
+    fn state_cost_grad(
+        &self,
+        x: &SVector<f32, NX>,
+        xref: &SVector<f32, NX>,
+        grad_x: &mut SVector<f32, NX>,
+    ) -> f32;
     fn state_cost_hess_grad(
         &self,
-        x: &[f32; NX],
-        xref: &[f32; NX],
-        grad_x: &mut [f32; NX],
-        hess_xx: &mut [[f32; NX]; NX],
+        x: &SVector<f32, NX>,
+        xref: &SVector<f32, NX>,
+        grad_x: &mut SVector<f32, NX>,
+        hess_xx: &mut SMatrix<f32, NX, NX>,
     ) -> f32;
-    fn input_cost_grad(&self, u: &[f32; NU], uref: &[f32; NU], grad_u: &mut [f32; NU]) -> f32;
+    fn input_cost_grad(
+        &self,
+        u: &SVector<f32, NU>,
+        uref: &SVector<f32, NU>,
+        grad_u: &mut SVector<f32, NU>,
+    ) -> f32;
     fn constraint_hess_grad(
         &self,
-        u: &[f32; NU],
-        grad_u: &mut [f32; NU],
-        r_diag: &mut [f32; NU],
+        u: &SVector<f32, NU>,
+        grad_u: &mut SVector<f32, NU>,
+        r_diag: &mut SVector<f32, NU>,
     ) -> f32;
     #[allow(clippy::too_many_arguments)]
     fn stage_cost_hess_grad(
         &self,
-        x: &[f32; NX],
-        u: &[f32; NU],
-        xref: &[f32; NX],
-        uref: &[f32; NU],
-        hess_xx: &mut [[f32; NX]; NX],
-        r_diag: &mut [f32; NU],
-        grad_x: &mut [f32; NX],
-        grad_u: &mut [f32; NU],
+        x: &SVector<f32, NX>,
+        u: &SVector<f32, NU>,
+        xref: &SVector<f32, NX>,
+        uref: &SVector<f32, NU>,
+        hess_xx: &mut SMatrix<f32, NX, NX>,
+        r_diag: &mut SVector<f32, NU>,
+        grad_x: &mut SVector<f32, NX>,
+        grad_u: &mut SVector<f32, NU>,
     ) -> f32;
-    fn clamp_control(&self, u: &[f32; NU]) -> [f32; NU];
+    fn clamp_control(&self, u: &SVector<f32, NU>) -> SVector<f32, NU>;
 }
 
 // ── Impl for FullQuadModel (NX=13, NU=4) ───────────────────────────────────
@@ -85,92 +97,93 @@ impl QuadDynamicsModel<{ full_quad_model::NX }, { full_quad_model::NU }> for Ful
     const BNZ_LEN: usize = 6;
 
     #[inline]
-    fn normalize_quat(x: &mut [f32; full_quad_model::NX]) {
+    fn normalize_quat(x: &mut SVector<f32, { full_quad_model::NX }>) {
         full_quad_model::normalize_quat(x);
     }
 
     #[inline]
     fn propagate_rk4(
         &self,
-        x: &[f32; full_quad_model::NX],
-        u: &[f32; full_quad_model::NU],
-    ) -> [f32; full_quad_model::NX] {
+        x: &SVector<f32, { full_quad_model::NX }>,
+        u: &SVector<f32, { full_quad_model::NU }>,
+    ) -> SVector<f32, { full_quad_model::NX }> {
         FullQuadModel::propagate_rk4(self, x, u)
     }
     #[inline]
     fn propagate_euler(
         &self,
-        x: &[f32; full_quad_model::NX],
-        u: &[f32; full_quad_model::NU],
-    ) -> [f32; full_quad_model::NX] {
+        x: &SVector<f32, { full_quad_model::NX }>,
+        u: &SVector<f32, { full_quad_model::NU }>,
+    ) -> SVector<f32, { full_quad_model::NX }> {
         FullQuadModel::propagate_euler(self, x, u)
     }
     #[inline]
     fn propagate_euler_grad(
         &self,
-        x: &[f32; full_quad_model::NX],
-        u: &[f32; full_quad_model::NU],
+        x: &SVector<f32, { full_quad_model::NX }>,
+        u: &SVector<f32, { full_quad_model::NU }>,
     ) -> (
-        [[f32; full_quad_model::NX]; full_quad_model::NX],
-        [[f32; full_quad_model::NU]; full_quad_model::NX],
+        SMatrix<f32, { full_quad_model::NX }, { full_quad_model::NX }>,
+        SMatrix<f32, { full_quad_model::NX }, { full_quad_model::NU }>,
     ) {
         FullQuadModel::propagate_euler_grad(self, x, u)
     }
     #[inline]
     fn state_cost_grad(
         &self,
-        x: &[f32; full_quad_model::NX],
-        xref: &[f32; full_quad_model::NX],
-        grad_x: &mut [f32; full_quad_model::NX],
+        x: &SVector<f32, { full_quad_model::NX }>,
+        xref: &SVector<f32, { full_quad_model::NX }>,
+        grad_x: &mut SVector<f32, { full_quad_model::NX }>,
     ) -> f32 {
         FullQuadModel::state_cost_grad(self, x, xref, grad_x)
     }
     #[inline]
     fn state_cost_hess_grad(
         &self,
-        x: &[f32; full_quad_model::NX],
-        xref: &[f32; full_quad_model::NX],
-        grad_x: &mut [f32; full_quad_model::NX],
-        hess_xx: &mut [[f32; full_quad_model::NX]; full_quad_model::NX],
+        x: &SVector<f32, { full_quad_model::NX }>,
+        xref: &SVector<f32, { full_quad_model::NX }>,
+        grad_x: &mut SVector<f32, { full_quad_model::NX }>,
+        hess_xx: &mut SMatrix<f32, { full_quad_model::NX }, { full_quad_model::NX }>,
     ) -> f32 {
         FullQuadModel::state_cost_hess_grad(self, x, xref, grad_x, hess_xx)
     }
     #[inline]
     fn input_cost_grad(
         &self,
-        u: &[f32; full_quad_model::NU],
-        uref: &[f32; full_quad_model::NU],
-        grad_u: &mut [f32; full_quad_model::NU],
+        u: &SVector<f32, { full_quad_model::NU }>,
+        uref: &SVector<f32, { full_quad_model::NU }>,
+        grad_u: &mut SVector<f32, { full_quad_model::NU }>,
     ) -> f32 {
         FullQuadModel::input_cost_grad(self, u, uref, grad_u)
     }
     #[inline]
     fn constraint_hess_grad(
         &self,
-        u: &[f32; full_quad_model::NU],
-        grad_u: &mut [f32; full_quad_model::NU],
-        r_diag: &mut [f32; full_quad_model::NU],
+        u: &SVector<f32, { full_quad_model::NU }>,
+        grad_u: &mut SVector<f32, { full_quad_model::NU }>,
+        r_diag: &mut SVector<f32, { full_quad_model::NU }>,
     ) -> f32 {
         FullQuadModel::constraint_hess_grad(self, u, grad_u, r_diag)
     }
     #[inline]
     fn stage_cost_hess_grad(
         &self,
-        x: &[f32; full_quad_model::NX],
-        u: &[f32; full_quad_model::NU],
-        xref: &[f32; full_quad_model::NX],
-        uref: &[f32; full_quad_model::NU],
-        hess_xx: &mut [[f32; full_quad_model::NX]; full_quad_model::NX],
-        r_diag: &mut [f32; full_quad_model::NU],
-        grad_x: &mut [f32; full_quad_model::NX],
-        grad_u: &mut [f32; full_quad_model::NU],
+        x: &SVector<f32, { full_quad_model::NX }>,
+        u: &SVector<f32, { full_quad_model::NU }>,
+        xref: &SVector<f32, { full_quad_model::NX }>,
+        uref: &SVector<f32, { full_quad_model::NU }>,
+        hess_xx: &mut SMatrix<f32, { full_quad_model::NX }, { full_quad_model::NX }>,
+        r_diag: &mut SVector<f32, { full_quad_model::NU }>,
+        grad_x: &mut SVector<f32, { full_quad_model::NX }>,
+        grad_u: &mut SVector<f32, { full_quad_model::NU }>,
     ) -> f32 {
-        FullQuadModel::stage_cost_hess_grad(
-            self, x, u, xref, uref, hess_xx, r_diag, grad_x, grad_u,
-        )
+        FullQuadModel::stage_cost_hess_grad(self, x, u, xref, uref, hess_xx, r_diag, grad_x, grad_u)
     }
     #[inline]
-    fn clamp_control(&self, u: &[f32; full_quad_model::NU]) -> [f32; full_quad_model::NU] {
+    fn clamp_control(
+        &self,
+        u: &SVector<f32, { full_quad_model::NU }>,
+    ) -> SVector<f32, { full_quad_model::NU }> {
         FullQuadModel::clamp_control(self, u)
     }
 }
@@ -184,92 +197,93 @@ impl QuadDynamicsModel<{ quad_model::NX }, { quad_model::NU }> for QuadModel {
     const BNZ_LEN: usize = 7;
 
     #[inline]
-    fn normalize_quat(x: &mut [f32; quad_model::NX]) {
+    fn normalize_quat(x: &mut SVector<f32, { quad_model::NX }>) {
         quad_model::normalize_quat(x);
     }
 
     #[inline]
     fn propagate_rk4(
         &self,
-        x: &[f32; quad_model::NX],
-        u: &[f32; quad_model::NU],
-    ) -> [f32; quad_model::NX] {
+        x: &SVector<f32, { quad_model::NX }>,
+        u: &SVector<f32, { quad_model::NU }>,
+    ) -> SVector<f32, { quad_model::NX }> {
         QuadModel::propagate_rk4(self, x, u)
     }
     #[inline]
     fn propagate_euler(
         &self,
-        x: &[f32; quad_model::NX],
-        u: &[f32; quad_model::NU],
-    ) -> [f32; quad_model::NX] {
+        x: &SVector<f32, { quad_model::NX }>,
+        u: &SVector<f32, { quad_model::NU }>,
+    ) -> SVector<f32, { quad_model::NX }> {
         QuadModel::propagate_euler(self, x, u)
     }
     #[inline]
     fn propagate_euler_grad(
         &self,
-        x: &[f32; quad_model::NX],
-        u: &[f32; quad_model::NU],
+        x: &SVector<f32, { quad_model::NX }>,
+        u: &SVector<f32, { quad_model::NU }>,
     ) -> (
-        [[f32; quad_model::NX]; quad_model::NX],
-        [[f32; quad_model::NU]; quad_model::NX],
+        SMatrix<f32, { quad_model::NX }, { quad_model::NX }>,
+        SMatrix<f32, { quad_model::NX }, { quad_model::NU }>,
     ) {
         QuadModel::propagate_euler_grad(self, x, u)
     }
     #[inline]
     fn state_cost_grad(
         &self,
-        x: &[f32; quad_model::NX],
-        xref: &[f32; quad_model::NX],
-        grad_x: &mut [f32; quad_model::NX],
+        x: &SVector<f32, { quad_model::NX }>,
+        xref: &SVector<f32, { quad_model::NX }>,
+        grad_x: &mut SVector<f32, { quad_model::NX }>,
     ) -> f32 {
         QuadModel::state_cost_grad(self, x, xref, grad_x)
     }
     #[inline]
     fn state_cost_hess_grad(
         &self,
-        x: &[f32; quad_model::NX],
-        xref: &[f32; quad_model::NX],
-        grad_x: &mut [f32; quad_model::NX],
-        hess_xx: &mut [[f32; quad_model::NX]; quad_model::NX],
+        x: &SVector<f32, { quad_model::NX }>,
+        xref: &SVector<f32, { quad_model::NX }>,
+        grad_x: &mut SVector<f32, { quad_model::NX }>,
+        hess_xx: &mut SMatrix<f32, { quad_model::NX }, { quad_model::NX }>,
     ) -> f32 {
         QuadModel::state_cost_hess_grad(self, x, xref, grad_x, hess_xx)
     }
     #[inline]
     fn input_cost_grad(
         &self,
-        u: &[f32; quad_model::NU],
-        uref: &[f32; quad_model::NU],
-        grad_u: &mut [f32; quad_model::NU],
+        u: &SVector<f32, { quad_model::NU }>,
+        uref: &SVector<f32, { quad_model::NU }>,
+        grad_u: &mut SVector<f32, { quad_model::NU }>,
     ) -> f32 {
         QuadModel::input_cost_grad(self, u, uref, grad_u)
     }
     #[inline]
     fn constraint_hess_grad(
         &self,
-        u: &[f32; quad_model::NU],
-        grad_u: &mut [f32; quad_model::NU],
-        r_diag: &mut [f32; quad_model::NU],
+        u: &SVector<f32, { quad_model::NU }>,
+        grad_u: &mut SVector<f32, { quad_model::NU }>,
+        r_diag: &mut SVector<f32, { quad_model::NU }>,
     ) -> f32 {
         QuadModel::constraint_hess_grad(self, u, grad_u, r_diag)
     }
     #[inline]
     fn stage_cost_hess_grad(
         &self,
-        x: &[f32; quad_model::NX],
-        u: &[f32; quad_model::NU],
-        xref: &[f32; quad_model::NX],
-        uref: &[f32; quad_model::NU],
-        hess_xx: &mut [[f32; quad_model::NX]; quad_model::NX],
-        r_diag: &mut [f32; quad_model::NU],
-        grad_x: &mut [f32; quad_model::NX],
-        grad_u: &mut [f32; quad_model::NU],
+        x: &SVector<f32, { quad_model::NX }>,
+        u: &SVector<f32, { quad_model::NU }>,
+        xref: &SVector<f32, { quad_model::NX }>,
+        uref: &SVector<f32, { quad_model::NU }>,
+        hess_xx: &mut SMatrix<f32, { quad_model::NX }, { quad_model::NX }>,
+        r_diag: &mut SVector<f32, { quad_model::NU }>,
+        grad_x: &mut SVector<f32, { quad_model::NX }>,
+        grad_u: &mut SVector<f32, { quad_model::NU }>,
     ) -> f32 {
-        QuadModel::stage_cost_hess_grad(
-            self, x, u, xref, uref, hess_xx, r_diag, grad_x, grad_u,
-        )
+        QuadModel::stage_cost_hess_grad(self, x, u, xref, uref, hess_xx, r_diag, grad_x, grad_u)
     }
     #[inline]
-    fn clamp_control(&self, u: &[f32; quad_model::NU]) -> [f32; quad_model::NU] {
+    fn clamp_control(
+        &self,
+        u: &SVector<f32, { quad_model::NU }>,
+    ) -> SVector<f32, { quad_model::NU }> {
         QuadModel::clamp_control(self, u)
     }
 }

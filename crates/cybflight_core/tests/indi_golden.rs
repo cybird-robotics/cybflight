@@ -19,9 +19,9 @@ use cybflight_core::indi::{
     linearization::ThrustLinearization,
 };
 use cybflight_core::mixer::{MotorParams, RigidBodyParams, SpinDir};
-use nalgebra::{SMatrix, SVector};
-use flight_solver::cls::solve;
 use flight_solver::cls::setup::wls::{setup_a, setup_b};
+use flight_solver::cls::solve;
+use nalgebra::{SMatrix, SVector, Vector3};
 
 const NU: usize = 4;
 const NV: usize = 6;
@@ -55,17 +55,21 @@ fn make_biquad() -> Biquad {
 fn ned_g1() -> SMatrix<f32, NV, NU> {
     // After config scaling: fz*0.01, roll/pitch/yaw*0.1
     SMatrix::<f32, NV, NU>::from_row_slice(&[
-        0.0,      0.0,      0.0,      0.0,       // fx
-        0.0,      0.0,      0.0,      0.0,       // fy
-       -15.45,  -15.45,   -15.45,   -15.45,      // fz
-      -340.0,  -340.0,    340.0,    340.0,        // roll
-      -303.6,   303.6,   -303.6,    303.6,        // pitch
-       -43.5,    43.5,     43.5,    -43.5,         // yaw
+        0.0, 0.0, 0.0, 0.0, // fx
+        0.0, 0.0, 0.0, 0.0, // fy
+        -15.45, -15.45, -15.45, -15.45, // fz
+        -340.0, -340.0, 340.0, 340.0, // roll
+        -303.6, 303.6, -303.6, 303.6, // pitch
+        -43.5, 43.5, 43.5, -43.5, // yaw
     ])
 }
 
-fn wls_wv() -> [f32; NV] { [1.0, 1.0, 50.0, 50.0, 50.0, 5.0] }
-fn wls_wu() -> [f32; NU] { [1.0; NU] }
+fn wls_wv() -> SVector<f32, NV> {
+    [1.0, 1.0, 50.0, 50.0, 50.0, 5.0].into()
+}
+fn wls_wu() -> SVector<f32, NU> {
+    SVector::from_element(1.0)
+}
 const WLS_THETA: f32 = 1e-4;
 const WLS_COND_BOUND: f32 = 3.2768e8; // (1<<15) * 1e4
 
@@ -74,79 +78,79 @@ const WLS_COND_BOUND: f32 = 3.2768e8; // (1<<15) * 1e4
 // ---------------------------------------------------------------------------
 
 struct IndiTestState {
-    rate_gains: [f32; 3],
+    rate_gains: SVector<f32, 3>,
     rate_dot_filter: [Biquad; 3],
     spf_filter: [Biquad; 3],
     u_state_filter: [Biquad; NU],
     linearization: [ThrustLinearization; NU],
-    prev_rate: [f32; 3],
-    u_state: [f32; NU],
-    u_state_fs: [f32; NU],
+    prev_rate: Vector3<f32>,
+    u_state: SVector<f32, NU>,
+    u_state_fs: SVector<f32, NU>,
     pt1_alpha: f32,
     ws: [i8; NU],
-    u: [f32; NU],
-    d: [f32; NU],
-    dv: [f32; NV],
-    act_limit: [f32; NU],
+    u: SVector<f32, NU>,
+    d: SVector<f32, NU>,
+    dv: SVector<f32, NV>,
+    act_limit: SVector<f32, NU>,
     // G1 matrix used for allocation (configurable: NED or FLU)
     g1: SMatrix<f32, NV, NU>,
     // G2 support
-    g2_yaw: [f32; NU],          // G2 yaw values per motor
-    g2_scaler: [f32; NU],       // ω_max² / (2·τ)
-    omega_fs: [f32; NU],        // filtered motor speed (rad/s)
-    max_omega: [f32; NU],       // max motor speed (rad/s)
-    prev_du: [f32; NU],         // previous du for omegaDot fallback
+    g2_yaw: SVector<f32, NU>,    // G2 yaw values per motor
+    g2_scaler: SVector<f32, NU>, // ω_max² / (2·τ)
+    omega_fs: SVector<f32, NU>,  // filtered motor speed (rad/s)
+    max_omega: SVector<f32, NU>, // max motor speed (rad/s)
+    prev_du: SVector<f32, NU>,   // previous du for omegaDot fallback
 }
 
 struct StepOutput {
-    u: [f32; NU],
-    d: [f32; NU],
-    dv: [f32; NV],
+    u: SVector<f32, NU>,
+    d: SVector<f32, NU>,
+    dv: SVector<f32, NV>,
 }
 
 impl IndiTestState {
     fn new() -> Self {
-        Self::with_g1_and_limits(ned_g1(), [1.0; NU])
+        Self::with_g1_and_limits(ned_g1(), SVector::from_element(1.0))
     }
 
     fn with_g1(g1: SMatrix<f32, NV, NU>) -> Self {
-        Self::with_g1_and_limits(g1, [1.0; NU])
+        Self::with_g1_and_limits(g1, SVector::from_element(1.0))
     }
 
-    fn with_limits(act_limit: [f32; NU]) -> Self {
+    fn with_limits(act_limit: SVector<f32, NU>) -> Self {
         Self::with_g1_and_limits(ned_g1(), act_limit)
     }
 
-    fn with_g1_and_limits(g1: SMatrix<f32, NV, NU>, act_limit: [f32; NU]) -> Self {
+    fn with_g1_and_limits(g1: SMatrix<f32, NV, NU>, act_limit: SVector<f32, NU>) -> Self {
         let dt = 1.0 / LOOP_HZ;
         let tau = 0.025f32;
         let max_rpm = 40000.0f32;
         let max_omega = max_rpm / 60.0 * core::f32::consts::TAU;
         Self {
-            rate_gains: [20.0, 20.0, 20.0],
+            rate_gains: [20.0, 20.0, 20.0].into(),
             rate_dot_filter: core::array::from_fn(|_| make_biquad()),
             spf_filter: core::array::from_fn(|_| make_biquad()),
             u_state_filter: core::array::from_fn(|_| make_biquad()),
             linearization: [ThrustLinearization::new(0.5); NU],
-            prev_rate: [0.0; 3],
-            u_state: [0.0; NU],
-            u_state_fs: [0.0; NU],
+            prev_rate: SVector::zeros(),
+            u_state: SVector::zeros(),
+            u_state_fs: SVector::zeros(),
             pt1_alpha: dt / (tau + dt),
             ws: [0; NU],
-            u: [0.0; NU],
-            d: [0.0; NU],
-            dv: [0.0; NV],
+            u: SVector::zeros(),
+            d: SVector::zeros(),
+            dv: SVector::zeros(),
             act_limit,
             g1,
-            g2_yaw: [0.0; NU],
-            g2_scaler: [0.5 * max_omega * max_omega / tau; NU],
-            omega_fs: [0.0; NU],
-            max_omega: [max_omega; NU],
-            prev_du: [0.0; NU],
+            g2_yaw: SVector::zeros(),
+            g2_scaler: SVector::from_element(0.5 * max_omega * max_omega / tau),
+            omega_fs: SVector::zeros(),
+            max_omega: SVector::from_element(max_omega),
+            prev_du: SVector::zeros(),
         }
     }
 
-    fn with_g2(mut self, g2_yaw: [f32; NU], hover_omega: [f32; NU]) -> Self {
+    fn with_g2(mut self, g2_yaw: SVector<f32, NU>, hover_omega: SVector<f32, NU>) -> Self {
         self.g2_yaw = g2_yaw;
         self.omega_fs = hover_omega;
         self
@@ -154,17 +158,25 @@ impl IndiTestState {
 
     fn step(
         &mut self,
-        gyro_dps: [f32; 3],
-        accel_g: [f32; 3],
-        rate_sp_rads: [f32; 3],
+        gyro_dps: SVector<f32, 3>,
+        accel_g: SVector<f32, 3>,
+        rate_sp_rads: SVector<f32, 3>,
         spf_sp_z: f32,
         do_indi: bool,
     ) -> StepOutput {
         let do_f = if do_indi { 1.0f32 } else { 0.0 };
         let deg2rad = core::f32::consts::PI / 180.0;
 
-        let rate = [gyro_dps[0] * deg2rad, gyro_dps[1] * deg2rad, gyro_dps[2] * deg2rad];
-        let spf = [accel_g[0] * GRAVITY, accel_g[1] * GRAVITY, accel_g[2] * GRAVITY];
+        let rate = Vector3::new(
+            gyro_dps[0] * deg2rad,
+            gyro_dps[1] * deg2rad,
+            gyro_dps[2] * deg2rad,
+        );
+        let spf = [
+            accel_g[0] * GRAVITY,
+            accel_g[1] * GRAVITY,
+            accel_g[2] * GRAVITY,
+        ];
 
         let rate_dot = [
             (rate[0] - self.prev_rate[0]) * LOOP_HZ,
@@ -201,7 +213,7 @@ impl IndiTestState {
         ];
 
         // Compute omegaDot_fs using du-based fallback (matches C when no dshot telem)
-        let mut omega_dot_fs = [0.0f32; NU];
+        let mut omega_dot_fs = SVector::<f32, NU>::from_element(0.0f32);
         for i in 0..NU {
             if self.g2_yaw[i].abs() > 1e-10 {
                 let inv_thresh = 0.1 * self.max_omega[i];
@@ -214,7 +226,7 @@ impl IndiTestState {
             }
         }
 
-        self.dv = [0.0; NV];
+        self.dv = SVector::<f32, 6>::zeros();
         self.dv[2] = spf_sp_z - do_f * spf_fs[2];
         self.dv[3] = rate_dot_sp[0] - do_f * rate_dot_fs[0];
         self.dv[4] = rate_dot_sp[1] - do_f * rate_dot_fs[1];
@@ -240,9 +252,9 @@ impl IndiTestState {
             }
         }
 
-        let wv = SVector::<f32, NV>::from_row_slice(&wls_wv());
-        let mut wu = SVector::<f32, NU>::from_row_slice(&wls_wu());
-        let v = SVector::<f32, NV>::from_row_slice(&self.dv);
+        let wv = wls_wv();
+        let mut wu = wls_wu();
+        let v = self.dv;
 
         let (a_mat, gamma) = setup_a::<NU, NV, NC>(&g1g2, &wv, &mut wu, WLS_THETA, WLS_COND_BOUND);
 
@@ -257,11 +269,12 @@ impl IndiTestState {
         let b_vec = setup_b::<NU, NV, NC>(&v, &du_pref, &wv, &wu, gamma);
 
         let mut du = SVector::<f32, NU>::zeros();
-        for i in 0..NU { du[i] = (du_min[i] + du_max[i]) * 0.5; }
+        for i in 0..NU {
+            du[i] = (du_min[i] + du_max[i]) * 0.5;
+        }
 
-        let _stats = solve::<NU, NV, NC>(
-            &a_mat, &b_vec, &du_min, &du_max, &mut du, &mut self.ws, 1,
-        );
+        let _stats =
+            solve::<NU, NV, NC>(&a_mat, &b_vec, &du_min, &du_max, &mut du, &mut self.ws, 1);
 
         for i in 0..NU {
             self.u[i] = (do_f * self.u_state_fs[i] + du[i]).clamp(0.0, self.act_limit[i]);
@@ -275,7 +288,11 @@ impl IndiTestState {
             self.u_state[i] += self.pt1_alpha * (u_from_d - self.u_state[i]);
         }
 
-        StepOutput { u: self.u, d: self.d, dv: self.dv }
+        StepOutput {
+            u: self.u,
+            d: self.d,
+            dv: self.dv,
+        }
     }
 }
 
@@ -286,9 +303,9 @@ impl IndiTestState {
 struct GoldenRow {
     test_case: String,
     step: usize,
-    dv: [f32; 6],
-    u: [f32; 4],
-    d: [f32; 4],
+    dv: SVector<f32, 6>,
+    u: SVector<f32, 4>,
+    d: SVector<f32, 4>,
 }
 
 fn parse_golden_csv() -> Vec<GoldenRow> {
@@ -296,21 +313,26 @@ fn parse_golden_csv() -> Vec<GoldenRow> {
     let mut rows = Vec::new();
     for line in csv_data.lines().skip(1) {
         let cols: Vec<&str> = line.split(',').collect();
-        if cols.len() < 28 { continue; }
+        if cols.len() < 28 {
+            continue;
+        }
         let f = |i: usize| cols[i].trim().parse::<f32>().unwrap();
         rows.push(GoldenRow {
             test_case: cols[0].to_string(),
             step: cols[1].parse().unwrap(),
-            dv: [f(16), f(17), f(18), f(19), f(20), f(21)],
-            u: [f(22), f(23), f(24), f(25)],
-            d: [f(26), f(27), f(28), f(29)],
+            dv: [f(16), f(17), f(18), f(19), f(20), f(21)].into(),
+            u: [f(22), f(23), f(24), f(25)].into(),
+            d: [f(26), f(27), f(28), f(29)].into(),
         });
     }
     rows
 }
 
 fn max_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 // ---------------------------------------------------------------------------
@@ -318,21 +340,33 @@ fn max_diff(a: &[f32], b: &[f32]) -> f32 {
 // ---------------------------------------------------------------------------
 
 struct ConstInput {
-    gyro_dps: [f32; 3],
-    accel_g: [f32; 3],
-    rate_sp: [f32; 3],
+    gyro_dps: SVector<f32, 3>,
+    accel_g: SVector<f32, 3>,
+    rate_sp: SVector<f32, 3>,
     spf_sp_z: f32,
     do_indi: bool,
 }
 
 impl ConstInput {
-    fn at(&self, _step: usize) -> ([f32;3], [f32;3], [f32;3], f32, bool) {
-        (self.gyro_dps, self.accel_g, self.rate_sp, self.spf_sp_z, self.do_indi)
+    fn at(&self, _step: usize) -> (SVector<f32, 3>, SVector<f32, 3>, SVector<f32, 3>, f32, bool) {
+        (
+            self.gyro_dps,
+            self.accel_g,
+            self.rate_sp,
+            self.spf_sp_z,
+            self.do_indi,
+        )
     }
 }
 
 fn hover_input() -> ConstInput {
-    ConstInput { gyro_dps: [0.;3], accel_g: [0.,0.,-1.], rate_sp: [0.;3], spf_sp_z: -GRAVITY, do_indi: true }
+    ConstInput {
+        gyro_dps: SVector::from_element(0.),
+        accel_g: Vector3::new(0., 0., -1.),
+        rate_sp: SVector::from_element(0.),
+        spf_sp_z: -GRAVITY,
+        do_indi: true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -343,10 +377,13 @@ fn compare_case(
     case_name: &str,
     golden_rows: &[GoldenRow],
     state: &mut IndiTestState,
-    input_fn: &dyn Fn(usize) -> ([f32;3], [f32;3], [f32;3], f32, bool),
+    input_fn: &dyn Fn(usize) -> (SVector<f32, 3>, SVector<f32, 3>, SVector<f32, 3>, f32, bool),
     achieved_tol: f32,
 ) {
-    let case_rows: Vec<&GoldenRow> = golden_rows.iter().filter(|r| r.test_case == case_name).collect();
+    let case_rows: Vec<&GoldenRow> = golden_rows
+        .iter()
+        .filter(|r| r.test_case == case_name)
+        .collect();
     assert!(!case_rows.is_empty(), "No golden rows for {case_name}");
 
     // Use the same G1 (without G2 correction) for achieved comparison.
@@ -360,8 +397,8 @@ fn compare_case(
         let (gyro, accel, rate_sp, spf_z, do_indi) = input_fn(step);
         let out = state.step(gyro, accel, rate_sp, spf_z, do_indi);
 
-        let u_rust = SVector::<f32, NU>::from_row_slice(&out.u);
-        let u_ref = SVector::<f32, NU>::from_row_slice(&golden.u);
+        let u_rust = out.u;
+        let u_ref = golden.u;
         let achieved_rust = g1_for_comparison * u_rust;
         let achieved_ref = g1_for_comparison * u_ref;
 
@@ -373,7 +410,10 @@ fn compare_case(
         for i in 0..NV {
             let abs_diff = (achieved_rust[i] - achieved_ref[i]).abs();
             // Scale by the row's maximum possible output for relative comparison
-            let row_scale = (0..NU).map(|j| g1_for_comparison[(i, j)].abs()).fold(0.0f32, f32::max).max(1.0);
+            let row_scale = (0..NU)
+                .map(|j| g1_for_comparison[(i, j)].abs())
+                .fold(0.0f32, f32::max)
+                .max(1.0);
             let rel_diff = abs_diff / row_scale;
             achieved_diff = achieved_diff.max(rel_diff);
         }
@@ -385,19 +425,28 @@ fn compare_case(
                  rust u: {:?}\n  ref u: {:?}\n\
                  rust G1*u: {:?}\n  ref G1*u: {:?}\n\
                  rust dv: {:?}\n  ref dv: {:?}",
-                out.u, golden.u, achieved_rust.as_slice(), achieved_ref.as_slice(), out.dv, golden.dv
+                out.u,
+                golden.u,
+                achieved_rust.as_slice(),
+                achieved_ref.as_slice(),
+                out.dv,
+                golden.dv
             );
         }
 
         for i in 0..NU {
             assert!(
                 out.u[i] >= -1e-6 && out.u[i] <= state.act_limit[i] + 1e-6,
-                "{case_name} step {step}: u[{i}]={:.6} out of bounds", out.u[i]
+                "{case_name} step {step}: u[{i}]={:.6} out of bounds",
+                out.u[i]
             );
         }
     }
 
-    eprintln!("{case_name}: PASS ({} steps, max achieved_diff={max_achieved_diff:.6e})", case_rows.len());
+    eprintln!(
+        "{case_name}: PASS ({} steps, max achieved_diff={max_achieved_diff:.6e})",
+        case_rows.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +465,10 @@ fn golden_hover_steady() {
 fn golden_roll_step() {
     let rows = parse_golden_csv();
     let mut state = IndiTestState::new();
-    let inp = ConstInput { rate_sp: [2.0, 0., 0.], ..hover_input() };
+    let inp = ConstInput {
+        rate_sp: Vector3::new(2.0, 0., 0.),
+        ..hover_input()
+    };
     compare_case("roll_step", &rows, &mut state, &|s| inp.at(s), 0.01);
 }
 
@@ -424,7 +476,11 @@ fn golden_roll_step() {
 fn golden_ground_ndi() {
     let rows = parse_golden_csv();
     let mut state = IndiTestState::new();
-    let inp = ConstInput { spf_sp_z: -5.0, do_indi: false, ..hover_input() };
+    let inp = ConstInput {
+        spf_sp_z: -5.0,
+        do_indi: false,
+        ..hover_input()
+    };
     compare_case("ground_ndi", &rows, &mut state, &|s| inp.at(s), 0.01);
 }
 
@@ -432,7 +488,10 @@ fn golden_ground_ndi() {
 fn golden_saturation() {
     let rows = parse_golden_csv();
     let mut state = IndiTestState::new();
-    let inp = ConstInput { rate_sp: [15.0, 15.0, 0.], ..hover_input() };
+    let inp = ConstInput {
+        rate_sp: Vector3::new(15.0, 15.0, 0.),
+        ..hover_input()
+    };
     compare_case("saturation", &rows, &mut state, &|s| inp.at(s), 0.01);
 }
 
@@ -444,7 +503,10 @@ fn golden_saturation() {
 fn golden_combined_axes() {
     let rows = parse_golden_csv();
     let mut state = IndiTestState::new();
-    let inp = ConstInput { rate_sp: [3.0, -2.0, 1.5], ..hover_input() };
+    let inp = ConstInput {
+        rate_sp: Vector3::new(3.0, -2.0, 1.5),
+        ..hover_input()
+    };
     compare_case("combined_axes", &rows, &mut state, &|s| inp.at(s), 0.01);
 }
 
@@ -452,10 +514,26 @@ fn golden_combined_axes() {
 fn golden_ramp_command() {
     let rows = parse_golden_csv();
     let mut state = IndiTestState::new();
-    compare_case("ramp_command", &rows, &mut state, &|step| {
-        let roll_sp = if step < 40 { step as f32 * 0.2 } else { (80 - step) as f32 * 0.2 };
-        ([0.;3], [0.,0.,-1.], [roll_sp, 0., 0.], -GRAVITY, true)
-    }, 0.01);
+    compare_case(
+        "ramp_command",
+        &rows,
+        &mut state,
+        &|step| {
+            let roll_sp = if step < 40 {
+                step as f32 * 0.2
+            } else {
+                (80 - step) as f32 * 0.2
+            };
+            (
+                SVector::from_element(0.),
+                Vector3::new(0., 0., -1.),
+                Vector3::new(roll_sp, 0., 0.),
+                -GRAVITY,
+                true,
+            )
+        },
+        0.01,
+    );
 }
 
 #[test]
@@ -463,8 +541,8 @@ fn golden_spinning_vehicle() {
     let rows = parse_golden_csv();
     let mut state = IndiTestState::new();
     let inp = ConstInput {
-        gyro_dps: [100., 50., -20.],
-        rate_sp: [0.; 3],
+        gyro_dps: Vector3::new(100., 50., -20.),
+        rate_sp: SVector::from_element(0.),
         ..hover_input()
     };
     // Higher tolerance: large G1 values (340 rad/s²) amplify the biquad filter
@@ -479,7 +557,7 @@ fn golden_tilted_accel() {
     let rows = parse_golden_csv();
     let mut state = IndiTestState::new();
     let inp = ConstInput {
-        accel_g: [0.0, 0.5, -0.866],
+        accel_g: Vector3::new(0.0, 0.5, -0.866),
         ..hover_input()
     };
     compare_case("tilted_accel", &rows, &mut state, &|s| inp.at(s), 0.01);
@@ -488,8 +566,11 @@ fn golden_tilted_accel() {
 #[test]
 fn golden_asymmetric_limits() {
     let rows = parse_golden_csv();
-    let mut state = IndiTestState::with_limits([0.8, 1.0, 1.0, 1.0]);
-    let inp = ConstInput { rate_sp: [5.0, 3.0, 0.], ..hover_input() };
+    let mut state = IndiTestState::with_limits(SVector::from_row_slice(&[0.8, 1.0, 1.0, 1.0]));
+    let inp = ConstInput {
+        rate_sp: Vector3::new(5.0, 3.0, 0.),
+        ..hover_input()
+    };
     compare_case("asymmetric_limits", &rows, &mut state, &|s| inp.at(s), 0.01);
 }
 
@@ -498,9 +579,9 @@ fn golden_small_corrections() {
     let rows = parse_golden_csv();
     let mut state = IndiTestState::new();
     let inp = ConstInput {
-        gyro_dps: [2., -1., 0.5],
-        accel_g: [0.01, -0.02, -0.998],
-        rate_sp: [0.05, -0.03, 0.01],
+        gyro_dps: Vector3::new(2., -1., 0.5),
+        accel_g: Vector3::new(0.01, -0.02, -0.998),
+        rate_sp: Vector3::new(0.05, -0.03, 0.01),
         ..hover_input()
     };
     compare_case("small_corrections", &rows, &mut state, &|s| inp.at(s), 0.01);
@@ -510,36 +591,78 @@ fn golden_small_corrections() {
 fn golden_setpoint_reversal() {
     let rows = parse_golden_csv();
     let mut state = IndiTestState::new();
-    compare_case("setpoint_reversal", &rows, &mut state, &|step| {
-        let roll_sp = if step < 20 { 5.0 } else if step < 40 { -5.0 } else { 0.0 };
-        ([0.;3], [0.,0.,-1.], [roll_sp, 0., 0.], -GRAVITY, true)
-    }, 0.01);
+    compare_case(
+        "setpoint_reversal",
+        &rows,
+        &mut state,
+        &|step| {
+            let roll_sp = if step < 20 {
+                5.0
+            } else if step < 40 {
+                -5.0
+            } else {
+                0.0
+            };
+            (
+                SVector::from_element(0.),
+                Vector3::new(0., 0., -1.),
+                Vector3::new(roll_sp, 0., 0.),
+                -GRAVITY,
+                true,
+            )
+        },
+        0.01,
+    );
 }
 
 #[test]
 fn golden_doindi_transition() {
     let rows = parse_golden_csv();
     let mut state = IndiTestState::new();
-    compare_case("doindi_transition", &rows, &mut state, &|step| {
-        let do_indi = step >= 20;
-        let spf_z = if step < 20 {
-            -5.0 + step as f32 * (-4.81 / 20.0)
-        } else {
-            -GRAVITY
-        };
-        ([0.;3], [0.,0.,-1.], [0.;3], spf_z, do_indi)
-    }, 0.01);
+    compare_case(
+        "doindi_transition",
+        &rows,
+        &mut state,
+        &|step| {
+            let do_indi = step >= 20;
+            let spf_z = if step < 20 {
+                -5.0 + step as f32 * (-4.81 / 20.0)
+            } else {
+                -GRAVITY
+            };
+            (
+                SVector::from_element(0.),
+                Vector3::new(0., 0., -1.),
+                SVector::from_element(0.),
+                spf_z,
+                do_indi,
+            )
+        },
+        0.01,
+    );
 }
 
 #[test]
 fn golden_changing_gyro() {
     let rows = parse_golden_csv();
     let mut state = IndiTestState::new();
-    compare_case("changing_gyro", &rows, &mut state, &|step| {
-        let roll_dps = if step < 40 { step as f32 * 5.0 } else { 200.0 };
-        let pitch_dps = 30.0 * num_traits::Float::sin(step as f32 * 0.3);
-        ([roll_dps, pitch_dps, 0.0], [0.,0.,-1.], [0.;3], -GRAVITY, true)
-    }, 0.01);
+    compare_case(
+        "changing_gyro",
+        &rows,
+        &mut state,
+        &|step| {
+            let roll_dps = if step < 40 { step as f32 * 5.0 } else { 200.0 };
+            let pitch_dps = 30.0 * num_traits::Float::sin(step as f32 * 0.3);
+            (
+                Vector3::new(roll_dps, pitch_dps, 0.0),
+                Vector3::new(0., 0., -1.),
+                SVector::from_element(0.),
+                -GRAVITY,
+                true,
+            )
+        },
+        0.01,
+    );
 }
 
 #[test]
@@ -547,12 +670,14 @@ fn golden_g2_active() {
     let rows = parse_golden_csv();
     // Match C harness: G2 yaw values + hover omega
     let hover_omega = 20000.0f32 / 60.0 * core::f32::consts::TAU; // 20000 RPM → rad/s
-    let mut state = IndiTestState::new()
-        .with_g2(
-            [-0.001, 0.001, 0.001, -0.001], // NED: CW=negative, CCW=positive
-            [hover_omega; NU],
-        );
-    let inp = ConstInput { rate_sp: [0., 0., 2.0], ..hover_input() };
+    let mut state = IndiTestState::new().with_g2(
+        SVector::from_row_slice(&[-0.001, 0.001, 0.001, -0.001]), // NED: CW=negative, CCW=positive
+        SVector::from_element(hover_omega),
+    );
+    let inp = ConstInput {
+        rate_sp: Vector3::new(0., 0., 2.0),
+        ..hover_input()
+    };
     compare_case("g2_active", &rows, &mut state, &|s| inp.at(s), 0.01);
 }
 
@@ -567,21 +692,48 @@ fn golden_g2_active() {
 #[test]
 fn golden_flu_frame_convention() {
     let rows = parse_golden_csv();
-    let case_rows: Vec<&GoldenRow> = rows.iter().filter(|r| r.test_case == "hover_steady").collect();
+    let case_rows: Vec<&GoldenRow> = rows
+        .iter()
+        .filter(|r| r.test_case == "hover_steady")
+        .collect();
 
     // Build FLU G1 from MotorParams (same as cybflight's vehicle.rs)
     let motors = [
-        MotorParams { position_m: [-0.075, -0.1], spin_dir: SpinDir::Cw,  max_thrust_n: 8.5, torque_coeff_m: 0.022 },
-        MotorParams { position_m: [ 0.075, -0.1], spin_dir: SpinDir::Ccw, max_thrust_n: 8.5, torque_coeff_m: 0.022 },
-        MotorParams { position_m: [-0.075,  0.1], spin_dir: SpinDir::Ccw, max_thrust_n: 8.5, torque_coeff_m: 0.022 },
-        MotorParams { position_m: [ 0.075,  0.1], spin_dir: SpinDir::Cw,  max_thrust_n: 8.5, torque_coeff_m: 0.022 },
+        MotorParams {
+            position_m: [-0.075, -0.1],
+            spin_dir: SpinDir::Cw,
+            max_thrust_n: 8.5,
+            torque_coeff_m: 0.022,
+        },
+        MotorParams {
+            position_m: [0.075, -0.1],
+            spin_dir: SpinDir::Ccw,
+            max_thrust_n: 8.5,
+            torque_coeff_m: 0.022,
+        },
+        MotorParams {
+            position_m: [-0.075, 0.1],
+            spin_dir: SpinDir::Ccw,
+            max_thrust_n: 8.5,
+            torque_coeff_m: 0.022,
+        },
+        MotorParams {
+            position_m: [0.075, 0.1],
+            spin_dir: SpinDir::Cw,
+            max_thrust_n: 8.5,
+            torque_coeff_m: 0.022,
+        },
     ];
     let body = RigidBodyParams {
         mass_kg: 0.55,
         inertia_kg_m2: [0.0025, 0.0, 0.0, 0.0, 0.0021, 0.0, 0.0, 0.0, 0.0043],
         max_rate_rad_s: [10.0, 10.0, 6.0],
     };
-    let indi_params = [IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 }; 4];
+    let indi_params = [IndiMotorParams {
+        time_const_s: 0.025,
+        max_rpm: 40000.0,
+        g2_yaw: 0.0,
+    }; 4];
     let eff = IndiEffectiveness::new(&motors, &body, &indi_params);
     let g1_flu = eff.g1; // 6×4 in FLU acceleration space
 
@@ -595,12 +747,12 @@ fn golden_flu_frame_convention() {
     //   yaw:   sign(spin) — CW(+1) → positive, CCW(-1) → negative
     //
     // Motor layout: M0=RR(CW), M1=FR(CCW), M2=RL(CCW), M3=FL(CW)
-    let expected_signs: [[f32; 4]; 4] = [
+    let expected_signs: [SVector<f32, 4>; 4] = [
         // [fz,  roll,  pitch, yaw] for each motor
-        [1.0, -1.0,  1.0,  1.0],  // M0: RR, CW — right→-roll, rear→+pitch, CW→+yaw
-        [1.0, -1.0, -1.0, -1.0],  // M1: FR, CCW — right→-roll, front→-pitch, CCW→-yaw
-        [1.0,  1.0,  1.0, -1.0],  // M2: RL, CCW — left→+roll, rear→+pitch, CCW→-yaw
-        [1.0,  1.0, -1.0,  1.0],  // M3: FL, CW — left→+roll, front→-pitch, CW→+yaw
+        SVector::from_row_slice(&[1.0, -1.0, 1.0, 1.0]), // M0: RR, CW — right→-roll, rear→+pitch, CW→+yaw
+        SVector::from_row_slice(&[1.0, -1.0, -1.0, -1.0]), // M1: FR, CCW — right→-roll, front→-pitch, CCW→-yaw
+        SVector::from_row_slice(&[1.0, 1.0, 1.0, -1.0]), // M2: RL, CCW — left→+roll, rear→+pitch, CCW→-yaw
+        SVector::from_row_slice(&[1.0, 1.0, -1.0, 1.0]), // M3: FL, CW — left→+roll, front→-pitch, CW→+yaw
     ];
     let row_names = ["fz", "roll", "pitch", "yaw"];
 
@@ -641,17 +793,41 @@ fn golden_flu_frame_convention() {
 fn golden_ned_flu_transform() {
     // FLU motor params (cybflight convention)
     let motors_flu = [
-        MotorParams { position_m: [-0.075, -0.1], spin_dir: SpinDir::Cw,  max_thrust_n: 8.5, torque_coeff_m: 0.022 },
-        MotorParams { position_m: [ 0.075, -0.1], spin_dir: SpinDir::Ccw, max_thrust_n: 8.5, torque_coeff_m: 0.022 },
-        MotorParams { position_m: [-0.075,  0.1], spin_dir: SpinDir::Ccw, max_thrust_n: 8.5, torque_coeff_m: 0.022 },
-        MotorParams { position_m: [ 0.075,  0.1], spin_dir: SpinDir::Cw,  max_thrust_n: 8.5, torque_coeff_m: 0.022 },
+        MotorParams {
+            position_m: [-0.075, -0.1],
+            spin_dir: SpinDir::Cw,
+            max_thrust_n: 8.5,
+            torque_coeff_m: 0.022,
+        },
+        MotorParams {
+            position_m: [0.075, -0.1],
+            spin_dir: SpinDir::Ccw,
+            max_thrust_n: 8.5,
+            torque_coeff_m: 0.022,
+        },
+        MotorParams {
+            position_m: [-0.075, 0.1],
+            spin_dir: SpinDir::Ccw,
+            max_thrust_n: 8.5,
+            torque_coeff_m: 0.022,
+        },
+        MotorParams {
+            position_m: [0.075, 0.1],
+            spin_dir: SpinDir::Cw,
+            max_thrust_n: 8.5,
+            torque_coeff_m: 0.022,
+        },
     ];
     let body = RigidBodyParams {
         mass_kg: 0.55,
         inertia_kg_m2: [0.0025, 0.0, 0.0, 0.0, 0.0021, 0.0, 0.0, 0.0, 0.0043],
         max_rate_rad_s: [10.0, 10.0, 6.0],
     };
-    let indi_params = [IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 }; 4];
+    let indi_params = [IndiMotorParams {
+        time_const_s: 0.025,
+        max_rpm: 40000.0,
+        g2_yaw: 0.0,
+    }; 4];
 
     // Get FLU G1 from IndiEffectiveness
     let eff_flu = IndiEffectiveness::new(&motors_flu, &body, &indi_params);
@@ -688,9 +864,9 @@ fn golden_ned_flu_transform() {
         g1_ned[(2, i)] = -t / body.mass_kg; // fz: thrust in -z NED
 
         // NED torques from cross product
-        let tau_roll  = py_ned * (-t);           // = -py_ned * T = py_flu * T
-        let tau_pitch = 0.0 - px * (-t);         // = px * T
-        let tau_yaw   = -s * m.torque_coeff_m * t; // CW → negative in NED
+        let tau_roll = py_ned * (-t); // = -py_ned * T = py_flu * T
+        let tau_pitch = 0.0 - px * (-t); // = px * T
+        let tau_yaw = -s * m.torque_coeff_m * t; // CW → negative in NED
 
         let torque = nalgebra::Vector3::new(tau_roll, tau_pitch, tau_yaw);
         let ang_accel = inertia_inv * torque;
@@ -721,14 +897,24 @@ fn golden_ned_flu_transform() {
     eprintln!("G1_NED (derived from physical params):");
     for j in 0..NV {
         let label = ["fx", "fy", "fz", "roll", "pitch", "yaw"][j];
-        eprintln!("  {label:>5}: [{:>10.4}, {:>10.4}, {:>10.4}, {:>10.4}]",
-            g1_ned[(j,0)], g1_ned[(j,1)], g1_ned[(j,2)], g1_ned[(j,3)]);
+        eprintln!(
+            "  {label:>5}: [{:>10.4}, {:>10.4}, {:>10.4}, {:>10.4}]",
+            g1_ned[(j, 0)],
+            g1_ned[(j, 1)],
+            g1_ned[(j, 2)],
+            g1_ned[(j, 3)]
+        );
     }
     eprintln!("G1_FLU (from IndiEffectiveness::new):");
     for j in 0..NV {
         let label = ["fx", "fy", "fz", "roll", "pitch", "yaw"][j];
-        eprintln!("  {label:>5}: [{:>10.4}, {:>10.4}, {:>10.4}, {:>10.4}]",
-            g1_flu[(j,0)], g1_flu[(j,1)], g1_flu[(j,2)], g1_flu[(j,3)]);
+        eprintln!(
+            "  {label:>5}: [{:>10.4}, {:>10.4}, {:>10.4}, {:>10.4}]",
+            g1_flu[(j, 0)],
+            g1_flu[(j, 1)],
+            g1_flu[(j, 2)],
+            g1_flu[(j, 3)]
+        );
     }
 
     eprintln!("NED↔FLU frame transform: PASS");
@@ -743,10 +929,30 @@ use cybflight_core::indi::controller::{IndiConfig, IndiController};
 
 fn flu_controller_config() -> IndiConfig {
     let motors = [
-        MotorParams { position_m: [-0.075, -0.1], spin_dir: SpinDir::Cw,  max_thrust_n: 8.5, torque_coeff_m: 0.022 },
-        MotorParams { position_m: [ 0.075, -0.1], spin_dir: SpinDir::Ccw, max_thrust_n: 8.5, torque_coeff_m: 0.022 },
-        MotorParams { position_m: [-0.075,  0.1], spin_dir: SpinDir::Ccw, max_thrust_n: 8.5, torque_coeff_m: 0.022 },
-        MotorParams { position_m: [ 0.075,  0.1], spin_dir: SpinDir::Cw,  max_thrust_n: 8.5, torque_coeff_m: 0.022 },
+        MotorParams {
+            position_m: [-0.075, -0.1],
+            spin_dir: SpinDir::Cw,
+            max_thrust_n: 8.5,
+            torque_coeff_m: 0.022,
+        },
+        MotorParams {
+            position_m: [0.075, -0.1],
+            spin_dir: SpinDir::Ccw,
+            max_thrust_n: 8.5,
+            torque_coeff_m: 0.022,
+        },
+        MotorParams {
+            position_m: [-0.075, 0.1],
+            spin_dir: SpinDir::Ccw,
+            max_thrust_n: 8.5,
+            torque_coeff_m: 0.022,
+        },
+        MotorParams {
+            position_m: [0.075, 0.1],
+            spin_dir: SpinDir::Cw,
+            max_thrust_n: 8.5,
+            torque_coeff_m: 0.022,
+        },
     ];
     IndiConfig {
         rate_gains: nalgebra::Vector3::new(20.0, 20.0, 20.0),
@@ -757,11 +963,15 @@ fn flu_controller_config() -> IndiConfig {
             inertia_kg_m2: [0.0025, 0.0, 0.0, 0.0, 0.0021, 0.0, 0.0, 0.0, 0.0043],
             max_rate_rad_s: [10.0, 10.0, 6.0],
         },
-        indi_motors: [IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: 0.0 }; 4],
-        nonlinearity: [0.5; 4],
-        act_limit: [1.0; 4],
-        wls_wv: [1.0, 1.0, 50.0, 50.0, 50.0, 5.0],
-        wls_wu: [1.0; 4],
+        indi_motors: [IndiMotorParams {
+            time_const_s: 0.025,
+            max_rpm: 40000.0,
+            g2_yaw: 0.0,
+        }; 4],
+        nonlinearity: SVector::from_element(0.5),
+        act_limit: SVector::from_element(1.0),
+        wls_wv: SVector::from_row_slice(&[1.0, 1.0, 50.0, 50.0, 50.0, 5.0]),
+        wls_wu: SVector::from_element(1.0),
         wls_cond_bound: 3.2768e8,
         wls_theta: 1e-4,
         wls_imax: 1,
@@ -786,8 +996,16 @@ fn flu_test_state() -> IndiTestState {
 fn run_controller_scenario(
     name: &str,
     steps: usize,
-    input_fn: &dyn Fn(usize) -> (nalgebra::Vector3<f32>, nalgebra::Vector3<f32>, nalgebra::Vector3<f32>, f32, bool),
-) -> Vec<[f32; 4]> {
+    input_fn: &dyn Fn(
+        usize,
+    ) -> (
+        nalgebra::Vector3<f32>,
+        nalgebra::Vector3<f32>,
+        nalgebra::Vector3<f32>,
+        f32,
+        bool,
+    ),
+) -> Vec<SVector<f32, 4>> {
     let mut ctrl = IndiController::new(&flu_controller_config(), LOOP_HZ);
     let g2_valid = [false; 4];
     let mut outputs = Vec::new();
@@ -828,7 +1046,8 @@ fn controller_deterministic() {
             assert!(
                 (a[i] - b[i]).abs() < 1e-10,
                 "non-deterministic at step {step} motor {i}: {:.10} vs {:.10}",
-                a[i], b[i]
+                a[i],
+                b[i]
             );
         }
     }
@@ -851,7 +1070,10 @@ fn controller_hover_flu() {
     let last = outputs.last().unwrap();
     let mean = last.iter().sum::<f32>() / 4.0;
     for (i, &c) in last.iter().enumerate() {
-        assert!((c - mean).abs() < 0.05, "hover motor {i} = {c}, mean = {mean}");
+        assert!(
+            (c - mean).abs() < 0.05,
+            "hover motor {i} = {c}, mean = {mean}"
+        );
     }
     assert!(mean > 0.1 && mean < 0.7, "hover mean = {mean}");
     eprintln!("controller_hover_flu: PASS (mean={mean:.4})");
@@ -873,7 +1095,10 @@ fn controller_roll_step_flu() {
     // FLU positive roll: left motors (M2=RL, M3=FL) increase
     let left = (last[2] + last[3]) / 2.0;
     let right = (last[0] + last[1]) / 2.0;
-    assert!(left > right, "FLU roll: left={left:.4} should > right={right:.4}");
+    assert!(
+        left > right,
+        "FLU roll: left={left:.4} should > right={right:.4}"
+    );
     eprintln!("controller_roll_step_flu: PASS (left={left:.4}, right={right:.4})");
 }
 
@@ -894,7 +1119,10 @@ fn controller_spinning_flu() {
     // To stop positive roll (left going up), right motors should increase
     let left = (last[2] + last[3]) / 2.0;
     let right = (last[0] + last[1]) / 2.0;
-    assert!(right > left, "stopping roll: right={right:.4} should > left={left:.4}");
+    assert!(
+        right > left,
+        "stopping roll: right={right:.4} should > left={left:.4}"
+    );
     eprintln!("controller_spinning_flu: PASS (right={right:.4}, left={left:.4})");
 }
 
@@ -938,14 +1166,23 @@ fn controller_combined_axes_flu() {
     let last = outputs.last().unwrap();
     let mean = last.iter().sum::<f32>() / 4.0;
     let max_dev = last.iter().map(|c| (c - mean).abs()).fold(0.0f32, f32::max);
-    assert!(max_dev > 0.01, "combined command should produce differential thrust: max_dev={max_dev}");
+    assert!(
+        max_dev > 0.01,
+        "combined command should produce differential thrust: max_dev={max_dev}"
+    );
     eprintln!("controller_combined_axes_flu: PASS (max_dev={max_dev:.4})");
 }
 
 #[test]
 fn controller_setpoint_reversal_flu() {
     let outputs = run_controller_scenario("reversal_flu", 200, &|step| {
-        let roll_sp = if step < 60 { 5.0 } else if step < 120 { -5.0 } else { 0.0 };
+        let roll_sp = if step < 60 {
+            5.0
+        } else if step < 120 {
+            -5.0
+        } else {
+            0.0
+        };
         (
             nalgebra::Vector3::zeros(),
             nalgebra::Vector3::new(0.0, 0.0, GRAVITY),
@@ -965,7 +1202,10 @@ fn controller_setpoint_reversal_flu() {
     let right_100 = (at_100[0] + at_100[1]) / 2.0;
 
     assert!(left_50 > right_50, "phase 1: left should > right");
-    assert!(right_100 > left_100, "phase 2: right should > left (reversed)");
+    assert!(
+        right_100 > left_100,
+        "phase 2: right should > left (reversed)"
+    );
     eprintln!("controller_setpoint_reversal_flu: PASS");
 }
 
@@ -997,11 +1237,51 @@ fn controller_matches_test_state_flu() {
     // Test scenarios: (name, steps, gyro_dps, accel_g, rate_sp_rad_s, spf_sp_z, armed)
     // IndiTestState takes gyro in deg/s and accel in g-units (converts internally).
     // IndiController takes gyro in rad/s and accel in m/s².
-    let scenarios: &[(&str, usize, [f32;3], [f32;3], [f32;3], f32, bool)] = &[
-        ("hover",    100, [0.;3],           [0.,0.,1.],     [0.;3],             GRAVITY, true),
-        ("roll",     100, [0.;3],           [0.,0.,1.],     [3.0, 0., 0.],      GRAVITY, true),
-        ("combined", 100, [0.;3],           [0.,0.,1.],     [3.0, -2.0, 1.5],   GRAVITY, true),
-        ("ground",    50, [0.;3],           [0.,0.,1.],     [0.;3],             2.0,     false),
+    let scenarios: &[(
+        &str,
+        usize,
+        SVector<f32, 3>,
+        SVector<f32, 3>,
+        SVector<f32, 3>,
+        f32,
+        bool,
+    )] = &[
+        (
+            "hover",
+            100,
+            SVector::from_element(0.),
+            Vector3::new(0., 0., 1.),
+            SVector::from_element(0.),
+            GRAVITY,
+            true,
+        ),
+        (
+            "roll",
+            100,
+            SVector::from_element(0.),
+            Vector3::new(0., 0., 1.),
+            Vector3::new(3.0, 0., 0.),
+            GRAVITY,
+            true,
+        ),
+        (
+            "combined",
+            100,
+            SVector::from_element(0.),
+            Vector3::new(0., 0., 1.),
+            Vector3::new(3.0, -2.0, 1.5),
+            GRAVITY,
+            true,
+        ),
+        (
+            "ground",
+            50,
+            SVector::from_element(0.),
+            Vector3::new(0., 0., 1.),
+            SVector::from_element(0.),
+            2.0,
+            false,
+        ),
     ];
 
     for &(name, steps, gyro_dps, accel_g, rate_sp, spf_z, armed) in scenarios {
@@ -1011,9 +1291,9 @@ fn controller_matches_test_state_flu() {
 
         // Convert for IndiController: deg/s → rad/s, g → m/s²
         let deg2rad = core::f32::consts::PI / 180.0;
-        let gyro_v = Vector3::new(gyro_dps[0] * deg2rad, gyro_dps[1] * deg2rad, gyro_dps[2] * deg2rad);
-        let accel_v = Vector3::new(accel_g[0] * GRAVITY, accel_g[1] * GRAVITY, accel_g[2] * GRAVITY);
-        let rate_sp_v = Vector3::new(rate_sp[0], rate_sp[1], rate_sp[2]);
+        let gyro_v = gyro_dps * deg2rad;
+        let accel_v = accel_g * GRAVITY;
+        let rate_sp_v = rate_sp;
 
         for step in 0..steps {
             let ref_out = reference.step(gyro_dps, accel_g, rate_sp, spf_z, armed);
@@ -1021,7 +1301,9 @@ fn controller_matches_test_state_flu() {
 
             // Compare linearized motor commands (d, not u).
             // IndiTestState.d = linearize(u), IndiController.motor_commands = linearize(u).
-            let motor_diff = ref_out.d.iter()
+            let motor_diff = ref_out
+                .d
+                .iter()
                 .zip(ctrl_out.motor_commands.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
@@ -1051,10 +1333,26 @@ fn controller_matches_test_state_flu_with_g2() {
     // Config with G2 active (FLU signs)
     let config = IndiConfig {
         indi_motors: [
-            IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw:  0.001 },
-            IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: -0.001 },
-            IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw: -0.001 },
-            IndiMotorParams { time_const_s: 0.025, max_rpm: 40000.0, g2_yaw:  0.001 },
+            IndiMotorParams {
+                time_const_s: 0.025,
+                max_rpm: 40000.0,
+                g2_yaw: 0.001,
+            },
+            IndiMotorParams {
+                time_const_s: 0.025,
+                max_rpm: 40000.0,
+                g2_yaw: -0.001,
+            },
+            IndiMotorParams {
+                time_const_s: 0.025,
+                max_rpm: 40000.0,
+                g2_yaw: -0.001,
+            },
+            IndiMotorParams {
+                time_const_s: 0.025,
+                max_rpm: 40000.0,
+                g2_yaw: 0.001,
+            },
         ],
         ..flu_controller_config()
     };
@@ -1069,8 +1367,11 @@ fn controller_matches_test_state_flu_with_g2() {
     let hover_erpm = (hover_rpm * pole_pairs / 100.0) as u32; // 1400
     let hover_omega = hover_rpm / 60.0 * core::f32::consts::TAU;
 
-    let mut reference = IndiTestState::with_g1(g1_flu)
-        .with_g2([0.001, -0.001, -0.001, 0.001], [hover_omega; NU]);
+    let mut reference =
+        IndiTestState::with_g1(g1_flu).with_g2(
+            SVector::from_row_slice(&[0.001, -0.001, -0.001, 0.001]),
+            SVector::from_element(hover_omega),
+        );
 
     let mut ctrl = IndiController::new(&config, LOOP_HZ);
     ctrl.update_rpm(&[cybflight_core::indi::rpm_tracker::RpmInput::Erpm(hover_erpm); NU]);
@@ -1079,14 +1380,14 @@ fn controller_matches_test_state_flu_with_g2() {
     let g2_valid = [true; NU];
 
     // Yaw command to exercise G2 path
-    let gyro_dps = [0.0f32; 3];
-    let accel_g = [0.0, 0.0, 1.0];
-    let rate_sp = [0.0, 0.0, 3.0]; // yaw command
+    let gyro_dps = Vector3::new(0.0f32, 0.0, 0.0);
+    let accel_g = Vector3::new(0.0, 0.0, 1.0);
+    let rate_sp = Vector3::new(0.0, 0.0, 3.0); // yaw command
     let spf_z = GRAVITY;
 
-    let gyro_v = Vector3::new(gyro_dps[0] * deg2rad, gyro_dps[1] * deg2rad, gyro_dps[2] * deg2rad);
-    let accel_v = Vector3::new(accel_g[0] * GRAVITY, accel_g[1] * GRAVITY, accel_g[2] * GRAVITY);
-    let rate_sp_v = Vector3::new(rate_sp[0], rate_sp[1], rate_sp[2]);
+    let gyro_v = gyro_dps * deg2rad;
+    let accel_v = accel_g * GRAVITY;
+    let rate_sp_v = rate_sp;
 
     // Settle phase: run both for 200 steps to let all filters converge
     // (omega biquad, u_state PT1+biquad). The IndiTestState has instant omega
@@ -1105,7 +1406,9 @@ fn controller_matches_test_state_flu_with_g2() {
         let ref_out = reference.step(gyro_dps, accel_g, rate_sp, spf_z, true);
         let (ctrl_out, _) = ctrl.step(&gyro_v, &accel_v, &rate_sp_v, spf_z, true, &g2_valid);
 
-        let diff = ref_out.d.iter()
+        let diff = ref_out
+            .d
+            .iter()
             .zip(ctrl_out.motor_commands.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);

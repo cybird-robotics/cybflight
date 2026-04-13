@@ -12,15 +12,15 @@
 extern crate alloc;
 
 use cybflight_core::attitude_control::{
-    AttitudeControlSetpoint, AttitudeControlState,
-    geometric_controller::GeometricAttitudeController,
+    geometric_controller::GeometricAttitudeController, AttitudeControlSetpoint,
+    AttitudeControlState,
 };
 use cybflight_core::mixer::{LinearAllocator, MotorEffectiveness, MotorParams, SpinDir};
 use cybflight_core::mpc::{FullQuadModel, FullQuadProblem, FullSqpSolver, N, NU, NX};
 use cybflight_core::position_control::{
-    self, PositionControlSetpoint, PositionControlState, pd_ff_control::PositionController,
+    self, pd_ff_control::PositionController, PositionControlSetpoint, PositionControlState,
 };
-use nalgebra::{Quaternion, UnitQuaternion, Vector3, Vector4};
+use nalgebra::{Quaternion, SVector, UnitQuaternion, Vector3, Vector4};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Vehicle parameters — single source of truth, matching vehicle.rs
@@ -65,7 +65,7 @@ fn test_quad_model(dt: f32) -> FullQuadModel {
         mass: MASS,
         grav: GRAV,
         dt,
-        inertia: INERTIA,
+        inertia: INERTIA.into(),
         ..Default::default()
     }
 }
@@ -76,7 +76,7 @@ fn test_quad_model(dt: f32) -> FullQuadModel {
 
 trait QuadDynamics {
     /// Propagate state one timestep given per-motor forces [N].
-    fn step(&self, x: &[f32; NX], u: &[f32; NU]) -> [f32; NX];
+    fn step(&self, x: &SVector<f32, NX>, u: &SVector<f32, NU>) -> SVector<f32, NX>;
 }
 
 /// Full nonlinear rigid-body dynamics (RK4).
@@ -85,7 +85,7 @@ struct FullDynamics {
 }
 
 impl QuadDynamics for FullDynamics {
-    fn step(&self, x: &[f32; NX], u: &[f32; NU]) -> [f32; NX] {
+    fn step(&self, x: &SVector<f32, NX>, u: &SVector<f32, NU>) -> SVector<f32, NX> {
         // propagate_rk4 already normalizes the result internally.
         self.model.propagate_rk4(x, u)
     }
@@ -95,15 +95,20 @@ impl QuadDynamics for FullDynamics {
 // State helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn make_state(pos: [f32; 3], quat_xyzw: [f32; 4], vel: [f32; 3], omega: [f32; 3]) -> [f32; NX] {
+fn make_state(
+    pos: SVector<f32, 3>,
+    quat_xyzw: UnitQuaternion<f32>,
+    vel: SVector<f32, 3>,
+    omega: SVector<f32, 3>,
+) -> SVector<f32, NX> {
     [
         pos[0],
         pos[1],
         pos[2],
-        quat_xyzw[0],
-        quat_xyzw[1],
-        quat_xyzw[2],
-        quat_xyzw[3],
+        quat_xyzw.i,
+        quat_xyzw.j,
+        quat_xyzw.k,
+        quat_xyzw.w,
         vel[0],
         vel[1],
         vel[2],
@@ -111,9 +116,10 @@ fn make_state(pos: [f32; 3], quat_xyzw: [f32; 4], vel: [f32; 3], omega: [f32; 3]
         omega[1],
         omega[2],
     ]
+    .into()
 }
 
-fn pos_of(x: &[f32; NX]) -> Vector3<f32> {
+fn pos_of(x: &SVector<f32, NX>) -> Vector3<f32> {
     Vector3::new(x[0], x[1], x[2])
 }
 
@@ -190,7 +196,7 @@ impl CascadeController {
         }
     }
 
-    fn compute(&self, x: &[f32; NX], target: &Vector3<f32>) -> [f32; NU] {
+    fn compute(&self, x: &SVector<f32, NX>, target: &Vector3<f32>) -> SVector<f32, NU> {
         let pos = Vector3::new(x[0] as f32, x[1] as f32, x[2] as f32);
         let vel = Vector3::new(x[7] as f32, x[8] as f32, x[9] as f32);
         let quat = UnitQuaternion::from_quaternion(Quaternion::new(
@@ -244,12 +250,12 @@ impl CascadeController {
             .allocator
             .allocate(Vector4::new(thrust, torque.x, torque.y, torque.z));
 
-        [
+        Vector4::new(
             (throttles[0] * MAX_THRUST_N) as f32,
             (throttles[1] * MAX_THRUST_N) as f32,
             (throttles[2] * MAX_THRUST_N) as f32,
             (throttles[3] * MAX_THRUST_N) as f32,
-        ]
+        )
     }
 }
 
@@ -260,10 +266,10 @@ impl CascadeController {
 struct MpcController {
     solver: alloc::boxed::Box<FullSqpSolver>,
     problem: FullQuadProblem,
-    x_refs: [[f32; NX]; N + 1],
-    u_refs: [[f32; NU]; N],
-    u_warm: [[f32; NU]; N],
-    last_u: [f32; NU],
+    x_refs: [SVector<f32, NX>; N + 1],
+    u_refs: [SVector<f32, NU>; N],
+    u_warm: [SVector<f32, NU>; N],
+    last_u: SVector<f32, NU>,
     /// Sim steps between MPC solves.
     solve_period: usize,
     step_counter: usize,
@@ -280,9 +286,9 @@ impl MpcController {
         let problem = FullQuadProblem::with_rk4(model, N);
 
         let hover_per_motor = MASS * GRAV / 4.0;
-        let u_ref = [hover_per_motor; NU];
+        let u_ref = SVector::<f32, NU>::from_element(hover_per_motor);
 
-        let mut x_ref = [0.0f32; NX];
+        let mut x_ref = SVector::<f32, NX>::zeros();
         x_ref[0] = target.x;
         x_ref[1] = target.y;
         x_ref[2] = target.z;
@@ -302,7 +308,7 @@ impl MpcController {
         }
     }
 
-    fn compute(&mut self, x: &[f32; NX]) -> [f32; NU] {
+    fn compute(&mut self, x: &SVector<f32, NX>) -> SVector<f32, NU> {
         self.step_counter += 1;
         if self.step_counter >= self.solve_period {
             self.step_counter = 0;
@@ -338,7 +344,7 @@ enum Controller {
 }
 
 impl Controller {
-    fn compute(&mut self, x: &[f32; NX], target: &Vector3<f32>) -> [f32; NU] {
+    fn compute(&mut self, x: &SVector<f32, NX>, target: &Vector3<f32>) -> SVector<f32, NU> {
         match self {
             Controller::Cascade(c) => {
                 let t32 = Vector3::new(target.x as f32, target.y as f32, target.z as f32);
@@ -363,7 +369,7 @@ struct SimResult {
 fn run_simulation(
     controller: &mut Controller,
     dynamics: &dyn QuadDynamics,
-    x0: &[f32; NX],
+    x0: &SVector<f32, NX>,
     target: &Vector3<f32>,
     max_steps: usize,
     tol: f32,
@@ -433,8 +439,8 @@ fn make_dynamics() -> FullDynamics {
 }
 
 /// Build an initial state at the origin with a given orientation.
-fn initial_state(q: &UnitQuaternion<f32>) -> [f32; NX] {
-    make_state([0.0, 0.0, 0.0], [q.i, q.j, q.k, q.w], [0.0; 3], [0.0; 3])
+fn initial_state(q: &UnitQuaternion<f32>) -> SVector<f32, NX> {
+    make_state(Vector3::zeros(), *q, Vector3::zeros(), Vector3::zeros())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -543,7 +549,7 @@ fn mpc_alloc_matches_firmware_mixer() {
     let motors = test_motors();
     let effectiveness = MotorEffectiveness::from_motors(&motors);
 
-    let forces = [2.0, 3.0, 1.5, 4.0];
+    let forces = Vector4::new(2.0, 3.0, 1.5, 4.0);
     let (f_total, tau_x, tau_y, tau_z) = model.alloc(&forces);
 
     let throttles = nalgebra::SVector::<f32, 4>::new(
@@ -610,8 +616,8 @@ fn bench_solve_runtime() {
     let mut full_solver = alloc::boxed::Box::new(FullSqpSolver::new());
 
     let hover_per_motor = MASS * GRAV / 4.0;
-    let full_u_ref = [hover_per_motor; NU];
-    let mut full_x_ref = [0.0f32; NX];
+    let full_u_ref = SVector::<f32, NU>::from_element(hover_per_motor);
+    let mut full_x_ref = SVector::<f32, NX>::from_element(0.0f32);
     full_x_ref[0] = target.x;
     full_x_ref[1] = target.y;
     full_x_ref[2] = target.z;
@@ -620,7 +626,7 @@ fn bench_solve_runtime() {
     let full_u_refs = [full_u_ref; N];
     let full_u_warm = [full_u_ref; N];
 
-    let mut full_x0 = [0.0f32; NX];
+    let mut full_x0 = SVector::<f32, NX>::from_element(0.0f32);
     full_x0[6] = 1.0; // identity quaternion at origin
 
     // Warm up (cache-priming, CPU frequency scaling)
@@ -660,8 +666,8 @@ fn bench_solve_runtime() {
     let mut simple_solver = alloc::boxed::Box::new(SimpleSqpSolver::new());
 
     // Hover input: collective thrust = m·g, zero body-rate command
-    let simple_u_ref = [MASS * GRAV, 0.0, 0.0, 0.0];
-    let mut simple_x_ref = [0.0f32; SIMPLE_NX];
+    let simple_u_ref = SVector::<f32, { SIMPLE_NU }>::from_row_slice(&[MASS * GRAV, 0.0, 0.0, 0.0]);
+    let mut simple_x_ref = SVector::<f32, { SIMPLE_NX }>::zeros();
     simple_x_ref[0] = target.x;
     simple_x_ref[1] = target.y;
     simple_x_ref[2] = target.z;
@@ -670,7 +676,7 @@ fn bench_solve_runtime() {
     let simple_u_refs = [simple_u_ref; SIMPLE_N];
     let simple_u_warm = [simple_u_ref; SIMPLE_N];
 
-    let mut simple_x0 = [0.0f32; SIMPLE_NX];
+    let mut simple_x0 = SVector::<f32, SIMPLE_NX>::zeros();
     simple_x0[6] = 1.0;
 
     for _ in 0..WARMUP {
@@ -703,22 +709,39 @@ fn bench_solve_runtime() {
     let speedup = full_per_call_us / simple_per_call_us;
     println!();
     println!("─────────────────────────────────────────────────────────────");
-    println!("MPC solver per-call runtime ({} iters after {} warm-up)", MEASURE, WARMUP);
+    println!(
+        "MPC solver per-call runtime ({} iters after {} warm-up)",
+        MEASURE, WARMUP
+    );
     println!("─────────────────────────────────────────────────────────────");
     println!(
         "  FullQuadModel  (NX={}, NU={}, N={}): {:>7.2} µs/call  →  {:>6.1} kHz max rate",
-        NX, NU, N, full_per_call_us, 1000.0 / full_per_call_us
+        NX,
+        NU,
+        N,
+        full_per_call_us,
+        1000.0 / full_per_call_us
     );
     println!(
         "  QuadModel      (NX={}, NU={}, N={}): {:>7.2} µs/call  →  {:>6.1} kHz max rate",
-        SIMPLE_NX, SIMPLE_NU, SIMPLE_N, simple_per_call_us, 1000.0 / simple_per_call_us
+        SIMPLE_NX,
+        SIMPLE_NU,
+        SIMPLE_N,
+        simple_per_call_us,
+        1000.0 / simple_per_call_us
     );
     println!("  Speedup (full / simple):           {:>7.2}×", speedup);
     println!("─────────────────────────────────────────────────────────────");
 
     // Sanity assertions: both must complete with positive elapsed time.
-    assert!(full_per_call_us > 0.0, "full solver timing must be positive");
-    assert!(simple_per_call_us > 0.0, "simple solver timing must be positive");
+    assert!(
+        full_per_call_us > 0.0,
+        "full solver timing must be positive"
+    );
+    assert!(
+        simple_per_call_us > 0.0,
+        "simple solver timing must be positive"
+    );
 }
 
 // ─── 10-case benchmark with non-trivial tilts + velocities ─────────────────
@@ -736,7 +759,7 @@ fn bench_solve_runtime_varied() {
     use std::hint::black_box;
     use std::time::Instant;
 
-    use cybflight_core::mpc::quad_model::{N as SIMPLE_N, NX as SIMPLE_NX};
+    use cybflight_core::mpc::quad_model::{N as SIMPLE_N, NU as SIMPLE_NU, NX as SIMPLE_NX};
     use cybflight_core::mpc::{QuadModel, SimpleQuadProblem, SimpleSqpSolver};
     use nalgebra::Unit;
 
@@ -747,25 +770,65 @@ fn bench_solve_runtime_varied() {
     // Spans 5°–50° tilt magnitude, varied axes, varied velocity directions.
     let cases: [(Vector3<f32>, f32, Vector3<f32>); 10] = [
         // 0: pure roll, small tilt + small +x velocity
-        (Vector3::new(1.0, 0.0, 0.0), 5.0_f32.to_radians(), Vector3::new(0.5, 0.0, 0.0)),
+        (
+            Vector3::new(1.0, 0.0, 0.0),
+            5.0_f32.to_radians(),
+            Vector3::new(0.5, 0.0, 0.0),
+        ),
         // 1: pure pitch, small tilt + small +y velocity
-        (Vector3::new(0.0, 1.0, 0.0), 10.0_f32.to_radians(), Vector3::new(0.0, 0.5, 0.0)),
+        (
+            Vector3::new(0.0, 1.0, 0.0),
+            10.0_f32.to_radians(),
+            Vector3::new(0.0, 0.5, 0.0),
+        ),
         // 2: pure roll, medium tilt + medium velocity
-        (Vector3::new(1.0, 0.0, 0.0), 15.0_f32.to_radians(), Vector3::new(1.0, 0.0, 0.3)),
+        (
+            Vector3::new(1.0, 0.0, 0.0),
+            15.0_f32.to_radians(),
+            Vector3::new(1.0, 0.0, 0.3),
+        ),
         // 3: pure pitch, medium tilt + larger velocity
-        (Vector3::new(0.0, 1.0, 0.0), 20.0_f32.to_radians(), Vector3::new(0.0, 1.5, -0.3)),
+        (
+            Vector3::new(0.0, 1.0, 0.0),
+            20.0_f32.to_radians(),
+            Vector3::new(0.0, 1.5, -0.3),
+        ),
         // 4: yaw + horizontal velocity
-        (Vector3::new(0.0, 0.0, 1.0), 30.0_f32.to_radians(), Vector3::new(0.5, 0.5, 0.0)),
+        (
+            Vector3::new(0.0, 0.0, 1.0),
+            30.0_f32.to_radians(),
+            Vector3::new(0.5, 0.5, 0.0),
+        ),
         // 5: mixed roll/pitch
-        (Vector3::new(1.0, 1.0, 0.0).normalize(), 25.0_f32.to_radians(), Vector3::new(1.0, 1.0, 0.5)),
+        (
+            Vector3::new(1.0, 1.0, 0.0).normalize(),
+            25.0_f32.to_radians(),
+            Vector3::new(1.0, 1.0, 0.5),
+        ),
         // 6: asymmetric mixed roll/pitch + bigger velocity
-        (Vector3::new(1.0, 0.5, 0.0).normalize(), 35.0_f32.to_radians(), Vector3::new(2.0, 1.0, 0.0)),
+        (
+            Vector3::new(1.0, 0.5, 0.0).normalize(),
+            35.0_f32.to_radians(),
+            Vector3::new(2.0, 1.0, 0.0),
+        ),
         // 7: fully 3D axis + 3D velocity
-        (Vector3::new(1.0, 1.0, 1.0).normalize(), 40.0_f32.to_radians(), Vector3::new(1.5, -0.5, 0.5)),
+        (
+            Vector3::new(1.0, 1.0, 1.0).normalize(),
+            40.0_f32.to_radians(),
+            Vector3::new(1.5, -0.5, 0.5),
+        ),
         // 8: oblique axis + reverse velocity
-        (Vector3::new(0.5, -1.0, 0.5).normalize(), 45.0_f32.to_radians(), Vector3::new(-1.0, 1.5, 1.0)),
+        (
+            Vector3::new(0.5, -1.0, 0.5).normalize(),
+            45.0_f32.to_radians(),
+            Vector3::new(-1.0, 1.5, 1.0),
+        ),
         // 9: extreme tilt + large velocity
-        (Vector3::new(1.0, -1.0, 0.5).normalize(), 50.0_f32.to_radians(), Vector3::new(2.0, -1.0, -0.5)),
+        (
+            Vector3::new(1.0, -1.0, 0.5).normalize(),
+            50.0_f32.to_radians(),
+            Vector3::new(2.0, -1.0, -0.5),
+        ),
     ];
 
     // ── Build full-model solver/problem/refs (reused across all cases) ────
@@ -776,8 +839,8 @@ fn bench_solve_runtime_varied() {
     let mut full_solver = alloc::boxed::Box::new(FullSqpSolver::new());
 
     let hover_per_motor = MASS * GRAV / 4.0;
-    let full_u_ref = [hover_per_motor; NU];
-    let mut full_x_ref = [0.0f32; NX];
+    let full_u_ref = SVector::<f32, NU>::from_element(hover_per_motor);
+    let mut full_x_ref = SVector::<f32, NX>::zeros();
     full_x_ref[0] = target.x;
     full_x_ref[1] = target.y;
     full_x_ref[2] = target.z;
@@ -794,8 +857,8 @@ fn bench_solve_runtime_varied() {
     let simple_problem = SimpleQuadProblem::with_rk4(simple_model, SIMPLE_N);
     let mut simple_solver = alloc::boxed::Box::new(SimpleSqpSolver::new());
 
-    let simple_u_ref = [MASS * GRAV, 0.0, 0.0, 0.0];
-    let mut simple_x_ref = [0.0f32; SIMPLE_NX];
+    let simple_u_ref = SVector::<f32, SIMPLE_NU>::from_row_slice(&[MASS * GRAV, 0.0, 0.0, 0.0]);
+    let mut simple_x_ref = SVector::<f32, SIMPLE_NX>::zeros();
     simple_x_ref[0] = target.x;
     simple_x_ref[1] = target.y;
     simple_x_ref[2] = target.z;
@@ -825,17 +888,17 @@ fn bench_solve_runtime_varied() {
         let q = UnitQuaternion::from_axis_angle(&Unit::new_normalize(*axis), *angle);
 
         // Build initial states for both models from the same physical pose.
-        let full_x0: [f32; NX] = [
-            0.0, 0.0, 0.0,                  // position
-            q.i, q.j, q.k, q.w,             // quaternion (xyzw)
-            vel.x, vel.y, vel.z,            // velocity
-            0.0, 0.0, 0.0,                  // body rates (state in full model)
-        ];
-        let simple_x0: [f32; SIMPLE_NX] = [
-            0.0, 0.0, 0.0,                  // position
-            q.i, q.j, q.k, q.w,             // quaternion (xyzw)
-            vel.x, vel.y, vel.z,            // velocity
-        ];
+        let full_x0 = SVector::<f32, NX>::from_row_slice(&[
+            0.0, 0.0, 0.0, // position
+            q.i, q.j, q.k, q.w, // quaternion (xyzw)
+            vel.x, vel.y, vel.z, // velocity
+            0.0, 0.0, 0.0, // body rates (state in full model)
+        ]);
+        let simple_x0 = SVector::<f32, SIMPLE_NX>::from_row_slice(&[
+            0.0, 0.0, 0.0, // position
+            q.i, q.j, q.k, q.w, // quaternion (xyzw)
+            vel.x, vel.y, vel.z, // velocity
+        ]);
 
         // Reset warm-start each case for a fair "cold from hover" measurement.
         let mut full_u_warm = full_u_warm_init;
@@ -916,9 +979,8 @@ fn bench_solve_runtime_varied() {
 
     // Summary stats
     let mean = |xs: &[f64; 10]| xs.iter().sum::<f64>() / 10.0;
-    let stddev = |xs: &[f64; 10], m: f64| {
-        (xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / 10.0).sqrt()
-    };
+    let stddev =
+        |xs: &[f64; 10], m: f64| (xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / 10.0).sqrt();
     let min = |xs: &[f64; 10]| xs.iter().cloned().fold(f64::INFINITY, f64::min);
     let max = |xs: &[f64; 10]| xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
@@ -940,7 +1002,10 @@ fn bench_solve_runtime_varied() {
         "Simple :  mean={:.2} µs   σ={:.2} µs   min={:.2}   max={:.2}",
         simple_mean, simple_std, simple_min, simple_max
     );
-    println!("Ratio  :  full / simple = {:.2}×  (mean of means)", ratio_mean);
+    println!(
+        "Ratio  :  full / simple = {:.2}×  (mean of means)",
+        ratio_mean
+    );
     println!("─────────────────────────────────────────────────────────────────────────────");
 
     // Sanity assertions
@@ -987,8 +1052,8 @@ fn final_steady_state_error() {
     );
 
     let max_steps: usize = (15.0 / SIM_DT) as usize; // 7500 steps = 15 s
-    // Time checkpoints (in seconds) at which to record position error.
-    let checkpoints_s: [f32; 6] = [0.5, 1.0, 2.0, 5.0, 10.0, 15.0];
+                                                     // Time checkpoints (in seconds) at which to record position error.
+    let checkpoints_s: SVector<f32, 6> = SVector::from_row_slice(&[0.5, 1.0, 2.0, 5.0, 10.0, 15.0]);
     let checkpoint_steps: [usize; 6] = [
         (0.5 / SIM_DT) as usize,
         (1.0 / SIM_DT) as usize,
@@ -1002,7 +1067,7 @@ fn final_steady_state_error() {
     let dyn_full = make_dynamics();
     let mut x = initial_state(&q0);
     let mut ctrl = MpcController::new(&target, SIM_DT);
-    let mut full_errs = [0.0f32; 6];
+    let mut full_errs = SVector::<f32, 6>::zeros();
     let mut cp_idx = 0;
     for step in 0..max_steps {
         let u = ctrl.compute(&x);
@@ -1021,9 +1086,10 @@ fn final_steady_state_error() {
 
     // ── QuadModel run ──────────────────────────────────────────────────────
     let simple_dyn = SimpleDyn::new(SIM_DT);
-    let mut sx: [f32; SIMPLE_NX] = [0.0, 0.0, 0.0, q0.i, q0.j, q0.k, q0.w, 0.0, 0.0, 0.0];
+    let mut sx: SVector<f32, SIMPLE_NX> =
+        SVector::from_row_slice(&[0.0, 0.0, 0.0, q0.i, q0.j, q0.k, q0.w, 0.0, 0.0, 0.0]);
     let mut sctrl = SimpleCtrl::new(&target, SIM_DT);
-    let mut simple_errs = [0.0f32; 6];
+    let mut simple_errs = SVector::<f32, 6>::zeros();
     let mut cp_idx = 0;
     for step in 0..max_steps {
         let u = sctrl.compute(&sx);
@@ -1102,9 +1168,9 @@ impl SimpleDyn {
     }
     fn step(
         &self,
-        x: &[f32; cybflight_core::mpc::quad_model::NX],
-        u: &[f32; cybflight_core::mpc::quad_model::NU],
-    ) -> [f32; cybflight_core::mpc::quad_model::NX] {
+        x: &SVector<f32, { cybflight_core::mpc::quad_model::NX }>,
+        u: &SVector<f32, { cybflight_core::mpc::quad_model::NU }>,
+    ) -> SVector<f32, { cybflight_core::mpc::quad_model::NX }> {
         self.model.propagate_rk4(x, u)
     }
 }
@@ -1112,13 +1178,13 @@ impl SimpleDyn {
 struct SimpleCtrl {
     solver: alloc::boxed::Box<cybflight_core::mpc::SimpleSqpSolver>,
     problem: cybflight_core::mpc::SimpleQuadProblem,
-    x_refs: [[f32; cybflight_core::mpc::quad_model::NX];
+    x_refs: [SVector<f32, { cybflight_core::mpc::quad_model::NX }>;
         cybflight_core::mpc::quad_model::N + 1],
-    u_refs: [[f32; cybflight_core::mpc::quad_model::NU];
-        cybflight_core::mpc::quad_model::N],
-    u_warm: [[f32; cybflight_core::mpc::quad_model::NU];
-        cybflight_core::mpc::quad_model::N],
-    last_u: [f32; cybflight_core::mpc::quad_model::NU],
+    u_refs:
+        [SVector<f32, { cybflight_core::mpc::quad_model::NU }>; cybflight_core::mpc::quad_model::N],
+    u_warm:
+        [SVector<f32, { cybflight_core::mpc::quad_model::NU }>; cybflight_core::mpc::quad_model::N],
+    last_u: SVector<f32, { cybflight_core::mpc::quad_model::NU }>,
     solve_period: usize,
     step_counter: usize,
 }
@@ -1132,8 +1198,13 @@ impl SimpleCtrl {
             ..Default::default()
         };
         let problem = cybflight_core::mpc::SimpleQuadProblem::with_rk4(model, SN);
-        let u_ref = [MASS * GRAV, 0.0, 0.0, 0.0];
-        let mut x_ref = [0.0f32; SNX];
+        let u_ref = SVector::<f32, { cybflight_core::mpc::quad_model::NU }>::from_row_slice(&[
+            MASS * GRAV,
+            0.0,
+            0.0,
+            0.0,
+        ]);
+        let mut x_ref = SVector::<f32, SNX>::zeros();
         x_ref[0] = target.x;
         x_ref[1] = target.y;
         x_ref[2] = target.z;
@@ -1152,8 +1223,8 @@ impl SimpleCtrl {
     }
     fn compute(
         &mut self,
-        x: &[f32; cybflight_core::mpc::quad_model::NX],
-    ) -> [f32; cybflight_core::mpc::quad_model::NU] {
+        x: &SVector<f32, { cybflight_core::mpc::quad_model::NX }>,
+    ) -> SVector<f32, { cybflight_core::mpc::quad_model::NU }> {
         self.step_counter += 1;
         if self.step_counter >= self.solve_period {
             self.step_counter = 0;
@@ -1188,7 +1259,7 @@ impl SimpleCtrl {
 mod simple_quad {
     use cybflight_core::mpc::quad_model::{N as SIMPLE_N, NU as SIMPLE_NU, NX as SIMPLE_NX};
     use cybflight_core::mpc::{QuadModel, SimpleQuadProblem, SimpleSqpSolver};
-    use nalgebra::{UnitQuaternion, Vector3};
+    use nalgebra::{SVector, UnitQuaternion, Vector3};
 
     use super::{generate_initial_orientations, GRAV, MASS, NUM_ORIENTATIONS, POS_TOL, SIM_DT};
 
@@ -1203,11 +1274,11 @@ mod simple_quad {
     }
 
     /// Initial state at the origin with a given orientation, zero velocity.
-    fn initial_state(q: &UnitQuaternion<f32>) -> [f32; SIMPLE_NX] {
-        [0.0, 0.0, 0.0, q.i, q.j, q.k, q.w, 0.0, 0.0, 0.0]
+    fn initial_state(q: &UnitQuaternion<f32>) -> SVector<f32, SIMPLE_NX> {
+        SVector::from_row_slice(&[0.0, 0.0, 0.0, q.i, q.j, q.k, q.w, 0.0, 0.0, 0.0])
     }
 
-    fn pos_of(x: &[f32; SIMPLE_NX]) -> Vector3<f32> {
+    fn pos_of(x: &SVector<f32, SIMPLE_NX>) -> Vector3<f32> {
         Vector3::new(x[0], x[1], x[2])
     }
 
@@ -1225,7 +1296,11 @@ mod simple_quad {
             }
         }
 
-        fn step(&self, x: &[f32; SIMPLE_NX], u: &[f32; SIMPLE_NU]) -> [f32; SIMPLE_NX] {
+        fn step(
+            &self,
+            x: &SVector<f32, SIMPLE_NX>,
+            u: &SVector<f32, SIMPLE_NU>,
+        ) -> SVector<f32, SIMPLE_NX> {
             self.model.propagate_rk4(x, u)
         }
     }
@@ -1234,10 +1309,10 @@ mod simple_quad {
     struct SimpleMpcController {
         solver: alloc::boxed::Box<SimpleSqpSolver>,
         problem: SimpleQuadProblem,
-        x_refs: [[f32; SIMPLE_NX]; SIMPLE_N + 1],
-        u_refs: [[f32; SIMPLE_NU]; SIMPLE_N],
-        u_warm: [[f32; SIMPLE_NU]; SIMPLE_N],
-        last_u: [f32; SIMPLE_NU],
+        x_refs: [SVector<f32, SIMPLE_NX>; SIMPLE_N + 1],
+        u_refs: [SVector<f32, SIMPLE_NU>; SIMPLE_N],
+        u_warm: [SVector<f32, SIMPLE_NU>; SIMPLE_N],
+        last_u: SVector<f32, SIMPLE_NU>,
         solve_period: usize,
         step_counter: usize,
     }
@@ -1253,9 +1328,9 @@ mod simple_quad {
             let problem = SimpleQuadProblem::with_rk4(model, SIMPLE_N);
 
             // Hover input: collective thrust = m·g, zero body-rate command.
-            let u_ref = [MASS * GRAV, 0.0, 0.0, 0.0];
+            let u_ref = SVector::<f32, SIMPLE_NU>::from_row_slice(&[MASS * GRAV, 0.0, 0.0, 0.0]);
 
-            let mut x_ref = [0.0f32; SIMPLE_NX];
+            let mut x_ref = SVector::<f32, SIMPLE_NX>::zeros();
             x_ref[0] = target.x;
             x_ref[1] = target.y;
             x_ref[2] = target.z;
@@ -1275,7 +1350,7 @@ mod simple_quad {
             }
         }
 
-        fn compute(&mut self, x: &[f32; SIMPLE_NX]) -> [f32; SIMPLE_NU] {
+        fn compute(&mut self, x: &SVector<f32, SIMPLE_NX>) -> SVector<f32, SIMPLE_NU> {
             self.step_counter += 1;
             if self.step_counter >= self.solve_period {
                 self.step_counter = 0;
@@ -1309,7 +1384,7 @@ mod simple_quad {
     fn run_simulation(
         ctrl: &mut SimpleMpcController,
         dynamics: &SimpleDynamics,
-        x0: &[f32; SIMPLE_NX],
+        x0: &SVector<f32, SIMPLE_NX>,
         target: &Vector3<f32>,
         max_steps: usize,
     ) -> SimResult {

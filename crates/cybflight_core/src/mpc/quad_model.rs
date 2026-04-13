@@ -74,13 +74,13 @@ impl Default for QuadModel {
         let mass = 0.55;
         let grav = 9.81;
         // Sum of per-motor max thrusts from QUADROTOR_MOTORS (4 × 8.5 N).
-        let thrust_max = 4.0 * 8.5;
+        let max_collective_thrust_n: f32 = 4.0 * 8.5;
         Self {
             mass,
             grav,
             dt: 0.05,
             u_bounds: [
-                [mass * grav * 0.1, thrust_max],
+                [mass * grav * 0.1, max_collective_thrust_n],
                 [-10.0, 10.0],
                 [-10.0, 10.0],
                 [-6.0, 6.0],
@@ -110,16 +110,16 @@ impl QuadModel {
         let grav = 9.81;
         let mr = vp.body.max_rate_rad_s;
         // Total collective thrust ceiling = Σ per-motor max thrusts.
-        let mut thrust_max = 0.0_f32;
+        let mut max_collective_thrust_n = 0.0_f32;
         for m in &vp.motors {
-            thrust_max += m.max_thrust_n;
+            max_collective_thrust_n += m.max_thrust_n;
         }
         Self {
             mass,
             grav,
             dt: vp.mpc.dt,
             u_bounds: [
-                [mass * grav * 0.1, thrust_max],
+                [mass * grav * 0.1, max_collective_thrust_n],
                 [-mr[0], mr[0]],
                 [-mr[1], mr[1]],
                 [-mr[2], mr[2]],
@@ -371,7 +371,8 @@ impl QuadModel {
     /// Stage state cost + gradient. Returns cost, writes grad_x.
     pub fn state_cost_grad(&self, x: &[f32; NX], xref: &[f32; NX], grad_x: &mut [f32; NX]) -> f32 {
         let dt = self.dt;
-        let mut cost = model_utils::write_pos_vel_cost_grad(x, xref, &self.w_pos, &self.w_vel, dt, grad_x);
+        let mut cost =
+            model_utils::write_pos_vel_cost_grad(x, xref, &self.w_pos, &self.w_vel, dt, grad_x);
         let (ea, de, dqa_dq) = model_utils::attitude_error(x, xref);
         cost += model_utils::write_quat_cost_grad(&ea, &de, &dqa_dq, &self.w_att, dt, grad_x);
         cost
@@ -388,7 +389,8 @@ impl QuadModel {
         let dt = self.dt;
 
         // ── Pos + vel cost/gradient via shared helper ──
-        let mut cost = model_utils::write_pos_vel_cost_grad(x, xref, &self.w_pos, &self.w_vel, dt, grad_x);
+        let mut cost =
+            model_utils::write_pos_vel_cost_grad(x, xref, &self.w_pos, &self.w_vel, dt, grad_x);
 
         // ── Quaternion cost/gradient via shared helpers ──
         let (ea, de, dqa_dq) = model_utils::attitude_error(x, xref);
@@ -405,12 +407,7 @@ impl QuadModel {
     }
 
     /// Input cost + gradient.
-    pub fn input_cost_grad(
-        &self,
-        u: &[f32; NU],
-        uref: &[f32; NU],
-        grad_u: &mut [f32; NU],
-    ) -> f32 {
+    pub fn input_cost_grad(&self, u: &[f32; NU], uref: &[f32; NU], grad_u: &mut [f32; NU]) -> f32 {
         let dt = self.dt;
         let mut cost = 0.0;
         for i in 0..NU {

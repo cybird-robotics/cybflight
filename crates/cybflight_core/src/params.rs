@@ -1,13 +1,13 @@
 //! Persistent vehicle parameter container with manual serialization.
 //!
-//! On-flash layout (little-endian, 576 bytes, aligned to 32-byte flash words):
+//! On-flash layout (little-endian, 640 bytes, aligned to 32-byte flash words):
 //!
 //! ```text
 //! [0x00]  magic:   u32 = 0x43594250 ("CYBP")
-//! [0x04]  version: u32 = 6
-//! [0x08]  length:  u32 = PAYLOAD_SIZE (552)
+//! [0x04]  version: u32 = 7
+//! [0x08]  length:  u32 = PAYLOAD_SIZE (624)
 //! [0x0C]  crc32:   u32 (over payload only)
-//! [0x10]  payload: 552 bytes
+//! [0x10]  payload: 624 bytes
 //!   Body:               mass(4) + inertia(36) + max_rate(12) = 52 bytes
 //!   Motors (x4):        px(4) + py(4) + spin_dir(4) + max_thrust(4) + torque_coeff(4) = 80 bytes
 //!   Control gains:      pos_kp(12) + pos_kd(12) + att_k_rate(12) + rate_kp(12) + rate_ki(12) + rate_kd(12) = 72 bytes
@@ -15,18 +15,20 @@
 //!   INDI controller:    rate_gains(12) + sync_filter_hz(4) + wls_wv(24) + wls_wu(16) + motor_pole_count(4 as f32) = 60 bytes
 //!   Learner:            fx_filt_hz(4) + motor_filt_hz(4) + acc_offset_m(12) + rls_gamma(4) + rls_t_char_s(4) + zeta_rate(4) + zeta_attitude(4) = 36 bytes
 //!   MpcParams:          pos(12) + vel(12) + att(12) + rate(12) + thrust(4) + dt(4) + rho(4) = 60 bytes
-//! [0x238] padding: 8 bytes (zeros)
+//!   PlannerParams:      max_vel_m_s(4) + max_tilt_rad(4) + weight_time(4) + weight_energy(4) + weight_pos(4) + weight_vel(4) + weight_tilt(4) + weight_body_rate(4) + weight_thrust(4) + smoothing_eps(4) + num_check_per_piece(4 as f32) = 44 bytes
+//!   BfgsTrustParams:    delta_init(4) + delta_max(4) + eta(4) + g_epsilon(4) + max_iterations(4 as f32) + past(4 as f32) + delta_conv(4) = 28 bytes
+//! [0x280] padding: 0 bytes
 //! ```
 
 use crate::mixer::{MotorParams, RigidBodyParams, SpinDir};
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
-/// Total payload: 52 + 80 + 72 + 192 + 60 + 36 + 60 = 552 bytes
-const PAYLOAD_SIZE: usize = 552;
-/// Padded to 32-byte flash word boundary: ceil((16+552)/32)*32 = 576
-pub const PADDED_SIZE: usize = 576;
+/// Total payload: 52 + 80 + 72 + 192 + 60 + 36 + 60 + 44 + 28 = 624 bytes
+const PAYLOAD_SIZE: usize = 624;
+/// Padded to 32-byte flash word boundary: ceil((16+624)/32)*32 = 640
+pub const PADDED_SIZE: usize = 640;
 
 /// MPC tuning parameters: cost weights, discretization, and constraint penalty.
 ///
@@ -61,6 +63,79 @@ impl Default for MpcParams {
             thrust_weight: 6.0,
             dt: 0.05,
             rho: 1e4,
+        }
+    }
+}
+
+/// BFGS trust-region parameters.
+#[derive(Clone, Debug)]
+pub struct BfgsTrustParams {
+    pub delta_init: f32,
+    pub delta_max: f32,
+    /// Acceptance threshold: accept step if actual/predicted > eta.
+    pub eta: f32,
+    pub g_epsilon: f32,
+    pub max_iterations: usize,
+    /// Delta-based convergence: check cost stagnation over `past` iterations.
+    pub past: usize,
+    pub delta_conv: f32,
+}
+
+impl Default for BfgsTrustParams {
+    fn default() -> Self {
+        Self {
+            delta_init: 1.0,
+            delta_max: 100.0,
+            eta: 0.1,
+            g_epsilon: 1.0e-5,
+            max_iterations: 50,
+            past: 3,
+            delta_conv: 1.0e-6,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PlannerParams {
+    pub max_vel_m_s: f32,
+    pub max_tilt_rad: f32,
+    /// Weight on total trajectory time Σ T_i (higher → faster trajectories).
+    pub weight_time: f32,
+    /// Weight on energy (∫‖jerk‖² or ∫‖snap‖²) — controls smoothness.
+    pub weight_energy: f32,
+    /// Weight on position constraint penalty
+    pub weight_pos: f32,
+    /// Weight on velocity constraint penalty (soft ‖v‖ ≤ max_vel).
+    pub weight_vel: f32,
+    /// Weight on tilt angle penalty. Set to 0 to disable.
+    pub weight_tilt: f32,
+    /// Weight on body rate penalty. Set to 0 to disable.
+    pub weight_body_rate: f32,
+    /// Weight on thrust constraint penalty (soft thrust bounds).
+    pub weight_thrust: f32,
+    /// Smoothing parameter ε for the smoothed L1 penalty function.
+    pub smoothing_eps: f32,
+    /// Number of Gauss–Legendre sample points per piece for constraint evaluation.
+    pub num_check_per_piece: usize,
+    /// Which nonlinear solver backend to use.
+    pub bfgs_trust: BfgsTrustParams,
+}
+
+impl Default for PlannerParams {
+    fn default() -> Self {
+        Self {
+            max_vel_m_s: 5.0,
+            max_tilt_rad: core::f32::consts::FRAC_PI_3,
+            weight_time: 1.0,
+            weight_energy: 0.1,
+            weight_pos: 10.0,
+            weight_vel: 10.0,
+            weight_tilt: 10.0,
+            weight_body_rate: 10.0,
+            weight_thrust: 10.0,
+            smoothing_eps: 0.01,
+            num_check_per_piece: 8,
+            bfgs_trust: BfgsTrustParams::default(),
         }
     }
 }
@@ -206,6 +281,7 @@ pub struct VehicleParams {
     pub indi_controller: IndiControllerParams,
     pub learner: LearnerParams,
     pub mpc: MpcParams,
+    pub planner: PlannerParams,
 }
 
 impl VehicleParams {
@@ -316,6 +392,26 @@ impl VehicleParams {
         off = put_f32(&mut buf, off, self.mpc.thrust_weight);
         off = put_f32(&mut buf, off, self.mpc.dt);
         off = put_f32(&mut buf, off, self.mpc.rho);
+        // PlannerParams
+        off = put_f32(&mut buf, off, self.planner.max_vel_m_s);
+        off = put_f32(&mut buf, off, self.planner.max_tilt_rad);
+        off = put_f32(&mut buf, off, self.planner.weight_time);
+        off = put_f32(&mut buf, off, self.planner.weight_energy);
+        off = put_f32(&mut buf, off, self.planner.weight_pos);
+        off = put_f32(&mut buf, off, self.planner.weight_vel);
+        off = put_f32(&mut buf, off, self.planner.weight_tilt);
+        off = put_f32(&mut buf, off, self.planner.weight_body_rate);
+        off = put_f32(&mut buf, off, self.planner.weight_thrust);
+        off = put_f32(&mut buf, off, self.planner.smoothing_eps);
+        off = put_f32(&mut buf, off, self.planner.num_check_per_piece as f32);
+        // BfgsTrustParams (nested in planner)
+        off = put_f32(&mut buf, off, self.planner.bfgs_trust.delta_init);
+        off = put_f32(&mut buf, off, self.planner.bfgs_trust.delta_max);
+        off = put_f32(&mut buf, off, self.planner.bfgs_trust.eta);
+        off = put_f32(&mut buf, off, self.planner.bfgs_trust.g_epsilon);
+        off = put_f32(&mut buf, off, self.planner.bfgs_trust.max_iterations as f32);
+        off = put_f32(&mut buf, off, self.planner.bfgs_trust.past as f32);
+        off = put_f32(&mut buf, off, self.planner.bfgs_trust.delta_conv);
         debug_assert_eq!(off - HEADER_SIZE, PAYLOAD_SIZE);
 
         // Header
@@ -568,6 +664,67 @@ impl VehicleParams {
             rho,
         };
 
+        // PlannerParams
+        let max_vel_m_s = get_f32(buf, off);
+        off += 4;
+        let max_tilt_rad = get_f32(buf, off);
+        off += 4;
+        let weight_time = get_f32(buf, off);
+        off += 4;
+        let weight_energy = get_f32(buf, off);
+        off += 4;
+        let weight_pos = get_f32(buf, off);
+        off += 4;
+        let weight_vel = get_f32(buf, off);
+        off += 4;
+        let weight_tilt = get_f32(buf, off);
+        off += 4;
+        let weight_body_rate = get_f32(buf, off);
+        off += 4;
+        let weight_thrust = get_f32(buf, off);
+        off += 4;
+        let smoothing_eps = get_f32(buf, off);
+        off += 4;
+        let num_check_per_piece = get_f32(buf, off) as usize;
+        off += 4;
+        // BfgsTrustParams (nested in planner)
+        let delta_init = get_f32(buf, off);
+        off += 4;
+        let delta_max = get_f32(buf, off);
+        off += 4;
+        let eta = get_f32(buf, off);
+        off += 4;
+        let g_epsilon = get_f32(buf, off);
+        off += 4;
+        let max_iterations = get_f32(buf, off) as usize;
+        off += 4;
+        let past = get_f32(buf, off) as usize;
+        off += 4;
+        let delta_conv = get_f32(buf, off);
+        off += 4;
+        let planner = PlannerParams {
+            max_vel_m_s,
+            max_tilt_rad,
+            weight_time,
+            weight_energy,
+            weight_pos,
+            weight_vel,
+            weight_tilt,
+            weight_body_rate,
+            weight_thrust,
+            smoothing_eps,
+            num_check_per_piece,
+            bfgs_trust: BfgsTrustParams {
+                delta_init,
+                delta_max,
+                eta,
+                g_epsilon,
+                max_iterations,
+                past,
+                delta_conv,
+            },
+        };
+
         let _ = off; // suppress unused warning
 
         Some(VehicleParams {
@@ -578,6 +735,7 @@ impl VehicleParams {
             indi_controller,
             learner,
             mpc,
+            planner,
         })
     }
 
@@ -1455,6 +1613,7 @@ mod tests {
             indi_controller: IndiControllerParams::default(),
             learner: LearnerParams::default(),
             mpc: MpcParams::default(),
+            planner: PlannerParams::default(),
         }
     }
 

@@ -77,6 +77,7 @@ pub fn default_params() -> cybflight_core::params::VehicleParams {
         indi_controller: cybflight_core::params::IndiControllerParams::default(),
         learner: cybflight_core::params::LearnerParams::default(),
         mpc: cybflight_core::params::MpcParams::default(),
+        planner: cybflight_core::params::PlannerParams::default(),
     }
 }
 

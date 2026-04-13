@@ -9,3 +9,4 @@ pub mod params;
 pub mod position_control;
 pub mod rc;
 pub mod rotation;
+pub mod trajectory_planning;

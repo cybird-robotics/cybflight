@@ -49,7 +49,7 @@ pub static ATTITUDE_CONTROL_SETPOINT: PubSubChannel<
     msgs::AttitudeControlSetpoint,
     2,
     3,
-    1,
+    2,
 > = PubSubChannel::new();
 
 #[cfg(feature = "est_eskf")]
@@ -65,14 +65,15 @@ pub static AUTO_SETPOINT: Signal<CriticalSectionRawMutex, msgs::VehicleOdometry>
 pub static MPC_RATE_COMMAND: Signal<CriticalSectionRawMutex, msgs::AttitudeControlSetpoint> =
     Signal::new();
 
-// Position control setpoint telemetry: CAP=2, SUBS=3 (esp_bridge + shell + spare), PUBS=1.
+// Position control setpoint telemetry: CAP=2, SUBS=3 (esp_bridge + shell + spare), PUBS=2
+// (indi_task in cascade mode, outer_loop in MPC mode).
 #[cfg(feature = "est_eskf")]
 pub static POSITION_CONTROL_SETPOINT: PubSubChannel<
     CriticalSectionRawMutex,
     msgs::PositionControlSetpoint,
     2,
     3,
-    1,
+    2,
 > = PubSubChannel::new();
 
 /// In-flight learning toggle. When `true` AND learner prearm is latched,

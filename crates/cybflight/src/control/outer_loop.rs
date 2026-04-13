@@ -15,7 +15,7 @@
 
 use cybflight_core::mpc::quad_model::{N as MPC_N, NU as MPC_NU, NX as MPC_NX};
 use cybflight_core::mpc::{QuadModel, SimpleQuadProblem, SimpleSqpSolver};
-use cybflight_core::rotation::{euler_angles_rpy_to_quaternion, quaternion_to_yaw};
+use cybflight_core::rotation::quaternion_to_yaw;
 use embassy_time::{Duration, Instant, Ticker};
 use nalgebra::Vector3;
 use static_cell::StaticCell;
@@ -23,6 +23,7 @@ use static_cell::StaticCell;
 use crate::msgs;
 use crate::sensors::VEHICLE_ODOMETRY;
 use crate::vehicle::QUADROTOR_BODY;
+use nalgebra::UnitQuaternion;
 
 /// Static-allocated SQP workspace (~32 KB in BSS, init-once at task startup).
 static MPC_SOLVER: StaticCell<SimpleSqpSolver> = StaticCell::new();
@@ -78,7 +79,10 @@ pub async fn control_loop_task() {
     let mut u_refs: [[f32; MPC_NU]; MPC_N] = [[hover_thrust, 0.0, 0.0, 0.0]; MPC_N];
     let mut u_warm: [[f32; MPC_NU]; MPC_N] = u_refs;
 
-    // ── Subscribers ────────────────────────────────────────────────────
+    // ── Publishers / Subscribers ──────────────────────────────────────
+    let pos_ctrl_pub = super::POSITION_CONTROL_SETPOINT.immediate_publisher();
+    let att_ctrl_pub = super::ATTITUDE_CONTROL_SETPOINT.immediate_publisher();
+    let ocp_pub = super::OCP_SOLVER_OUTPUT.immediate_publisher();
     let mut odom_sub = VEHICLE_ODOMETRY
         .subscriber()
         .expect("outer_loop: VEHICLE_ODOMETRY subscriber");
@@ -173,24 +177,9 @@ pub async fn control_loop_task() {
         }
 
         // 6. Solve one SQP iteration (max_iters = 1, matches host benchmark).
-        //    Wall-clock-bracket the call so a runaway solve is detected
-        //    post-hoc (C2: solver is synchronous, no true preemption).
-        // let solve_start = Instant::now();
-        let _ = mpc_solver.solve(&mpc_problem, &mpc_x0, &x_refs, &u_refs, &u_warm, 1, 1e-3);
-        // let solve_elapsed = Instant::now().duration_since(solve_start);
-        // if solve_elapsed > MPC_SOLVE_BUDGET {
-        //     // Discard this solve: refuse to publish, and reset the warm-start
-        //     // to a known-good hover trajectory so the next tick does not
-        //     // continue from a possibly diverged interior. The inner loop's
-        //     // staleness gate will see no fresh command and (after
-        //     // MPC_CMD_STALE_TIMEOUT) the failsafe watchdog will engage.
-        //     defmt::warn!(
-        //         "MPC outer loop: solve overran budget ({}us), discarding",
-        //         solve_elapsed.as_micros() as u32
-        //     );
-        //     u_warm = u_refs;
-        //     continue;
-        // }
+        let solve_start = Instant::now();
+        let result = mpc_solver.solve(&mpc_problem, &mpc_x0, &x_refs, &u_refs, &u_warm, 1, 1e-3);
+        let solve_time_us = Instant::now().duration_since(solve_start).as_micros();
         u_warm = *mpc_solver.u_bar();
         let mut u0 = mpc_solver.u_bar()[0];
 
@@ -213,26 +202,52 @@ pub async fn control_loop_task() {
         //     the command reach INDI.
         clamp_mpc_output(&mut u0, &mpc_problem.model.u_bounds);
 
-        // 8. Build a yaw-only desired attitude for telemetry consistency.
-        //    The MPC commands body rates directly; this field is purely
-        //    informational. We pick "current heading, level roll/pitch"
-        //    so the ground station's desired-attitude widget shows something
-        //    meaningful (the heading the controller is implicitly holding).
-        //    `quaternion_to_yaw` measures the geometric heading (angle of
-        //    body x-axis projected onto world XY) — exactly the quantity we
-        //    want here. Falls back to 0 if the body is too tilted for the
-        //    projection to be defined.
-        // let current_yaw = quaternion_to_yaw(&q, 0.0);
-        // let yaw_only = euler_angles_rpy_to_quaternion(&Vector3::new(0.0, 0.0, current_yaw));
-        // let yaw_only = euler_angles_rpy_to_quaternion(&Vector3::new(0.0, 0.0, 0.0));
+        // 8. Extract predicted attitude from the SECOND MPC state (index 1).
+        //    x_bar[0] is the current/measured state; x_bar[1] is the
+        //    one-step-ahead prediction — the attitude reference the MPC is
+        //    driving toward.
+        let x1 = &mpc_solver.x_bar()[1];
+        let att_ref = UnitQuaternion::new_normalize(nalgebra::Quaternion::new(
+            x1[6], // qw (scalar-last layout in state, scalar-first in nalgebra ctor)
+            x1[3], // qx
+            x1[4], // qy
+            x1[5], // qz
+        ));
+        let yaw_ref = quaternion_to_yaw(&att_ref, 0.0);
+
+        let publish_time = Instant::now();
 
         // 9. Publish to the inner loop.
         super::MPC_RATE_COMMAND.signal(msgs::AttitudeControlSetpoint {
-            timestamp: Instant::now(),
+            timestamp: publish_time,
             collective_thrust_n: u0[0],
             attitude_quaternion: att_setpoint,
             body_rate_rad_s: Vector3::new(u0[1], u0[2], u0[3]),
             torque_n_m: Vector3::zeros(),
+        });
+
+        // 10. Publish telemetry for downlink (fulfils the promise in indi_task's
+        //     comment that the MPC path delegates these to outer_loop).
+        pos_ctrl_pub.publish_immediate(msgs::PositionControlSetpoint {
+            timestamp: publish_time,
+            position: pos_setpoint,
+            velocity: Vector3::new(x1[7], x1[8], x1[9]),
+            yaw: yaw_ref,
+            collective_thrust_n: u0[0],
+        });
+        att_ctrl_pub.publish_immediate(msgs::AttitudeControlSetpoint {
+            timestamp: publish_time,
+            collective_thrust_n: u0[0],
+            attitude_quaternion: att_ref,
+            body_rate_rad_s: Vector3::new(u0[1], u0[2], u0[3]),
+            torque_n_m: Vector3::zeros(),
+        });
+        ocp_pub.publish_immediate(msgs::OcpSolverOutput {
+            timestamp: publish_time,
+            command: nalgebra::SVector::from(u0),
+            iterations: result.iters as i32,
+            converged: result.converged,
+            solve_time_us,
         });
     }
 }

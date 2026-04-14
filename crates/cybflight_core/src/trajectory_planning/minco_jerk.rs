@@ -269,7 +269,20 @@ impl MincoJerk {
             grad_points[i] = adj_grad[6 * i + 5];
         }
 
-        // Compute gradient w.r.t. times via ∂A/∂T
+        // Compute gradient w.r.t. times via ∂A/∂T for interior segments.
+        //
+        // A(T)·b = boundary. The T-dependent rows for segment i's end (rows
+        // 6i+3 .. 6i+8) evaluate derivatives of the piece polynomial at
+        // t = T_i. ∂A/∂T applied to b raises each derivative order by one:
+        //
+        //   row 6i+3 (jerk continuity, p''')  →  ∂/∂T = p'''' = snap at end
+        //   row 6i+4 (snap continuity, p'''') →  ∂/∂T = p''''' = crackle at end
+        //   row 6i+5 (pos = waypoint,   p)    →  ∂/∂T = p'     = velocity at end
+        //   row 6i+6 (pos continuity,   p)    →  ∂/∂T = p'     = velocity at end
+        //   row 6i+7 (vel continuity,   p')   →  ∂/∂T = p''    = acceleration at end
+        //   row 6i+8 (acc continuity,   p'')  →  ∂/∂T = p'''   = jerk at end
+        //
+        // gradT_i = -adjGrad · (∂A/∂T · b), so we store negatives in b1.
         for i in 0..(n - 1) {
             let o = i * 6;
             let t1 = self.t1[i]; let t2 = self.t2[i]; let t3 = self.t3[i];
@@ -277,25 +290,34 @@ impl MincoJerk {
 
             let mut b1 = [[0.0f32; 3]; 6];
 
-            // negative velocity at end of segment
+            // k=0: jerk continuity row → negative snap at end (24 b4 + 120 T b5)
+            b1[0] = neg3(add_scaled_rows(&self.b, o, &[
+                (4, 24.0), (5, 120.0 * t1)
+            ]));
+
+            // k=1: snap continuity row → negative crackle at end (120 b5)
+            b1[1] = neg3(add_scaled_rows(&self.b, o, &[
+                (5, 120.0)
+            ]));
+
+            // k=2, k=3: pos=waypoint and pos continuity → negative velocity at end
             let neg_vel = neg3(add_scaled_rows(&self.b, o, &[
                 (1, 1.0), (2, 2.0*t1), (3, 3.0*t2), (4, 4.0*t3), (5, 5.0*t4)
             ]));
-            b1[2] = neg_vel; // jerk continuity row
-            b1[3] = neg_vel; // position at end row
+            b1[2] = neg_vel;
+            b1[3] = neg_vel;
 
-            // negative acceleration
+            // k=4: velocity continuity row → negative acceleration at end
             b1[4] = neg3(add_scaled_rows(&self.b, o, &[
                 (2, 2.0), (3, 6.0*t1), (4, 12.0*t2), (5, 20.0*t3)
             ]));
 
-            // negative jerk
+            // k=5: acceleration continuity row → negative jerk at end
             b1[5] = neg3(add_scaled_rows(&self.b, o, &[
                 (3, 6.0), (4, 24.0*t1), (5, 60.0*t2)
             ]));
 
             // gradByTimes(i) = B1 . adjGrad[6i+3 .. 6i+9]
-            // The continuity rows for segment i boundary start at row 6i+3
             let mut sum = 0.0;
             for k in 0..6 {
                 sum += dot3(b1[k], adj_grad[6 * i + 3 + k]);

@@ -6,11 +6,11 @@
 #[allow(unused_imports)]
 use num_traits::Float;
 
-use super::flatness::{self, FlatnessState};
+use super::flatness::{self, AlphaState, FlatnessState};
 use super::minco_jerk::MincoJerk;
 use super::penalties::{
-    self, eval_dynamics_derivatives, forward_t_log, jerk_basis_vectors, smoothed_l1,
-    DynDerivatives,
+    back_propagate_t, eval_dynamics_derivatives, forward_t, jerk_basis_vectors,
+    smoothed_l1, DynDerivatives,
 };
 use super::piecewise_polynomial::PiecewisePolynomial;
 use super::quad_planning_config::QuadPlanningConfig;
@@ -26,7 +26,10 @@ struct ConstraintBounds {
     thr_mean: f32,
     thr_radi_sq: f32,
     cos_max_tilt: f32,
-    max_rate_sq: [f32; 3],
+    /// Squared maximum pitch/roll rate magnitude: ω_xy_max² (bound on ‖ω_xy‖²).
+    max_rate_xy_sq: f32,
+    /// Squared maximum yaw rate magnitude: ω_z_max².
+    max_rate_z_sq: f32,
     gravity: f32,
     mass: f32,
 }
@@ -97,7 +100,11 @@ impl CostEvaluator {
             thr_mean,
             thr_radi_sq: thr_radi * thr_radi,
             cos_max_tilt,
-            max_rate_sq: [mr[0] * mr[0], mr[1] * mr[1], mr[2] * mr[2]],
+            // max_rate_rad_s[0] is the pitch/roll rate limit (a scalar bound
+            // on the xy-plane body rate magnitude, matching the C++
+            // `maxOmgXY`). max_rate_rad_s[2] is the yaw rate limit.
+            max_rate_xy_sq: mr[0] * mr[0],
+            max_rate_z_sq: mr[2] * mr[2],
             gravity: config.grav,
             mass: config.mass,
         };
@@ -150,7 +157,7 @@ impl CostEvaluator {
     /// Decode decision vector into times[] and waypoints[].
     fn decode_decision_vars(&mut self, x: &[f32]) {
         for i in 0..self.n_pieces {
-            self.times[i] = forward_t_log(x[i]);
+            self.times[i] = forward_t(x[i]);
         }
         for i in 0..self.n_waypoints {
             self.waypoints[i] = [
@@ -204,17 +211,38 @@ impl CostEvaluator {
     }
 
     /// Sample dynamics penalties across all segments and sample points.
+    ///
+    /// Precomputes which penalties are active once per evaluation. Within the
+    /// hot loop:
+    /// - Zero-weight penalties are skipped via outer flags (no function call).
+    /// - `AlphaState` (α, zB) is computed only when any flatness-dependent
+    ///   penalty is active. It is always well-defined (unlike the old
+    ///   "None if zb_z ≤ -0.9" guard, which incorrectly skipped tilt).
+    /// - `FlatnessState` (adds dzB, ω) is computed only when the body-rate
+    ///   penalty is active *and* zB is away from the inversion singularity.
+    /// - `assemble_basis_gradients` and the per-sample cost term are skipped
+    ///   entirely when no penalty activated at this point (feasible sample).
     fn accumulate_dynamics_penalties(&mut self, traj: &PiecewisePolynomial) -> f32 {
         let n_check = self.params.num_check_per_piece;
-        let need_flatness =
-            self.params.weight_tilt > 1e-6 || self.params.weight_body_rate > 1e-6;
+        let inv_n = 1.0 / n_check as f32;
+
+        // Active-penalty flags, cached once per evaluation.
+        let need_vel = self.params.weight_vel > 1e-6;
+        let need_thrust = self.params.weight_thrust > 1e-6;
+        let need_tilt = self.params.weight_tilt > 1e-6;
+        let need_body_rate = self.params.weight_body_rate > 1e-6;
+        let need_alpha = need_thrust || need_tilt || need_body_rate;
+
+        // Nothing to do if no penalty is active.
+        if !(need_vel || need_alpha) {
+            return 0.0;
+        }
 
         let mut total_cost = 0.0;
 
         for seg in 0..self.n_pieces {
             let seg_dur = self.times[seg];
             let step = seg_dur / n_check as f32;
-            let inv_n = 1.0 / n_check as f32;
 
             for j in 0..=n_check {
                 let t_local = j as f32 * step;
@@ -224,34 +252,37 @@ impl CostEvaluator {
 
                 let dd = eval_dynamics_derivatives(traj, seg, t_local);
                 let mut grads = PointGradients::zero();
-
-                // Compute flatness state (shared by tilt + body rate penalties)
-                let fs = if need_flatness {
-                    flatness::compute_flatness_state(dd.acc, dd.jer, self.bounds.gravity)
-                } else {
-                    None
-                };
-
                 let mut penalty = 0.0;
 
-                // -- Individual penalties --
-                penalty += self.velocity_penalty(&dd, &mut grads);
-
-                if let Some(ref fs) = fs {
-                    penalty += self.thrust_penalty(fs, &mut grads);
-                    penalty += self.tilt_penalty(fs, &mut grads);
-                    penalty += self.body_rate_penalty(fs, &mut grads);
-                } else {
-                    // Without flatness, still compute collective thrust penalty
-                    penalty += self.thrust_penalty_collective(&dd, &mut grads);
+                if need_vel {
+                    penalty += self.velocity_penalty(&dd, &mut grads);
                 }
 
-                // -- Assemble basis gradients --
-                self.assemble_basis_gradients(
-                    base, &dd, &grads, penalty, step, node, t_frac,
-                );
+                if need_alpha {
+                    let alpha = flatness::compute_alpha_state(dd.acc, self.bounds.gravity);
 
-                total_cost += node * step * penalty;
+                    if need_thrust {
+                        penalty += self.thrust_penalty(&alpha, &mut grads);
+                    }
+                    if need_tilt {
+                        penalty += self.tilt_penalty(&alpha, &mut grads);
+                    }
+                    // Body rate requires the 1/(1+zb_z) factor — guard against
+                    // near-inversion where that term blows up.
+                    if need_body_rate && alpha.zb[2] > -0.9 {
+                        let fs = flatness::extend_to_flatness(&alpha, dd.jer);
+                        penalty += self.body_rate_penalty(&fs, &mut grads);
+                    }
+                }
+
+                // Feasible sample: every penalty returned (0, 0) and grads
+                // are all zero. Skip basis assembly + time chain (all zero).
+                if penalty > 0.0 {
+                    self.assemble_basis_gradients(
+                        base, &dd, &grads, penalty, step, node, t_frac, inv_n,
+                    );
+                    total_cost += node * step * penalty;
+                }
             }
         }
 
@@ -282,9 +313,9 @@ impl CostEvaluator {
 
     /// Transform grad_times/points back to decision variable space.
     fn encode_gradient(&self, x: &[f32], grad: &mut [f32]) {
-        // Time gradients: ∂L/∂K = T · ∂L/∂T (log parameterization: ∂T/∂K = exp(K) = T)
+        // Time gradients: ∂L/∂K = ∂T/∂K · ∂L/∂T (quadratic parameterization)
         for i in 0..self.n_pieces {
-            grad[i] = self.grad_times[i] * self.times[i];
+            grad[i] = back_propagate_t(x[i], self.grad_times[i]);
         }
         // Waypoint gradients: identity
         for i in 0..self.n_waypoints {
@@ -298,17 +329,17 @@ impl CostEvaluator {
     // Individual penalties (take &self, write to stack-local PointGradients)
     // -----------------------------------------------------------------------
 
+    // Per-penalty methods: the outer loop guards with `need_*` flags, so
+    // these are only called when the corresponding weight is > 1e-6. Each
+    // still returns 0.0 when the constraint is satisfied (no violation).
+
     /// Velocity penalty: smoothed_l1(‖v‖² - max_vel²).
     #[inline]
     fn velocity_penalty(&self, dd: &DynDerivatives, grads: &mut PointGradients) -> f32 {
-        let w = self.params.weight_vel;
-        if w < 1e-6 {
-            return 0.0;
-        }
-        let v_sq = norm_sq3(dd.vel);
-        let violation = v_sq - self.bounds.max_vel_sq;
+        let violation = norm_sq3(dd.vel) - self.bounds.max_vel_sq;
         let (f, df) = smoothed_l1(violation, self.params.smoothing_eps);
         if f > 0.0 {
+            let w = self.params.weight_vel;
             let scale = w * df * 2.0;
             for d in 0..3 {
                 grads.vel[d] += scale * dd.vel[d];
@@ -319,57 +350,18 @@ impl CostEvaluator {
         }
     }
 
-    /// Collective thrust penalty (used when flatness state is available).
-    /// F = mass * ‖α‖, penalty on (F - F_mean)² - F_radius².
+    /// Collective thrust penalty: F = mass·‖α‖, penalty on (F − F_mean)² − F_radius².
     #[inline]
-    fn thrust_penalty(&self, fs: &FlatnessState, grads: &mut PointGradients) -> f32 {
-        let w = self.params.weight_thrust;
-        if w < 1e-6 {
-            return 0.0;
-        }
-        let collective = self.bounds.mass * fs.norm_alpha;
-        let thr_violation =
-            (collective - self.bounds.thr_mean) * (collective - self.bounds.thr_mean)
-                - self.bounds.thr_radi_sq;
-        let (f, df) = smoothed_l1(thr_violation, self.params.smoothing_eps);
+    fn thrust_penalty(&self, alpha: &AlphaState, grads: &mut PointGradients) -> f32 {
+        let collective = self.bounds.mass * alpha.norm_alpha;
+        let delta = collective - self.bounds.thr_mean;
+        let (f, df) = smoothed_l1(delta * delta - self.bounds.thr_radi_sq, self.params.smoothing_eps);
         if f > 0.0 {
-            let d_violation =
-                2.0 * (collective - self.bounds.thr_mean) * self.bounds.mass * fs.inv_norm_alpha;
+            let w = self.params.weight_thrust;
+            let d_violation = 2.0 * delta * self.bounds.mass * alpha.inv_norm_alpha;
             let scale = w * df * d_violation;
             for d in 0..3 {
-                grads.acc[d] += scale * fs.alpha[d];
-            }
-            w * f
-        } else {
-            0.0
-        }
-    }
-
-    /// Collective thrust penalty without full flatness state (fallback).
-    #[inline]
-    fn thrust_penalty_collective(
-        &self,
-        dd: &DynDerivatives,
-        grads: &mut PointGradients,
-    ) -> f32 {
-        let w = self.params.weight_thrust;
-        if w < 1e-6 {
-            return 0.0;
-        }
-        let alpha = [dd.acc[0], dd.acc[1], dd.acc[2] + self.bounds.gravity];
-        let norm_alpha = norm_sq3(alpha).sqrt().max(1e-8);
-        let inv_norm = 1.0 / norm_alpha;
-        let collective = self.bounds.mass * norm_alpha;
-        let thr_violation =
-            (collective - self.bounds.thr_mean) * (collective - self.bounds.thr_mean)
-                - self.bounds.thr_radi_sq;
-        let (f, df) = smoothed_l1(thr_violation, self.params.smoothing_eps);
-        if f > 0.0 {
-            let d_violation =
-                2.0 * (collective - self.bounds.thr_mean) * self.bounds.mass * inv_norm;
-            let scale = w * df * d_violation;
-            for d in 0..3 {
-                grads.acc[d] += scale * alpha[d];
+                grads.acc[d] += scale * alpha.alpha[d];
             }
             w * f
         } else {
@@ -379,22 +371,20 @@ impl CostEvaluator {
 
     /// Tilt angle penalty: smoothed_l1(cos_max_tilt - zb_z).
     ///
-    /// Works in cosine domain to avoid 1/sin singularity.
+    /// Works in cosine domain to avoid 1/sin singularity; safe to evaluate
+    /// across the full attitude range (including near inversion).
     #[inline]
-    fn tilt_penalty(&self, fs: &FlatnessState, grads: &mut PointGradients) -> f32 {
-        let w = self.params.weight_tilt;
-        if w < 1e-6 {
-            return 0.0;
-        }
-        let cos_tilt = fs.zb[2];
-        let violation = self.bounds.cos_max_tilt - cos_tilt;
+    fn tilt_penalty(&self, alpha: &AlphaState, grads: &mut PointGradients) -> f32 {
+        let violation = self.bounds.cos_max_tilt - alpha.zb[2];
         let (f, df) = smoothed_l1(violation, self.params.smoothing_eps);
         if f > 0.0 {
-            let inv3 = fs.inv_norm_alpha * fs.inv_norm_alpha * fs.inv_norm_alpha;
+            let w = self.params.weight_tilt;
+            let inv = alpha.inv_norm_alpha;
+            let inv3 = inv * inv * inv;
             let common = w * df;
-            let axy_sq = fs.alpha[0] * fs.alpha[0] + fs.alpha[1] * fs.alpha[1];
-            grads.acc[0] += common * fs.alpha[0] * fs.alpha[2] * inv3;
-            grads.acc[1] += common * fs.alpha[1] * fs.alpha[2] * inv3;
+            let axy_sq = alpha.alpha[0] * alpha.alpha[0] + alpha.alpha[1] * alpha.alpha[1];
+            grads.acc[0] += common * alpha.alpha[0] * alpha.alpha[2] * inv3;
+            grads.acc[1] += common * alpha.alpha[1] * alpha.alpha[2] * inv3;
             grads.acc[2] -= common * axy_sq * inv3;
             w * f
         } else {
@@ -402,22 +392,24 @@ impl CostEvaluator {
         }
     }
 
-    /// Body rate penalty: smoothed_l1(ω_xy² - max²) + smoothed_l1(ω_z² - max²).
+    /// Body rate penalty: smoothed_l1(ω_xy² − max²) + smoothed_l1(ω_z² − max²).
+    ///
+    /// Matches the C++ `addBodyratePenalities`: ‖ω_xy‖² bounded by a single
+    /// scalar `maxOmgXYSqr` (pitch/roll scalar limit).
     #[inline]
     fn body_rate_penalty(&self, fs: &FlatnessState, grads: &mut PointGradients) -> f32 {
-        let w = self.params.weight_body_rate;
-        if w < 1e-6 {
-            return 0.0;
-        }
         let omega_xy_sq = fs.omega[0] * fs.omega[0] + fs.omega[1] * fs.omega[1];
-        let (f_xy, df_xy) =
-            smoothed_l1(omega_xy_sq - self.bounds.max_rate_sq[0], self.params.smoothing_eps);
+        let (f_xy, df_xy) = smoothed_l1(
+            omega_xy_sq - self.bounds.max_rate_xy_sq,
+            self.params.smoothing_eps,
+        );
         let (f_z, df_z) = smoothed_l1(
-            fs.omega[2] * fs.omega[2] - self.bounds.max_rate_sq[2],
+            fs.omega[2] * fs.omega[2] - self.bounds.max_rate_z_sq,
             self.params.smoothing_eps,
         );
 
         if f_xy > 0.0 || f_z > 0.0 {
+            let w = self.params.weight_body_rate;
             let mut g_omega = ZERO3;
             if f_xy > 0.0 {
                 g_omega[0] = w * df_xy * 2.0 * fs.omega[0];
@@ -438,6 +430,9 @@ impl CostEvaluator {
     // -----------------------------------------------------------------------
 
     /// Assemble monomial basis gradients and accumulate into partial_grad_c/t.
+    ///
+    /// Only called when `penalty > 0.0` (outer loop guard), so `grads` is
+    /// guaranteed non-trivial.
     fn assemble_basis_gradients(
         &mut self,
         base: usize,
@@ -447,6 +442,7 @@ impl CostEvaluator {
         step: f32,
         node: f32,
         t_frac: f32,
+        inv_n: f32,
     ) {
         let (beta_vel, beta_acc, beta_jer) = jerk_basis_vectors(dd);
         let scale = step * node;
@@ -464,7 +460,6 @@ impl CostEvaluator {
         let time_chain =
             dot3(grads.vel, dd.acc) + dot3(grads.acc, dd.jer) + dot3(grads.jer, dd.sna);
         let seg = base / JERK_COEFFS;
-        let inv_n = 1.0 / self.params.num_check_per_piece as f32;
         self.partial_grad_t[seg] += time_chain * scale * t_frac + node * inv_n * penalty;
     }
 }

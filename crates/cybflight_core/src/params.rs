@@ -87,10 +87,13 @@ impl Default for BfgsTrustParams {
             delta_init: 1.0,
             delta_max: 100.0,
             eta: 0.1,
-            g_epsilon: 1.0e-5,
-            max_iterations: 50,
+            // Tight enough to avoid premature termination in multi-waypoint
+            // trajectory optimization problems (empirically the loose 1e-5
+            // caused non-monotonic weight-time behavior).
+            g_epsilon: 1.0e-7,
+            max_iterations: 500,
             past: 3,
-            delta_conv: 1.0e-6,
+            delta_conv: 1.0e-8,
         }
     }
 }
@@ -128,9 +131,9 @@ impl Default for PlannerParams {
             max_tilt_rad: core::f32::consts::FRAC_PI_3,
             weight_time: 1.0,
             weight_energy: 0.1,
-            weight_pos: 10.0,
-            weight_vel: 10.0,
-            weight_tilt: 10.0,
+            weight_pos: 0.0,
+            weight_vel: 0.0,
+            weight_tilt: 0.0,
             weight_body_rate: 10.0,
             weight_thrust: 10.0,
             smoothing_eps: 0.01,

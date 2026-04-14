@@ -33,19 +33,50 @@ pub fn smoothed_l1(x: f32, mu: f32) -> (f32, f32) {
 }
 
 // ---------------------------------------------------------------------------
-// Time parameterization (log map)
+// Time parameterization (piecewise quadratic map K ↔ T)
 // ---------------------------------------------------------------------------
+//
+// Smooth bijection ℝ → ℝ⁺ anchored at (K=0, T=1):
+//   K ≥ 0:  T = ½K² + K + 1
+//   K < 0:  T = 1 / (½K² − K + 1)
+//
+// C¹-continuous at K=0 (both branches give T=1 and dT/dK=1). Keeps dT/dK
+// growing only linearly (vs. exponentially for the log map), producing a
+// better-conditioned Hessian for typical quadrotor segment durations.
 
-/// Forward: K → T = exp(K). Always positive.
+/// Forward: K → T. Always positive.
 #[inline]
-pub fn forward_t_log(k: f32) -> f32 {
-    k.exp()
+pub fn forward_t(k: f32) -> f32 {
+    if k > 0.0 {
+        (0.5 * k + 1.0) * k + 1.0
+    } else {
+        1.0 / ((0.5 * k - 1.0) * k + 1.0)
+    }
 }
 
-/// Backward: T → K = ln(T). Clamps T to 1e-5 minimum.
+/// Backward: T → K. Clamps T to 1e-5 minimum to avoid singularity.
 #[inline]
-pub fn backward_t_log(t: f32) -> f32 {
-    t.max(1e-5).ln()
+pub fn backward_t(t: f32) -> f32 {
+    let t = t.max(1e-5);
+    if t > 1.0 {
+        (2.0 * t - 1.0).sqrt() - 1.0
+    } else {
+        1.0 - (2.0 / t - 1.0).sqrt()
+    }
+}
+
+/// Gradient chain rule: ∂L/∂K = ∂T/∂K · ∂L/∂T.
+///
+/// For K ≥ 0:  dT/dK = K + 1
+/// For K < 0:  dT/dK = (1 − K) / (½K² − K + 1)²
+#[inline]
+pub fn back_propagate_t(k: f32, grad_t: f32) -> f32 {
+    if k > 0.0 {
+        grad_t * (k + 1.0)
+    } else {
+        let den = (0.5 * k - 1.0) * k + 1.0;
+        grad_t * (1.0 - k) / (den * den)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -177,10 +208,25 @@ mod tests {
     }
 
     #[test]
-    fn time_log_round_trip() {
-        let t = 2.5;
-        let k = backward_t_log(t);
-        let t2 = forward_t_log(k);
-        assert!((t - t2).abs() < 1e-6);
+    fn time_quadratic_round_trip() {
+        // T > 1 branch
+        for t in [1.5, 2.5, 5.0, 100.0] {
+            let k = backward_t(t);
+            let t2 = forward_t(k);
+            assert!((t - t2).abs() < 1e-4, "T={t}: got {t2}");
+        }
+        // T ≤ 1 branch
+        for t in [0.01, 0.1, 0.5, 1.0] {
+            let k = backward_t(t);
+            let t2 = forward_t(k);
+            assert!((t - t2).abs() < 1e-5, "T={t}: got {t2}");
+        }
+    }
+
+    #[test]
+    fn time_quadratic_anchor_and_c1() {
+        // Both branches meet at K=0 with T=1 and dT/dK=1.
+        assert!((forward_t(0.0) - 1.0).abs() < 1e-6);
+        assert!((back_propagate_t(0.0, 1.0) - 1.0).abs() < 1e-6);
     }
 }

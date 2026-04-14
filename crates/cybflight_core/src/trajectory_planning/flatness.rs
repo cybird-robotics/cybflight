@@ -3,19 +3,26 @@
 //! Forward chain: position derivatives → thrust vector, body axis, body rates.
 //! Backward chain: gradient backpropagation through the same transforms.
 //!
-//! All functions are pure math with no planner dependency.
+//! The chain is split into two stages:
+//! - [`AlphaState`] from `acc` alone: thrust vector α, body z-axis zB — needed
+//!   by the tilt and collective-thrust penalties.
+//! - [`FlatnessState`] extends `AlphaState` with jerk-dependent terms (dzB, ω)
+//!   — needed only by the body-rate penalty.
+//!
+//! Splitting avoids computing ω when only tilt/thrust are active.
 
 #[allow(unused_imports)]
 use num_traits::Float;
 
-use super::types::{dot3, norm_sq3, Vec3, ZERO3};
+use super::types::{dot3, norm_sq3, Vec3};
 
-/// Intermediate flatness quantities at a single trajectory sample point.
+/// Thrust-vector basis. Computed from acceleration alone — cheap.
 ///
-/// Bundles the shared intermediates that multiple penalties reuse,
-/// avoiding redundant computation of zb, dzb, omega, etc.
-pub struct FlatnessState {
-    /// Thrust vector: α = acc + [0,0,g].
+/// Always well-defined (division by `max(‖α‖, 1e-8)` clamps the singularity).
+/// Callers that use ω must additionally check `zb[2] > -0.9` before extending
+/// to [`FlatnessState`].
+pub struct AlphaState {
+    /// α = acc + [0, 0, g].
     pub alpha: Vec3,
     /// ‖α‖.
     pub norm_alpha: f32,
@@ -23,7 +30,20 @@ pub struct FlatnessState {
     pub inv_norm_alpha: f32,
     /// Body z-axis: α/‖α‖.
     pub zb: Vec3,
-    /// dot(zb, jerk).
+}
+
+/// Full flatness state, including body-rate terms.
+///
+/// Duplicates the [`AlphaState`] fields for direct access; extended with
+/// jerk-dependent quantities used by the body-rate penalty and its gradient.
+pub struct FlatnessState {
+    // --- Alpha fields (copied from AlphaState) ---
+    pub alpha: Vec3,
+    pub norm_alpha: f32,
+    pub inv_norm_alpha: f32,
+    pub zb: Vec3,
+    // --- Body-rate fields ---
+    /// dot(zB, jer).
     pub dot_zb_j: f32,
     /// Body z-axis time derivative: dzB = DN(α)·j / ‖α‖.
     pub dzb: Vec3,
@@ -33,10 +53,9 @@ pub struct FlatnessState {
     pub omega: Vec3,
 }
 
-/// Compute flatness state from acceleration and jerk.
-///
-/// Returns `None` if zb_z <= -0.9 (model undefined near fully inverted).
-pub fn compute_flatness_state(acc: Vec3, jer: Vec3, gravity: f32) -> Option<FlatnessState> {
+/// Compute the thrust-vector basis (α, ‖α‖, zB) from acceleration.
+#[inline]
+pub fn compute_alpha_state(acc: Vec3, gravity: f32) -> AlphaState {
     let alpha = [acc[0], acc[1], acc[2] + gravity];
     let norm_alpha = norm_sq3(alpha).sqrt().max(1e-8);
     let inv_norm_alpha = 1.0 / norm_alpha;
@@ -45,11 +64,22 @@ pub fn compute_flatness_state(acc: Vec3, jer: Vec3, gravity: f32) -> Option<Flat
         alpha[1] * inv_norm_alpha,
         alpha[2] * inv_norm_alpha,
     ];
-
-    if zb[2] <= -0.9 {
-        return None;
+    AlphaState {
+        alpha,
+        norm_alpha,
+        inv_norm_alpha,
+        zb,
     }
+}
 
+/// Extend an [`AlphaState`] with body-rate terms.
+///
+/// Precondition: `alpha.zb[2] > -0.9` (caller must guard; the `1/(1+zb_z)`
+/// factor becomes ill-conditioned near inversion).
+#[inline]
+pub fn extend_to_flatness(alpha: &AlphaState, jer: Vec3) -> FlatnessState {
+    let zb = alpha.zb;
+    let inv_norm_alpha = alpha.inv_norm_alpha;
     let dot_zb_j = dot3(zb, jer);
     let dzb = [
         (jer[0] - zb[0] * dot_zb_j) * inv_norm_alpha,
@@ -62,17 +92,16 @@ pub fn compute_flatness_state(acc: Vec3, jer: Vec3, gravity: f32) -> Option<Flat
         dzb[0] - s_inv * zb[0] * dzb[2],
         s_inv * (zb[1] * dzb[0] - zb[0] * dzb[1]),
     ];
-
-    Some(FlatnessState {
-        alpha,
-        norm_alpha,
+    FlatnessState {
+        alpha: alpha.alpha,
+        norm_alpha: alpha.norm_alpha,
         inv_norm_alpha,
         zb,
         dot_zb_j,
         dzb,
         s_inv,
         omega,
-    })
+    }
 }
 
 /// Backpropagate body rate gradient through the flatness chain.

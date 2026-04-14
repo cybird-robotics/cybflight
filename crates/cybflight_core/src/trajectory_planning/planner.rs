@@ -10,7 +10,7 @@ use num_traits::Float;
 use super::bfgs_trust::{bfgs_trust_optimize, BfgsTrustResult};
 use super::cost_eval::CostEvaluator;
 use super::minco_jerk::MincoJerk;
-use super::penalties::{backward_t_log, forward_t_log};
+use super::penalties::{backward_t, forward_t};
 use super::piecewise_polynomial::PiecewisePolynomial;
 use super::quad_planning_config::QuadPlanningConfig;
 use super::types::*;
@@ -156,7 +156,7 @@ pub fn plan(input: &PlannerInput, config: &QuadPlanningConfig) -> PlannerResult 
     // Initialize decision vector: x = [K_times, D_waypoints]
     let mut x = [0.0f32; 4 * MAX_PIECES];
     for i in 0..n_pieces {
-        x[i] = backward_t_log(input.init_times[i]);
+        x[i] = backward_t(input.init_times[i]);
     }
     for i in 0..n_wp {
         x[dim_k + 3 * i] = input.waypoints[i][0];
@@ -180,7 +180,7 @@ pub fn plan(input: &PlannerInput, config: &QuadPlanningConfig) -> PlannerResult 
     let mut opt_times = [0.0f32; MAX_PIECES];
     let mut opt_wp = [ZERO3; MAX_PIECES];
     for i in 0..n_pieces {
-        opt_times[i] = forward_t_log(x[i]);
+        opt_times[i] = forward_t(x[i]);
     }
     for i in 0..n_wp {
         opt_wp[i] = [

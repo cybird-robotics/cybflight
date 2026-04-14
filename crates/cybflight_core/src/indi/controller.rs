@@ -15,6 +15,7 @@ use nalgebra::{SMatrix, SVector, Vector3};
 use super::{
     effectiveness::{IndiEffectiveness, IndiMotorParams},
     linearization::ThrustLinearization,
+    rate_dot_estimator::{RateDotEstimator, RateDotEstimatorConfig},
     rpm_tracker::{RpmInput, RpmTracker},
 };
 use crate::mixer::{MotorParams, RigidBodyParams};
@@ -34,8 +35,19 @@ pub const NC: usize = NU + NV;
 pub struct IndiConfig {
     /// Rate error → angular acceleration gains (rad/s² per rad/s).
     pub rate_gains: Vector3<f32>,
-    /// Biquad low-pass cutoff frequency (Hz) for all synchronized filters.
+    /// Biquad low-pass cutoff frequency (Hz) for `spf`, `u_state`, `omega`
+    /// sync filters, and for the `rate_dot` post-biquad that follows the
+    /// Savitzky–Golay derivative filter.
     pub sync_filter_hz: f32,
+    /// Savitzky–Golay window size (odd, ≥3, ≤19). Used for the `rate_dot`
+    /// first-derivative filter.
+    pub rate_dot_sg_window_size: i32,
+    /// Savitzky–Golay polynomial order (1 ≤ n ≤ 3, n < window_size).
+    pub rate_dot_sg_order: i32,
+    /// Target SG sample rate. The controller decimates the loop-rate gyro
+    /// stream to the nearest integer divisor of this rate before feeding it
+    /// to the SG derivative filter.
+    pub rate_dot_sg_target_rate_hz: f32,
     /// Motor parameters (from vehicle definition).
     pub motors: [MotorParams; NU],
     /// Body rigid-body parameters.
@@ -81,12 +93,11 @@ pub struct IndiController {
 
     rate_gains: Vector3<f32>,
 
-    rate_dot_filter: [Biquad; 3],
+    rate_dot_estimator: RateDotEstimator,
     spf_filter: [Biquad; 3],
     u_state_filter: [Biquad; NU],
     omega_filter: [Biquad; NU],
 
-    prev_rate: Vector3<f32>,
     prev_omega_fs: SVector<f32, NU>,
     prev_du: SVector<f32, NU>,
 
@@ -130,7 +141,7 @@ pub struct IndiOutput {
 /// a different cutoff frequency.
 #[derive(Clone, Copy)]
 pub struct IndiStepState {
-    /// Unfiltered angular acceleration (rad/s²), from gyro finite difference.
+    /// SG first-derivative output (rad/s²), pre-post-biquad.
     pub rate_dot_raw: Vector3<f32>,
     /// True if the ground-detection heuristic thinks the vehicle is on the ground.
     pub touching_ground: bool,
@@ -161,6 +172,16 @@ impl IndiController {
             dt / (tau + dt)
         });
 
+        let rate_dot_estimator = RateDotEstimator::new(
+            loop_rate_hz,
+            &RateDotEstimatorConfig {
+                sg_window_size: config.rate_dot_sg_window_size,
+                sg_order: config.rate_dot_sg_order,
+                sg_target_rate_hz: config.rate_dot_sg_target_rate_hz,
+                post_cutoff_hz: config.sync_filter_hz,
+            },
+        );
+
         let pole_pairs = config.motor_pole_count as f32 / 2.0;
         let erpm_to_rads = 100.0 / pole_pairs / 60.0 * core::f32::consts::TAU;
 
@@ -168,11 +189,10 @@ impl IndiController {
             effectiveness,
             linearization,
             rate_gains: config.rate_gains,
-            rate_dot_filter: core::array::from_fn(|_| make_biquad()),
+            rate_dot_estimator,
             spf_filter: core::array::from_fn(|_| make_biquad()),
             u_state_filter: core::array::from_fn(|_| make_biquad()),
             omega_filter: core::array::from_fn(|_| make_biquad()),
-            prev_rate: Vector3::zeros(),
             prev_omega_fs: SVector::zeros(),
             prev_du: SVector::zeros(),
             u_state: SVector::zeros(),
@@ -289,14 +309,9 @@ impl IndiController {
         g2_valid: &[bool; NU],
     ) -> (IndiOutput, IndiStepState) {
         // --- 1. Sensor processing ---
-        let rate_dot_raw = (*gyro_rad_s - self.prev_rate) * self.freq;
-        self.prev_rate = *gyro_rad_s;
-
-        let rate_dot_fs = Vector3::new(
-            self.rate_dot_filter[0].apply(rate_dot_raw[0]),
-            self.rate_dot_filter[1].apply(rate_dot_raw[1]),
-            self.rate_dot_filter[2].apply(rate_dot_raw[2]),
-        );
+        self.rate_dot_estimator.update(gyro_rad_s);
+        let rate_dot_raw = self.rate_dot_estimator.raw();
+        let rate_dot_fs = self.rate_dot_estimator.filtered();
 
         let spf_fs = Vector3::new(
             self.spf_filter[0].apply(accel_m_s2[0]),
@@ -444,6 +459,9 @@ mod tests {
         IndiConfig {
             rate_gains: Vector3::new(20.0, 20.0, 20.0),
             sync_filter_hz: 15.0,
+            rate_dot_sg_window_size: 7,
+            rate_dot_sg_order: 2,
+            rate_dot_sg_target_rate_hz: 1000.0,
             motors: [
                 MotorParams {
                     position_m: [-0.075, -0.1],

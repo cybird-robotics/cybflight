@@ -957,6 +957,9 @@ fn flu_controller_config() -> IndiConfig {
     IndiConfig {
         rate_gains: nalgebra::Vector3::new(20.0, 20.0, 20.0),
         sync_filter_hz: 15.0,
+        rate_dot_sg_window_size: 7,
+        rate_dot_sg_order: 2,
+        rate_dot_sg_target_rate_hz: 1000.0,
         motors,
         body: RigidBodyParams {
             mass_kg: 0.55,

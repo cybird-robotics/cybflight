@@ -173,6 +173,9 @@ pub async fn indi_task() {
     let config = IndiConfig {
         rate_gains: ic.rate_gains.into(),
         sync_filter_hz: ic.sync_filter_hz,
+        rate_dot_sg_window_size: 7,
+        rate_dot_sg_order: 2,
+        rate_dot_sg_target_rate_hz: 1000.0,
         motors: QUADROTOR_MOTORS,
         body: QUADROTOR_BODY,
         indi_motors: INDI_MOTOR_PARAMS,

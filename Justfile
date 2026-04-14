@@ -44,7 +44,7 @@ print-features:
 
 # Run all host-side tests (cybflight-core convergence + benchmark suite).
 test:
-    cargo test -p cybflight-core --target {{HOST}}
+    cargo test -p cybflight-core --target {{HOST}} --release
 
 # Run only the MPC convergence + benchmark tests (faster iteration).
 test-mpc:

@@ -7,7 +7,7 @@
 #[allow(unused_imports)]
 use num_traits::Float;
 
-use super::bfgs_trust::{bfgs_trust_optimize, BfgsTrustResult};
+use super::bfgs_trust::{bfgs_trust_optimize, BfgsTrustResult, BfgsWorkspace};
 use super::cost_eval::CostEvaluator;
 use super::minco_jerk::MincoJerk;
 use super::penalties::{backward_t, forward_t};
@@ -204,9 +204,16 @@ pub fn plan(input: &PlannerInput, config: &QuadPlanningConfig) -> PlannerResult 
         evaluator.evaluate(xv, grad)
     };
 
-    // Optimize
-    let (result, final_cost, iterations) =
-        bfgs_trust_optimize(&mut x[..dim_total], &mut eval_fn, &config.planner.bfgs_trust);
+    // Optimize. Workspace is stack-allocated here (~35 KB). For tighter
+    // stacks, lift it into a user-owned slot (static, DTCM, etc.) and
+    // call `bfgs_trust_optimize` directly with a `&mut BfgsWorkspace`.
+    let mut ws = BfgsWorkspace::new();
+    let (result, final_cost, iterations) = bfgs_trust_optimize(
+        &mut x[..dim_total],
+        &mut eval_fn,
+        &config.planner.bfgs_trust,
+        &mut ws,
+    );
 
     // Extract solution via stereographic forward map.
     let r = input.waypoint_radius;

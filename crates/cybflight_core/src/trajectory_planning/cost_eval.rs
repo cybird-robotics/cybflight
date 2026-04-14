@@ -9,10 +9,8 @@ use num_traits::Float;
 use super::flatness::{self, AlphaState, FlatnessState};
 use super::minco_jerk::MincoJerk;
 use super::penalties::{
-    back_propagate_t, eval_dynamics_derivatives, forward_t, jerk_basis_vectors,
-    smoothed_l1, DynDerivatives,
+    back_propagate_t, eval_dynamics_derivatives, forward_t, smoothed_l1_inv, DynDerivatives,
 };
-use super::piecewise_polynomial::PiecewisePolynomial;
 use super::quad_planning_config::QuadPlanningConfig;
 use super::types::*;
 use super::MAX_PIECES;
@@ -32,6 +30,10 @@ struct ConstraintBounds {
     max_rate_z_sq: f32,
     gravity: f32,
     mass: f32,
+    /// Smoothed-L1 transition width μ.
+    mu: f32,
+    /// 1 / μ — hoisted out of the inner sample loop.
+    inv_mu: f32,
 }
 
 /// Accumulated derivative gradients at a single sample point.
@@ -81,8 +83,6 @@ pub struct CostEvaluator {
     partial_grad_t: [f32; MAX_PIECES],
     grad_points: [Vec3; MAX_PIECES],
     grad_times: [f32; MAX_PIECES],
-    eg_c: [[f32; 3]; JERK_COEFFS * MAX_PIECES],
-    eg_t: [f32; MAX_PIECES],
 }
 
 impl CostEvaluator {
@@ -106,6 +106,7 @@ impl CostEvaluator {
         let cos_max_tilt = p.max_tilt_rad.cos();
         let mr = config.max_rate_rad_s;
 
+        let mu = p.smoothing_eps;
         let bounds = ConstraintBounds {
             max_vel_sq: max_vel * max_vel,
             thr_mean,
@@ -118,6 +119,8 @@ impl CostEvaluator {
             max_rate_z_sq: mr[2] * mr[2],
             gravity: config.grav,
             mass: config.mass,
+            mu,
+            inv_mu: 1.0 / mu,
         };
 
         let n_wp = n_pieces - 1;
@@ -136,8 +139,6 @@ impl CostEvaluator {
             partial_grad_t: [0.0; MAX_PIECES],
             grad_points: [ZERO3; MAX_PIECES],
             grad_times: [0.0; MAX_PIECES],
-            eg_c: [[0.0; 3]; JERK_COEFFS * MAX_PIECES],
-            eg_t: [0.0; MAX_PIECES],
         }
     }
 
@@ -149,13 +150,11 @@ impl CostEvaluator {
     pub fn evaluate(&mut self, x: &[f32], grad: &mut [f32]) -> f32 {
         self.decode_decision_vars(x);
         self.solve_minco();
-        let traj = self.minco.get_trajectory();
-
         self.zero_grad_accumulators();
 
         let mut cost = 0.0;
         cost += self.accumulate_energy_cost();
-        cost += self.accumulate_dynamics_penalties(&traj);
+        cost += self.accumulate_dynamics_penalties();
         self.propagate_through_minco();
         cost += self.accumulate_time_cost();
         self.encode_gradient(x, grad);
@@ -205,30 +204,22 @@ impl CostEvaluator {
     }
 
     /// Energy cost: weight_energy * minco.get_energy().
+    ///
+    /// Accumulates the scaled energy gradient directly into
+    /// `partial_grad_c` and `partial_grad_t` — no intermediate buffers.
     fn accumulate_energy_cost(&mut self) -> f32 {
         let w = self.params.weight_energy;
         if w < 1e-6 {
             return 0.0;
         }
 
-        let energy = self.minco.get_energy();
         let sys = JERK_COEFFS * self.n_pieces;
-
         self.minco
-            .get_energy_partial_grad_by_coeffs(&mut self.eg_c[..sys]);
+            .add_energy_grad_by_coeffs(&mut self.partial_grad_c[..sys], w);
         self.minco
-            .get_energy_partial_grad_by_times(&mut self.eg_t[..self.n_pieces]);
+            .add_energy_grad_by_times(&mut self.partial_grad_t[..self.n_pieces], w);
 
-        for j in 0..sys {
-            for d in 0..3 {
-                self.partial_grad_c[j][d] += w * self.eg_c[j][d];
-            }
-        }
-        for j in 0..self.n_pieces {
-            self.partial_grad_t[j] += w * self.eg_t[j];
-        }
-
-        w * energy
+        w * self.minco.get_energy()
     }
 
     /// Sample dynamics penalties across all segments and sample points.
@@ -243,7 +234,7 @@ impl CostEvaluator {
     ///   penalty is active *and* zB is away from the inversion singularity.
     /// - `assemble_basis_gradients` and the per-sample cost term are skipped
     ///   entirely when no penalty activated at this point (feasible sample).
-    fn accumulate_dynamics_penalties(&mut self, traj: &PiecewisePolynomial) -> f32 {
+    fn accumulate_dynamics_penalties(&mut self) -> f32 {
         let n_check = self.params.num_check_per_piece;
         let inv_n = 1.0 / n_check as f32;
 
@@ -271,7 +262,7 @@ impl CostEvaluator {
                 let t_frac = j as f32 * inv_n;
                 let base = seg * JERK_COEFFS;
 
-                let dd = eval_dynamics_derivatives(traj, seg, t_local);
+                let dd = eval_dynamics_derivatives(self.minco.piece_coeffs(seg), t_local);
                 let mut grads = PointGradients::zero();
                 let mut penalty = 0.0;
 
@@ -370,7 +361,7 @@ impl CostEvaluator {
     #[inline]
     fn velocity_penalty(&self, dd: &DynDerivatives, grads: &mut PointGradients) -> f32 {
         let violation = norm_sq3(dd.vel) - self.bounds.max_vel_sq;
-        let (f, df) = smoothed_l1(violation, self.params.smoothing_eps);
+        let (f, df) = smoothed_l1_inv(violation, self.bounds.mu, self.bounds.inv_mu);
         if f > 0.0 {
             let w = self.params.weight_vel;
             let scale = w * df * 2.0;
@@ -388,7 +379,11 @@ impl CostEvaluator {
     fn thrust_penalty(&self, alpha: &AlphaState, grads: &mut PointGradients) -> f32 {
         let collective = self.bounds.mass * alpha.norm_alpha;
         let delta = collective - self.bounds.thr_mean;
-        let (f, df) = smoothed_l1(delta * delta - self.bounds.thr_radi_sq, self.params.smoothing_eps);
+        let (f, df) = smoothed_l1_inv(
+            delta * delta - self.bounds.thr_radi_sq,
+            self.bounds.mu,
+            self.bounds.inv_mu,
+        );
         if f > 0.0 {
             let w = self.params.weight_thrust;
             let d_violation = 2.0 * delta * self.bounds.mass * alpha.inv_norm_alpha;
@@ -409,7 +404,7 @@ impl CostEvaluator {
     #[inline]
     fn tilt_penalty(&self, alpha: &AlphaState, grads: &mut PointGradients) -> f32 {
         let violation = self.bounds.cos_max_tilt - alpha.zb[2];
-        let (f, df) = smoothed_l1(violation, self.params.smoothing_eps);
+        let (f, df) = smoothed_l1_inv(violation, self.bounds.mu, self.bounds.inv_mu);
         if f > 0.0 {
             let w = self.params.weight_tilt;
             let inv = alpha.inv_norm_alpha;
@@ -432,13 +427,15 @@ impl CostEvaluator {
     #[inline]
     fn body_rate_penalty(&self, fs: &FlatnessState, grads: &mut PointGradients) -> f32 {
         let omega_xy_sq = fs.omega[0] * fs.omega[0] + fs.omega[1] * fs.omega[1];
-        let (f_xy, df_xy) = smoothed_l1(
+        let (f_xy, df_xy) = smoothed_l1_inv(
             omega_xy_sq - self.bounds.max_rate_xy_sq,
-            self.params.smoothing_eps,
+            self.bounds.mu,
+            self.bounds.inv_mu,
         );
-        let (f_z, df_z) = smoothed_l1(
+        let (f_z, df_z) = smoothed_l1_inv(
             fs.omega[2] * fs.omega[2] - self.bounds.max_rate_z_sq,
-            self.params.smoothing_eps,
+            self.bounds.mu,
+            self.bounds.inv_mu,
         );
 
         if f_xy > 0.0 || f_z > 0.0 {
@@ -477,21 +474,58 @@ impl CostEvaluator {
         t_frac: f32,
         inv_n: f32,
     ) {
-        let (beta_vel, beta_acc, beta_jer) = jerk_basis_vectors(dd);
+        // Monomial basis (jerk order, degree 5). The zero entries of each
+        // beta vector are baked in below so that the inner loop is
+        // unrolled with only nonzero FMAs:
+        //
+        //   beta_vel[k] = [0, 1,   2s,   3s²,  4s³,   5s⁴]
+        //   beta_acc[k] = [0, 0,   2,    6s,  12s²,  20s³]
+        //   beta_jer[k] = [0, 0,   0,    6,   24s,   60s²]
+        //
+        // k = 0: all zero — skip
+        // k = 1: only beta_vel contributes
+        // k = 2: beta_vel and beta_acc contribute
+        // k = 3..=5: all three contribute
+        let s1 = dd.s1;
+        let s2 = dd.s2;
+        let s3 = dd.s3;
+        let s4 = dd.s4;
         let scale = step * node;
+        let bv1 = 1.0;
+        let bv2 = 2.0 * s1;
+        let bv3 = 3.0 * s2;
+        let bv4 = 4.0 * s3;
+        let bv5 = 5.0 * s4;
+        let ba2 = 2.0;
+        let ba3 = 6.0 * s1;
+        let ba4 = 12.0 * s2;
+        let ba5 = 20.0 * s3;
+        let bj3 = 6.0;
+        let bj4 = 24.0 * s1;
+        let bj5 = 60.0 * s2;
 
-        for k in 0..JERK_COEFFS {
-            for d in 0..3 {
-                self.partial_grad_c[base + k][d] += (beta_vel[k] * grads.vel[d]
-                    + beta_acc[k] * grads.acc[d]
-                    + beta_jer[k] * grads.jer[d])
-                    * scale;
-            }
+        let gv = grads.vel;
+        let ga = grads.acc;
+        let gj = grads.jer;
+
+        for d in 0..3 {
+            // k = 1
+            self.partial_grad_c[base + 1][d] += bv1 * gv[d] * scale;
+            // k = 2
+            self.partial_grad_c[base + 2][d] += (bv2 * gv[d] + ba2 * ga[d]) * scale;
+            // k = 3
+            self.partial_grad_c[base + 3][d] +=
+                (bv3 * gv[d] + ba3 * ga[d] + bj3 * gj[d]) * scale;
+            // k = 4
+            self.partial_grad_c[base + 4][d] +=
+                (bv4 * gv[d] + ba4 * ga[d] + bj4 * gj[d]) * scale;
+            // k = 5
+            self.partial_grad_c[base + 5][d] +=
+                (bv5 * gv[d] + ba5 * ga[d] + bj5 * gj[d]) * scale;
         }
 
-        // Time gradient: ∂penalty/∂t via chain rule through derivatives
-        let time_chain =
-            dot3(grads.vel, dd.acc) + dot3(grads.acc, dd.jer) + dot3(grads.jer, dd.sna);
+        // Time gradient: ∂penalty/∂T via chain rule through derivatives.
+        let time_chain = dot3(gv, dd.acc) + dot3(ga, dd.jer) + dot3(gj, dd.sna);
         let seg = base / JERK_COEFFS;
         self.partial_grad_t[seg] += time_chain * scale * t_frac + node * inv_n * penalty;
     }

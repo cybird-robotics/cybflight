@@ -1,8 +1,12 @@
 //! Full BFGS optimizer with trust-region globalization (Cauchy-dogleg).
-//! Zero heap allocations. Stores the full n×n Hessian approximation B.
 //!
-//! For n≤64, the Hessian is at most 64×64 = 32 KB — trivially fits on stack.
-//! Cholesky solve per iteration: O(n³/6) ≈ 43K flops for n=64.
+//! Zero heap allocations — all scratch memory lives in [`BfgsWorkspace`]
+//! (caller-owned) rather than on the `bfgs_trust_optimize` stack frame.
+//! This keeps the single-function-frame size tiny, preventing stack
+//! overflow on embedded targets (e.g. STM32H743 task stacks ≈ 4-8 KB).
+//!
+//! The workspace itself is ~35 KB for MAX_VARS = 64; place it on the
+//! main stack, in a `static`, or in DTCM as the deployment requires.
 
 #[allow(unused_imports)]
 use num_traits::Float;
@@ -11,6 +15,7 @@ pub use crate::params::BfgsTrustParams;
 
 const MAX_VARS: usize = 4 * super::MAX_PIECES; // 64
 const MAX_VARS_SQ: usize = MAX_VARS * MAX_VARS; // 4096
+const MAX_PAST: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BfgsTrustResult {
@@ -20,17 +25,90 @@ pub enum BfgsTrustResult {
     InvalidValue,
 }
 
+/// All mutable working memory for a BFGS trust-region solve.
+///
+/// Construct once and reuse across calls — nothing here is problem-specific.
+/// Sized for the worst-case `MAX_VARS` so the struct has a fixed footprint.
+pub struct BfgsWorkspace {
+    /// Hessian approximation B (n×n row-major).
+    hess: [f32; MAX_VARS_SQ],
+    /// Cholesky factor L scratch (n×n row-major).
+    l: [f32; MAX_VARS_SQ],
+    /// Current gradient.
+    g: [f32; MAX_VARS],
+    /// Trial-point gradient.
+    g_new: [f32; MAX_VARS],
+    /// Step direction.
+    p: [f32; MAX_VARS],
+    /// Trial point.
+    x_trial: [f32; MAX_VARS],
+    /// s = x_{k+1} − x_k (accepted step).
+    s: [f32; MAX_VARS],
+    /// y = g_{k+1} − g_k.
+    y: [f32; MAX_VARS],
+    /// B · s (BFGS update scratch).
+    bs: [f32; MAX_VARS],
+    /// B · g (Cauchy / dogleg scratch).
+    bg: [f32; MAX_VARS],
+    /// Cached Newton point −B⁻¹g.
+    p_newton: [f32; MAX_VARS],
+    /// Cached Cauchy point.
+    p_cauchy: [f32; MAX_VARS],
+    /// Powell-damped y (BFGS update scratch).
+    y_damped: [f32; MAX_VARS],
+    /// Dogleg interpolation direction (p_n − p_c).
+    d_dogleg: [f32; MAX_VARS],
+    /// B · p scratch (predicted-reduction).
+    bp: [f32; MAX_VARS],
+    /// Cholesky forward-substitution intermediate.
+    chol_y: [f32; MAX_VARS],
+    /// Past cost-value ring buffer for the "cost stagnation" convergence test.
+    past_f: [f32; MAX_PAST],
+}
+
+impl BfgsWorkspace {
+    pub const fn new() -> Self {
+        Self {
+            hess: [0.0; MAX_VARS_SQ],
+            l: [0.0; MAX_VARS_SQ],
+            g: [0.0; MAX_VARS],
+            g_new: [0.0; MAX_VARS],
+            p: [0.0; MAX_VARS],
+            x_trial: [0.0; MAX_VARS],
+            s: [0.0; MAX_VARS],
+            y: [0.0; MAX_VARS],
+            bs: [0.0; MAX_VARS],
+            bg: [0.0; MAX_VARS],
+            p_newton: [0.0; MAX_VARS],
+            p_cauchy: [0.0; MAX_VARS],
+            y_damped: [0.0; MAX_VARS],
+            d_dogleg: [0.0; MAX_VARS],
+            bp: [0.0; MAX_VARS],
+            chol_y: [0.0; MAX_VARS],
+            past_f: [0.0; MAX_PAST],
+        }
+    }
+}
+
+impl Default for BfgsWorkspace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Run full BFGS with trust-region optimization.
 ///
 /// - `x`: initial guess, overwritten with solution
 /// - `cost_grad`: closure `|x, grad| -> cost` computing cost and filling gradient
 /// - `params`: optimizer parameters
+/// - `ws`: preallocated working memory (see [`BfgsWorkspace`])
 ///
 /// Returns `(result, final_cost, iterations)`.
 pub fn bfgs_trust_optimize<F>(
     x: &mut [f32],
     cost_grad: &mut F,
     params: &BfgsTrustParams,
+    ws: &mut BfgsWorkspace,
 ) -> (BfgsTrustResult, f32, usize)
 where
     F: FnMut(&[f32], &mut [f32]) -> f32,
@@ -38,178 +116,207 @@ where
     let n = x.len();
     debug_assert!(n <= MAX_VARS);
 
-    // Hessian approximation B (n×n, row-major), initialized to identity
-    let mut hess = [0.0f32; MAX_VARS_SQ];
+    // Initialize B to identity (reuse ws.hess; zero the working portion first).
+    for i in 0..(n * n) {
+        ws.hess[i] = 0.0;
+    }
     for i in 0..n {
-        hess[i * n + i] = 1.0;
+        ws.hess[i * n + i] = 1.0;
     }
 
-    let mut g = [0.0f32; MAX_VARS];
-    let mut g_new = [0.0f32; MAX_VARS];
-    let mut p = [0.0f32; MAX_VARS]; // step
-    let mut x_trial = [0.0f32; MAX_VARS];
-    let mut s = [0.0f32; MAX_VARS]; // x_{k+1} - x_k
-    let mut y = [0.0f32; MAX_VARS]; // g_{k+1} - g_k
-    let mut bs = [0.0f32; MAX_VARS]; // B * s
-
-    // Cached dogleg quantities (Newton point, Cauchy point, B*g).
-    // Valid until B or g changes (i.e. until a step is accepted).
-    let mut p_newton = [0.0f32; MAX_VARS];
-    let mut p_cauchy = [0.0f32; MAX_VARS];
-    let mut bg = [0.0f32; MAX_VARS];
+    // Cached dogleg quantities — valid until B or g changes.
     let mut newton_ok = false;
     let mut pn_norm = 0.0f32;
     let mut pc_norm = 0.0f32;
     let mut gtg = 0.0f32;
     let mut cache_valid = false;
 
-    // Past function values for convergence test
-    let mut past_f = [0.0f32; 16];
+    // Past-f ring buffer (bounded by MAX_PAST regardless of user `past` config).
+    let past_len = (params.past + 1).min(MAX_PAST);
+    for v in &mut ws.past_f[..past_len] {
+        *v = 0.0;
+    }
+    // `accepted` counts accepted steps; the ring index should advance on
+    // accepts only, so the "cost from `past` iters ago" is physically correct.
+    let mut accepted: usize = 0;
 
     let mut delta = params.delta_init;
-    let mut fx = cost_grad(x, &mut g[..n]);
+    let mut fx = cost_grad(x, &mut ws.g[..n]);
     if !fx.is_finite() {
         return (BfgsTrustResult::InvalidValue, fx, 0);
     }
 
     if params.past > 0 {
-        past_f[0] = fx;
+        ws.past_f[0] = fx;
     }
 
-    for k in 0..params.max_iterations.max(1000) {
-        // Convergence check: ||g||_inf / max(1, ||x||_inf) < g_epsilon
+    let max_iter = if params.max_iterations > 0 {
+        params.max_iterations
+    } else {
+        usize::MAX
+    };
+
+    let mut k: usize = 0;
+    while k < max_iter {
+        // Convergence: ||g||_inf / max(1, ||x||_inf) < g_epsilon
         let xnorm = vec_norm_inf(&x[..n]).max(1.0);
-        let gnorm = vec_norm_inf(&g[..n]);
+        let gnorm = vec_norm_inf(&ws.g[..n]);
         if gnorm / xnorm < params.g_epsilon {
             return (BfgsTrustResult::Convergence, fx, k);
         }
 
-        if params.max_iterations > 0 && k >= params.max_iterations {
-            return (BfgsTrustResult::MaxIterations, fx, k);
-        }
-
-        // Compute Newton and Cauchy points only when B or g has changed.
         if !cache_valid {
-            // Newton point: p_n = -B^{-1} g via Cholesky (O(n³/6))
-            newton_ok = cholesky_solve(&hess, &g[..n], &mut p_newton[..n], n);
-            pn_norm = if newton_ok { vec_norm(&p_newton[..n]) } else { 0.0 };
+            // Newton point via Cholesky solve.
+            newton_ok = cholesky_solve(
+                &ws.hess,
+                &ws.g[..n],
+                &mut ws.p_newton[..n],
+                &mut ws.l,
+                &mut ws.chol_y,
+                n,
+            );
+            pn_norm = if newton_ok {
+                vec_norm(&ws.p_newton[..n])
+            } else {
+                0.0
+            };
 
-            // Cauchy point: p_c = -alpha * g where alpha = ||g||² / (g^T B g)
-            mat_vec(&hess, &g[..n], &mut bg[..n], n);
-            gtg = vec_dot(&g[..n], &g[..n]);
-            let g_bg = vec_dot(&g[..n], &bg[..n]);
+            // Cauchy point: p_c = -(||g||² / g^T B g) g
+            mat_vec(&ws.hess, &ws.g[..n], &mut ws.bg[..n], n);
+            gtg = vec_dot(&ws.g[..n], &ws.g[..n]);
+            let g_bg = vec_dot(&ws.g[..n], &ws.bg[..n]);
 
             if g_bg > 0.0 && gtg >= 1e-7 {
                 let alpha_c = gtg / g_bg;
-                for i in 0..n { p_cauchy[i] = -alpha_c * g[i]; }
-                pc_norm = vec_norm(&p_cauchy[..n]);
+                for i in 0..n {
+                    ws.p_cauchy[i] = -alpha_c * ws.g[i];
+                }
+                pc_norm = vec_norm(&ws.p_cauchy[..n]);
             } else {
-                // Negative curvature or zero gradient
                 pc_norm = 0.0;
             }
-
             cache_valid = true;
         }
 
-        // Compute dogleg step from cached Newton/Cauchy points.
+        // Dogleg step (uses cached Newton & Cauchy).
         let pred = dogleg_step_cached(
-            &hess, &g[..n], delta,
-            &p_newton[..n], newton_ok, pn_norm,
-            &p_cauchy[..n], pc_norm, gtg,
-            &mut p[..n], n,
+            &ws.hess,
+            &ws.g[..n],
+            &ws.bg[..n],
+            delta,
+            &ws.p_newton[..n],
+            newton_ok,
+            pn_norm,
+            &ws.p_cauchy[..n],
+            pc_norm,
+            gtg,
+            &mut ws.p[..n],
+            &mut ws.d_dogleg[..n],
+            &mut ws.bp[..n],
+            n,
         );
 
         if pred.abs() < 1e-7 {
             return (BfgsTrustResult::Convergence, fx, k);
         }
 
-        // Evaluate trial point
+        // Evaluate trial point.
         for i in 0..n {
-            x_trial[i] = x[i] + p[i];
+            ws.x_trial[i] = x[i] + ws.p[i];
         }
-        let fx_trial = cost_grad(&x_trial[..n], &mut g_new[..n]);
+        let fx_trial = cost_grad(&ws.x_trial[..n], &mut ws.g_new[..n]);
 
         let actual = fx - fx_trial;
         let rho = if pred.abs() > 1e-7 { actual / pred } else { 0.0 };
 
-        // Update trust region radius
+        // Update trust radius.
         if rho < 0.25 {
             delta *= 0.25;
         } else if rho > 0.75 {
-            let pnorm = vec_norm(&p[..n]);
+            let pnorm = vec_norm(&ws.p[..n]);
             if pnorm > 0.99 * delta {
-                // Step was at boundary — expand
                 delta = (2.0 * delta).min(params.delta_max);
             }
         }
 
-        // Accept or reject
+        // Accept or reject.
         if rho > params.eta && fx_trial.is_finite() {
-            // Compute s and y for BFGS update
+            // s, y for BFGS update.
             for i in 0..n {
-                s[i] = p[i];
-                y[i] = g_new[i] - g[i];
+                ws.s[i] = ws.p[i];
+                ws.y[i] = ws.g_new[i] - ws.g[i];
             }
 
-            // Accept step
-            x[..n].copy_from_slice(&x_trial[..n]);
-            g[..n].copy_from_slice(&g_new[..n]);
+            x[..n].copy_from_slice(&ws.x_trial[..n]);
+            ws.g[..n].copy_from_slice(&ws.g_new[..n]);
             fx = fx_trial;
 
-            // BFGS update of Hessian B with Powell's damping for robustness
-            bfgs_update_damped(&mut hess, &s[..n], &y[..n], &mut bs[..n], n);
+            bfgs_update_damped(
+                &mut ws.hess,
+                &ws.s[..n],
+                &ws.y[..n],
+                &mut ws.bs[..n],
+                &mut ws.y_damped,
+                n,
+            );
 
-            // B and g changed — invalidate cached Newton/Cauchy points.
             cache_valid = false;
+            accepted += 1;
 
-            // Delta-based convergence test
-            if params.past > 0 {
-                let idx = (k + 1) % past_f.len().min(params.past + 1);
-                past_f[idx] = fx;
-                if k + 1 > params.past {
-                    let old_idx = (k + 1 - params.past) % past_f.len().min(params.past + 1);
-                    let rate = (past_f[old_idx] - fx).abs() / fx.abs().max(1.0);
+            // Cost-stagnation convergence test using a ring of past accepted
+            // cost values. Index advances only on accepts → `past` counts
+            // accepted iterations regardless of how many trials were rejected.
+            if params.past > 0 && past_len > 0 {
+                let idx = accepted % past_len;
+                ws.past_f[idx] = fx;
+                if accepted > params.past {
+                    let old_idx = (accepted - params.past) % past_len;
+                    let rate = (ws.past_f[old_idx] - fx).abs() / fx.abs().max(1.0);
                     if rate < params.delta_conv {
                         return (BfgsTrustResult::Stop, fx, k + 1);
                     }
                 }
             }
         }
-        // If rejected, delta was already shrunk; cache remains valid for next iteration.
 
-        // Safety: if delta is too small, we've converged (or gotten stuck)
         if delta < 1e-7 {
             return (BfgsTrustResult::Convergence, fx, k + 1);
         }
+
+        k += 1;
     }
 
-    (BfgsTrustResult::MaxIterations, fx, params.max_iterations)
+    (BfgsTrustResult::MaxIterations, fx, k)
 }
 
-/// Compute the dogleg step using pre-computed Newton and Cauchy points.
-///
-/// Avoids recomputing the Cholesky factorization and B*g product on rejected
-/// steps where only delta changes.
+/// Dogleg step from pre-computed Newton & Cauchy points.
+#[allow(clippy::too_many_arguments)]
 fn dogleg_step_cached(
-    b: &[f32],       // n×n Hessian (row-major)
-    g: &[f32],       // gradient (length n)
-    delta: f32,      // trust region radius
-    p_newton: &[f32], // pre-computed Newton point (-B^{-1} g)
-    newton_ok: bool,  // whether Cholesky succeeded
-    pn_norm: f32,     // ||p_newton||
-    p_cauchy: &[f32], // pre-computed Cauchy point
-    pc_norm: f32,     // ||p_cauchy||
-    gtg: f32,         // ||g||²
-    p: &mut [f32],    // output step
+    b: &[f32],
+    g: &[f32],
+    bg: &[f32],
+    delta: f32,
+    p_newton: &[f32],
+    newton_ok: bool,
+    pn_norm: f32,
+    p_cauchy: &[f32],
+    pc_norm: f32,
+    gtg: f32,
+    p: &mut [f32],
+    d_scratch: &mut [f32],
+    bp_scratch: &mut [f32],
     n: usize,
 ) -> f32 {
-    // 1. Try Newton step if inside trust region
+    // 1. Newton step lies inside trust region: analytic predicted reduction.
+    //
+    //    B·p_newton = −g exactly (by Newton-point definition), so
+    //    pred = −(g·p + ½ p·B·p) = −(g·p − ½ g·p) = −½ g·p
     if newton_ok && pn_norm <= delta {
         p[..n].copy_from_slice(&p_newton[..n]);
-        return predicted_reduction(b, g, p, n);
+        return -0.5 * vec_dot(&g[..n], &p[..n]);
     }
 
-    // 2. Handle degenerate Cauchy (negative curvature or zero gradient)
+    // 2. Degenerate Cauchy: take a steepest-descent step to the trust radius.
     if pc_norm < 1e-7 {
         let gnorm = gtg.sqrt();
         if gnorm < 1e-7 {
@@ -217,22 +324,39 @@ fn dogleg_step_cached(
             return 0.0;
         }
         let scale = -delta / gnorm;
-        for i in 0..n { p[i] = scale * g[i]; }
-        return predicted_reduction(b, g, p, n);
+        for i in 0..n {
+            p[i] = scale * g[i];
+        }
+        return predicted_reduction(b, g, p, bp_scratch, n);
     }
 
-    // 3. Cauchy outside trust region or Newton failed — cap Cauchy to delta
+    // 3. Cauchy already past the trust boundary (or Newton failed): scale it in.
+    //
+    //    p = σ · p_cauchy = (σ · −α_c) g. Since bg = B·g is cached,
+    //    B·p = (σ · −α_c) · bg, avoiding a fresh mat_vec.
     if !newton_ok || pc_norm >= delta {
         let scale = delta / pc_norm;
-        for i in 0..n { p[i] = scale * p_cauchy[i]; }
-        return predicted_reduction(b, g, p, n);
+        // p_cauchy = −α_c · g, so p = scale · p_cauchy = (scale · −α_c) · g.
+        let coeff = -scale * (vec_dot(&g[..n], &p_cauchy[..n]) / gtg.max(1e-20));
+        // Equivalent direct form:
+        for i in 0..n {
+            p[i] = scale * p_cauchy[i];
+        }
+        // pred = −(g·p + ½ p·B·p); B·p = coeff · bg.
+        let gp = vec_dot(&g[..n], &p[..n]);
+        let mut pbp = 0.0;
+        for i in 0..n {
+            pbp += p[i] * (coeff * bg[i]);
+        }
+        return -(gp + 0.5 * pbp);
     }
 
-    // 4. Dogleg interpolation: find tau such that ||p_c + tau*(p_n - p_c)|| = delta
-    let mut d = [0.0f32; MAX_VARS];
-    for i in 0..n { d[i] = p_newton[i] - p_cauchy[i]; }
-    let dd = vec_dot(&d[..n], &d[..n]);
-    let pd = vec_dot(&p_cauchy[..n], &d[..n]);
+    // 4. Dogleg: find τ so that ‖p_c + τ·d‖ = delta, d = p_n − p_c.
+    for i in 0..n {
+        d_scratch[i] = p_newton[i] - p_cauchy[i];
+    }
+    let dd = vec_dot(&d_scratch[..n], &d_scratch[..n]);
+    let pd = vec_dot(&p_cauchy[..n], &d_scratch[..n]);
     let pp_sq = pc_norm * pc_norm;
 
     let a = dd;
@@ -246,106 +370,114 @@ fn dogleg_step_cached(
         0.0
     };
 
-    for i in 0..n { p[i] = p_cauchy[i] + tau * d[i]; }
-    predicted_reduction(b, g, p, n)
+    for i in 0..n {
+        p[i] = p_cauchy[i] + tau * d_scratch[i];
+    }
+    predicted_reduction(b, g, p, bp_scratch, n)
 }
 
-/// Predicted reduction of the quadratic model: pred = -(g^T p + 0.5 p^T B p)
-fn predicted_reduction(b: &[f32], g: &[f32], p: &[f32], n: usize) -> f32 {
-    let mut bp = [0.0f32; MAX_VARS];
-    mat_vec(b, p, &mut bp[..n], n);
+/// Predicted reduction: −(g·p + ½ p·B·p). Writes `bp = B·p` into `bp_scratch`.
+#[inline]
+fn predicted_reduction(b: &[f32], g: &[f32], p: &[f32], bp_scratch: &mut [f32], n: usize) -> f32 {
+    mat_vec(b, p, &mut bp_scratch[..n], n);
     let gp = vec_dot(&g[..n], &p[..n]);
-    let pbp = vec_dot(&p[..n], &bp[..n]);
+    let pbp = vec_dot(&p[..n], &bp_scratch[..n]);
     -(gp + 0.5 * pbp)
 }
 
-/// Cholesky factorization and solve: B p = -g => p = -B^{-1} g.
+/// Cholesky factorization and solve: B p = −g ⇒ p = −B⁻¹ g.
+///
+/// `l_scratch` and `y_scratch` are caller-provided working buffers.
 /// Returns false if B is not positive definite.
-fn cholesky_solve(b: &[f32], g: &[f32], p: &mut [f32], n: usize) -> bool {
-    // Copy B to work buffer L (lower triangular will be stored here)
-    let mut l = [0.0f32; MAX_VARS_SQ];
-    l[..n * n].copy_from_slice(&b[..n * n]);
+fn cholesky_solve(
+    b: &[f32],
+    g: &[f32],
+    p: &mut [f32],
+    l_scratch: &mut [f32],
+    y_scratch: &mut [f32],
+    n: usize,
+) -> bool {
+    // Copy B into L (lower triangular will be built in place).
+    l_scratch[..n * n].copy_from_slice(&b[..n * n]);
 
-    // Cholesky factorization: L L^T = B
+    // Cholesky factorization: L Lᵀ = B.
     for j in 0..n {
-        let mut sum = l[j * n + j];
+        let mut sum = l_scratch[j * n + j];
         for k in 0..j {
-            sum -= l[j * n + k] * l[j * n + k];
+            let lj = l_scratch[j * n + k];
+            sum -= lj * lj;
         }
         if sum <= 0.0 {
-            return false; // Not positive definite
+            return false;
         }
-        // Regularize tiny diagonals to prevent ill-conditioned L factor
         if sum < 1e-6 {
             sum = 1e-6;
         }
-        l[j * n + j] = sum.sqrt();
-        let ljj = l[j * n + j];
+        let ljj = sum.sqrt();
+        l_scratch[j * n + j] = ljj;
+        let inv_ljj = 1.0 / ljj;
 
         for i in (j + 1)..n {
-            let mut sum = l[i * n + j];
+            let mut sum = l_scratch[i * n + j];
             for k in 0..j {
-                sum -= l[i * n + k] * l[j * n + k];
+                sum -= l_scratch[i * n + k] * l_scratch[j * n + k];
             }
-            l[i * n + j] = sum / ljj;
+            l_scratch[i * n + j] = sum * inv_ljj;
         }
     }
 
-    // Solve L y = -g (forward substitution)
-    let mut y = [0.0f32; MAX_VARS];
+    // Forward-substitute: L y = −g.
     for i in 0..n {
         let mut sum = -g[i];
         for k in 0..i {
-            sum -= l[i * n + k] * y[k];
+            sum -= l_scratch[i * n + k] * y_scratch[k];
         }
-        y[i] = sum / l[i * n + i];
+        y_scratch[i] = sum / l_scratch[i * n + i];
     }
 
-    // Solve L^T p = y (backward substitution)
+    // Back-substitute: Lᵀ p = y.
     for i in (0..n).rev() {
-        let mut sum = y[i];
+        let mut sum = y_scratch[i];
         for k in (i + 1)..n {
-            sum -= l[k * n + i] * p[k];
+            sum -= l_scratch[k * n + i] * p[k];
         }
-        p[i] = sum / l[i * n + i];
+        p[i] = sum / l_scratch[i * n + i];
     }
 
     true
 }
 
 /// BFGS Hessian update with Powell's damping for non-convex robustness.
-///
-/// Standard BFGS: B' = B - (Bs)(Bs)^T/(s^T Bs) + yy^T/(y^T s)
-/// Powell's damping: if y^T s < 0.2 * s^T Bs, use damped y.
-fn bfgs_update_damped(b: &mut [f32], s: &[f32], y: &[f32], bs: &mut [f32], n: usize) {
+fn bfgs_update_damped(
+    b: &mut [f32],
+    s: &[f32],
+    y: &[f32],
+    bs: &mut [f32],
+    y_damped: &mut [f32],
+    n: usize,
+) {
     mat_vec(b, s, bs, n);
     let s_bs = vec_dot(&s[..n], &bs[..n]);
     let y_s = vec_dot(&y[..n], &s[..n]);
 
     if s_bs < 1e-7 {
-        return; // Skip update if s^T B s is too small
+        return;
     }
 
-    // Powell's damping
-    let mut y_damped = [0.0f32; MAX_VARS];
-    let theta = if y_s < 0.2 * s_bs {
+    if y_s < 0.2 * s_bs {
         let th = 0.8 * s_bs / (s_bs - y_s);
         for i in 0..n {
             y_damped[i] = th * y[i] + (1.0 - th) * bs[i];
         }
-        th
     } else {
         y_damped[..n].copy_from_slice(&y[..n]);
-        1.0
-    };
-    let _ = theta;
+    }
 
     let yd_s = vec_dot(&y_damped[..n], &s[..n]);
     if yd_s < 1e-7 {
-        return; // Skip if damped y^T s is too small
+        return;
     }
 
-    // B' = B - (Bs)(Bs)^T / (s^T Bs) + (yd)(yd)^T / (yd^T s)
     let inv_sbs = 1.0 / s_bs;
     let inv_yds = 1.0 / yd_s;
     for i in 0..n {
@@ -355,7 +487,6 @@ fn bfgs_update_damped(b: &mut [f32], s: &[f32], y: &[f32], bs: &mut [f32], n: us
     }
 }
 
-/// Matrix-vector product: y = A * x (A is n×n row-major)
 #[inline]
 fn mat_vec(a: &[f32], x: &[f32], y: &mut [f32], n: usize) {
     for i in 0..n {
@@ -403,8 +534,13 @@ mod tests {
             g[1] = 2.0 * xv[1];
             xv[0] * xv[0] + xv[1] * xv[1]
         };
-        let (status, cost, iters) = bfgs_trust_optimize(&mut x, &mut eval, &BfgsTrustParams::default());
-        eprintln!("Quadratic: status={status:?}, x=[{:.6}, {:.6}], cost={cost:.2e}, iters={iters}", x[0], x[1]);
+        let mut ws = BfgsWorkspace::new();
+        let (status, cost, iters) =
+            bfgs_trust_optimize(&mut x, &mut eval, &BfgsTrustParams::default(), &mut ws);
+        eprintln!(
+            "Quadratic: status={status:?}, x=[{:.6}, {:.6}], cost={cost:.2e}, iters={iters}",
+            x[0], x[1]
+        );
         assert!(x[0].abs() < 1e-6);
         assert!(x[1].abs() < 1e-6);
         assert!(cost < 1e-10);
@@ -420,24 +556,31 @@ mod tests {
             g[1] = 200.0 * b;
             a * a + 100.0 * b * b
         };
-        // Rosenbrock needs more iterations than the planner default (pathological test function)
-        let params = BfgsTrustParams { max_iterations: 200, ..BfgsTrustParams::default() };
-        let (status, cost, iters) = bfgs_trust_optimize(&mut x, &mut eval, &params);
-        eprintln!("Rosenbrock: status={status:?}, x=[{:.6}, {:.6}], cost={cost:.2e}, iters={iters}", x[0], x[1]);
+        let params = BfgsTrustParams {
+            max_iterations: 200,
+            ..BfgsTrustParams::default()
+        };
+        let mut ws = BfgsWorkspace::new();
+        let (status, cost, iters) = bfgs_trust_optimize(&mut x, &mut eval, &params, &mut ws);
+        eprintln!(
+            "Rosenbrock: status={status:?}, x=[{:.6}, {:.6}], cost={cost:.2e}, iters={iters}",
+            x[0], x[1]
+        );
         assert!((x[0] - 1.0).abs() < 1e-3);
         assert!((x[1] - 1.0).abs() < 1e-3);
     }
 
     #[test]
     fn test_ill_conditioned() {
-        // f(x) = 0.5 * (x1^2 + 1000*x2^2), condition number = 1000
         let mut x = [10.0, 10.0];
         let mut eval = |xv: &[f32], g: &mut [f32]| -> f32 {
             g[0] = xv[0];
             g[1] = 1000.0 * xv[1];
             0.5 * (xv[0] * xv[0] + 1000.0 * xv[1] * xv[1])
         };
-        let (status, cost, iters) = bfgs_trust_optimize(&mut x, &mut eval, &BfgsTrustParams::default());
+        let mut ws = BfgsWorkspace::new();
+        let (status, cost, iters) =
+            bfgs_trust_optimize(&mut x, &mut eval, &BfgsTrustParams::default(), &mut ws);
         eprintln!("Ill-cond (κ=1000): status={status:?}, cost={cost:.2e}, iters={iters}");
         assert!(cost < 1e-10);
     }

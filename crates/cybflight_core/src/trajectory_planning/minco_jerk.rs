@@ -200,42 +200,58 @@ impl MincoJerk {
         self.b[6 * piece_idx + coeff_idx][dim]
     }
 
-    /// Compute partial gradients of jerk energy w.r.t. polynomial coefficients.
-    /// `grad_c` must have length 6*N.
-    pub fn get_energy_partial_grad_by_coeffs(&self, grad_c: &mut [[f32; 3]]) {
+    /// Borrow the 6 polynomial coefficients for `piece_idx` in ascending order.
+    ///
+    /// Avoids constructing a `PiecewisePolynomial` just to pull out one piece's
+    /// coefficients — useful for the dynamics-sample hot loop.
+    #[inline]
+    pub fn piece_coeffs(&self, piece_idx: usize) -> &[[f32; 3]] {
+        let base = 6 * piece_idx;
+        &self.b[base..base + 6]
+    }
+
+    /// Accumulate `scale · ∂E/∂coeffs` directly into `grad_c` (length 6·N).
+    ///
+    /// Prefer this over a separate "compute then add-scale" pattern — it
+    /// eliminates a full scratch buffer (6·MAX_PIECES·3·f32 ≈ 1 KB) and
+    /// halves the memory traffic in the energy-gradient path.
+    pub fn add_energy_grad_by_coeffs(&self, grad_c: &mut [[f32; 3]], scale: f32) {
         for i in 0..self.n {
             let base = 6 * i;
             let b3 = self.b[base + 3];
             let b4 = self.b[base + 4];
             let b5 = self.b[base + 5];
-            let t1 = self.t1[i]; let t2 = self.t2[i]; let t3 = self.t3[i];
-            let t4 = self.t4[i]; let t5 = self.t5[i];
+            let t1 = self.t1[i];
+            let t2 = self.t2[i];
+            let t3 = self.t3[i];
+            let t4 = self.t4[i];
+            let t5 = self.t5[i];
             for d in 0..3 {
-                grad_c[base + 5][d] = 240.0*b3[d]*t3 + 720.0*b4[d]*t4 + 1440.0*b5[d]*t5;
-                grad_c[base + 4][d] = 144.0*b3[d]*t2 + 384.0*b4[d]*t3 + 720.0*b5[d]*t4;
-                grad_c[base + 3][d] = 72.0*b3[d]*t1 + 144.0*b4[d]*t2 + 240.0*b5[d]*t3;
-                grad_c[base + 0][d] = 0.0;
-                grad_c[base + 1][d] = 0.0;
-                grad_c[base + 2][d] = 0.0;
+                grad_c[base + 3][d] += scale * (72.0 * b3[d] * t1 + 144.0 * b4[d] * t2 + 240.0 * b5[d] * t3);
+                grad_c[base + 4][d] += scale * (144.0 * b3[d] * t2 + 384.0 * b4[d] * t3 + 720.0 * b5[d] * t4);
+                grad_c[base + 5][d] += scale * (240.0 * b3[d] * t3 + 720.0 * b4[d] * t4 + 1440.0 * b5[d] * t5);
+                // rows 0,1,2 unchanged (energy is independent of them).
             }
         }
     }
 
-    /// Compute partial gradients of jerk energy w.r.t. times.
-    /// `grad_t` must have length N.
-    pub fn get_energy_partial_grad_by_times(&self, grad_t: &mut [f32]) {
+    /// Accumulate `scale · ∂E/∂times` directly into `grad_t` (length N).
+    pub fn add_energy_grad_by_times(&self, grad_t: &mut [f32], scale: f32) {
         for i in 0..self.n {
             let base = 6 * i;
             let b3 = self.b[base + 3];
             let b4 = self.b[base + 4];
             let b5 = self.b[base + 5];
-            let t1 = self.t1[i]; let t2 = self.t2[i]; let t3 = self.t3[i];
+            let t1 = self.t1[i];
+            let t2 = self.t2[i];
+            let t3 = self.t3[i];
             let t4 = self.t4[i];
-            grad_t[i] = 36.0 * norm_sq3(b3)
-                + 288.0 * dot3(b3, b4) * t1
-                + (720.0 * dot3(b3, b5) + 576.0 * norm_sq3(b4)) * t2
-                + 2880.0 * dot3(b4, b5) * t3
-                + 3600.0 * norm_sq3(b5) * t4;
+            grad_t[i] += scale
+                * (36.0 * norm_sq3(b3)
+                    + 288.0 * dot3(b3, b4) * t1
+                    + (720.0 * dot3(b3, b5) + 576.0 * norm_sq3(b4)) * t2
+                    + 2880.0 * dot3(b4, b5) * t3
+                    + 3600.0 * norm_sq3(b5) * t4);
         }
     }
 

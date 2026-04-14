@@ -1,7 +1,9 @@
-/// Maximum banded storage size, covering the snap solver with MAX_PIECES pieces.
-/// Snap: system size = 8*N, bandwidth = 8, band width = 17 rows in compact storage.
-/// Storage = 8*MAX_PIECES * 17.
-const MAX_STORAGE: usize = 8 * super::MAX_PIECES * (8 + 8 + 1);
+/// Maximum banded storage size.
+///
+/// Sized for the MINCO min-jerk solver (only consumer): system size = 6·N,
+/// upper bandwidth = lower bandwidth = 6, band width = 13 rows in compact
+/// storage. Storage = 6 · MAX_PIECES · 13.
+const MAX_STORAGE: usize = 6 * super::MAX_PIECES * (6 + 6 + 1);
 
 /// A banded matrix with compact band storage (Golub & Van Loan convention).
 ///
@@ -73,32 +75,34 @@ impl BandedSystem {
     ///
     /// Tiny pivots are clamped to ±1e-6 to prevent NaN/Inf propagation
     /// from near-singular systems.
+    ///
+    /// Inner loops are unconditional multiply-adds: for the MINCO-jerk
+    /// structure, the band is structurally dense, so adding `!= 0.0`
+    /// guards costs more in branch mispredicts than it saves in skipped FMAs.
     pub fn factorize_lu(&mut self) {
         let n = self.n;
         for k in 0..n - 1 {
             let i_max = (k + self.lower_bw).min(n - 1);
             let raw_pivot = self.get(k, k);
-            // Clamp tiny pivots to prevent catastrophic amplification
             let pivot = if raw_pivot.abs() < 1e-6 {
-                if raw_pivot >= 0.0 { 1e-6 } else { -1e-6 }
+                if raw_pivot >= 0.0 {
+                    1e-6
+                } else {
+                    -1e-6
+                }
             } else {
                 raw_pivot
             };
+            let inv_pivot = 1.0 / pivot;
             for i in (k + 1)..=i_max {
-                if self.get(i, k) != 0.0 {
-                    *self.get_mut_ref(i, k) /= pivot;
-                }
+                *self.get_mut_ref(i, k) *= inv_pivot;
             }
             let j_max = (k + self.upper_bw).min(n - 1);
             for j in (k + 1)..=j_max {
                 let c = self.get(k, j);
-                if c != 0.0 {
-                    for i in (k + 1)..=i_max {
-                        let lik = self.get(i, k);
-                        if lik != 0.0 {
-                            *self.get_mut_ref(i, j) -= lik * c;
-                        }
-                    }
+                for i in (k + 1)..=i_max {
+                    let lik = self.get(i, k);
+                    *self.get_mut_ref(i, j) -= lik * c;
                 }
             }
         }
@@ -113,37 +117,33 @@ impl BandedSystem {
     /// the need to flatten/unflatten between the solver and the caller.
     pub fn solve3(&self, b: &mut [[f32; 3]]) {
         let n = self.n;
-        // Forward substitution (L)
+        // Forward substitution (L). Inner FMA is unconditional — see the
+        // comment on `factorize_lu` for why we drop the zero-skip.
         for j in 0..n {
             let i_max = (j + self.lower_bw).min(n - 1);
             for i in (j + 1)..=i_max {
                 let lij = self.get(i, j);
-                if lij != 0.0 {
-                    let bj = b[j];
-                    let bi = &mut b[i];
-                    bi[0] -= lij * bj[0];
-                    bi[1] -= lij * bj[1];
-                    bi[2] -= lij * bj[2];
-                }
+                let bj = b[j];
+                let bi = &mut b[i];
+                bi[0] -= lij * bj[0];
+                bi[1] -= lij * bj[1];
+                bi[2] -= lij * bj[2];
             }
         }
-        // Backward substitution (U)
+        // Backward substitution (U).
         for j in (0..n).rev() {
-            let diag = self.get(j, j);
-            let inv_diag = 1.0 / diag;
+            let inv_diag = 1.0 / self.get(j, j);
             b[j][0] *= inv_diag;
             b[j][1] *= inv_diag;
             b[j][2] *= inv_diag;
             let i_min = j.saturating_sub(self.upper_bw);
             for i in i_min..j {
                 let uij = self.get(i, j);
-                if uij != 0.0 {
-                    let bj = b[j];
-                    let bi = &mut b[i];
-                    bi[0] -= uij * bj[0];
-                    bi[1] -= uij * bj[1];
-                    bi[2] -= uij * bj[2];
-                }
+                let bj = b[j];
+                let bi = &mut b[i];
+                bi[0] -= uij * bj[0];
+                bi[1] -= uij * bj[1];
+                bi[2] -= uij * bj[2];
             }
         }
     }
@@ -152,7 +152,7 @@ impl BandedSystem {
     /// Used for gradient backpropagation through the MINCO system.
     pub fn solve3_adj(&self, b: &mut [[f32; 3]]) {
         let n = self.n;
-        // Forward pass: solve U^T part
+        // Forward pass: solve U^T part.
         for j in 0..n {
             let inv_diag = 1.0 / self.get(j, j);
             b[j][0] *= inv_diag;
@@ -160,30 +160,24 @@ impl BandedSystem {
             b[j][2] *= inv_diag;
             let i_max = (j + self.upper_bw).min(n - 1);
             for i in (j + 1)..=i_max {
-                // In A^T, element (i,j) of A^T = A(j,i)
                 let aji = self.get(j, i);
-                if aji != 0.0 {
-                    let bj = b[j];
-                    let bi = &mut b[i];
-                    bi[0] -= aji * bj[0];
-                    bi[1] -= aji * bj[1];
-                    bi[2] -= aji * bj[2];
-                }
+                let bj = b[j];
+                let bi = &mut b[i];
+                bi[0] -= aji * bj[0];
+                bi[1] -= aji * bj[1];
+                bi[2] -= aji * bj[2];
             }
         }
-        // Backward pass: solve L^T part
+        // Backward pass: solve L^T part.
         for j in (0..n).rev() {
             let i_min = j.saturating_sub(self.lower_bw);
             for i in i_min..j {
-                // In A^T, element (i,j) of A^T = A(j,i)
                 let aji = self.get(j, i);
-                if aji != 0.0 {
-                    let bj = b[j];
-                    let bi = &mut b[i];
-                    bi[0] -= aji * bj[0];
-                    bi[1] -= aji * bj[1];
-                    bi[2] -= aji * bj[2];
-                }
+                let bj = b[j];
+                let bi = &mut b[i];
+                bi[0] -= aji * bj[0];
+                bi[1] -= aji * bj[1];
+                bi[2] -= aji * bj[2];
             }
         }
     }

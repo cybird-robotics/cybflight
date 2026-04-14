@@ -3,7 +3,6 @@
 #[allow(unused_imports)]
 use num_traits::Float;
 
-use super::piecewise_polynomial::PiecewisePolynomial;
 use super::types::{fma3, scale3, Vec3};
 
 // ---------------------------------------------------------------------------
@@ -16,18 +15,28 @@ use super::types::{fma3, scale3, Vec3};
 /// - `x < 0` (no violation): `(0, 0)`
 /// - `x > mu`: linear tail `(x - mu/2, 1)`
 /// - `0 <= x <= mu`: cubic smoothing transition
+///
+/// For hot-path use, prefer [`smoothed_l1_inv`] with a precomputed `inv_mu`
+/// to avoid a per-call `f32` division (14 cycles on Cortex-M7).
 #[inline]
 pub fn smoothed_l1(x: f32, mu: f32) -> (f32, f32) {
+    smoothed_l1_inv(x, mu, 1.0 / mu)
+}
+
+/// Smoothed L1 penalty — variant taking `inv_mu = 1.0 / mu` so the division
+/// can be hoisted out of a sample loop.
+#[inline]
+pub fn smoothed_l1_inv(x: f32, mu: f32, inv_mu: f32) -> (f32, f32) {
     if x < 0.0 {
         (0.0, 0.0)
     } else if x > mu {
         (x - 0.5 * mu, 1.0)
     } else {
-        let xdmu = x / mu;
+        let xdmu = x * inv_mu;
         let sqr = xdmu * xdmu;
         let mumxd2 = mu - 0.5 * x;
         let f = mumxd2 * sqr * xdmu;
-        let df = sqr * ((-0.5) * xdmu + 3.0 * mumxd2 / mu);
+        let df = sqr * ((-0.5) * xdmu + 3.0 * mumxd2 * inv_mu);
         (f, df)
     }
 }
@@ -97,17 +106,17 @@ pub struct DynDerivatives {
     pub s4: f32,
 }
 
-/// Fused evaluation of vel/acc/jer/snap at local time `t` for segment `seg`.
+/// Fused evaluation of vel/acc/jer/snap at local time `t` given the 6
+/// ascending polynomial coefficients for a piece.
 ///
 /// Skips position (unused in dynamics penalties). Precomputes powers of t once,
 /// avoiding redundant work across 4 derivative evaluations.
+///
+/// `coeffs` must have at least 6 entries; only indices 1..=5 are read (the
+/// k=0 constant term doesn't contribute to any derivative).
 #[inline]
-pub fn eval_dynamics_derivatives(
-    traj: &PiecewisePolynomial,
-    seg: usize,
-    t: f32,
-) -> DynDerivatives {
-    let c = &traj.piece(seg).coeffs;
+pub fn eval_dynamics_derivatives(coeffs: &[[f32; 3]], t: f32) -> DynDerivatives {
+    let c = coeffs;
 
     let s1 = t;
     let s2 = s1 * s1;

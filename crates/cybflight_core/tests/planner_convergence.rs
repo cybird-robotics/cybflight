@@ -680,6 +680,510 @@ fn circular_input() -> PlannerInput {
 }
 
 #[test]
+#[ignore] // benchmark — run with `--release --ignored`
+fn bench_runtime_across_tasks() {
+    // Comprehensive runtime evaluation across task complexity, using the
+    // NEW default parameterization (ball-shape radius 0.01 m, we=0.01).
+    //
+    //   cargo test -p cybflight-core --target x86_64-unknown-linux-gnu \
+    //     --release --test planner_convergence bench_runtime_across_tasks \
+    //     -- --nocapture --ignored
+    use std::time::Instant;
+
+    fn make_bench_config() -> QuadPlanningConfig {
+        // Use PlannerParams::default() to verify the new defaults work.
+        let mut vp = test_vehicle_params();
+        vp.planner.max_vel_m_s = 4.0;
+        vp.planner.max_tilt_rad = 60_f32.to_radians();
+        vp.planner.weight_vel = 50.0;
+        vp.planner.weight_tilt = 50.0;
+        vp.planner.weight_body_rate = 50.0;
+        vp.planner.weight_thrust = 10.0;
+        // weight_energy = 0.01 and BFGS defaults come from PlannerParams::default()
+        // via VehicleParams default. Only override max_iterations for headroom.
+        vp.planner.bfgs_trust.max_iterations = 2000;
+        QuadPlanningConfig::from_vehicle_params(&vp)
+    }
+
+    fn time_task<F: Fn() -> PlannerInput>(
+        label: &str,
+        n_pieces: usize,
+        make_input: F,
+    ) -> (f64, f64, f64, f64, usize, f32) {
+        let config = make_bench_config();
+        let _ = plan(&make_input(), &config); // warm-up
+
+        let n_samples = 50;
+        let mut durations_ms = Vec::with_capacity(n_samples);
+        let mut last_iters = 0;
+        let mut last_traj_dur = 0.0;
+        for _ in 0..n_samples {
+            let input = make_input();
+            let t0 = Instant::now();
+            let result = plan(&input, &config);
+            durations_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+            last_iters = result.iterations;
+            last_traj_dur = result.trajectory.total_duration();
+        }
+        durations_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p10 = durations_ms[n_samples / 10];
+        let p50 = durations_ms[n_samples / 2];
+        let p90 = durations_ms[(n_samples * 9) / 10];
+        let p99 = durations_ms[(n_samples * 99) / 100];
+        let _ = label;
+        let _ = n_pieces;
+        (p10, p50, p90, p99, last_iters, last_traj_dur)
+    }
+
+    println!(
+        "\n=== Planner runtime evaluation (defaults: ball_radius=0.01m, we=0.01) ==="
+    );
+    println!("Weights: w_time=1, w_energy=0.01, w_vel=50, w_tilt=50, w_rate=50, w_thr=10");
+    println!("Limits:  max_vel=4.0 m/s, max_tilt=60°");
+    println!("Desktop x86 release build, 50 samples per task.\n");
+    println!(
+        "  {:<28} {:>3}  {:>5}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {:>8}",
+        "task", "pc", "iters", "p10", "p50", "p90", "p99", "us/it", "traj(s)"
+    );
+    println!(
+        "  {:<28} {:>3}  {:>5}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {:>8}",
+        "", "", "", "(ms)", "(ms)", "(ms)", "(ms)", "(us)", ""
+    );
+
+    struct Task {
+        label: &'static str,
+        n_pieces: usize,
+        p50_ms: f64,
+    }
+    let mut tasks: Vec<Task> = Vec::new();
+
+    macro_rules! run {
+        ($label:expr, $n_pieces:expr, $input:expr) => {{
+            let (p10, p50, p90, p99, iters, traj) = time_task($label, $n_pieces, $input);
+            let us_it = if iters > 0 { p50 * 1000.0 / iters as f64 } else { 0.0 };
+            println!(
+                "  {:<28} {:>3}  {:>5}  {:>7.3}  {:>7.3}  {:>7.3}  {:>7.3}  {:>7.1}  {:>8.3}",
+                $label, $n_pieces, iters, p10, p50, p90, p99, us_it, traj
+            );
+            tasks.push(Task { label: $label, n_pieces: $n_pieces, p50_ms: p50 });
+        }};
+    }
+
+    // 1 piece: simple goto (no waypoints)
+    run!("goto 3m", 1, || {
+        PlannerInput::goto([0.0, 0.0, 1.0], ZERO3, [3.0, 0.0, 1.0])
+    });
+
+    // 1 piece: slightly more demanding goto
+    run!("goto 5m", 1, || {
+        PlannerInput::goto([0.0, 0.0, 1.0], ZERO3, [5.0, 0.0, 1.0])
+    });
+
+    // 2 pieces: single intermediate waypoint
+    run!("waypoints (1 wp)", 2, || {
+        PlannerInput::waypoints(
+            [0.0, 0.0, 1.0], ZERO3,
+            &[[2.0, 1.0, 1.0], [4.0, 0.0, 1.0]])
+    });
+
+    // 3 pieces: zig-zag
+    run!("waypoints (2 wp zig-zag)", 3, || {
+        PlannerInput::waypoints(
+            [0.0, 0.0, 1.0], ZERO3,
+            &[[2.0, 1.0, 1.0], [4.0, -1.0, 1.0], [6.0, 0.0, 1.0]])
+    });
+
+    // 5 pieces
+    run!("waypoints (4 wp)", 5, || {
+        let pts: [Vec3; 5] = [
+            [1.0, 1.0, 1.0], [2.0, 0.0, 1.0],
+            [3.0, -1.0, 1.0], [4.0, 0.0, 1.0], [5.0, 1.0, 1.0],
+        ];
+        PlannerInput::waypoints([0.0, 0.0, 1.0], ZERO3, &pts)
+    });
+
+    // 8 pieces: medium
+    run!("waypoints (7 wp)", 8, || {
+        let pts: [Vec3; 7] = [
+            [1.0, 1.0, 1.0], [2.0, -1.0, 1.2], [3.0, 1.0, 1.0],
+            [4.0, -1.0, 0.8], [5.0, 1.0, 1.0], [6.0, -1.0, 1.2], [7.0, 0.0, 1.0],
+        ];
+        PlannerInput::waypoints([0.0, 0.0, 1.0], ZERO3, &pts)
+    });
+
+    // 13 pieces: circular closed loop
+    run!("circular (12 wp)", 13, || circular_input());
+
+    // STM32H7 scaled estimates.
+    const STM32_FACTOR: f64 = 35.0;
+    println!("\nSTM32H7 @ 480 MHz estimates (×{:.0} typical slowdown):", STM32_FACTOR);
+    println!(
+        "  {:<28} {:>3}  {:>10}  {:>10}  {:>12}",
+        "task", "pc", "p50 (ms)", "p99 (ms)", "max rate (Hz)"
+    );
+    for t in &tasks {
+        let stm = t.p50_ms * STM32_FACTOR;
+        let max_rate_hz = 1000.0 / stm;
+        println!(
+            "  {:<28} {:>3}  {:>10.2}  {:>10.2}  {:>12.1}",
+            t.label, t.n_pieces, stm, stm * 1.3, max_rate_hz
+        );
+    }
+}
+
+#[test]
+#[ignore] // benchmark — run with `--release --ignored`
+fn bench_runtime_vs_weight_energy() {
+    // Sweep weight_energy ∈ [0, 1.0] (with weight_time fixed at 1.0) and
+    // measure planner runtime on three problem sizes.
+    //
+    //   cargo test -p cybflight-core --target x86_64-unknown-linux-gnu \
+    //     --release --test planner_convergence bench_runtime_vs_weight_energy \
+    //     -- --nocapture --ignored
+    use std::time::Instant;
+
+    fn make_bench_config(weight_energy: f32) -> QuadPlanningConfig {
+        let mut vp = test_vehicle_params();
+        vp.planner.max_vel_m_s = 4.0;
+        vp.planner.max_tilt_rad = 60_f32.to_radians();
+        vp.planner.weight_vel = 50.0;
+        vp.planner.weight_tilt = 50.0;
+        vp.planner.weight_body_rate = 50.0;
+        vp.planner.weight_thrust = 10.0;
+        vp.planner.weight_energy = weight_energy;
+        vp.planner.weight_time = 1.0;
+        vp.planner.smoothing_eps = 0.01;
+        vp.planner.num_check_per_piece = 8;
+        // Large budget so every case can fully converge (or hit the ceiling).
+        vp.planner.bfgs_trust.max_iterations = 2000;
+        QuadPlanningConfig::from_vehicle_params(&vp)
+    }
+
+    struct Row {
+        we: f32,
+        p50_ms: f64,
+        mean_ms: f64,
+        iters: usize,
+        us_per_iter: f64,
+        traj_dur: f32,
+        final_cost: f32,
+    }
+
+    fn time_case<F: Fn() -> PlannerInput>(
+        label: &str,
+        make_input: F,
+        weight_energies: &[f32],
+    ) {
+        let n_samples = 30;
+        let mut rows: Vec<Row> = Vec::new();
+        for &we in weight_energies {
+            let config = make_bench_config(we);
+            let _ = plan(&make_input(), &config); // warm-up
+
+            let mut durations_ms = Vec::with_capacity(n_samples);
+            let mut last_iters = 0;
+            let mut last_dur = 0.0;
+            let mut last_cost = 0.0;
+            for _ in 0..n_samples {
+                let input = make_input();
+                let t0 = Instant::now();
+                let result = plan(&input, &config);
+                durations_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                last_iters = result.iterations;
+                last_dur = result.trajectory.total_duration();
+                last_cost = result.final_cost;
+            }
+            durations_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p50 = durations_ms[n_samples / 2];
+            let mean: f64 = durations_ms.iter().sum::<f64>() / n_samples as f64;
+            let us_per_iter = (p50 / last_iters.max(1) as f64) * 1000.0;
+            rows.push(Row {
+                we,
+                p50_ms: p50,
+                mean_ms: mean,
+                iters: last_iters,
+                us_per_iter,
+                traj_dur: last_dur,
+                final_cost: last_cost,
+            });
+        }
+
+        println!("\n=== {label} — weight_time=1.0, sweep weight_energy ===");
+        println!(
+            "  {:<8}  {:>5}  {:>8}  {:>8}  {:>8}  {:>8}  {:>9}",
+            "we", "iters", "p50(ms)", "mean(ms)", "us/iter", "traj(s)", "cost"
+        );
+        for r in &rows {
+            println!(
+                "  {:<8.4}  {:>5}  {:>8.3}  {:>8.3}  {:>8.2}  {:>8.3}  {:>9.3}",
+                r.we, r.iters, r.p50_ms, r.mean_ms, r.us_per_iter, r.traj_dur, r.final_cost
+            );
+        }
+    }
+
+    let we_values: &[f32] = &[0.0, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0];
+
+    // 1 piece: goto
+    time_case(
+        "GOTO 3m (1 piece)",
+        || PlannerInput::goto([0.0, 0.0, 1.0], ZERO3, [3.0, 0.0, 1.0]),
+        we_values,
+    );
+
+    // 5 pieces: 4-waypoint path
+    time_case(
+        "WAYPOINTS (5 pieces)",
+        || {
+            let pts: [Vec3; 5] = [
+                [1.0, 1.0, 1.0],
+                [2.0, 0.0, 1.0],
+                [3.0, -1.0, 1.0],
+                [4.0, 0.0, 1.0],
+                [5.0, 1.0, 1.0],
+            ];
+            PlannerInput::waypoints([0.0, 0.0, 1.0], ZERO3, &pts)
+        },
+        we_values,
+    );
+
+    // 13 pieces: circular closed loop
+    time_case(
+        "CIRCULAR (13 pieces)",
+        || circular_input(),
+        we_values,
+    );
+
+    println!(
+        "\nNote: with we > 0 the waypoint D-variables drift (the Rust port has no \
+         corridor/ball anchoring), so the \"traj(s)\" column for we > 0 often \
+         reflects a collapsed path rather than the intended traversal. This \
+         benchmark measures runtime only — constraint satisfaction at we > 0 \
+         should not be inferred from the trajectory duration."
+    );
+    println!(
+        "STM32H7 @ 480 MHz estimate: multiply desktop p50 by ~35 for typical workload."
+    );
+}
+
+#[test]
+#[ignore] // benchmark — run with `--release --ignored`
+fn bench_planner_scaling_by_piece_count() {
+    // Measure planner runtime vs. number of trajectory pieces.
+    // Runs each problem to FULL convergence (max_iter=2000) so we capture
+    // the actual workload, not a fixed-budget cutoff.
+    //
+    //   cargo test -p cybflight-core --target x86_64-unknown-linux-gnu \
+    //     --release --test planner_convergence bench_planner_scaling \
+    //     -- --nocapture --ignored
+    use std::time::Instant;
+
+    fn make_bench_config() -> QuadPlanningConfig {
+        let mut vp = test_vehicle_params();
+        vp.planner.max_vel_m_s = 4.0;
+        vp.planner.max_tilt_rad = 60_f32.to_radians();
+        vp.planner.weight_vel = 50.0;
+        vp.planner.weight_tilt = 50.0;
+        vp.planner.weight_body_rate = 50.0;
+        vp.planner.weight_thrust = 10.0;
+        vp.planner.weight_energy = 0.1;
+        vp.planner.weight_time = 1.0;
+        vp.planner.smoothing_eps = 0.01;
+        vp.planner.num_check_per_piece = 8;
+        vp.planner.bfgs_trust.max_iterations = 2000;
+        QuadPlanningConfig::from_vehicle_params(&vp)
+    }
+
+    fn time_case<F: Fn() -> PlannerInput>(
+        label: &str,
+        n_pieces: usize,
+        make_input: F,
+    ) {
+        let config = make_bench_config();
+        let _ = plan(&make_input(), &config); // warm-up
+        let n_samples = 50;
+        let mut durations_ms = Vec::with_capacity(n_samples);
+        let mut iter_counts = Vec::with_capacity(n_samples);
+        for _ in 0..n_samples {
+            let input = make_input();
+            let t0 = Instant::now();
+            let result = plan(&input, &config);
+            durations_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+            iter_counts.push(result.iterations);
+        }
+        durations_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p50 = durations_ms[n_samples / 2];
+        let p99 = durations_ms[(n_samples * 99) / 100];
+        let mean: f64 = durations_ms.iter().sum::<f64>() / n_samples as f64;
+        let mean_iters: f64 =
+            iter_counts.iter().map(|&x| x as f64).sum::<f64>() / n_samples as f64;
+        let us_per_iter = (p50 / mean_iters.max(1.0)) * 1000.0;
+        println!(
+            "  {:<18} {:>2} pc   iters={:>5.0}   mean={:>6.2}ms  p50={:>6.2}ms  p99={:>6.2}ms  {:>5.1} us/iter",
+            label, n_pieces, mean_iters, mean, p50, p99, us_per_iter
+        );
+    }
+
+    println!("\n=== Planner scaling: pieces vs. wall-clock ===");
+    println!(" (desktop x86 release build, full convergence)\n");
+    println!("  problem           n  pieces   iters        mean       p50       p99    per-iter");
+
+    // 1 piece: simple goto
+    time_case("goto 3m", 1, || {
+        PlannerInput::goto([0.0, 0.0, 1.0], ZERO3, [3.0, 0.0, 1.0])
+    });
+
+    // 2 pieces: 1 intermediate waypoint
+    time_case("waypoints (1 wp)", 2, || {
+        PlannerInput::waypoints(
+            [0.0, 0.0, 1.0],
+            ZERO3,
+            &[[2.0, 1.0, 1.0], [4.0, 0.0, 1.0]],
+        )
+    });
+
+    // 3 pieces: 2 intermediate waypoints
+    time_case("waypoints (2 wp)", 3, || {
+        PlannerInput::waypoints(
+            [0.0, 0.0, 1.0],
+            ZERO3,
+            &[[2.0, 1.0, 1.0], [4.0, -1.0, 1.0], [6.0, 0.0, 1.0]],
+        )
+    });
+
+    // 5 pieces: 4 intermediate waypoints
+    time_case("waypoints (4 wp)", 5, || {
+        let pts: [Vec3; 5] = [
+            [1.0, 1.0, 1.0],
+            [2.0, 0.0, 1.0],
+            [3.0, -1.0, 1.0],
+            [4.0, 0.0, 1.0],
+            [5.0, 1.0, 1.0],
+        ];
+        PlannerInput::waypoints([0.0, 0.0, 1.0], ZERO3, &pts)
+    });
+
+    // 13 pieces: the full circular closed loop
+    time_case("circular (12 wp)", 13, || circular_input());
+
+    println!();
+    println!("STM32H7 @ 480 MHz scaled estimates (using 35× typical slowdown):");
+    println!("  (multiply p50 above by 35 — per-iter costs by 35× too)");
+}
+
+#[test]
+#[ignore] // benchmark — run with `--release --ignored`
+fn bench_circular_planner_runtime() {
+    // Measure planner runtime on the 13-piece closed-loop circular path,
+    // across multiple iteration budgets to characterize per-iteration cost.
+    //
+    // Run with:
+    //   cargo test -p cybflight-core --target x86_64-unknown-linux-gnu \
+    //     --release --test planner_convergence bench_circular \
+    //     -- --nocapture --ignored
+    use std::time::Instant;
+
+    fn time_one_budget(max_iters: usize, n_samples: usize) -> (f64, f64, f64, usize) {
+        // Build a config with the given iteration cap.
+        let mut vp = test_vehicle_params();
+        vp.planner.max_vel_m_s = 4.0;
+        vp.planner.max_tilt_rad = 60_f32.to_radians();
+        vp.planner.weight_vel = 50.0;
+        vp.planner.weight_tilt = 50.0;
+        vp.planner.weight_body_rate = 50.0;
+        vp.planner.weight_thrust = 10.0;
+        vp.planner.weight_energy = 0.1;
+        vp.planner.weight_time = 1.0;
+        vp.planner.smoothing_eps = 0.01;
+        vp.planner.num_check_per_piece = 8;
+        vp.planner.bfgs_trust.max_iterations = max_iters;
+        let config = QuadPlanningConfig::from_vehicle_params(&vp);
+
+        // Warm-up.
+        let _ = plan(&circular_input(), &config);
+
+        let mut durations_ms = Vec::with_capacity(n_samples);
+        let mut iter_counts = Vec::with_capacity(n_samples);
+        for _ in 0..n_samples {
+            let input = circular_input();
+            let t0 = Instant::now();
+            let result = plan(&input, &config);
+            durations_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+            iter_counts.push(result.iterations);
+        }
+        durations_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean: f64 = durations_ms.iter().sum::<f64>() / n_samples as f64;
+        let p50 = durations_ms[n_samples / 2];
+        let p99 = durations_ms[(n_samples * 99) / 100];
+        let mean_iters = iter_counts.iter().sum::<usize>() / iter_counts.len();
+        (mean, p50, p99, mean_iters)
+    }
+
+    println!("\n=== Planner runtime: 13-piece circular waypoint path ===");
+    println!("desktop x86 (release build, f32, no AVX explicit):");
+    println!(" max_iter  actual_iters  mean (ms)  p50 (ms)  p99 (ms)  us/iter");
+    let budgets = [50_usize, 100, 200, 500, 1000];
+    let mut per_iter_ms_samples = Vec::new();
+    for &budget in &budgets {
+        let (mean, p50, p99, mean_iters) = time_one_budget(budget, 30);
+        let us_per_iter = (p50 / mean_iters.max(1) as f64) * 1000.0;
+        println!(
+            "  {:>5}    {:>5}        {:>7.2}   {:>7.2}   {:>7.2}   {:>5.1}",
+            budget, mean_iters, mean, p50, p99, us_per_iter
+        );
+        // Only sample per-iter from budgets that actually hit the cap
+        // (so the total time accurately reflects the cap).
+        if mean_iters == budget {
+            per_iter_ms_samples.push(p50 / mean_iters as f64);
+        }
+    }
+
+    // Derive per-iteration cost from the capped runs.
+    let per_iter_ms: f64 = per_iter_ms_samples.iter().sum::<f64>()
+        / per_iter_ms_samples.len() as f64;
+
+    println!("\nderived per-BFGS-iteration cost: {:.3} ms ({:.1} μs)",
+        per_iter_ms, per_iter_ms * 1000.0);
+
+    // STM32H7 scaling estimate.
+    //
+    // Cortex-M7 @ 480 MHz: single-lane scalar FPU, f32 mul/add ~1/cycle,
+    // f32 div ~14 cycles, f32 sqrt ~14 cycles. No SIMD, no FMA.
+    // Branch predictor exists but small; caches are 16 KB L1I / 16 KB L1D.
+    //
+    // Desktop x86 with opt-level=3 (no explicit AVX here): ~3-4 GHz, scalar
+    // f32 ops through SSE2 (~1 FLOP/cycle effective), but with aggressive
+    // out-of-order execution and much larger caches.
+    //
+    // Observed slowdowns for float-heavy no_std Rust on STM32H7:
+    //   - simple hot loops (cache-resident, straight-line):  15-25×
+    //   - mixed arithmetic with branches & divisions:        25-50×
+    //   - memory-bound (banded system >4KB):                 40-80×
+    //
+    // The planner has:
+    //   - A 78×78 banded LU factorize + solve per BFGS iter (MincoJerk)
+    //   - 13 × 9 = 117 sample points with flatness chain per iter
+    //   - Several f32 divisions and sqrts (inv_norm_alpha, s_inv, etc.)
+    //   - BFGS also does a 52×52 Cholesky per iter (dim_k + dim_d = 13+36)
+    // So the workload is mixed — estimate ~30× typical, with caveat that the
+    // BFGS Hessian (52×52 = 10KB of f32) likely spills out of M7 L1D.
+    println!("\nSTM32H7 @ 480 MHz scaled estimate (f32 scalar FPU):");
+    for &(label, factor) in &[
+        ("optimistic (×20)", 20.0_f64),
+        ("typical    (×35)", 35.0),
+        ("worst      (×60)", 60.0),
+    ] {
+        let per_iter_stm = per_iter_ms * factor;
+        println!(
+            "  {}:  {:.2} ms/iter  →  200 iters = {:.0} ms, 500 iters = {:.0} ms",
+            label,
+            per_iter_stm,
+            per_iter_stm * 200.0,
+            per_iter_stm * 500.0
+        );
+    }
+}
+
+#[test]
 fn save_circular_waypoints_trajectory_csv() {
     // Baseline circular trajectory with default weight_time / weight_energy.
     let config = test_config();

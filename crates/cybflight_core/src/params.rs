@@ -130,7 +130,11 @@ impl Default for PlannerParams {
             max_vel_m_s: 5.0,
             max_tilt_rad: core::f32::consts::FRAC_PI_3,
             weight_time: 1.0,
-            weight_energy: 0.1,
+            // A small amount of jerk-integral regularization conditions the
+            // BFGS landscape and typically speeds convergence by an order of
+            // magnitude vs we=0. The ball-shape waypoint parameterization
+            // prevents this from collapsing the path.
+            weight_energy: 0.01,
             weight_pos: 0.0,
             weight_vel: 0.0,
             weight_tilt: 0.0,

@@ -48,7 +48,24 @@ pub struct PlannerInput {
     pub num_waypoints: usize,
     /// Initial time allocation per segment (first `num_waypoints + 1` entries valid).
     pub init_times: [f32; MAX_PIECES],
+    /// Ball-shape radius for anchoring each waypoint (stereographic
+    /// projection, following the C++ reference `Ball::toP` parameterization).
+    ///
+    /// Each waypoint is constrained to a ball of this radius around its
+    /// specified value. Decision variables live in a stereographic chart:
+    /// `P = P̂ + 2·r·D / (‖D‖² + 1)`. Regardless of how large `D` grows,
+    /// `‖P − P̂‖ ≤ r`.
+    ///
+    /// Default: 0.01 m — effectively freezes waypoints at their specified
+    /// values while keeping BFGS's Hessian approximation well-conditioned.
+    /// Override via [`with_ball_radius`](Self::with_ball_radius) for a
+    /// looser corridor.
+    pub waypoint_radius: f32,
 }
+
+/// Default ball-shape radius [m] — tight enough to pin waypoints to their
+/// specified values while allowing the optimizer to see smooth gradients.
+pub const DEFAULT_WAYPOINT_RADIUS: f32 = 0.01;
 
 impl PlannerInput {
     /// Build input for a single go-to-position (1 piece, 0 intermediate waypoints).
@@ -67,6 +84,7 @@ impl PlannerInput {
             waypoints: [ZERO3; MAX_PIECES],
             num_waypoints: 0,
             init_times,
+            waypoint_radius: DEFAULT_WAYPOINT_RADIUS,
         }
     }
 
@@ -117,7 +135,17 @@ impl PlannerInput {
             waypoints: wps,
             num_waypoints: num_intermediate,
             init_times,
+            waypoint_radius: DEFAULT_WAYPOINT_RADIUS,
         }
+    }
+
+    /// Override the ball-shape radius (default: [`DEFAULT_WAYPOINT_RADIUS`]).
+    ///
+    /// A larger radius lets the optimizer move waypoints within a wider
+    /// corridor; a smaller radius pins them harder to the specified values.
+    pub fn with_ball_radius(mut self, r: f32) -> Self {
+        self.waypoint_radius = r;
+        self
     }
 }
 
@@ -153,19 +181,23 @@ pub fn plan(input: &PlannerInput, config: &QuadPlanningConfig) -> PlannerResult 
     let dim_d = 3 * n_wp;
     let dim_total = dim_k + dim_d;
 
-    // Initialize decision vector: x = [K_times, D_waypoints]
+    // Initialize decision vector: x = [K_times, D_stereographic_coords].
+    // D = 0 maps to the nominal waypoint via the stereographic projection.
     let mut x = [0.0f32; 4 * MAX_PIECES];
     for i in 0..n_pieces {
         x[i] = backward_t(input.init_times[i]);
     }
-    for i in 0..n_wp {
-        x[dim_k + 3 * i] = input.waypoints[i][0];
-        x[dim_k + 3 * i + 1] = input.waypoints[i][1];
-        x[dim_k + 3 * i + 2] = input.waypoints[i][2];
-    }
+    // D is already zero from the array initializer.
 
     // Build cost evaluator
-    let mut evaluator = CostEvaluator::new(config, n_pieces, &input.head, &input.tail);
+    let mut evaluator = CostEvaluator::new(
+        config,
+        n_pieces,
+        &input.head,
+        &input.tail,
+        &input.waypoints,
+        input.waypoint_radius,
+    );
 
     // Wrap as closure for the optimizer
     let mut eval_fn = |xv: &[f32], grad: &mut [f32]| -> f32 {
@@ -176,17 +208,23 @@ pub fn plan(input: &PlannerInput, config: &QuadPlanningConfig) -> PlannerResult 
     let (result, final_cost, iterations) =
         bfgs_trust_optimize(&mut x[..dim_total], &mut eval_fn, &config.planner.bfgs_trust);
 
-    // Extract solution
+    // Extract solution via stereographic forward map.
+    let r = input.waypoint_radius;
     let mut opt_times = [0.0f32; MAX_PIECES];
     let mut opt_wp = [ZERO3; MAX_PIECES];
     for i in 0..n_pieces {
         opt_times[i] = forward_t(x[i]);
     }
     for i in 0..n_wp {
+        let dx = x[dim_k + 3 * i];
+        let dy = x[dim_k + 3 * i + 1];
+        let dz = x[dim_k + 3 * i + 2];
+        let norm_sq = dx * dx + dy * dy + dz * dz;
+        let s = 2.0 * r / (norm_sq + 1.0);
         opt_wp[i] = [
-            x[dim_k + 3 * i],
-            x[dim_k + 3 * i + 1],
-            x[dim_k + 3 * i + 2],
+            input.waypoints[i][0] + s * dx,
+            input.waypoints[i][1] + s * dy,
+            input.waypoints[i][2] + s * dz,
         ];
     }
 

@@ -66,6 +66,11 @@ pub struct CostEvaluator {
     n_waypoints: usize,
     dim_k: usize,
 
+    /// Nominal (user-specified) waypoint positions — ball centers.
+    nominal_waypoints: [Vec3; MAX_PIECES],
+    /// Stereographic ball radius around each nominal waypoint.
+    waypoint_radius: f32,
+
     // MINCO solver (mutated on each evaluate call)
     minco: MincoJerk,
 
@@ -82,11 +87,17 @@ pub struct CostEvaluator {
 
 impl CostEvaluator {
     /// Construct evaluator from config and boundary conditions.
+    ///
+    /// `nominal_waypoints` holds the user-specified waypoint positions (only
+    /// the first `n_pieces - 1` entries are consulted). `waypoint_radius`
+    /// sets the stereographic ball radius around each nominal waypoint.
     pub fn new(
         config: &QuadPlanningConfig,
         n_pieces: usize,
         head: &PVA3D,
         tail: &PVA3D,
+        nominal_waypoints: &[Vec3; MAX_PIECES],
+        waypoint_radius: f32,
     ) -> Self {
         let p = &config.planner;
         let max_vel = p.max_vel_m_s;
@@ -116,6 +127,8 @@ impl CostEvaluator {
             n_pieces,
             n_waypoints: n_wp,
             dim_k: n_pieces,
+            nominal_waypoints: *nominal_waypoints,
+            waypoint_radius,
             minco: MincoJerk::new(head, tail, n_pieces),
             times: [0.0; MAX_PIECES],
             waypoints: [ZERO3; MAX_PIECES],
@@ -155,15 +168,23 @@ impl CostEvaluator {
     // -----------------------------------------------------------------------
 
     /// Decode decision vector into times[] and waypoints[].
+    ///
+    /// Stereographic forward map: `P = P̂ + 2·r·D / (‖D‖² + 1)`.
     fn decode_decision_vars(&mut self, x: &[f32]) {
         for i in 0..self.n_pieces {
             self.times[i] = forward_t(x[i]);
         }
+        let r = self.waypoint_radius;
         for i in 0..self.n_waypoints {
+            let dx = x[self.dim_k + 3 * i];
+            let dy = x[self.dim_k + 3 * i + 1];
+            let dz = x[self.dim_k + 3 * i + 2];
+            let norm_sq = dx * dx + dy * dy + dz * dz;
+            let s = 2.0 * r / (norm_sq + 1.0);
             self.waypoints[i] = [
-                x[self.dim_k + 3 * i],
-                x[self.dim_k + 3 * i + 1],
-                x[self.dim_k + 3 * i + 2],
+                self.nominal_waypoints[i][0] + s * dx,
+                self.nominal_waypoints[i][1] + s * dy,
+                self.nominal_waypoints[i][2] + s * dz,
             ];
         }
     }
@@ -313,15 +334,27 @@ impl CostEvaluator {
 
     /// Transform grad_times/points back to decision variable space.
     fn encode_gradient(&self, x: &[f32], grad: &mut [f32]) {
-        // Time gradients: ∂L/∂K = ∂T/∂K · ∂L/∂T (quadratic parameterization)
+        // Time gradients: ∂L/∂K = ∂T/∂K · ∂L/∂T (quadratic parameterization).
         for i in 0..self.n_pieces {
             grad[i] = back_propagate_t(x[i], self.grad_times[i]);
         }
-        // Waypoint gradients: identity
+        // Waypoint gradients via stereographic Jacobian:
+        //   P = P̂ + s·D,   s = 2r / (‖D‖² + 1)
+        //   ∂P/∂D = s·I − (s²/r)·D Dᵀ   (symmetric)
+        //   ∂L/∂D = (∂P/∂D)ᵀ · ∂L/∂P = s·g − (s²/r) · (D·g) · D
+        let r = self.waypoint_radius;
         for i in 0..self.n_waypoints {
-            grad[self.dim_k + 3 * i] = self.grad_points[i][0];
-            grad[self.dim_k + 3 * i + 1] = self.grad_points[i][1];
-            grad[self.dim_k + 3 * i + 2] = self.grad_points[i][2];
+            let dx = x[self.dim_k + 3 * i];
+            let dy = x[self.dim_k + 3 * i + 1];
+            let dz = x[self.dim_k + 3 * i + 2];
+            let norm_sq = dx * dx + dy * dy + dz * dz;
+            let s = 2.0 * r / (norm_sq + 1.0);
+            let g = self.grad_points[i];
+            let dot_dg = dx * g[0] + dy * g[1] + dz * g[2];
+            let coeff = s * s / r;
+            grad[self.dim_k + 3 * i]     = s * g[0] - coeff * dx * dot_dg;
+            grad[self.dim_k + 3 * i + 1] = s * g[1] - coeff * dy * dot_dg;
+            grad[self.dim_k + 3 * i + 2] = s * g[2] - coeff * dz * dot_dg;
         }
     }
 

@@ -6,7 +6,7 @@ publish = false
 
 [features]
 # Pick one board by default; enable CRSF RC and UART logging by default
-default = ["board_sakurah743", "rx_crsf", "defmt_uart", "est_mahony"]
+default = ["board_sakurah743", "rx_crsf", "defmt_uart"]
 
 board_sakurah743 = ["dep:bsp-sakurah743"]
 board_foxeerh743 = ["dep:bsp-foxeerh743"]

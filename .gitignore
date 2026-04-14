@@ -4,3 +4,4 @@ output
 tmp
 .claude
 tests/indi_golden/gen_golden
+.env

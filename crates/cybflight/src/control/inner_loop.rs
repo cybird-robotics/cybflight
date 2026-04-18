@@ -475,7 +475,6 @@ impl<const N: usize> ControlLoop<N> {
                 position: self.pos_setpoint.position,
                 velocity: self.pos_setpoint.velocity,
                 yaw: self.pos_setpoint.yaw,
-                collective_thrust_n: self.collective_thrust_n,
             });
 
             embassy_futures::yield_now().await;

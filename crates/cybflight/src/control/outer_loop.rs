@@ -240,7 +240,6 @@ pub async fn control_loop_task() {
             position: pos_setpoint,
             velocity: Vector3::new(x1[7], x1[8], x1[9]),
             yaw: yaw_ref,
-            collective_thrust_n: u0[0],
         });
         att_ctrl_pub.publish_immediate(msgs::AttitudeControlSetpoint {
             timestamp: publish_time,

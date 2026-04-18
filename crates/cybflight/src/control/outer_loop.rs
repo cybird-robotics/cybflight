@@ -90,10 +90,20 @@ pub async fn control_loop_task() {
         .subscriber()
         .expect("outer_loop: VEHICLE_ODOMETRY subscriber");
 
-    // ── Wait for the first AUTO_SETPOINT and ESKF convergence ──────────
-    let sp = super::AUTO_SETPOINT.wait().await;
-    let mut pos_setpoint: Vector3<f32> = sp.pose.position;
-    let mut att_setpoint: nalgebra::UnitQuaternion<f32> = sp.pose.orientation;
+    // ── Wait for the shared setpoint cell to be seeded + ESKF ready ────
+    //
+    // `rc_interpreter_task` fires `ACTIVE_SETPOINT_READY` once it has
+    // written the init value (after ESKF convergence + first finite
+    // origin). We are the sole waiter under `outer_mpc`.
+    super::ACTIVE_SETPOINT_READY.wait().await;
+    let initial = super::read_active_setpoint()
+        .expect("outer_loop: ACTIVE_POSITION_SETPOINT empty after READY");
+    let mut pos_setpoint: Vector3<f32> = initial.position;
+    let half = 0.5 * initial.yaw_rad;
+    let (sin_h, cos_h) = (libm::sinf(half), libm::cosf(half));
+    let mut att_setpoint: nalgebra::UnitQuaternion<f32> = nalgebra::UnitQuaternion::new_normalize(
+        nalgebra::Quaternion::new(cos_h, 0.0, 0.0, sin_h),
+    );
     while !crate::estimation::ESTIMATOR_READY.load(core::sync::atomic::Ordering::Acquire) {
         embassy_time::Timer::after_millis(100).await;
     }
@@ -108,10 +118,15 @@ pub async fn control_loop_task() {
     loop {
         ticker.next().await;
 
-        // 1. Drain new position setpoint (RC joystick → target).
-        if let Some(sp) = super::AUTO_SETPOINT.try_take() {
-            pos_setpoint = sp.pose.position;
-            att_setpoint = sp.pose.orientation;
+        // 1. Snapshot the current tracked position setpoint (RC stick
+        //    integrator writes ACTIVE_POSITION_SETPOINT each frame).
+        if let Some(sp) = super::read_active_setpoint() {
+            pos_setpoint = sp.position;
+            let half = 0.5 * sp.yaw_rad;
+            let (sin_h, cos_h) = (libm::sinf(half), libm::cosf(half));
+            att_setpoint = nalgebra::UnitQuaternion::new_normalize(
+                nalgebra::Quaternion::new(cos_h, 0.0, 0.0, sin_h),
+            );
         }
 
         // 2. Hot-reload params when disarmed (mirrors indi_task's pattern).

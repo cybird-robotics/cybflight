@@ -1,7 +1,7 @@
 use core::cell::Cell;
 use core::sync::atomic::AtomicBool;
 
-use embassy_sync::blocking_mutex::{raw::CriticalSectionRawMutex, Mutex};
+use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_sync::signal::Signal;
 use nalgebra::Vector3;
 
@@ -48,11 +48,11 @@ pub static ESTIMATOR_STATUS: Mutex<CriticalSectionRawMutex, Cell<EstimatorPhase>
 pub static ESTIMATOR_READY: AtomicBool = AtomicBool::new(false);
 
 /// Current ESKF gyro bias estimate (rad/s).
-/// Written by estimation_task every predict step, read by INDI task to
-/// bias-correct raw gyro before rate control and angular acceleration estimation.
-pub static GYRO_BIAS: Signal<CriticalSectionRawMutex, Vector3<f32>> = Signal::new();
+/// Written by estimation_task every predict step. Available for diagnostics
+/// and consumers that need the EKF-refined estimate.
+pub static ESKF_GYRO_BIAS: Signal<CriticalSectionRawMutex, Vector3<f32>> = Signal::new();
 
 /// Current ESKF accel bias estimate (m/s²).
 /// Written by estimation_task every predict step, read by INDI task to
 /// bias-correct raw accel for specific force feedback.
-pub static ACCEL_BIAS: Signal<CriticalSectionRawMutex, Vector3<f32>> = Signal::new();
+pub static ESKF_ACCEL_BIAS: Signal<CriticalSectionRawMutex, Vector3<f32>> = Signal::new();

@@ -1,19 +1,32 @@
-#[cfg(all(feature = "est_mahony", feature = "est_eskf"))]
-compile_error!("features est_mahony and est_eskf are mutually exclusive");
-#[cfg(not(any(feature = "est_mahony", feature = "est_eskf")))]
-compile_error!("one of est_mahony or est_eskf must be selected");
-#[cfg(all(feature = "outer_mpc", not(feature = "est_eskf")))]
-compile_error!("feature `outer_mpc` requires `est_eskf`");
+// ── Controller mode selection ────────────────────────────────────────
+//
+// outer_rate:      INDI + manual rate control (RC sticks → rate_ref)
+// outer_geometric: INDI + cascade pos→att→geometric (→ rate_ref)
+// outer_mpc:       INDI + SQP/MPC (→ rate_ref)
+//
+// Exactly one must be selected. outer_geometric and outer_mpc auto-enable
+// est_eskf in Cargo.toml. Mahony attitude filter always runs.
 
-// attitude_control is folded into inner_loop — one unified control loop.
-// INDI controller (est_eskf) replaces rate PIDs + linear allocation.
+#[cfg(not(any(
+    feature = "outer_rate",
+    feature = "outer_geometric",
+    feature = "outer_mpc",
+)))]
+compile_error!("one of outer_rate, outer_geometric, or outer_mpc must be selected");
+
+#[cfg(any(
+    all(feature = "outer_rate", feature = "outer_geometric"),
+    all(feature = "outer_rate", feature = "outer_mpc"),
+    all(feature = "outer_geometric", feature = "outer_mpc"),
+))]
+compile_error!("at most one of outer_rate, outer_geometric, outer_mpc may be selected");
+
 pub mod failsafe;
-// indi module moved to cybflight_core::indi::controller
-#[cfg(feature = "est_eskf")]
 pub mod indi_task;
-pub mod inner_loop;
-// pub mod nmpc_driver;
-#[cfg(all(feature = "est_eskf", feature = "outer_mpc"))]
+#[cfg(feature = "outer_geometric")]
+pub mod cascade_task;
+// inner_loop.rs (legacy rate PIDs) removed — INDI is the sole inner loop.
+#[cfg(feature = "outer_mpc")]
 pub mod outer_loop;
 pub mod rc_interpreter;
 
@@ -22,13 +35,12 @@ pub mod flight_mode;
 
 use cybflight_msgs as msgs;
 
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, pubsub::PubSubChannel};
-
-#[cfg(feature = "est_eskf")]
 use core::cell::Cell;
-#[cfg(feature = "est_eskf")]
-use embassy_sync::{blocking_mutex, signal::Signal};
-#[cfg(feature = "est_eskf")]
+use embassy_sync::{
+    blocking_mutex::{self, raw::CriticalSectionRawMutex},
+    pubsub::PubSubChannel,
+    signal::Signal,
+};
 use embassy_time::Instant;
 
 pub static OCP_SOLVER_OUTPUT: PubSubChannel<
@@ -39,8 +51,6 @@ pub static OCP_SOLVER_OUTPUT: PubSubChannel<
     1,
 > = PubSubChannel::new();
 
-// NMPC position setpoint: CAP=2 (fresh setpoints only), SUBS=2 (nmpc_driver + spare),
-// PUBS=1 (single RC-to-setpoint converter, not yet implemented).
 pub static NMPC_SETPOINT: PubSubChannel<CriticalSectionRawMutex, msgs::NmpcSetpoint, 2, 2, 1> =
     PubSubChannel::new();
 
@@ -52,21 +62,44 @@ pub static ATTITUDE_CONTROL_SETPOINT: PubSubChannel<
     2,
 > = PubSubChannel::new();
 
+/// Auto setpoint signal (used by outer_loop in MPC mode pre-planner).
 #[cfg(feature = "est_eskf")]
 pub static AUTO_SETPOINT: Signal<CriticalSectionRawMutex, msgs::VehicleOdometry> = Signal::new();
 
-/// MPC outer-loop command from `outer_loop::control_loop_task` to `indi_task`:
-/// body-rate setpoint + collective thrust + a yaw-only reference attitude
-/// (for telemetry display only — the MPC commands rates directly).
+/// Rate command from outer loop to INDI inner loop.
 ///
-/// Single producer (`outer_loop::control_loop_task`), single consumer
-/// (`indi_task`). Latest-value semantics → `Signal` rather than `PubSubChannel`.
-#[cfg(all(feature = "est_eskf", feature = "outer_mpc"))]
-pub static MPC_RATE_COMMAND: Signal<CriticalSectionRawMutex, msgs::AttitudeControlSetpoint> =
+/// Published by the active outer-loop task:
+/// - `outer_rate`:      rc_interpreter (stick → rate + thrust)
+/// - `outer_geometric`: cascade_task (pos→att→geometric → rate + thrust)
+/// - `outer_mpc`:       outer_loop (SQP/MPC → rate + thrust)
+///
+/// Consumed by `indi_task` via `try_take()`. Latest-value semantics.
+pub static RATE_COMMAND: Signal<CriticalSectionRawMutex, msgs::AttitudeControlSetpoint> =
     Signal::new();
 
-// Position control setpoint telemetry: CAP=2, SUBS=3 (esp_bridge + shell + spare), PUBS=2
-// (indi_task in cascade mode, outer_loop in MPC mode).
+/// Snapshot of the position setpoint the controller is currently tracking.
+#[cfg(feature = "est_eskf")]
+#[derive(Copy, Clone, Debug, defmt::Format)]
+pub struct ActiveSetpoint {
+    pub timestamp: Instant,
+    pub position: nalgebra::Vector3<f32>,
+    pub yaw_rad: f32,
+}
+
+#[cfg(feature = "est_eskf")]
+pub static ACTIVE_POSITION_SETPOINT: blocking_mutex::Mutex<
+    CriticalSectionRawMutex,
+    Cell<Option<ActiveSetpoint>>,
+> = blocking_mutex::Mutex::new(Cell::new(None));
+
+#[cfg(feature = "est_eskf")]
+pub fn read_active_setpoint() -> Option<ActiveSetpoint> {
+    ACTIVE_POSITION_SETPOINT.lock(|cell| cell.get())
+}
+
+#[cfg(feature = "est_eskf")]
+pub static ACTIVE_SETPOINT_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 #[cfg(feature = "est_eskf")]
 pub static POSITION_CONTROL_SETPOINT: PubSubChannel<
     CriticalSectionRawMutex,
@@ -76,31 +109,22 @@ pub static POSITION_CONTROL_SETPOINT: PubSubChannel<
     2,
 > = PubSubChannel::new();
 
-/// In-flight learning toggle. When `true` AND learner prearm is latched,
-/// the RLS learner collects data from raw ESC telemetry. Set by the RC
-/// interpreter from the learning switch channel.
-#[cfg(feature = "est_eskf")]
+/// In-flight learning toggle.
 pub static LEARNING_ENABLED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Learner prearm switch. When `true` at arm time, the flight is configured
-/// for data collection: KF off, G2 zeroed, geometric G1 only. Latched at
-/// arm — mid-flight changes are ignored by the INDI task.
-#[cfg(feature = "est_eskf")]
+/// Learner prearm switch.
 pub static LEARNER_PREARM: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-// Last time the control loop published a motor command.
-// Written by inner_loop or indi_task (est_eskf), read by failsafe controller watchdog.
-#[cfg(feature = "est_eskf")]
+/// Last time the control loop published a motor command.
+/// Written by indi_task, read by failsafe controller watchdog.
 pub static LAST_CONTROLLER_PUBLISH: blocking_mutex::Mutex<
     CriticalSectionRawMutex,
     Cell<Option<Instant>>,
 > = blocking_mutex::Mutex::new(Cell::new(None));
 
-// Motor command telemetry: published by INDI task, subscribed by ESP bridge.
-// CAP=2 (latest only), SUBS=2 (esp_bridge + spare), PUBS=1 (indi_task).
-#[cfg(feature = "est_eskf")]
+/// Motor command telemetry: published by INDI task, subscribed by ESP bridge.
 pub static ACTUATOR_MOTORS_TELEM: PubSubChannel<
     CriticalSectionRawMutex,
     msgs::ActuatorMotors,
@@ -109,10 +133,7 @@ pub static ACTUATOR_MOTORS_TELEM: PubSubChannel<
     1,
 > = PubSubChannel::new();
 
-// Processed motor RPM telemetry: post-slew-limiter (learner prearm) or post-KF (normal).
-// Published by INDI task at ~100 Hz, subscribed by ESP bridge for ground telemetry.
-// CAP=2 (latest only), SUBS=2 (esp_bridge + spare), PUBS=1 (indi_task).
-#[cfg(feature = "est_eskf")]
+/// Processed motor RPM telemetry.
 pub static PROCESSED_DSHOT_TELEM: PubSubChannel<
     CriticalSectionRawMutex,
     msgs::DshotTelemetry,

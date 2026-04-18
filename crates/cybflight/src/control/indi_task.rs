@@ -1,12 +1,12 @@
-// INDI task: runs at IMU rate (~8 kHz).
+// INDI task: pure rate controller running at IMU rate (~8 kHz).
 //
-// Subscribes to IMU_1 (raw gyro+accel), VEHICLE_ODOMETRY (for position/attitude
-// controller), DSHOT_TELEMETRY (motor RPM), and AUTO_SETPOINT (position commands).
+// Subscribes to IMU_1 (raw gyro+accel), RATE_COMMAND (from outer loop),
+// and DSHOT_TELEMETRY (motor RPM).
 // Publishes ACTUATOR_MOTORS and telemetry.
 //
-// Replaces inner_loop_task as the sole controller. The position controller and
-// geometric attitude controller still run here (decimated), but the rate PIDs
-// and linear allocator are replaced by INDI.
+// The outer loop (cascade, MPC, or RC rate mode) publishes rate_ref +
+// collective_thrust to RATE_COMMAND. INDI tracks the rate reference using
+// bias-corrected gyro and WLS motor allocation.
 //
 // Safety principle: when any input is stale or output is non-finite, the task
 // stops publishing ACTUATOR_MOTORS (goes silent). The failsafe controller
@@ -141,27 +141,6 @@ fn write_learned_to_params(learned: &LearnedParams) {
     crate::params::set(params);
 }
 
-// Helper functions used only by the cascade path. Cfg-gated to avoid
-// dead-code warnings when `outer_mpc` is enabled.
-#[cfg(not(feature = "outer_mpc"))]
-fn extract_yaw(q: &UnitQuaternion<f32>) -> f32 {
-    let (_roll, _pitch, yaw) = q.euler_angles();
-    yaw
-}
-
-#[cfg(not(feature = "outer_mpc"))]
-fn odom_is_valid(odom: &msgs::VehicleOdometry) -> bool {
-    let fin = |v: &Vector3<f32>| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
-    let q = odom.pose.orientation.as_vector();
-    fin(&odom.pose.position)
-        && q.x.is_finite()
-        && q.y.is_finite()
-        && q.z.is_finite()
-        && q.w.is_finite()
-        && fin(&odom.twist.linear)
-        && fin(&odom.twist.angular)
-}
-
 #[embassy_executor::task]
 pub async fn indi_task() {
     // --- Load params for INDI controller and learner ---
@@ -262,93 +241,32 @@ pub async fn indi_task() {
     // Local param version — re-read params when global version changes.
     let mut local_param_ver =
         crate::params::PARAM_VERSION.load(core::sync::atomic::Ordering::Acquire);
-    // --- Position + attitude controllers (gains from params, same as inner_loop) ---
-    //
-    // When `outer_mpc` is enabled, the cascade controllers are replaced by an
-    // MPC running in `super::outer_loop::control_loop_task`. The inner INDI
-    // step then consumes a `MPC_RATE_COMMAND` Signal instead of computing
-    // rate setpoints locally. The cascade code path is preserved verbatim
-    // when the feature is off (default — verified in real-world flight).
-    #[cfg(not(feature = "outer_mpc"))]
-    let pc = {
-        let g = &params.control;
-        pd_ff_control::PositionController::new(
-            Vector3::new(g.pos_kp[0], g.pos_kp[1], g.pos_kp[2]),
-            Vector3::new(g.pos_kd[0], g.pos_kd[1], g.pos_kd[2]),
-            position_control::VehicleParams {
-                mass: QUADROTOR_BODY.mass_kg,
-                gravity: 9.81,
-            },
-        )
-    };
-    #[cfg(not(feature = "outer_mpc"))]
-    let ac = {
-        let g = &params.control;
-        geometric_controller::GeometricAttitudeController::new(
-            Vector3::new(g.att_k_rate[0], g.att_k_rate[1], g.att_k_rate[2]),
-            Vector3::new(1.0, 1.0, 0.2),
-        )
-        .with_inertia(QUADROTOR_BODY.inertia_matrix())
-    };
-
     // --- Subscribe to channels ---
     let mut imu_sub = IMU_1.subscriber().unwrap();
-    #[cfg(not(feature = "outer_mpc"))]
-    let mut odom_sub = VEHICLE_ODOMETRY.subscriber().unwrap();
     let mut dshot_sub = DSHOT_TELEMETRY.subscriber().unwrap();
     // Armed state read from IS_ARMED atomic (set by DShot task).
     let att_pub = super::ATTITUDE_CONTROL_SETPOINT.immediate_publisher();
-    #[cfg(not(feature = "outer_mpc"))]
-    let pos_pub = super::POSITION_CONTROL_SETPOINT.immediate_publisher();
     let motor_telem_pub = super::ACTUATOR_MOTORS_TELEM.immediate_publisher();
     let processed_dshot_pub = super::PROCESSED_DSHOT_TELEM.immediate_publisher();
 
     // --- State ---
-    // Cascade-only locals: gone when `outer_mpc` is enabled (the MPC outer
-    // loop owns position/attitude state in its own task).
-    #[cfg(not(feature = "outer_mpc"))]
-    let mut pos_state = position_control::PositionControlState::<f32>::default();
-    #[cfg(not(feature = "outer_mpc"))]
-    let mut att_state = attitude_control::AttitudeControlState::<f32>::default();
-    #[cfg(not(feature = "outer_mpc"))]
-    let mut att_ref = attitude_control::AttitudeControlSetpoint::<f32>::default();
-
-    // These three flow into the INDI step regardless of which controller
-    // produced them, so they live in both code paths.
+    // Rate command from outer loop (cascade, MPC, or RC rate mode).
     let mut collective_thrust_n: f32 = 0.0;
     let mut rate_ref = Vector3::<f32>::zeros();
     let mut spf_sp_z: f32 = 0.0; // thrust / mass in body z
+    let mut telem_attitude = UnitQuaternion::<f32>::identity();
 
     // armed is read from IS_ARMED atomic each frame (no channel subscription needed)
-    let mut gyro_bias = Vector3::<f32>::zeros();
-    let mut accel_bias = Vector3::<f32>::zeros();
+    let mut g2_valid = [false; NU];
 
-    // --- Cascade odometry tracking ---
-    // Cascade path: persist the latest valid odometry across inner-loop iterations
-    // so the decimated outer loop always has a recent sample regardless of phase
-    // offset. The MPC path delegates this entirely to `outer_loop::control_loop_task`.
-    #[cfg(not(feature = "outer_mpc"))]
-    let mut latest_odom: Option<msgs::VehicleOdometry> = None;
-    #[cfg(not(feature = "outer_mpc"))]
-    let mut last_odom_time: Option<Instant> = None;
-    // Skip outer-loop control when odometry is older than this (cascade path).
-    #[cfg(not(feature = "outer_mpc"))]
-    const ODOM_STALE_TIMEOUT: Duration = Duration::from_millis(100);
-
-    // --- MPC outer-loop tracking ---
-    // MPC path: cache the latest command from `outer_loop::control_loop_task`
-    // (drained from `MPC_RATE_COMMAND` on every IMU tick) plus its arrival time
-    // for the staleness gate. The yaw-only telemetry attitude is preserved so
-    // the publish at the end of the loop can echo it.
-    #[cfg(feature = "outer_mpc")]
-    let mut last_mpc_cmd_time: Option<Instant> = None;
-    #[cfg(feature = "outer_mpc")]
-    let mut last_mpc_attitude = UnitQuaternion::<f32>::identity();
-    /// Failsafe timeout on the MPC command Signal. After this many ms without
-    /// a fresh command from `outer_loop`, the inner loop goes silent and the
-    /// watchdog disarms (same path as today's odom-loss failsafe).
-    #[cfg(feature = "outer_mpc")]
-    const MPC_CMD_STALE_TIMEOUT: Duration = Duration::from_millis(100);
+    // --- Rate command tracking ---
+    // Cache the latest RATE_COMMAND from the outer loop (cascade, MPC, or
+    // RC rate mode) plus its arrival time for the staleness gate.
+    let mut last_cmd_time: Option<Instant> = None;
+    /// Failsafe timeout on the rate command Signal. After this many ms
+    /// without a fresh command from the outer loop, the inner loop goes
+    /// silent and the watchdog disarms.
+    const CMD_STALE_TIMEOUT: Duration = Duration::from_millis(100);
 
     // RPM estimator timestamp tracking (seconds, f32 relative to task start)
     let mut est_prev_ts: Option<Instant> = None;
@@ -360,26 +278,10 @@ pub async fn indi_task() {
     // 8000 / 80 = 100 Hz (matching the old inner_loop rate)
     const OUTER_DECIMATION: u32 = 80;
 
-    // Wait for first setpoint (cascade only — the MPC outer loop is the
-    // canonical consumer of AUTO_SETPOINT when `outer_mpc` is enabled, and
-    // `Signal::wait()` would race the two tasks for the first value).
-    #[cfg(not(feature = "outer_mpc"))]
-    let mut pos_setpoint = {
-        let sp = super::AUTO_SETPOINT.wait().await;
-        position_control::PositionControlSetpoint {
-            position: sp.pose.position,
-            velocity: sp.twist.linear,
-            yaw: extract_yaw(&sp.pose.orientation),
-            ..Default::default()
-        }
-    };
-
-    // Wait for ESKF to converge before entering the control loop.
-    // Before convergence, gyro bias is unreliable and odometry may be off.
-    defmt::info!("INDI: waiting for ESKF convergence...");
-    while !crate::estimation::ESTIMATOR_READY.load(core::sync::atomic::Ordering::Acquire) {
-        embassy_time::Timer::after_millis(100).await;
-    }
+    // INDI starts immediately. Gyro bias begins at zero and improves as
+    // Mahony's ki integral converges (~1–2 s). Rate control runs from
+    // the first IMU tick; the outer loop's first RATE_COMMAND activates
+    // motor output.
     defmt::info!("INDI task started ({}Hz)", loop_rate_hz as u32);
 
     loop {
@@ -393,17 +295,14 @@ pub async fn indi_task() {
         est_prev_ts = Some(imu.timestamp);
         est_current_ts += est_dt;
 
-        // Bias-correct raw gyro with latest ESKF estimate.
-        // GYRO_BIAS is a Signal — try_take returns the latest value if updated,
-        // otherwise we keep using the previous bias (changes slowly, ~1 Hz).
-        if let Some(bias) = crate::estimation::GYRO_BIAS.try_take() {
-            gyro_bias = bias;
-        }
-        if let Some(bias) = crate::estimation::ACCEL_BIAS.try_take() {
-            accel_bias = bias;
-        }
-        let gyro_corrected = imu.gyro_rad_s - gyro_bias;
-        let accel_corrected = imu.accel_m_s2 - accel_bias;
+        // INDI runs on raw IMU without gyro/accel bias correction.
+        // Rationale: ESKF bias degrades under external-sensor loss (mocap/
+        // GPS), and Mahony has been removed. The outer loop (cascade /
+        // MPC / RC rate mode) compensates for steady-state bias via its
+        // attitude/position feedback — any constant gyro offset shows up
+        // as a small trim on rate_ref and is absorbed naturally.
+        let gyro_corrected = imu.gyro_rad_s;
+        let accel_corrected = imu.accel_m_s2;
 
         // 2. Non-blocking reads of other channels.
         // Arming state — read from atomic (set by DShot task, single source of truth)
@@ -524,110 +423,26 @@ pub async fn indi_task() {
             [false; NU]
         };
 
-        // Latest odometry for position/attitude controllers (cascade only).
-        // Persist across iterations so the decimated outer loop always has a
-        // recent sample regardless of phase offset between odom and outer tick.
-        // The MPC path delegates odom handling to `outer_loop::control_loop_task`.
-        #[cfg(not(feature = "outer_mpc"))]
-        {
-            while let Some(o) = odom_sub.try_next_message_pure() {
-                if odom_is_valid(&o) {
-                    att_state.attitude_quaternion = o.pose.orientation;
-                    latest_odom = Some(o);
-                    last_odom_time = Some(Instant::now());
-                }
-            }
-            // Use bias-corrected gyro for body rate (8kHz, not 100Hz odom).
-            att_state.body_rate_rad_s = gyro_corrected;
-        }
-
-        // New position setpoint (cascade only — the MPC outer loop reads
-        // AUTO_SETPOINT in its own task at 100 Hz).
-        #[cfg(not(feature = "outer_mpc"))]
-        if let Some(sp) = super::AUTO_SETPOINT.try_take() {
-            pos_setpoint.position = sp.pose.position;
-            pos_setpoint.velocity = sp.twist.linear;
-            pos_setpoint.yaw = extract_yaw(&sp.pose.orientation);
-        }
-
-        // 3. Input recency — check all critical inputs before computing.
-        //    If any is stale, skip publishing (go silent). The failsafe
-        //    controller watchdog detects silence and disarms.
+        // 3. Drain latest rate command from outer loop.
         let now = Instant::now();
-
-        #[cfg(not(feature = "outer_mpc"))]
-        let setpoint_fresh = match last_odom_time {
-            Some(t) => now.duration_since(t) < ODOM_STALE_TIMEOUT,
-            None => false,
-        };
-        #[cfg(feature = "outer_mpc")]
-        let setpoint_fresh = match last_mpc_cmd_time {
-            Some(t) => now.duration_since(t) < MPC_CMD_STALE_TIMEOUT,
-            None => false,
-        };
-
-        // 4. Outer loop — produces (rate_ref, spf_sp_z) for the INDI step.
-        //
-        //    Cascade path (default): decimated to ~100 Hz; computes
-        //    PD-position → desired-attitude → geometric-attitude → body-rate.
-        //
-        //    MPC path (outer_mpc enabled): drains the latest command from
-        //    `super::MPC_RATE_COMMAND` (published by `outer_loop` at 100 Hz)
-        //    on every IMU tick; the channel is essentially free to read.
-        #[cfg(not(feature = "outer_mpc"))]
-        {
-            outer_counter += 1;
-            if outer_counter >= OUTER_DECIMATION {
-                outer_counter = 0;
-
-                if setpoint_fresh {
-                    if let Some(ref odom) = latest_odom {
-                        pos_state.position = odom.pose.position;
-                        pos_state.velocity = odom.twist.linear;
-                        pos_state.attitude = odom.pose.orientation;
-
-                        let pc_out = pc.compute(&pos_state, &pos_setpoint);
-                        collective_thrust_n = pc_out.collective_thrust_n;
-                        att_ref.attitude_quaternion = Some(pc_out.desired_attitude_quaternion);
-                        att_ref.body_rate_rad_s = pc_out.desired_body_rate_rad_s;
-
-                        // Convert collective thrust to specific force in body z (m/s²)
-                        // In FLU: positive = up. spf = thrust / mass.
-                        spf_sp_z = collective_thrust_n / QUADROTOR_BODY.mass_kg;
-                    }
-
-                    // Attitude controller → rate reference
-                    let AttitudeControlOutput {
-                        body_rate_rad_s,
-                        torque_n_m: _,
-                    } = ac.compute(&att_state, &att_ref);
-                    rate_ref = body_rate_rad_s;
-                }
-            }
+        outer_counter += 1;
+        if outer_counter >= OUTER_DECIMATION {
+            outer_counter = 0;
         }
-        #[cfg(feature = "outer_mpc")]
-        {
-            // outer_counter is still incremented unconditionally so the
-            // `outer_counter == 1` telemetry-rate-limit block further below
-            // continues to fire at 100 Hz.
-            outer_counter += 1;
-            if outer_counter >= OUTER_DECIMATION {
-                outer_counter = 0;
-            }
-            // Drain the latest MPC command (Signal — at most one new value).
-            if let Some(cmd) = super::MPC_RATE_COMMAND.try_take() {
-                rate_ref = cmd.body_rate_rad_s;
-                collective_thrust_n = cmd.collective_thrust_n;
-                spf_sp_z = collective_thrust_n / QUADROTOR_BODY.mass_kg;
-                last_mpc_attitude = cmd.attitude_quaternion;
-                last_mpc_cmd_time = Some(now);
-            }
+        if let Some(cmd) = super::RATE_COMMAND.try_take() {
+            rate_ref = cmd.body_rate_rad_s;
+            collective_thrust_n = cmd.collective_thrust_n;
+            spf_sp_z = collective_thrust_n / QUADROTOR_BODY.mass_kg;
+            telem_attitude = cmd.attitude_quaternion;
+            last_cmd_time = Some(now);
         }
 
-        // 5. Stale setpoint while armed — go silent, let watchdog handle it.
-        //    INDI can't produce meaningful output without recent state feedback
-        //    (cascade) or a recent MPC command (outer_mpc).
-        if armed && !setpoint_fresh {
+        // 4. Stale command while armed — go silent, let watchdog handle it.
+        let cmd_fresh = match last_cmd_time {
+            Some(t) => now.duration_since(t) < CMD_STALE_TIMEOUT,
+            None => false,
+        };
+        if armed && !cmd_fresh {
             continue;
         }
 
@@ -745,32 +560,12 @@ pub async fn indi_task() {
 
         // 9. Publish telemetry (at reduced rate — every OUTER_DECIMATION frames).
         if outer_counter == 1 {
-            // Cascade path: desired attitude comes from the position controller's
-            // computed `att_ref`. MPC path: the outer-loop task carried a yaw-only
-            // reference attitude through `MPC_RATE_COMMAND` for telemetry display.
-            #[cfg(not(feature = "outer_mpc"))]
-            let telem_attitude = att_ref
-                .attitude_quaternion
-                .unwrap_or(UnitQuaternion::identity());
-            #[cfg(feature = "outer_mpc")]
-            let telem_attitude = last_mpc_attitude;
-
             att_pub.publish_immediate(msgs::AttitudeControlSetpoint {
                 timestamp: publish_time,
                 collective_thrust_n,
                 attitude_quaternion: telem_attitude,
                 body_rate_rad_s: rate_ref,
                 torque_n_m: Vector3::zeros(), // INDI doesn't compute explicit torque
-            });
-            // Cascade owns `pos_setpoint`; MPC path delegates position telemetry
-            // to `outer_loop::control_loop_task` (which has the same data).
-            #[cfg(not(feature = "outer_mpc"))]
-            pos_pub.publish_immediate(msgs::PositionControlSetpoint {
-                timestamp: publish_time,
-                position: pos_setpoint.position,
-                velocity: pos_setpoint.velocity,
-                yaw: pos_setpoint.yaw,
-                collective_thrust_n,
             });
             motor_telem_pub.publish_immediate(msgs::ActuatorMotors {
                 timestamp: publish_time,

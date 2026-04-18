@@ -6,7 +6,7 @@ publish = false
 
 [features]
 # Pick one board by default; enable CRSF RC and UART logging by default
-default = ["board_sakurah743", "rx_crsf", "defmt_uart"]
+default = ["board_foxeerh743", "rx_crsf", "defmt_uart", "outer_mpc"]
 
 board_sakurah743 = ["dep:bsp-sakurah743"]
 board_foxeerh743 = ["dep:bsp-foxeerh743"]
@@ -16,16 +16,19 @@ rx_ghst = []
 # blocking UART overhead and free USART2 (the peripheral is still consumed
 # and dropped at init, but no bytes are ever transmitted).
 defmt_uart = []
-# est_mahony: Mahony attitude filter → angle-mode stick control.
-# est_eskf:   ESKF (IMU + Vicon) → full ENU position control.
-# Exactly one must be selected.
-est_mahony = []
+# Controller mode — exactly one must be selected:
+#
+# outer_rate:      INDI inner loop + manual rate control (RC sticks → rate_ref).
+# outer_geometric: INDI + cascade position→attitude→geometric controller.
+# outer_mpc:       INDI + SQP/MPC outer loop at 100 Hz.
+#
+# Mahony attitude filter always runs (gyro bias for INDI).
+# outer_geometric and outer_mpc auto-enable est_eskf (ESKF position/velocity
+# estimation required for their outer loops).
 est_eskf = []
-# outer_mpc: replace the in-task cascade position+attitude controller with
-# a separate `outer_loop::control_loop_task` driving an SQP/MPC at 100 Hz.
-# Requires `est_eskf`. Default-off; the cascade controller (verified in
-# real-world flight) remains the default.
-outer_mpc = []
+outer_rate = []
+outer_geometric = ["est_eskf"]
+outer_mpc = ["est_eskf"]
 
 [dependencies]
 bsp-sakurah743 = { path = "../bsp/sakurah743", optional = true }

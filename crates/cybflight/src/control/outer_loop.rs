@@ -1,17 +1,14 @@
 //! MPC outer-loop task: 100 Hz position/attitude controller using
 //! `SimpleSqpSolver` over `QuadModel`. Publishes body-rate + collective-thrust
-//! commands to `super::MPC_RATE_COMMAND` for the INDI inner loop to consume.
+//! commands to `super::RATE_COMMAND` for the INDI inner loop to consume.
 //!
 //! Lives in its own embassy task to avoid blocking the 8 kHz INDI loop.
 //! Stack-allocated locals are tiny (~1 KB); the ~32 KB SQP workspace lives
 //! in BSS via `static_cell::StaticCell`.
 //!
-//! Gated on `cfg(all(feature = "est_eskf", feature = "outer_mpc"))`. Only
-//! compiled when the user explicitly opts in to the MPC outer loop. The
-//! cascade controller embedded in `indi_task.rs` is the default when this
-//! feature is off.
+//! Gated on `cfg(feature = "outer_mpc")`.
 
-#![cfg(all(feature = "est_eskf", feature = "outer_mpc"))]
+#![cfg(feature = "outer_mpc")]
 
 use cybflight_core::mpc::quad_model::{N as MPC_N, NU as MPC_NU, NX as MPC_NX};
 use cybflight_core::mpc::{QuadModel, SimpleQuadProblem, SimpleSqpSolver};
@@ -225,7 +222,7 @@ pub async fn control_loop_task() {
         let publish_time = Instant::now();
 
         // 9. Publish to the inner loop.
-        super::MPC_RATE_COMMAND.signal(msgs::AttitudeControlSetpoint {
+        super::RATE_COMMAND.signal(msgs::AttitudeControlSetpoint {
             timestamp: publish_time,
             collective_thrust_n: u0[0],
             attitude_quaternion: att_setpoint,

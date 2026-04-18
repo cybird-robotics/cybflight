@@ -58,10 +58,6 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::control::failsafe::failsafe_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn failsafe task"));
-    // Mahony attitude filter (est_mahony always; est_eskf for attitude bootstrap).
-    spawner
-        .spawn(cybflight::sensors::attitude::mahony_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude task"));
 
     #[cfg(feature = "est_eskf")]
     spawner
@@ -78,22 +74,19 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::usb_serial::imu2_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn IMU2 stream task"));
-    // est_mahony: rate PIDs + linear allocation (inner_loop).
-    // est_eskf:   INDI controller (replaces rate PIDs + mixer).
-    #[cfg(feature = "est_mahony")]
-    spawner
-        .spawn(cybflight::control::inner_loop::control_loop_task())
-        .unwrap_or_else(|_| defmt::panic!("failed to spawn control loop task"));
-    #[cfg(feature = "est_eskf")]
+    // ── Inner loop controller (INDI) ─────────────────────────────────
     spawner
         .spawn(cybflight::control::indi_task::indi_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn INDI task"));
-    // MPC outer-loop task: replaces the cascade controller embedded in
-    // indi_task with an SQP/MPC running at 100 Hz in its own task. The
-    // inner INDI step then consumes a `MPC_RATE_COMMAND` Signal instead
-    // of computing rate setpoints locally. Default-off; opt-in for the
-    // MPC flight-test build.
-    #[cfg(all(feature = "est_eskf", feature = "outer_mpc"))]
+
+    // ── Outer loop controllers ───────────────────────────────────────
+    // Cascade position→attitude→geometric controller (100 Hz).
+    #[cfg(feature = "outer_geometric")]
+    spawner
+        .spawn(cybflight::control::cascade_task::cascade_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn cascade task"));
+    // MPC SQP outer loop (100 Hz).
+    #[cfg(feature = "outer_mpc")]
     spawner
         .spawn(cybflight::control::outer_loop::control_loop_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn MPC outer loop task"));

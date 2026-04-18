@@ -184,6 +184,16 @@ impl Eskf {
         let (new_state, new_cov) = self.propagate_state(accel, gyro, dt);
         self.state = new_state;
         self.cov = new_cov;
+        // Prevent unit-quaternion magnitude drift from accumulating over
+        // millions of predict steps in float32.
+        self.renormalize_orientation();
+        // Clamp covariance diagonal so one bad step can't push P into an
+        // indefinite state that would produce Inf via matrix inversion.
+        self.clamp_covariance_diagonal();
+        // NaN guard — forces re-init on the next mocap frame.
+        if !self.state_is_finite() {
+            self.initialized = false;
+        }
     }
 
     /// Position measurement update (ENU). `pos_std` is std-dev in metres.
@@ -199,11 +209,21 @@ impl Eskf {
         let r = Matrix3::identity() * pv;
         let s_mat = h * self.cov * h.transpose() + r;
         if let Some(s_inv) = s_mat.try_inverse() {
+            // Innovation gate (per-DOF Mahalanobis²) — rejects outlier
+            // mocap frames that would otherwise produce huge corrections.
+            let gamma = z.dot(&(s_inv * z)) / 3.0;
+            if gamma > self.config.gate_sigma * self.config.gate_sigma {
+                return;
+            }
             let k = self.cov * h.transpose() * s_inv;
             self.state = self.state.boxplus(&(k * z));
             let i_kh = SMatrix::<f32, 15, 15>::identity() - k * h;
             self.cov = i_kh * self.cov * i_kh.transpose() + k * r * k.transpose();
             self.cov = (self.cov + self.cov.transpose()) * 0.5;
+            self.clamp_covariance_diagonal();
+            if !self.state_is_finite() {
+                self.initialized = false;
+            }
         }
     }
 
@@ -220,26 +240,33 @@ impl Eskf {
         let r = Matrix3::identity() * vv;
         let s_mat = h * self.cov * h.transpose() + r;
         if let Some(s_inv) = s_mat.try_inverse() {
+            let gamma = z.dot(&(s_inv * z)) / 3.0;
+            if gamma > self.config.gate_sigma * self.config.gate_sigma {
+                return;
+            }
             let k = self.cov * h.transpose() * s_inv;
             self.state = self.state.boxplus(&(k * z));
             let i_kh = SMatrix::<f32, 15, 15>::identity() - k * h;
             self.cov = i_kh * self.cov * i_kh.transpose() + k * r * k.transpose();
             self.cov = (self.cov + self.cov.transpose()) * 0.5;
+            self.clamp_covariance_diagonal();
+            if !self.state_is_finite() {
+                self.initialized = false;
+            }
         }
     }
 
     /// Attitude measurement update. `att_std` is std-dev in radians.
     pub fn update_att(&mut self, q: UnitQuaternion<f32>, att_std: f32) {
-        // Canonicalize q
+        if !self.initialized {
+            return;
+        }
+        // Canonicalize q to the same hemisphere as the current estimate.
         let q = if self.state.orientation.coords.dot(&q.coords) < 0.0 {
             UnitQuaternion::from_quaternion(-q.into_inner())
         } else {
             q
         };
-
-        if !self.initialized {
-            return;
-        }
         let q_err = self.state.orientation.inverse() * q;
         let z = q_err.scaled_axis();
         let mut h = SMatrix::<f32, 3, 15>::zeros();
@@ -249,11 +276,22 @@ impl Eskf {
         let r = Matrix3::identity() * av;
         let s_mat = h * self.cov * h.transpose() + r;
         if let Some(s_inv) = s_mat.try_inverse() {
+            let gamma = z.dot(&(s_inv * z)) / 3.0;
+            if gamma > self.config.gate_sigma * self.config.gate_sigma {
+                return;
+            }
             let k = self.cov * h.transpose() * s_inv;
             self.state = self.state.boxplus(&(k * z));
             let i_kh = SMatrix::<f32, 15, 15>::identity() - k * h;
             self.cov = i_kh * self.cov * i_kh.transpose() + k * r * k.transpose();
             self.cov = (self.cov + self.cov.transpose()) * 0.5;
+            self.clamp_covariance_diagonal();
+            // The boxplus applied a rotation correction — renormalize so
+            // round-off in the multiplication doesn't leave a non-unit q.
+            self.renormalize_orientation();
+            if !self.state_is_finite() {
+                self.initialized = false;
+            }
         }
     }
 
@@ -275,6 +313,10 @@ impl Eskf {
         let i_kh = SMatrix::<f32, 15, 15>::identity() - k * h;
         self.cov = i_kh * self.cov * i_kh.transpose() + k * k.transpose() * r;
         self.cov = (self.cov + self.cov.transpose()) * 0.5;
+        self.clamp_covariance_diagonal();
+        if !self.state_is_finite() {
+            self.initialized = false;
+        }
     }
 
     /// 3D magnetometer body-frame update.
@@ -307,6 +349,11 @@ impl Eskf {
             let i_kh = SMatrix::<f32, 15, 15>::identity() - k * h;
             self.cov = i_kh * self.cov * i_kh.transpose() + k * r * k.transpose();
             self.cov = (self.cov + self.cov.transpose()) * 0.5;
+            self.clamp_covariance_diagonal();
+            self.renormalize_orientation();
+            if !self.state_is_finite() {
+                self.initialized = false;
+            }
         }
     }
 
@@ -341,5 +388,41 @@ impl Eskf {
 
     pub fn is_initialized(&self) -> bool {
         self.initialized
+    }
+
+    /// Minimum variance floor for covariance diagonal.
+    /// Prevents pathological overconfidence that leads to indefinite P.
+    const MIN_VAR: f32 = 1e-10;
+
+    /// Clamp each diagonal entry of `cov` to at least `MIN_VAR`.
+    /// Float32 round-off in the Joseph update can drive diagonals negative;
+    /// this floor keeps P positive-definite on the diagonal.
+    fn clamp_covariance_diagonal(&mut self) {
+        for i in 0..15 {
+            if self.cov[(i, i)] < Self::MIN_VAR {
+                self.cov[(i, i)] = Self::MIN_VAR;
+            }
+        }
+    }
+
+    /// Re-normalize the orientation quaternion.
+    /// Protects against magnitude drift from many multiplications in float32.
+    fn renormalize_orientation(&mut self) {
+        self.state.orientation =
+            UnitQuaternion::new_normalize(self.state.orientation.into_inner());
+    }
+
+    /// `true` iff every component of the nominal state is finite.
+    pub fn state_is_finite(&self) -> bool {
+        let s = &self.state;
+        let q = s.orientation.as_vector();
+        s.position.iter().all(|v| v.is_finite())
+            && s.velocity.iter().all(|v| v.is_finite())
+            && s.accel_bias.iter().all(|v| v.is_finite())
+            && s.gyro_bias.iter().all(|v| v.is_finite())
+            && q.x.is_finite()
+            && q.y.is_finite()
+            && q.z.is_finite()
+            && q.w.is_finite()
     }
 }

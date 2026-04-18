@@ -2,97 +2,145 @@
 //!
 //! Which setpoint is published depends on the active control mode feature:
 //!
-//! | Feature         | Publishes to    | Semantics                          |
-//! |-----------------|-----------------|------------------------------------|
-//! | `est_mahony`   | `MANUAL_CONTROL`| Stick → tilt angle / yaw rate      |
-//! | `est_eskf` | `AUTO_SETPOINT` | Stick → ENU position offset [m]    |
+//! | Feature            | Publishes to                | Semantics                      |
+//! |--------------------|-----------------------------|--------------------------------|
+//! | `outer_rate`       | `RATE_COMMAND`              | Stick → body rate + thrust     |
+//! | `outer_geometric`  | `ACTIVE_POSITION_SETPOINT`  | Stick → ENU position offset    |
+//! | `outer_mpc`        | `ACTIVE_POSITION_SETPOINT`  | Stick → ENU position offset    |
 
 use embassy_time::Instant;
 
-use cybflight_msgs as msgs;
-
 use crate::sensors::RC_INPUT;
 
-// ── MANUAL MODE ───────────────────────────────────────────────────────────────
+// ── RATE MODE ────────────────────────────────────────────────────────────────
 
-#[cfg(feature = "est_mahony")]
-use crate::sensors::MANUAL_CONTROL;
+#[cfg(feature = "outer_rate")]
+use cybflight_core::rc::rc_mapping::ChannelCalibration as RateChannelCalibration;
 
-#[cfg(feature = "est_mahony")]
-use cybflight_core::rc::rc_mapping::{ChannelSetting, RcMapper, RcSettings};
+#[cfg(feature = "outer_rate")]
+#[embassy_executor::task]
+pub async fn rc_interpreter_task() {
+    use crate::vehicle::QUADROTOR_BODY;
 
-/// Stick scaling for manual mode.
-///
-/// Roll/pitch → tilt angle setpoint [rad]; yaw → heading rate [rad/s].
-/// When the attitude estimate is not yet valid the attitude controller uses
-/// these values as body rates (rate fallback), keeping the craft response
-/// gentle during startup.
-#[cfg(feature = "est_mahony")]
-fn manual_settings() -> RcSettings {
-    RcSettings {
-        roll: ChannelSetting::new(60.0_f32.to_radians(), 0.0, 0.02),
-        pitch: ChannelSetting::new(60.0_f32.to_radians(), 0.0, 0.02),
-        yaw: ChannelSetting::new(90.0_f32.to_radians(), 0.0, 0.02),
-        throttle: ChannelSetting::default(),
+    let mut rc_sub = RC_INPUT
+        .subscriber()
+        .expect("rc_interpreter: RC_INPUT subscriber");
+
+    let pitch_cal = RateChannelCalibration::centered(1);
+    let roll_cal = RateChannelCalibration::centered(0);
+    let throttle_cal = RateChannelCalibration::throttle(2);
+    let yaw_cal = RateChannelCalibration::centered(3);
+
+    let min_channels: u8 = {
+        let mut m = pitch_cal
+            .index
+            .max(roll_cal.index)
+            .max(throttle_cal.index)
+            .max(yaw_cal.index);
+        m += 1;
+        m as u8
+    };
+
+    /// Max body rate for roll/pitch [rad/s] (~460 deg/s).
+    const MAX_RATE_RP: f32 = 8.0;
+    /// Max body rate for yaw [rad/s] (~230 deg/s).
+    const MAX_RATE_YAW: f32 = 4.0;
+    const RATE_DEADBAND: f32 = 0.05;
+    const THROTTLE_DEADBAND: f32 = 0.05;
+
+    const LEARN_TOGGLE_CHANNEL: usize = 6;
+    const LEARNER_PREARM_CHANNEL: usize = 7;
+    const SWITCH_THRESHOLD: u16 = 1500;
+
+    let hover_thrust_n = QUADROTOR_BODY.mass_kg * 9.81;
+
+    defmt::info!("RC interpreter: rate mode started");
+
+    loop {
+        let mut rc = rc_sub.next_message_pure().await;
+        while let Some(newer) = rc_sub.try_next_message_pure() {
+            rc = newer;
+        }
+
+        if rc.channel_count < min_channels {
+            continue;
+        }
+
+        let learn_on = rc.channel_count > LEARN_TOGGLE_CHANNEL as u8
+            && rc.channels[LEARN_TOGGLE_CHANNEL] > SWITCH_THRESHOLD;
+        super::LEARNING_ENABLED.store(learn_on, core::sync::atomic::Ordering::Release);
+
+        let prearm_on = rc.channel_count > LEARNER_PREARM_CHANNEL as u8
+            && rc.channels[LEARNER_PREARM_CHANNEL] > SWITCH_THRESHOLD;
+        super::LEARNER_PREARM.store(prearm_on, core::sync::atomic::Ordering::Release);
+
+        let roll_norm = roll_cal.normalize(rc.channels[roll_cal.index] as i16);
+        let pitch_norm = pitch_cal.normalize(rc.channels[pitch_cal.index] as i16);
+        let yaw_norm = yaw_cal.normalize(rc.channels[yaw_cal.index] as i16);
+        let throttle_norm = throttle_cal.normalize(rc.channels[throttle_cal.index] as i16);
+
+        let roll_cmd = apply_deadband(roll_norm, RATE_DEADBAND);
+        let pitch_cmd = apply_deadband(pitch_norm, RATE_DEADBAND);
+        let yaw_cmd = apply_deadband(yaw_norm, RATE_DEADBAND);
+        let throttle_cmd = if throttle_norm < THROTTLE_DEADBAND {
+            0.0
+        } else {
+            throttle_norm
+        };
+
+        let rate_ref = nalgebra::Vector3::new(
+            roll_cmd * MAX_RATE_RP,
+            pitch_cmd * MAX_RATE_RP,
+            yaw_cmd * MAX_RATE_YAW,
+        );
+        // Throttle 0→1 maps to 0→2×hover thrust (mid-stick ≈ hover).
+        let collective_thrust_n = throttle_cmd * 2.0 * hover_thrust_n;
+
+        super::RATE_COMMAND.signal(cybflight_msgs::AttitudeControlSetpoint {
+            timestamp: Instant::now(),
+            collective_thrust_n,
+            attitude_quaternion: nalgebra::UnitQuaternion::identity(),
+            body_rate_rad_s: rate_ref,
+            torque_n_m: nalgebra::Vector3::zeros(),
+        });
     }
 }
 
-#[cfg(feature = "est_mahony")]
-#[embassy_executor::task]
-pub async fn rc_interpreter_task() {
-    let mut sub = RC_INPUT
-        .subscriber()
-        .expect("rc_interpreter: RC_INPUT subscriber");
-    let pub_ = MANUAL_CONTROL.immediate_publisher();
-    let mapper = RcMapper::aetr(manual_settings());
-
-    loop {
-        let rc = sub.next_message_pure().await;
-        let tr = mapper.map(&rc.channels);
-        pub_.publish_immediate(msgs::ManualControlSetpoint {
-            timestamp: Instant::now(),
-            thrust: tr.thrust,
-            roll_rate: tr.roll_rate,
-            pitch_rate: tr.pitch_rate,
-            yaw_rate: tr.yaw_rate,
-        });
-        defmt::debug!(
-            "RC: ch[0..4]={} {} {} {} {}, setpoint: thrust={} roll={} pitch={} yaw={}",
-            rc.channels[0],
-            rc.channels[1],
-            rc.channels[2],
-            rc.channels[3],
-            rc.channels[4],
-            tr.thrust,
-            tr.roll_rate,
-            tr.pitch_rate,
-            tr.yaw_rate
-        );
+#[cfg(feature = "outer_rate")]
+#[inline]
+fn apply_deadband(s: f32, deadband: f32) -> f32 {
+    let a = s.abs();
+    if a <= deadband {
+        0.0
+    } else {
+        let scaled = (a - deadband) / (1.0 - deadband);
+        let scaled = if scaled > 1.0 { 1.0 } else { scaled };
+        if s >= 0.0 { scaled } else { -scaled }
     }
 }
 
 // ── POSITION MODE ────────────────────────────────────────────────────────────
 
-#[cfg(feature = "est_eskf")]
+#[cfg(any(feature = "outer_geometric", feature = "outer_mpc"))]
 use crate::sensors::VEHICLE_ODOMETRY;
-#[cfg(feature = "est_eskf")]
+#[cfg(any(feature = "outer_geometric", feature = "outer_mpc"))]
 use cybflight_core::rc::rc_mapping::ChannelCalibration;
+#[cfg(any(feature = "outer_geometric", feature = "outer_mpc"))]
+use nalgebra::Vector3;
 
 /// Lateral half-range: centered stick ±1 → ±XY_HALF_RANGE m from origin.
-#[cfg(feature = "est_eskf")]
+#[cfg(any(feature = "outer_geometric", feature = "outer_mpc"))]
 const XY_HALF_RANGE: f32 = 0.5;
 /// Throttle full range: stick 0–1 → 0–Z_RANGE m above arming altitude.
-#[cfg(feature = "est_eskf")]
+#[cfg(any(feature = "outer_geometric", feature = "outer_mpc"))]
 const Z_RANGE: f32 = 1.0;
 /// Dead-band: skip publishing if target moved less than this [m].
-#[cfg(feature = "est_eskf")]
+#[cfg(any(feature = "outer_geometric", feature = "outer_mpc"))]
 const POSITION_THRESHOLD: f32 = 0.01;
 
-#[cfg(feature = "est_eskf")]
+#[cfg(any(feature = "outer_geometric", feature = "outer_mpc"))]
 #[embassy_executor::task]
 pub async fn rc_interpreter_task() {
-    use nalgebra::{UnitQuaternion, Vector3};
-
     let mut rc_sub = RC_INPUT
         .subscriber()
         .expect("rc_interpreter: RC_INPUT subscriber");
@@ -108,20 +156,26 @@ pub async fn rc_interpreter_task() {
     while !crate::estimation::ESTIMATOR_READY.load(core::sync::atomic::Ordering::Acquire) {
         embassy_time::Timer::after_millis(100).await;
     }
-    let odom = odom_sub.next_message_pure().await;
-    let origin = odom.pose.position;
+    let origin = loop {
+        let odom = odom_sub.next_message_pure().await;
+        let p = odom.pose.position;
+        if p.x.is_finite() && p.y.is_finite() && p.z.is_finite() {
+            break p;
+        }
+        defmt::warn!("rc_interpreter: discarding non-finite odometry during origin capture");
+    };
 
-    super::AUTO_SETPOINT.signal(msgs::VehicleOdometry {
-        timestamp: Instant::now(),
-        pose: msgs::Pose {
+    // Seed the shared setpoint cell and fire the readiness signal. Downstream
+    // consumers (cascade_task or outer_loop) wait on ACTIVE_SETPOINT_READY
+    // before entering their main loops.
+    super::ACTIVE_POSITION_SETPOINT.lock(|cell| {
+        cell.set(Some(super::ActiveSetpoint {
+            timestamp: Instant::now(),
             position: origin,
-            orientation: UnitQuaternion::identity(),
-        },
-        twist: msgs::Twist {
-            linear: Vector3::zeros(),
-            angular: Vector3::zeros(),
-        },
+            yaw_rad: 0.0,
+        }));
     });
+    super::ACTIVE_SETPOINT_READY.signal(());
 
     // Phase 2: Map sticks to ENU position offsets from arming origin.
     // Yaw-independent: pitch → world +X, roll → world +Y.
@@ -159,19 +213,12 @@ pub async fn rc_interpreter_task() {
         }
         last_target = target;
 
-        super::AUTO_SETPOINT.signal(msgs::VehicleOdometry {
-            timestamp: Instant::now(),
-            pose: msgs::Pose {
+        super::ACTIVE_POSITION_SETPOINT.lock(|cell| {
+            cell.set(Some(super::ActiveSetpoint {
+                timestamp: Instant::now(),
                 position: target,
-                orientation: UnitQuaternion::identity(),
-            },
-            twist: msgs::Twist {
-                linear: Vector3::zeros(),
-                angular: Vector3::zeros(),
-            },
+                yaw_rad: 0.0,
+            }));
         });
     }
-
-    // ── VELOCITY COMMAND stub ────────────────────────────────────────────────
-    // (see previous version of this file for the commented-out velocity loop body)
 }

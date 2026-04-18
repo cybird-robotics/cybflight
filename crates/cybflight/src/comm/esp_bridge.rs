@@ -110,12 +110,7 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
     let mut att_sub = sensors::VEHICLE_ATTITUDE.subscriber().unwrap();
     let mut rc_sub = sensors::RC_INPUT.subscriber().unwrap();
     let mut rc_link_sub = sensors::RC_LINK_STATUS.subscriber().unwrap();
-    // Under ESKF: use INDI-processed RPM (post-slew or post-KF).
-    // Without ESKF: use raw DShot telemetry (no INDI task running).
-    #[cfg(feature = "est_eskf")]
     let mut dshot_sub = control::PROCESSED_DSHOT_TELEM.subscriber().unwrap();
-    #[cfg(not(feature = "est_eskf"))]
-    let mut dshot_sub = sensors::DSHOT_TELEMETRY.subscriber().unwrap();
     let mut ocp_sub = control::OCP_SOLVER_OUTPUT.subscriber().unwrap();
     let mut gps_sub = sensors::GPS_FIX.subscriber().unwrap();
     let mut mag_ext_sub = sensors::MAG_EXT.subscriber().unwrap();
@@ -127,7 +122,6 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
     let mut pos_ctrl_sub = control::POSITION_CONTROL_SETPOINT.subscriber().unwrap();
     let mut arm_sub = crate::ARM_DISARM.subscriber().unwrap();
     let mut odom_sub = sensors::VEHICLE_ODOMETRY.subscriber().unwrap();
-    #[cfg(feature = "est_eskf")]
     let mut motor_sub = control::ACTUATOR_MOTORS_TELEM.subscriber().unwrap();
 
     let mut seq: u8 = 0;
@@ -237,7 +231,6 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
             w.timestamp_us = utc_ts(m.timestamp);
             pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
-        #[cfg(feature = "est_eskf")]
         if let Some(m) = drain_latest(&mut motor_sub) {
             let mut w = wire::WireActuatorMotors::from_msg(&m);
             w.timestamp_us = utc_ts(m.timestamp);

@@ -14,7 +14,7 @@
 //! 3. **Running** — covariance has converged; `ESTIMATOR_READY` is set and
 //!    arming is permitted.
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_sync::pubsub::WaitResult;
 use embassy_time::Instant;
 use nalgebra::Vector3;
@@ -23,7 +23,7 @@ use cybflight_core::eskf::{Eskf, EskfConfig};
 
 use core::sync::atomic::Ordering;
 
-use crate::estimation::{EstimatorPhase, ESTIMATOR_READY, ESTIMATOR_STATUS};
+use crate::estimation::{ESTIMATOR_READY, ESTIMATOR_STATUS, EstimatorPhase};
 use crate::sensors;
 use cybflight_msgs as msgs;
 
@@ -34,19 +34,40 @@ const PREDICT_DECIMATION: u32 = 8;
 const ODOM_DECIMATION: u32 = 1;
 
 /// Mocap position noise std-dev [m].
-const MOCAP_POS_STD: f32 = 0.001;
+const MOCAP_POS_STD: f32 = 0.01;
 /// Mocap attitude noise std-dev [rad].
-const MOCAP_ATT_STD: f32 = 0.01;
+const MOCAP_ATT_STD: f32 = 0.03;
 
 /// Gyro-bias covariance trace threshold for convergence.
 /// Initial trace = 3 × 0.01 = 0.03; this requires roughly a 10× reduction.
 const GYRO_BIAS_COV_TRACE_THRESH: f32 = 0.003;
+
+/// Reject IMU samples with any non-finite component — they cascade straight
+/// into the filter's predict step and produce NaN state in one call.
+fn imu_is_valid(accel: &Vector3<f32>, gyro: &Vector3<f32>) -> bool {
+    accel.iter().all(|v| v.is_finite()) && gyro.iter().all(|v| v.is_finite())
+}
+
+/// Reject mocap frames with any non-finite component. One bad frame from the
+/// transport pipeline (ESP bridge / COBS decode) would otherwise be absorbed
+/// directly into the filter via `update_pos`/`update_att`.
+fn mocap_is_valid(pose: &msgs::ViconPose) -> bool {
+    let q = pose.orientation.as_vector();
+    pose.position.iter().all(|v| v.is_finite())
+        && q.x.is_finite()
+        && q.y.is_finite()
+        && q.z.is_finite()
+        && q.w.is_finite()
+}
 
 #[embassy_executor::task]
 pub async fn estimation_task() {
     let mut imu_sub = sensors::IMU_1.subscriber().unwrap();
     let mut mocap_sub = sensors::VICON_POSE.subscriber().unwrap();
     let odom_pub = sensors::VEHICLE_ODOMETRY.immediate_publisher();
+    // Attitude telemetry (formerly published by mahony_task). Downstream
+    // consumers: CRSF telemetry, ESP bridge, USB streaming — all cosmetic.
+    let att_pub = sensors::VEHICLE_ATTITUDE.immediate_publisher();
 
     // --- Wait for first mocap pose ---
     let first_pose = loop {
@@ -91,8 +112,7 @@ pub async fn estimation_task() {
     };
 
     ESTIMATOR_STATUS.lock(|c| {
-        let (roll_deg, pitch_deg, yaw_deg, pos, vel, gyro_bias, accel_bias) =
-            state_fields(&eskf);
+        let (roll_deg, pitch_deg, yaw_deg, pos, vel, gyro_bias, accel_bias) = state_fields(&eskf);
         c.set(EstimatorPhase::Converging {
             roll_deg,
             pitch_deg,
@@ -121,6 +141,18 @@ pub async fn estimation_task() {
                     }
                 };
 
+                // Reject non-finite IMU samples before they enter the filter.
+                if !imu_is_valid(&sample.accel_m_s2, &sample.gyro_rad_s) {
+                    defmt::warn!("estimation: non-finite IMU sample, skipping");
+                    continue;
+                }
+
+                // If the filter reset itself (NaN guard tripped), wait for a
+                // fresh mocap frame to re-seed instead of running predict.
+                if !eskf.is_initialized() {
+                    continue;
+                }
+
                 // Decimate: only run predict every PREDICT_DECIMATION IMU samples.
                 imu_skip += 1;
                 if imu_skip < PREDICT_DECIMATION {
@@ -139,9 +171,19 @@ pub async fn estimation_task() {
 
                 eskf.predict(sample.accel_m_s2, sample.gyro_rad_s, dt);
 
+                // predict() clears `initialized` if it produced NaN. Report
+                // it and drop the convergence flag so downstream consumers
+                // know the estimate is no longer trusted.
+                if !eskf.is_initialized() {
+                    defmt::error!("ESKF: non-finite state after predict — awaiting re-init from mocap");
+                    converged = false;
+                    ESTIMATOR_READY.store(false, Ordering::Release);
+                    continue;
+                }
+
                 // Publish IMU biases for INDI bias correction (every predict step)
-                super::GYRO_BIAS.signal(eskf.gyro_bias());
-                super::ACCEL_BIAS.signal(eskf.accel_bias());
+                super::ESKF_GYRO_BIAS.signal(eskf.gyro_bias());
+                super::ESKF_ACCEL_BIAS.signal(eskf.accel_bias());
 
                 predict_count = predict_count.wrapping_add(1);
                 if predict_count.is_multiple_of(ODOM_DECIMATION) {
@@ -149,9 +191,7 @@ pub async fn estimation_task() {
                         state_fields(&eskf);
 
                     // Check convergence transition
-                    if !converged
-                        && eskf.gyro_bias_cov_trace() < GYRO_BIAS_COV_TRACE_THRESH
-                    {
+                    if !converged && eskf.gyro_bias_cov_trace() < GYRO_BIAS_COV_TRACE_THRESH {
                         converged = true;
                         ESTIMATOR_READY.store(true, Ordering::Release);
                         defmt::info!(
@@ -188,8 +228,9 @@ pub async fn estimation_task() {
 
                     let q = eskf.orientation();
                     let gb = eskf.gyro_bias();
+                    let now_publish = Instant::now();
                     odom_pub.publish_immediate(msgs::VehicleOdometry {
-                        timestamp: Instant::now(),
+                        timestamp: now_publish,
                         pose: msgs::Pose {
                             position: eskf.position(),
                             orientation: q,
@@ -198,6 +239,10 @@ pub async fn estimation_task() {
                             linear: eskf.velocity(),
                             angular: sample.gyro_rad_s - gb,
                         },
+                    });
+                    att_pub.publish_immediate(msgs::VehicleAttitude {
+                        timestamp: now_publish,
+                        orientation: q,
                     });
                 }
             }
@@ -208,8 +253,37 @@ pub async fn estimation_task() {
                     WaitResult::Lagged(_) => continue,
                 };
 
+                // Reject non-finite mocap frames before they enter the filter.
+                if !mocap_is_valid(&pose) {
+                    defmt::warn!("estimation: non-finite mocap frame, rejecting");
+                    continue;
+                }
+
+                // If the filter reset (NaN guard), re-seed from this pose.
+                if !eskf.is_initialized() {
+                    defmt::error!("ESKF: re-initializing from mocap after NaN reset");
+                    eskf.init(
+                        pose.position,
+                        pose.orientation,
+                        Vector3::zeros(),
+                        Vector3::zeros(),
+                    );
+                    converged = false;
+                    ESTIMATOR_READY.store(false, Ordering::Release);
+                    last_predict_ts = Instant::now();
+                    continue;
+                }
+
                 eskf.update_pos(pose.position, MOCAP_POS_STD);
                 eskf.update_att(pose.orientation, MOCAP_ATT_STD);
+
+                // If an update produced NaN, drop convergence so the next
+                // mocap frame re-seeds the filter.
+                if !eskf.is_initialized() {
+                    defmt::error!("ESKF: non-finite state after mocap update — awaiting re-init");
+                    converged = false;
+                    ESTIMATOR_READY.store(false, Ordering::Release);
+                }
             }
         }
     }

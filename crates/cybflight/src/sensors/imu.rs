@@ -9,7 +9,7 @@ use cybflight_drivers::imu::mpu6x00::Mpu6x00;
 use cybflight_drivers::imu::ReadImu;
 use cybflight_msgs as msgs;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
-use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::pubsub::PubSubChannel;
 use embassy_time::{Instant, Timer};
@@ -17,13 +17,27 @@ use hal::gpio::Output;
 use hal::spi::{self, Spi};
 
 pub type SpiBus = Spi<'static, hal::mode::Async, spi::mode::Master>;
-pub type SpiBusMtx = Mutex<NoopRawMutex, SpiBus>;
+/// Shared-bus mutex for SPI IMU/baro buses.
+///
+/// `CriticalSectionRawMutex` (not `NoopRawMutex`) because the IMU reader
+/// task lives on `EXECUTOR_CTRL` (interrupt P10) while other consumers
+/// of the same bus (e.g. DPS310 baro on SPI1) live on the thread
+/// executor. A `NoopRawMutex` would be undefined behavior in that
+/// cross-executor pattern.
+///
+/// Timing note: the `RawMutex` critical section guards only the
+/// `is-locked` flag and runs for a handful of instructions per
+/// acquire/release — NOT the full SPI/DMA transfer. The async mutex
+/// guard itself is held across the DMA wait with IRQs enabled, so
+/// neither the P6 DShot ISR nor the P0–P5 DMA-completion ISRs see any
+/// meaningful added latency.
+pub type SpiBusMtx = Mutex<CriticalSectionRawMutex, SpiBus>;
 pub type IcmDev = Icm426xx<
-    SpiDevice<'static, NoopRawMutex, SpiBus, Output<'static>>,
+    SpiDevice<'static, CriticalSectionRawMutex, SpiBus, Output<'static>>,
     hal::exti::ExtiInput<'static>,
 >;
 pub type MpuDev = Mpu6x00<
-    SpiDevice<'static, NoopRawMutex, SpiBus, Output<'static>>,
+    SpiDevice<'static, CriticalSectionRawMutex, SpiBus, Output<'static>>,
     hal::exti::ExtiInput<'static>,
 >;
 

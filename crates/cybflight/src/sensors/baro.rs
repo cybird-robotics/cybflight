@@ -16,8 +16,13 @@ use crate::sensors::mag::I2cBus;
 use cybflight_msgs as msgs;
 use hal::gpio::Output;
 
-pub type Dps310SpiDev =
-    Dps310<SpiBusWrapper<SpiDevice<'static, NoopRawMutex, SpiBus, Output<'static>>>>;
+// SPI shared-bus mutex on the baro SPI device matches the IMU bus
+// (see `sensors::imu::SpiBusMtx`): `CriticalSectionRawMutex` so the
+// bus can be safely shared between the IMU reader on the control
+// executor (P10) and the DPS310 baro reader on the thread executor.
+pub type Dps310SpiDev = Dps310<
+    SpiBusWrapper<SpiDevice<'static, CriticalSectionRawMutex, SpiBus, Output<'static>>>,
+>;
 pub type Dps310I2cDev =
     Dps310<I2cBusWrapper<I2cDevice<'static, NoopRawMutex, I2cBus>>>;
 pub type Icp20100Dev = Icp20100<I2cDevice<'static, NoopRawMutex, I2cBus>>;

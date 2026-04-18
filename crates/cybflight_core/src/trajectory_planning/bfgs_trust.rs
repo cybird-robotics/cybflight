@@ -23,12 +23,25 @@ pub enum BfgsTrustResult {
     Stop,
     MaxIterations,
     InvalidValue,
+    /// Caller-supplied `keep_going` callback returned `false` before the
+    /// optimizer had converged. Used to implement wall-clock time budgets
+    /// from an embedded caller (which has a clock the solver itself
+    /// should not depend on).
+    TimeExceeded,
 }
 
 /// All mutable working memory for a BFGS trust-region solve.
 ///
 /// Construct once and reuse across calls — nothing here is problem-specific.
 /// Sized for the worst-case `MAX_VARS` so the struct has a fixed footprint.
+///
+/// The fields below the scratch buffers are **persistent solver state**:
+/// they carry the Hessian approximation, current cost, trust radius,
+/// iteration count, and dogleg cache across calls to
+/// [`bfgs_trust_resume`]. This lets an embedded caller interleave solver
+/// bursts with `yield_now()` awaits on an async runtime — the sync solver
+/// body returns to the caller every `max_iters_this_call` iterations,
+/// and the workspace remembers where to pick up.
 pub struct BfgsWorkspace {
     /// Hessian approximation B (n×n row-major).
     hess: [f32; MAX_VARS_SQ],
@@ -64,6 +77,30 @@ pub struct BfgsWorkspace {
     chol_y: [f32; MAX_VARS],
     /// Past cost-value ring buffer for the "cost stagnation" convergence test.
     past_f: [f32; MAX_PAST],
+
+    // ---- Persistent solver state (valid between init/resume calls) ----
+    /// Current cost value at the latest accepted iterate `x`.
+    fx: f32,
+    /// Current trust-region radius.
+    delta: f32,
+    /// Outer-iteration counter (accepted + rejected).
+    k: usize,
+    /// Accepted-step counter (drives past-f ring buffer).
+    accepted: usize,
+    /// Dogleg cache validity; cleared after each accepted BFGS update.
+    cache_valid: bool,
+    /// Dogleg cache: Newton-solve succeeded (B is PD).
+    newton_ok: bool,
+    /// Dogleg cache: ‖p_newton‖.
+    pn_norm: f32,
+    /// Dogleg cache: ‖p_cauchy‖.
+    pc_norm: f32,
+    /// Dogleg cache: g·g.
+    gtg: f32,
+    /// Active length of the past-f ring buffer.
+    past_len: usize,
+    /// Active problem dimension `n` captured at `init`.
+    n: usize,
 }
 
 impl BfgsWorkspace {
@@ -86,7 +123,31 @@ impl BfgsWorkspace {
             bp: [0.0; MAX_VARS],
             chol_y: [0.0; MAX_VARS],
             past_f: [0.0; MAX_PAST],
+            fx: 0.0,
+            delta: 0.0,
+            k: 0,
+            accepted: 0,
+            cache_valid: false,
+            newton_ok: false,
+            pn_norm: 0.0,
+            pc_norm: 0.0,
+            gtg: 0.0,
+            past_len: 0,
+            n: 0,
         }
+    }
+
+    /// Current cost value `f(x)` at the latest accepted iterate.
+    /// Valid after [`bfgs_trust_init`]; updated each accepted step.
+    #[inline]
+    pub fn fx(&self) -> f32 {
+        self.fx
+    }
+
+    /// Outer-iteration counter (accepted + rejected steps).
+    #[inline]
+    pub fn iter_count(&self) -> usize {
+        self.k
     }
 }
 
@@ -113,8 +174,73 @@ pub fn bfgs_trust_optimize<F>(
 where
     F: FnMut(&[f32], &mut [f32]) -> f32,
 {
+    // No-budget variant: delegate to the budgeted form with a
+    // `keep_going` that always returns true. The optimizer only calls
+    // the callback once per outer iteration, so the extra indirection
+    // is free even on a hot path.
+    bfgs_trust_optimize_budgeted(x, cost_grad, params, ws, &mut || true)
+}
+
+/// Run BFGS with trust-region optimization and a caller-supplied
+/// `keep_going` callback. The callback is polled at the top of every
+/// outer iteration; returning `false` causes the optimizer to stop and
+/// report [`BfgsTrustResult::TimeExceeded`].
+///
+/// This is the mechanism by which an embedded caller can impose a
+/// **wall-clock deadline** on the solve without pulling a time source
+/// into `cybflight_core`: the caller captures `Instant::now()` before
+/// calling, and its closure returns `now < deadline`.
+///
+/// The returned `x` is always the latest accepted iterate, so an
+/// aborted solve still yields a valid (though possibly sub-optimal)
+/// decision vector; the caller is responsible for deciding whether to
+/// use it.
+pub fn bfgs_trust_optimize_budgeted<F, K>(
+    x: &mut [f32],
+    cost_grad: &mut F,
+    params: &BfgsTrustParams,
+    ws: &mut BfgsWorkspace,
+    keep_going: &mut K,
+) -> (BfgsTrustResult, f32, usize)
+where
+    F: FnMut(&[f32], &mut [f32]) -> f32,
+    K: FnMut() -> bool,
+{
+    // One-shot wrapper over the resumable API: init, then resume with
+    // no per-call iteration cap so we run to a terminal status.
+    if let Some(r) = bfgs_trust_init(x, cost_grad, params, ws) {
+        return (r, ws.fx, 0);
+    }
+    let r = match bfgs_trust_resume(x, cost_grad, params, ws, keep_going, usize::MAX) {
+        Some(r) => r,
+        // Never happens: `usize::MAX` iters can't be exhausted in practice,
+        // so resume always terminates. Fall back to MaxIterations for safety.
+        None => BfgsTrustResult::MaxIterations,
+    };
+    (r, ws.fx, ws.k)
+}
+
+/// Initialize a fresh BFGS trust-region solve.
+///
+/// Prepares `ws` for subsequent [`bfgs_trust_resume`] calls: zeroes the
+/// working portion of the Hessian to identity, evaluates the cost at the
+/// initial iterate, resets the past-f ring buffer, and captures the
+/// problem dimension `n = x.len()`.
+///
+/// Returns `Some(InvalidValue)` if the initial cost is non-finite (caller
+/// should not invoke `resume`), or `None` if the workspace is ready.
+pub fn bfgs_trust_init<F>(
+    x: &mut [f32],
+    cost_grad: &mut F,
+    params: &BfgsTrustParams,
+    ws: &mut BfgsWorkspace,
+) -> Option<BfgsTrustResult>
+where
+    F: FnMut(&[f32], &mut [f32]) -> f32,
+{
     let n = x.len();
     debug_assert!(n <= MAX_VARS);
+    ws.n = n;
 
     // Initialize B to identity (reuse ws.hess; zero the working portion first).
     for i in 0..(n * n) {
@@ -124,31 +250,61 @@ where
         ws.hess[i * n + i] = 1.0;
     }
 
-    // Cached dogleg quantities — valid until B or g changes.
-    let mut newton_ok = false;
-    let mut pn_norm = 0.0f32;
-    let mut pc_norm = 0.0f32;
-    let mut gtg = 0.0f32;
-    let mut cache_valid = false;
-
     // Past-f ring buffer (bounded by MAX_PAST regardless of user `past` config).
-    let past_len = (params.past + 1).min(MAX_PAST);
-    for v in &mut ws.past_f[..past_len] {
+    ws.past_len = (params.past + 1).min(MAX_PAST);
+    for v in &mut ws.past_f[..ws.past_len] {
         *v = 0.0;
     }
-    // `accepted` counts accepted steps; the ring index should advance on
-    // accepts only, so the "cost from `past` iters ago" is physically correct.
-    let mut accepted: usize = 0;
 
-    let mut delta = params.delta_init;
-    let mut fx = cost_grad(x, &mut ws.g[..n]);
-    if !fx.is_finite() {
-        return (BfgsTrustResult::InvalidValue, fx, 0);
+    ws.k = 0;
+    ws.accepted = 0;
+    ws.cache_valid = false;
+    ws.newton_ok = false;
+    ws.pn_norm = 0.0;
+    ws.pc_norm = 0.0;
+    ws.gtg = 0.0;
+    ws.delta = params.delta_init;
+
+    ws.fx = cost_grad(x, &mut ws.g[..n]);
+    if !ws.fx.is_finite() {
+        return Some(BfgsTrustResult::InvalidValue);
     }
-
     if params.past > 0 {
-        ws.past_f[0] = fx;
+        ws.past_f[0] = ws.fx;
     }
+    None
+}
+
+/// Run up to `max_iters_this_call` outer BFGS iterations, resuming from
+/// the state stored in `ws` by a prior [`bfgs_trust_init`] (and any
+/// previous `bfgs_trust_resume` call).
+///
+/// - Returns `Some(status)` with a terminal status (Convergence, Stop,
+///   MaxIterations, InvalidValue, or TimeExceeded) when the solve has
+///   finished for that reason.
+/// - Returns `None` when `max_iters_this_call` has been exhausted without
+///   reaching a terminal status. The caller should yield control to its
+///   async runtime (e.g. `embassy_futures::yield_now().await`) and then
+///   call `bfgs_trust_resume` again to continue.
+///
+/// `x` is always the latest accepted iterate on return, so an
+/// intermediate pause still leaves a valid (possibly sub-optimal)
+/// decision vector available to the caller.
+pub fn bfgs_trust_resume<F, K>(
+    x: &mut [f32],
+    cost_grad: &mut F,
+    params: &BfgsTrustParams,
+    ws: &mut BfgsWorkspace,
+    keep_going: &mut K,
+    max_iters_this_call: usize,
+) -> Option<BfgsTrustResult>
+where
+    F: FnMut(&[f32], &mut [f32]) -> f32,
+    K: FnMut() -> bool,
+{
+    let n = ws.n;
+    debug_assert!(n <= MAX_VARS);
+    debug_assert_eq!(n, x.len(), "x length must match dimension captured in init");
 
     let max_iter = if params.max_iterations > 0 {
         params.max_iterations
@@ -156,18 +312,31 @@ where
         usize::MAX
     };
 
-    let mut k: usize = 0;
-    while k < max_iter {
+    let mut iters_this_call: usize = 0;
+    while ws.k < max_iter {
+        if iters_this_call >= max_iters_this_call {
+            // Cooperative pause: solver hasn't terminated, but this
+            // burst is done. Caller should yield and call us again.
+            return None;
+        }
+
+        // Wall-clock / external-abort check. Polled once per outer
+        // iteration — cheap enough that per-iteration granularity is a
+        // good trade-off between responsiveness and overhead.
+        if !keep_going() {
+            return Some(BfgsTrustResult::TimeExceeded);
+        }
+
         // Convergence: ||g||_inf / max(1, ||x||_inf) < g_epsilon
         let xnorm = vec_norm_inf(&x[..n]).max(1.0);
         let gnorm = vec_norm_inf(&ws.g[..n]);
         if gnorm / xnorm < params.g_epsilon {
-            return (BfgsTrustResult::Convergence, fx, k);
+            return Some(BfgsTrustResult::Convergence);
         }
 
-        if !cache_valid {
+        if !ws.cache_valid {
             // Newton point via Cholesky solve.
-            newton_ok = cholesky_solve(
+            ws.newton_ok = cholesky_solve(
                 &ws.hess,
                 &ws.g[..n],
                 &mut ws.p_newton[..n],
@@ -175,7 +344,7 @@ where
                 &mut ws.chol_y,
                 n,
             );
-            pn_norm = if newton_ok {
+            ws.pn_norm = if ws.newton_ok {
                 vec_norm(&ws.p_newton[..n])
             } else {
                 0.0
@@ -183,19 +352,19 @@ where
 
             // Cauchy point: p_c = -(||g||² / g^T B g) g
             mat_vec(&ws.hess, &ws.g[..n], &mut ws.bg[..n], n);
-            gtg = vec_dot(&ws.g[..n], &ws.g[..n]);
+            ws.gtg = vec_dot(&ws.g[..n], &ws.g[..n]);
             let g_bg = vec_dot(&ws.g[..n], &ws.bg[..n]);
 
-            if g_bg > 0.0 && gtg >= 1e-7 {
-                let alpha_c = gtg / g_bg;
+            if g_bg > 0.0 && ws.gtg >= 1e-7 {
+                let alpha_c = ws.gtg / g_bg;
                 for i in 0..n {
                     ws.p_cauchy[i] = -alpha_c * ws.g[i];
                 }
-                pc_norm = vec_norm(&ws.p_cauchy[..n]);
+                ws.pc_norm = vec_norm(&ws.p_cauchy[..n]);
             } else {
-                pc_norm = 0.0;
+                ws.pc_norm = 0.0;
             }
-            cache_valid = true;
+            ws.cache_valid = true;
         }
 
         // Dogleg step (uses cached Newton & Cauchy).
@@ -203,13 +372,13 @@ where
             &ws.hess,
             &ws.g[..n],
             &ws.bg[..n],
-            delta,
+            ws.delta,
             &ws.p_newton[..n],
-            newton_ok,
-            pn_norm,
+            ws.newton_ok,
+            ws.pn_norm,
             &ws.p_cauchy[..n],
-            pc_norm,
-            gtg,
+            ws.pc_norm,
+            ws.gtg,
             &mut ws.p[..n],
             &mut ws.d_dogleg[..n],
             &mut ws.bp[..n],
@@ -217,7 +386,7 @@ where
         );
 
         if pred.abs() < 1e-7 {
-            return (BfgsTrustResult::Convergence, fx, k);
+            return Some(BfgsTrustResult::Convergence);
         }
 
         // Evaluate trial point.
@@ -226,16 +395,16 @@ where
         }
         let fx_trial = cost_grad(&ws.x_trial[..n], &mut ws.g_new[..n]);
 
-        let actual = fx - fx_trial;
+        let actual = ws.fx - fx_trial;
         let rho = if pred.abs() > 1e-7 { actual / pred } else { 0.0 };
 
         // Update trust radius.
         if rho < 0.25 {
-            delta *= 0.25;
+            ws.delta *= 0.25;
         } else if rho > 0.75 {
             let pnorm = vec_norm(&ws.p[..n]);
-            if pnorm > 0.99 * delta {
-                delta = (2.0 * delta).min(params.delta_max);
+            if pnorm > 0.99 * ws.delta {
+                ws.delta = (2.0 * ws.delta).min(params.delta_max);
             }
         }
 
@@ -249,7 +418,7 @@ where
 
             x[..n].copy_from_slice(&ws.x_trial[..n]);
             ws.g[..n].copy_from_slice(&ws.g_new[..n]);
-            fx = fx_trial;
+            ws.fx = fx_trial;
 
             bfgs_update_damped(
                 &mut ws.hess,
@@ -260,33 +429,36 @@ where
                 n,
             );
 
-            cache_valid = false;
-            accepted += 1;
+            ws.cache_valid = false;
+            ws.accepted += 1;
 
             // Cost-stagnation convergence test using a ring of past accepted
             // cost values. Index advances only on accepts → `past` counts
             // accepted iterations regardless of how many trials were rejected.
-            if params.past > 0 && past_len > 0 {
-                let idx = accepted % past_len;
-                ws.past_f[idx] = fx;
-                if accepted > params.past {
-                    let old_idx = (accepted - params.past) % past_len;
-                    let rate = (ws.past_f[old_idx] - fx).abs() / fx.abs().max(1.0);
+            if params.past > 0 && ws.past_len > 0 {
+                let idx = ws.accepted % ws.past_len;
+                ws.past_f[idx] = ws.fx;
+                if ws.accepted > params.past {
+                    let old_idx = (ws.accepted - params.past) % ws.past_len;
+                    let rate = (ws.past_f[old_idx] - ws.fx).abs() / ws.fx.abs().max(1.0);
                     if rate < params.delta_conv {
-                        return (BfgsTrustResult::Stop, fx, k + 1);
+                        ws.k += 1;
+                        return Some(BfgsTrustResult::Stop);
                     }
                 }
             }
         }
 
-        if delta < 1e-7 {
-            return (BfgsTrustResult::Convergence, fx, k + 1);
+        if ws.delta < 1e-7 {
+            ws.k += 1;
+            return Some(BfgsTrustResult::Convergence);
         }
 
-        k += 1;
+        ws.k += 1;
+        iters_this_call += 1;
     }
 
-    (BfgsTrustResult::MaxIterations, fx, k)
+    Some(BfgsTrustResult::MaxIterations)
 }
 
 /// Dogleg step from pre-computed Newton & Cauchy points.
@@ -568,6 +740,57 @@ mod tests {
         );
         assert!((x[0] - 1.0).abs() < 1e-3);
         assert!((x[1] - 1.0).abs() < 1e-3);
+    }
+
+    /// The resumable (init + repeated-resume) path must produce byte-
+    /// identical results to the one-shot `bfgs_trust_optimize` call — the
+    /// latter is implemented as a thin wrapper over the former, so any
+    /// divergence means state is being reset across bursts somewhere.
+    #[test]
+    fn test_resume_matches_oneshot() {
+        let eval = |xv: &[f32], g: &mut [f32]| -> f32 {
+            let a = 1.0 - xv[0];
+            let b = xv[1] - xv[0] * xv[0];
+            g[0] = -2.0 * a - 400.0 * xv[0] * b;
+            g[1] = 200.0 * b;
+            a * a + 100.0 * b * b
+        };
+        let params = BfgsTrustParams {
+            max_iterations: 200,
+            ..BfgsTrustParams::default()
+        };
+
+        // One-shot reference run.
+        let mut x_ref = [-1.0f32, 1.0];
+        let mut ws_ref = BfgsWorkspace::new();
+        let mut eval_ref = eval;
+        let (status_ref, cost_ref, iters_ref) =
+            bfgs_trust_optimize(&mut x_ref, &mut eval_ref, &params, &mut ws_ref);
+
+        // Resumable run: init + repeated 3-iter bursts until terminal.
+        let mut x_res = [-1.0f32, 1.0];
+        let mut ws_res = BfgsWorkspace::new();
+        let mut eval_res = eval;
+        assert!(bfgs_trust_init(&mut x_res, &mut eval_res, &params, &mut ws_res).is_none());
+        let mut keep_going = || true;
+        let status_res = loop {
+            if let Some(r) = bfgs_trust_resume(
+                &mut x_res,
+                &mut eval_res,
+                &params,
+                &mut ws_res,
+                &mut keep_going,
+                3,
+            ) {
+                break r;
+            }
+        };
+
+        assert_eq!(status_ref, status_res);
+        assert_eq!(iters_ref, ws_res.iter_count());
+        assert_eq!(cost_ref.to_bits(), ws_res.fx().to_bits());
+        assert_eq!(x_ref[0].to_bits(), x_res[0].to_bits());
+        assert_eq!(x_ref[1].to_bits(), x_res[1].to_bits());
     }
 
     #[test]

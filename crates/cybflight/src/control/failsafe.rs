@@ -67,6 +67,19 @@ fn enter_failsafe(reason: &str) {
     crate::status::STATUS
         .sender()
         .send(crate::status::SystemStatus::Failsafe);
+    // Clear any in-flight mission so a subsequent arm does not resume a
+    // stale trajectory. Safe no-op when no mission is active.
+    #[cfg(feature = "outer_mpc")]
+    {
+        super::MISSION_ABORT_REQUESTED.store(false, Ordering::Release);
+        super::MISSION_TRAJECTORY_SLOT.lock(|s| {
+            let _ = s.borrow_mut().take();
+            super::MISSION_STATE.store(
+                super::MissionState::Idle as u8,
+                Ordering::Release,
+            );
+        });
+    }
 }
 
 /// Check if the controller heartbeat has timed out.

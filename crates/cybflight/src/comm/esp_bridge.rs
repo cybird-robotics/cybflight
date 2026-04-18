@@ -17,6 +17,8 @@ use cybflight_msgs::wire::{
 };
 #[cfg(feature = "est_eskf")]
 use cybflight_msgs::wire::WirePositionControlSetpoint;
+#[cfg(feature = "outer_mpc")]
+use cybflight_msgs::wire::WireMissionStatus;
 
 use super::{encode_frame, FrameAccumulator};
 
@@ -123,6 +125,8 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
     let mut arm_sub = crate::ARM_DISARM.subscriber().unwrap();
     let mut odom_sub = sensors::VEHICLE_ODOMETRY.subscriber().unwrap();
     let mut motor_sub = control::ACTUATOR_MOTORS_TELEM.subscriber().unwrap();
+    #[cfg(feature = "outer_mpc")]
+    let mut mission_status_sub = control::MISSION_STATUS.subscriber().unwrap();
 
     let mut seq: u8 = 0;
     // Batch buffer: holds all COBS-encoded frames for one tick.
@@ -233,6 +237,12 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
         }
         if let Some(m) = drain_latest(&mut motor_sub) {
             let mut w = wire::WireActuatorMotors::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+        }
+        #[cfg(feature = "outer_mpc")]
+        if let Some(m) = drain_latest(&mut mission_status_sub) {
+            let mut w = WireMissionStatus::from_msg(&m);
             w.timestamp_us = utc_ts(m.timestamp);
             pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }

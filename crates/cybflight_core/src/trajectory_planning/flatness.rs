@@ -14,6 +14,8 @@
 #[allow(unused_imports)]
 use num_traits::Float;
 
+use nalgebra::{Matrix3, Rotation3, UnitQuaternion, Vector3};
+
 use super::types::{dot3, norm_sq3, Vec3};
 
 /// Thrust-vector basis. Computed from acceleration alone — cheap.
@@ -102,6 +104,42 @@ pub fn extend_to_flatness(alpha: &AlphaState, jer: Vec3) -> FlatnessState {
         s_inv,
         omega,
     }
+}
+
+/// Reference body-to-world quaternion from the flat output `acc` and a
+/// desired yaw `yaw_rad` (natural default `0.0`).
+///
+/// Direct port of `QuadManifold::toStateWithTrueYaw` (quaternion branch).
+/// Conventions: ENU world / FLU body, `gravity` is positive (e.g. 9.81),
+/// so `GVEC = (0, 0, -gravity)` and `accCmd = acc - GVEC = acc + (0, 0, g)`.
+///
+///   z_B   = accCmd.normalized()
+///   x_c   = R_z(yaw) · x̂      y_c = R_z(yaw) · ŷ
+///   x_B   = (y_c × z_B).normalized()
+///   y_B   = (z_B × x_B).normalized()
+///   R_W_B = [x_B  y_B  z_B]    → quaternion
+///
+/// Floors `‖accCmd‖` and `‖y_c × z_B‖` at 1e-8 to keep the result finite
+/// in free-fall and inverted-tilt edge cases; the planner's tilt-limit
+/// penalty already keeps trajectories well clear of those regimes.
+#[inline]
+pub fn reference_quaternion(acc: Vec3, yaw_rad: f32, gravity: f32) -> UnitQuaternion<f32> {
+    let acc_cmd = Vector3::new(acc[0], acc[1], acc[2] + gravity);
+    let inv_norm = 1.0 / acc_cmd.norm().max(1e-8);
+    let z_b = acc_cmd * inv_norm;
+
+    let s = libm::sinf(yaw_rad);
+    let c = libm::cosf(yaw_rad);
+    let y_c = Vector3::new(-s, c, 0.0);
+
+    let x_b_unnorm = y_c.cross(&z_b);
+    let x_b = x_b_unnorm * (1.0 / x_b_unnorm.norm().max(1e-8));
+
+    let y_b_unnorm = z_b.cross(&x_b);
+    let y_b = y_b_unnorm * (1.0 / y_b_unnorm.norm().max(1e-8));
+
+    let r_wb = Matrix3::from_columns(&[x_b, y_b, z_b]);
+    UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(r_wb))
 }
 
 /// Backpropagate body rate gradient through the flatness chain.

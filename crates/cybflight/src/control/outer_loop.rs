@@ -12,9 +12,9 @@
 
 use cybflight_core::mpc::quad_model::{N as MPC_N, NU as MPC_NU, NX as MPC_NX};
 use cybflight_core::mpc::{QuadModel, SimpleQuadProblem, SimpleSqpSolver};
-use cybflight_core::rotation::quaternion_to_yaw;
+use cybflight_core::trajectory_planning::flatness::reference_quaternion;
 use embassy_time::{Duration, Instant, Ticker};
-use nalgebra::{SVector, Vector3};
+use nalgebra::{SVector, UnitQuaternion, Vector3};
 use static_cell::StaticCell;
 
 type MpcStateVec = SVector<f32, MPC_NX>;
@@ -23,7 +23,6 @@ type MpcInputVec = SVector<f32, MPC_NU>;
 use crate::msgs;
 use crate::sensors::VEHICLE_ODOMETRY;
 use crate::vehicle::QUADROTOR_BODY;
-use nalgebra::UnitQuaternion;
 
 /// Static-allocated SQP workspace (~32 KB in BSS, init-once at task startup).
 static MPC_SOLVER: StaticCell<SimpleSqpSolver> = StaticCell::new();
@@ -42,6 +41,11 @@ const ODOM_STALE_TIMEOUT: Duration = Duration::from_millis(100);
 /// that ran long is more likely to have diverged. Persistent overruns will
 /// trip the inner loop's `MPC_CMD_STALE_TIMEOUT` and the failsafe watchdog.
 // const MPC_SOLVE_BUDGET: Duration = Duration::from_millis(8);
+
+const POS_PUB_DECIMATION: u32 = 1;
+const ATT_PUB_DECIMATION: u32 = 1;
+const OCP_PUB_DECIMATION: u32 = 1;
+const MISSION_PUB_DECIMATION: u32 = 10;
 
 /// Reject odometry with any non-finite component.
 fn odom_is_valid(odom: &msgs::VehicleOdometry) -> bool {
@@ -86,6 +90,7 @@ pub async fn control_loop_task() {
     let pos_ctrl_pub = super::POSITION_CONTROL_SETPOINT.immediate_publisher();
     let att_ctrl_pub = super::ATTITUDE_CONTROL_SETPOINT.immediate_publisher();
     let ocp_pub = super::OCP_SOLVER_OUTPUT.immediate_publisher();
+    let mission_status_pub = super::MISSION_STATUS.immediate_publisher();
     let mut odom_sub = VEHICLE_ODOMETRY
         .subscriber()
         .expect("outer_loop: VEHICLE_ODOMETRY subscriber");
@@ -94,16 +99,8 @@ pub async fn control_loop_task() {
     //
     // `rc_interpreter_task` fires `ACTIVE_SETPOINT_READY` once it has
     // written the init value (after ESKF convergence + first finite
-    // origin). We are the sole waiter under `outer_mpc`.
+    // origin). We are the sole waiter under `est_eskf + outer_mpc`.
     super::ACTIVE_SETPOINT_READY.wait().await;
-    let initial = super::read_active_setpoint()
-        .expect("outer_loop: ACTIVE_POSITION_SETPOINT empty after READY");
-    let mut pos_setpoint: Vector3<f32> = initial.position;
-    let half = 0.5 * initial.yaw_rad;
-    let (sin_h, cos_h) = (libm::sinf(half), libm::cosf(half));
-    let mut att_setpoint: nalgebra::UnitQuaternion<f32> = nalgebra::UnitQuaternion::new_normalize(
-        nalgebra::Quaternion::new(cos_h, 0.0, 0.0, sin_h),
-    );
     while !crate::estimation::ESTIMATOR_READY.load(core::sync::atomic::Ordering::Acquire) {
         embassy_time::Timer::after_millis(100).await;
     }
@@ -113,20 +110,67 @@ pub async fn control_loop_task() {
     let mut local_param_ver =
         crate::params::PARAM_VERSION.load(core::sync::atomic::Ordering::Acquire);
 
+    // ── Reference-state envelope (hard clamp on trajectory samples) ──
+    //
+    // The trajectory optimizer enforces velocity/thrust/tilt/body-rate
+    // limits as **soft** penalties. A MaxIterations solve may leave
+    // penalties only partly resolved, so we clamp reference components
+    // to hard limits before handing them to the MPC — preventing a
+    // marginally-feasible trajectory from commanding saturating
+    // references that then cause tracking error → failsafe trip.
+    //
+    // Position reference is not clamped (the planner's head/tail are
+    // algebraic boundary conditions, and the circle lives inside a
+    // bounded region by construction).
+    let mut max_vel_m_s = params.planner.max_vel_m_s;
+    // let mut max_tilt_rad = params.planner.max_tilt_rad;
+
     // ── 100 Hz tick loop ───────────────────────────────────────────────
     let mut ticker = Ticker::every(Duration::from_millis(10));
+    let mut tick: u32 = 0;
     loop {
         ticker.next().await;
+        tick = tick.wrapping_add(1);
 
-        // 1. Snapshot the current tracked position setpoint (RC stick
-        //    integrator writes ACTIVE_POSITION_SETPOINT each frame).
-        if let Some(sp) = super::read_active_setpoint() {
-            pos_setpoint = sp.position;
-            let half = 0.5 * sp.yaw_rad;
-            let (sin_h, cos_h) = (libm::sinf(half), libm::cosf(half));
-            att_setpoint = nalgebra::UnitQuaternion::new_normalize(
-                nalgebra::Quaternion::new(cos_h, 0.0, 0.0, sin_h),
-            );
+        // 1. Snapshot the current tracked position + yaw setpoint for
+        //    this tick. `ACTIVE_POSITION_SETPOINT` is the single source
+        //    of truth: rc_interpreter writes it during Idle, we write it
+        //    during Executing. Reading it once at the top of the tick
+        //    gives a consistent view for the hover-reference path below.
+        //
+        //    Defensive: if somehow None (should not happen after the
+        //    startup handshake), skip this tick. Liveness is preserved
+        //    because rc_interpreter will seed the cell on its next
+        //    frame and we'll resume.
+        let (pos_setpoint, yaw_setpoint_rad): (Vector3<f32>, f32) =
+            match super::read_active_setpoint() {
+                Some(sp) => (sp.position, sp.yaw_rad),
+                None => {
+                    defmt::warn!("MPC outer loop: ACTIVE_POSITION_SETPOINT empty, skipping tick");
+                    continue;
+                }
+            };
+
+        // Build the yaw-only reference attitude from `yaw_setpoint_rad`.
+        // Under the current stick integrator and MINCO planner this is
+        // always ψ=0 (identity quaternion), but threading the actual
+        // `yaw_rad` through keeps the plumbing honest and makes future
+        // yaw-commanding writers (e.g. a yaw-capable planner) drop in
+        // without touching this file.
+        let half = 0.5 * yaw_setpoint_rad;
+        let (sin_h, cos_h) = (libm::sinf(half), libm::cosf(half));
+        // let att_setpoint: UnitQuaternion<f32> = UnitQuaternion::new_normalize(
+        //     nalgebra::Quaternion::new(cos_h, 0.0, 0.0, sin_h), // (w, x, y, z)
+        // );
+
+        // Fill the MPC attitude reference (qx, qy, qz, qw at indices 3..7)
+        // for every horizon node with this yaw-only quaternion. Position
+        // and velocity slots are overwritten below per-state branch.
+        for k in 0..=MPC_N {
+            x_refs[k][3] = 0.0;
+            x_refs[k][4] = 0.0;
+            x_refs[k][5] = sin_h;
+            x_refs[k][6] = cos_h;
         }
 
         // 2. Hot-reload params when disarmed (mirrors indi_task's pattern).
@@ -142,6 +186,7 @@ pub async fn control_loop_task() {
                 let hover_u = MpcInputVec::from_row_slice(&[hover_thrust, 0.0, 0.0, 0.0]);
                 u_refs = [hover_u; MPC_N];
                 u_warm = u_refs;
+                max_vel_m_s = np.planner.max_vel_m_s;
                 defmt::info!("MPC outer loop: params reloaded (ver {})", cur);
             }
         }
@@ -187,12 +232,246 @@ pub async fn control_loop_task() {
             odom.twist.linear.z,
         ]);
 
-        // 5. Refresh reference position (identity quat + zero velocity were
-        //    set at task init).
-        for x_ref in x_refs.iter_mut() {
-            x_ref[0] = pos_setpoint.x;
-            x_ref[1] = pos_setpoint.y;
-            x_ref[2] = pos_setpoint.z;
+        // 5. Refresh reference state per horizon node.
+        //
+        //    If a mission is Executing, sample the trajectory at
+        //    τ_k = τ₀ + k · MPC_DT with τ₀ = now − t_start. Each node gets
+        //    its OWN position + velocity reference so the MPC tracks the
+        //    trajectory's time profile rather than a single moving target.
+        //
+        //    Past-end samples are clamped to the final pose (zero velocity)
+        //    so the terminal cost drives a clean hover at the landing point.
+        //    When node 0 (τ₀) has itself passed the end, we transition
+        //    Executing → Idle and clear the slot.
+        //
+        //    If Idle or Planning (no trajectory), all nodes get the current
+        //    hover setpoint (`pos_setpoint`, last RC stick value) with zero
+        //    velocity — same behavior as before the planner existed.
+        let mpc_dt: f32 = mpc_problem.model.dt;
+        let mut mission_state = super::MissionState::from_u8(
+            super::MISSION_STATE.load(core::sync::atomic::Ordering::Acquire),
+        );
+
+        // Graceful abort path (user released AUX switch before mission end).
+        //
+        // We own the transition so the hover fallback point is
+        // deterministic and bounded: we capture the **trajectory's**
+        // reference position at the moment of abort, not the live
+        // odometry. Rationale (same logic as rc_interpreter's passive
+        // tracking):
+        //   - trajectory samples are finite-by-construction from a
+        //     polynomial with finite coefficients,
+        //   - the MPC was actively driving the drone toward that
+        //     reference, so its pose is close,
+        //   - a spike in ESKF output at the abort instant cannot
+        //     poison the hover target.
+        //
+        // Zero velocity and identity attitude are the natural hover
+        // setpoint — the drone will roll/pitch back to level and arrest
+        // whatever velocity the mission had induced.
+        //
+        // If state was Planning (slot empty), there is no trajectory to
+        // sample; leave `pos_setpoint` at whatever pre-mission value it
+        // held. The drone is still near that point because it never
+        // started moving.
+        if mission_state != super::MissionState::Idle
+            && super::MISSION_ABORT_REQUESTED.swap(false, core::sync::atomic::Ordering::AcqRel)
+        {
+            let captured: Option<[f32; 3]> = super::MISSION_TRAJECTORY_SLOT.lock(|slot| {
+                let mut out = None;
+                {
+                    let cell = slot.borrow();
+                    if let Some(traj) = cell.as_ref() {
+                        let now = Instant::now();
+                        let tau = if now >= traj.t_start {
+                            (now.duration_since(traj.t_start).as_micros() as f32) * 1e-6
+                        } else {
+                            0.0
+                        };
+                        let tau_c = tau.clamp(0.0, traj.total_duration_s);
+                        let p = traj.traj.get_pos(tau_c);
+                        if p[0].is_finite() && p[1].is_finite() && p[2].is_finite() {
+                            out = Some(p);
+                        }
+                    }
+                }
+                // Clear slot AND flip state to Idle under the same lock so
+                // the (state, slot) pair stays consistent for any
+                // concurrent observer. See mission_planner.rs publish path.
+                *slot.borrow_mut() = None;
+                super::MISSION_STATE.store(
+                    super::MissionState::Idle as u8,
+                    core::sync::atomic::Ordering::Release,
+                );
+                out
+            });
+
+            // Invariant (a): ACTIVE_POSITION_SETPOINT must be refreshed
+            // BEFORE MISSION_STATE flips to Idle, so that rc_interpreter's
+            // very first Idle tick reads the abort-point (not a stale
+            // pre-mission value) as its stick-integration base.
+            let now = Instant::now();
+            if let Some(p) = captured {
+                super::ACTIVE_POSITION_SETPOINT.lock(|cell| {
+                    cell.set(Some(super::ActiveSetpoint {
+                        timestamp: now,
+                        position: Vector3::new(p[0], p[1], p[2]),
+                        yaw_rad: 0.0,
+                    }));
+                });
+                defmt::info!("outer_loop: mission abort honored — hovering at trajectory ref");
+            } else {
+                // Slot was empty (Planning phase, or race with completion).
+                // Refresh the timestamp on the existing value so the
+                // liveness stamp stays monotonic, but leave the position
+                // unchanged — the drone hasn't moved from it yet.
+                super::ACTIVE_POSITION_SETPOINT.lock(|cell| {
+                    if let Some(mut sp) = cell.get() {
+                        sp.timestamp = now;
+                        cell.set(Some(sp));
+                    }
+                });
+                defmt::info!(
+                    "outer_loop: mission abort honored (no trajectory ref, holding prior setpoint)"
+                );
+            }
+            // State already flipped to Idle inside the slot lock above;
+            // mirror it locally so the rest of the tick takes the hover
+            // branch.
+            mission_state = super::MissionState::Idle;
+        }
+
+        let mut sampled_from_trajectory = false;
+        // Per-tick outputs of the trajectory-sample block, produced under
+        // the slot lock and consumed below to (a) refresh
+        // `ACTIVE_POSITION_SETPOINT` with the τ₀ sample and (b) decide
+        // whether to end the mission.
+        let mut tau0_sample: Option<[f32; 3]> = None;
+        let mut mission_done_final: Option<[f32; 3]> = None;
+        // Captured for MISSION_STATUS telemetry publish below.
+        let mut tau_and_duration: Option<(f32, f32)> = None;
+        if mission_state == super::MissionState::Executing {
+            // Hold the mutex across all horizon samples to avoid cloning
+            // the ~2 KB polynomial. The slot is written at most once per
+            // mission by the planner task, so there is no contention.
+            super::MISSION_TRAJECTORY_SLOT.lock(|slot| {
+                let cell = slot.borrow();
+                let Some(traj) = cell.as_ref() else {
+                    return; // Race: slot was cleared. Fall through to hover.
+                };
+
+                let now = Instant::now();
+                let tau0 = if now >= traj.t_start {
+                    now.duration_since(traj.t_start).as_micros() as f32 * 1e-6
+                } else {
+                    0.0
+                };
+
+                // Defensive: a negative or non-finite `max_vel_m_s` would
+                // make `f32::clamp(-v, v)` panic (lo > hi). Coerce to a
+                // sane non-negative number. Default is 5 m/s.
+                let v_lim = if max_vel_m_s.is_finite() && max_vel_m_s >= 0.0 {
+                    max_vel_m_s
+                } else {
+                    0.0
+                };
+                let grav = mpc_problem.model.grav;
+                for k in 0..=MPC_N {
+                    let t_k = (tau0 + k as f32 * mpc_dt).min(traj.total_duration_s);
+                    let past_end = t_k >= traj.total_duration_s;
+                    let (p, v) = if past_end {
+                        // Clamp to terminal pose, zero velocity.
+                        (traj.traj.get_pos(traj.total_duration_s), [0.0_f32; 3])
+                    } else {
+                        (traj.traj.get_pos(t_k), traj.traj.get_vel(t_k))
+                    };
+                    // Position.
+                    x_refs[k][0] = p[0];
+                    x_refs[k][1] = p[1];
+                    x_refs[k][2] = p[2];
+                    // Velocity slots [7..10]. Hard-clamp each component to
+                    // ±`max_vel_m_s` to defend against a solve that left
+                    // soft velocity penalties only partially resolved
+                    // (e.g. SolverStatus::MaxIterations).
+                    x_refs[k][7] = v[0].clamp(-v_lim, v_lim);
+                    x_refs[k][8] = v[1].clamp(-v_lim, v_lim);
+                    x_refs[k][9] = v[2].clamp(-v_lim, v_lim);
+                    // Quaternion via differential-flatness map. Past-end
+                    // nodes keep the pre-loop yaw-only fill (zero accel →
+                    // identity tilt → terminal hover at yaw_setpoint_rad).
+                    if !past_end {
+                        let acc = traj.traj.get_acc(t_k);
+                        let q_ref = reference_quaternion(acc, yaw_setpoint_rad, grav);
+                        x_refs[k][3] = q_ref.i; // qx
+                        x_refs[k][4] = q_ref.j; // qy
+                        x_refs[k][5] = q_ref.k; // qz
+                        x_refs[k][6] = q_ref.w; // qw (scalar-last)
+                    }
+                }
+
+                sampled_from_trajectory = true;
+                tau_and_duration = Some((tau0, traj.total_duration_s));
+
+                // Snapshot the τ₀ sample — this is the "currently tracked
+                // point" we must publish to ACTIVE_POSITION_SETPOINT each
+                // tick (invariant b: every Executing tick refreshes the
+                // shared cell, so its timestamp is a live liveness proof).
+                // If τ₀ has reached the end, clamp to the terminal pose
+                // so the hand-off to Idle lands exactly on the endpoint.
+                tau0_sample = Some(if tau0 >= traj.total_duration_s {
+                    traj.traj.get_pos(traj.total_duration_s)
+                } else {
+                    traj.traj.get_pos(tau0)
+                });
+
+                if tau0 >= traj.total_duration_s {
+                    mission_done_final = Some(traj.traj.get_pos(traj.total_duration_s));
+                }
+            });
+
+            // Write the shared cell with this tick's tracked reference.
+            // Invariant (a): this happens BEFORE any MISSION_STATE
+            // transition, so rc_interpreter's first Idle tick reads a
+            // value consistent with the mission's endpoint.
+            if let Some(p) = tau0_sample {
+                if p[0].is_finite() && p[1].is_finite() && p[2].is_finite() {
+                    let now = Instant::now();
+                    super::ACTIVE_POSITION_SETPOINT.lock(|cell| {
+                        cell.set(Some(super::ActiveSetpoint {
+                            timestamp: now,
+                            position: Vector3::new(p[0], p[1], p[2]),
+                            yaw_rad: 0.0,
+                        }));
+                    });
+                }
+            }
+
+            if let Some(_final_pos) = mission_done_final {
+                // Cell was already refreshed to the terminal pose above.
+                // Clear slot AND flip state under the same lock to keep
+                // the (state, slot) pair consistent for any concurrent
+                // observer (mirrors mission_planner.rs's publish path).
+                super::MISSION_TRAJECTORY_SLOT.lock(|slot| {
+                    *slot.borrow_mut() = None;
+                    super::MISSION_STATE.store(
+                        super::MissionState::Idle as u8,
+                        core::sync::atomic::Ordering::Release,
+                    );
+                });
+                defmt::info!("outer_loop: mission complete → Idle");
+            }
+        }
+
+        if !sampled_from_trajectory {
+            // Hover reference: single pos_setpoint, zero velocity.
+            for k in 0..=MPC_N {
+                x_refs[k][0] = pos_setpoint.x;
+                x_refs[k][1] = pos_setpoint.y;
+                x_refs[k][2] = pos_setpoint.z;
+                x_refs[k][7] = 0.0;
+                x_refs[k][8] = 0.0;
+                x_refs[k][9] = 0.0;
+            }
         }
 
         // 6. Solve one SQP iteration (max_iters = 1, matches host benchmark).
@@ -221,18 +500,22 @@ pub async fn control_loop_task() {
         //     the command reach INDI.
         clamp_mpc_output(&mut u0, &mpc_problem.model.u_bounds);
 
-        // 8. Extract predicted attitude from the SECOND MPC state (index 1).
-        //    x_bar[0] is the current/measured state; x_bar[1] is the
-        //    one-step-ahead prediction — the attitude reference the MPC is
-        //    driving toward.
-        let x1 = &mpc_solver.x_bar()[1];
-        let att_ref = UnitQuaternion::new_normalize(nalgebra::Quaternion::new(
-            x1[6], // qw (scalar-last layout in state, scalar-first in nalgebra ctor)
-            x1[3], // qx
-            x1[4], // qy
-            x1[5], // qz
+        // 8. Reference attitude/velocity for telemetry come from the
+        //    current reference state x_refs[0] — the trajectory sample
+        //    (or hover fallback) we just handed to the SQP. Publishing the
+        //    reference rather than the MPC's one-step prediction makes the
+        //    downlink show what we *asked* the controller to track. Yaw is
+        //    `yaw_setpoint_rad` by construction (both the flatness map and
+        //    the hover fill build the reference attitude from it), so we
+        //    skip the `quaternion_to_yaw` round-trip.
+        let xr0 = &x_refs[0];
+        let ref_att = UnitQuaternion::new_normalize(nalgebra::Quaternion::new(
+            xr0[6], // qw (scalar-last in state, scalar-first in nalgebra ctor)
+            xr0[3], // qx
+            xr0[4], // qy
+            xr0[5], // qz
         ));
-        let yaw_ref = quaternion_to_yaw(&att_ref, 0.0);
+        let ref_vel = Vector3::new(xr0[7], xr0[8], xr0[9]);
 
         let publish_time = Instant::now();
 
@@ -240,32 +523,62 @@ pub async fn control_loop_task() {
         super::RATE_COMMAND.signal(msgs::AttitudeControlSetpoint {
             timestamp: publish_time,
             collective_thrust_n: u0[0],
-            attitude_quaternion: att_setpoint,
+            attitude_quaternion: ref_att,
             body_rate_rad_s: Vector3::new(u0[1], u0[2], u0[3]),
             torque_n_m: Vector3::zeros(),
         });
 
         // 10. Publish telemetry for downlink (fulfils the promise in indi_task's
         //     comment that the MPC path delegates these to outer_loop).
-        pos_ctrl_pub.publish_immediate(msgs::PositionControlSetpoint {
-            timestamp: publish_time,
-            position: pos_setpoint,
-            velocity: Vector3::new(x1[7], x1[8], x1[9]),
-            yaw: yaw_ref,
-        });
-        att_ctrl_pub.publish_immediate(msgs::AttitudeControlSetpoint {
-            timestamp: publish_time,
-            collective_thrust_n: u0[0],
-            attitude_quaternion: att_ref,
-            body_rate_rad_s: Vector3::new(u0[1], u0[2], u0[3]),
-            torque_n_m: Vector3::zeros(),
-        });
-        ocp_pub.publish_immediate(msgs::OcpSolverOutput {
-            timestamp: publish_time,
-            command: nalgebra::SVector::from(u0),
-            iterations: result.iters as i32,
-            converged: result.converged,
-            solve_time_us,
-        });
+        if tick % POS_PUB_DECIMATION == 0 {
+            pos_ctrl_pub.publish_immediate(msgs::PositionControlSetpoint {
+                timestamp: publish_time,
+                position: pos_setpoint,
+                velocity: ref_vel,
+                yaw: yaw_setpoint_rad,
+                // collective_thrust_n: u0[0],
+            });
+        }
+        if tick % ATT_PUB_DECIMATION == 0 {
+            att_ctrl_pub.publish_immediate(msgs::AttitudeControlSetpoint {
+                timestamp: publish_time,
+                collective_thrust_n: u0[0],
+                attitude_quaternion: ref_att,
+                body_rate_rad_s: Vector3::new(u0[1], u0[2], u0[3]),
+                torque_n_m: Vector3::zeros(),
+            });
+        }
+        if tick % OCP_PUB_DECIMATION == 0 {
+            ocp_pub.publish_immediate(msgs::OcpSolverOutput {
+                timestamp: publish_time,
+                command: u0,
+                iterations: result.iters as i32,
+                converged: result.converged,
+                solve_time_us,
+            });
+        }
+
+        // Mission status heartbeat. Read the authoritative state (may have
+        // been flipped to Idle above on completion or abort). For non-Executing
+        // ticks, tau/duration are zero; target_position is whatever the
+        // outer loop is currently tracking (pos_setpoint for hover, τ₀
+        // sample for Executing).
+        let final_state = super::MissionState::from_u8(
+            super::MISSION_STATE.load(core::sync::atomic::Ordering::Acquire),
+        );
+        let (tau_pub, dur_pub) = tau_and_duration.unwrap_or((0.0, 0.0));
+        let target_pub = match tau0_sample {
+            Some(p) => Vector3::new(p[0], p[1], p[2]),
+            None => pos_setpoint,
+        };
+        if tick % MISSION_PUB_DECIMATION == 0 {
+            mission_status_pub.publish_immediate(msgs::MissionStatus {
+                timestamp: publish_time,
+                state: final_state as u8,
+                tau_s: tau_pub,
+                total_duration_s: dur_pub,
+                target_position: target_pub,
+            });
+        }
     }
 }

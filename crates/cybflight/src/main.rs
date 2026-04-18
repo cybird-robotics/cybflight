@@ -148,6 +148,11 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::control::outer_loop::control_loop_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn MPC outer loop task"));
+    // Mission planner (BFGS trajectory solver, thread executor).
+    #[cfg(feature = "outer_mpc")]
+    spawner
+        .spawn(cybflight::control::mission_planner::mission_planner_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn mission planner task"));
     spawner
         .spawn(cybflight::usb_serial::att_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude stream task"));

@@ -7,7 +7,10 @@
 #[allow(unused_imports)]
 use num_traits::Float;
 
-use super::bfgs_trust::{bfgs_trust_optimize, BfgsTrustResult, BfgsWorkspace};
+use super::bfgs_trust::{
+    bfgs_trust_init, bfgs_trust_optimize_budgeted, bfgs_trust_resume, BfgsTrustResult,
+    BfgsWorkspace,
+};
 use super::cost_eval::CostEvaluator;
 use super::minco_jerk::MincoJerk;
 use super::penalties::{backward_t, forward_t};
@@ -23,6 +26,12 @@ pub enum SolverStatus {
     Stop,
     MaxIterations,
     InvalidValue,
+    /// The caller's time-budget callback returned `false` before
+    /// convergence. The returned trajectory is built from the last
+    /// accepted iterate and should typically be discarded — callers
+    /// that requested a budget did so because a timely abort was more
+    /// important than a valid trajectory.
+    TimeExceeded,
 }
 
 impl From<BfgsTrustResult> for SolverStatus {
@@ -32,6 +41,7 @@ impl From<BfgsTrustResult> for SolverStatus {
             BfgsTrustResult::Stop => Self::Stop,
             BfgsTrustResult::MaxIterations => Self::MaxIterations,
             BfgsTrustResult::InvalidValue => Self::InvalidValue,
+            BfgsTrustResult::TimeExceeded => Self::TimeExceeded,
         }
     }
 }
@@ -172,7 +182,47 @@ pub struct PlannerResult {
 /// Jointly optimizes waypoint positions and segment times to minimize a
 /// weighted sum of trajectory time, energy (jerk integral), and soft
 /// constraint penalties (velocity, thrust, tilt, body rate).
+///
+/// Allocates a `BfgsWorkspace` (~35 KB) on the caller's stack. For
+/// tight-stack / long-lived contexts (e.g. an Embassy task on a small
+/// task stack), use [`plan_with_workspace`] and own the workspace
+/// in `static`/BSS storage.
 pub fn plan(input: &PlannerInput, config: &QuadPlanningConfig) -> PlannerResult {
+    let mut ws = BfgsWorkspace::new();
+    plan_with_workspace(input, config, &mut ws)
+}
+
+/// Run trajectory optimization using a caller-provided BFGS workspace.
+///
+/// Identical to [`plan`] but lets the caller place the ~35 KB workspace
+/// in static storage (e.g. `static_cell::StaticCell<BfgsWorkspace>`),
+/// avoiding a large stack allocation per call. Safe to call repeatedly
+/// with the same workspace — `bfgs_trust_optimize` initializes all state
+/// it needs from the workspace on entry.
+pub fn plan_with_workspace(
+    input: &PlannerInput,
+    config: &QuadPlanningConfig,
+    ws: &mut BfgsWorkspace,
+) -> PlannerResult {
+    plan_with_workspace_budgeted(input, config, ws, &mut || true)
+}
+
+/// Same as [`plan_with_workspace`] but honors a caller-supplied
+/// `keep_going` callback. The solver polls it once per outer iteration;
+/// returning `false` aborts the solve with
+/// [`SolverStatus::TimeExceeded`] and a (possibly sub-optimal) last-
+/// accepted iterate in `trajectory`. Intended for wall-clock deadlines
+/// enforced by an embedded caller — e.g. a flight controller that
+/// cannot afford a planner thread to exceed a watchdog budget.
+pub fn plan_with_workspace_budgeted<K>(
+    input: &PlannerInput,
+    config: &QuadPlanningConfig,
+    ws: &mut BfgsWorkspace,
+    keep_going: &mut K,
+) -> PlannerResult
+where
+    K: FnMut() -> bool,
+{
     let n_wp = input.num_waypoints;
     let n_pieces = n_wp + 1;
     debug_assert!(n_pieces >= 1 && n_pieces <= MAX_PIECES);
@@ -204,15 +254,12 @@ pub fn plan(input: &PlannerInput, config: &QuadPlanningConfig) -> PlannerResult 
         evaluator.evaluate(xv, grad)
     };
 
-    // Optimize. Workspace is stack-allocated here (~35 KB). For tighter
-    // stacks, lift it into a user-owned slot (static, DTCM, etc.) and
-    // call `bfgs_trust_optimize` directly with a `&mut BfgsWorkspace`.
-    let mut ws = BfgsWorkspace::new();
-    let (result, final_cost, iterations) = bfgs_trust_optimize(
+    let (result, final_cost, iterations) = bfgs_trust_optimize_budgeted(
         &mut x[..dim_total],
         &mut eval_fn,
         &config.planner.bfgs_trust,
-        &mut ws,
+        ws,
+        keep_going,
     );
 
     // Extract solution via stereographic forward map.
@@ -247,6 +294,213 @@ pub fn plan(input: &PlannerInput, config: &QuadPlanningConfig) -> PlannerResult 
         optimized_times: opt_times,
         optimized_waypoints: opt_wp,
         num_pieces: n_pieces,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resumable planner API — lets an async caller interleave solver bursts with
+// `yield_now().await` so cooperatively-scheduled peer tasks (GPS, baro, mag)
+// are not starved during a long trajectory solve. The one-shot entry points
+// above are thin wrappers around this API.
+// ---------------------------------------------------------------------------
+
+/// Per-solve state for a resumable trajectory optimization.
+///
+/// Constructed by [`plan_init`]; advanced by repeated calls to
+/// [`plan_resume`]; consumed by [`plan_finalize`] to extract the
+/// `PlannerResult`. Holds its own `CostEvaluator` (which owns the
+/// inner MINCO solver) so the async caller only has to persist the
+/// session between yields — the workspace and session together carry
+/// all state the solver needs to pick up where it left off.
+pub struct PlanSession {
+    /// Decision vector: `[K_times..., D_stereographic...]`, padded to max size.
+    pub x: [f32; 4 * MAX_PIECES],
+    /// Active decision-vector length (`dim_k + dim_d`).
+    pub dim_total: usize,
+    /// Number of polynomial pieces.
+    pub n_pieces: usize,
+    /// Number of intermediate waypoints (`n_pieces - 1`).
+    pub n_wp: usize,
+    /// Ball-shape stereographic radius, copied from the input.
+    pub waypoint_radius: f32,
+    /// Nominal waypoint centers, copied from the input for later forward-map.
+    pub nominal_waypoints: [Vec3; MAX_PIECES],
+    /// Head/tail boundary conditions (for the final MINCO trajectory build).
+    pub head: PVA3D,
+    pub tail: PVA3D,
+    /// Owned cost evaluator (holds the MINCO solver used at every evaluate).
+    evaluator: CostEvaluator,
+    /// Terminal status once resume returns one; `None` while still running.
+    status: Option<SolverStatus>,
+}
+
+/// Initialize a resumable trajectory solve.
+///
+/// Performs the same setup as [`plan_with_workspace_budgeted`] up through
+/// (and including) the first cost/gradient evaluation on the initial
+/// guess, then returns. Subsequent [`plan_resume`] calls advance the solver.
+pub fn plan_init(
+    input: &PlannerInput,
+    config: &QuadPlanningConfig,
+    ws: &mut BfgsWorkspace,
+) -> PlanSession {
+    let n_wp = input.num_waypoints;
+    let n_pieces = n_wp + 1;
+    debug_assert!(n_pieces >= 1 && n_pieces <= MAX_PIECES);
+
+    let dim_k = n_pieces;
+    let dim_d = 3 * n_wp;
+    let dim_total = dim_k + dim_d;
+
+    // Decision vector: x = [K_times, D_stereographic_coords].
+    // D = 0 maps to the nominal waypoint via the stereographic projection.
+    let mut x = [0.0f32; 4 * MAX_PIECES];
+    for i in 0..n_pieces {
+        x[i] = backward_t(input.init_times[i]);
+    }
+
+    let mut evaluator = CostEvaluator::new(
+        config,
+        n_pieces,
+        &input.head,
+        &input.tail,
+        &input.waypoints,
+        input.waypoint_radius,
+    );
+
+    // Seed the solver: evaluate initial cost, set up Hessian, past-f ring.
+    let init_result = {
+        let mut eval_fn = |xv: &[f32], grad: &mut [f32]| -> f32 {
+            evaluator.evaluate(xv, grad)
+        };
+        bfgs_trust_init(
+            &mut x[..dim_total],
+            &mut eval_fn,
+            &config.planner.bfgs_trust,
+            ws,
+        )
+    };
+
+    let status = init_result.map(SolverStatus::from);
+
+    PlanSession {
+        x,
+        dim_total,
+        n_pieces,
+        n_wp,
+        waypoint_radius: input.waypoint_radius,
+        nominal_waypoints: input.waypoints,
+        head: input.head,
+        tail: input.tail,
+        evaluator,
+        status,
+    }
+}
+
+/// Run up to `max_iters_this_call` outer BFGS iterations against the session.
+///
+/// - Returns `Some(status)` if the solve has reached a terminal status
+///   (Convergence, Stop, MaxIterations, InvalidValue, TimeExceeded).
+/// - Returns `None` if the iteration budget for this call was exhausted
+///   without terminating. The caller should `yield_now().await` (or do
+///   whatever equivalent cooperative hand-off its runtime requires) and
+///   then call `plan_resume` again to continue.
+///
+/// `keep_going` is polled once per outer iteration; returning `false`
+/// aborts with `TimeExceeded`. Use this for wall-clock deadlines and
+/// emergency-disarm interlocks.
+pub fn plan_resume<K>(
+    session: &mut PlanSession,
+    config: &QuadPlanningConfig,
+    ws: &mut BfgsWorkspace,
+    keep_going: &mut K,
+    max_iters_this_call: usize,
+) -> Option<SolverStatus>
+where
+    K: FnMut() -> bool,
+{
+    // If init already produced a terminal status (e.g. InvalidValue),
+    // report it without running another step.
+    if let Some(s) = session.status {
+        return Some(s);
+    }
+
+    // Split-borrow the session so the closure can take `&mut evaluator`
+    // while the outer call takes `&mut x`.
+    let PlanSession {
+        evaluator,
+        x,
+        dim_total,
+        ..
+    } = session;
+
+    let mut eval_fn = |xv: &[f32], grad: &mut [f32]| -> f32 {
+        evaluator.evaluate(xv, grad)
+    };
+
+    let result = bfgs_trust_resume(
+        &mut x[..*dim_total],
+        &mut eval_fn,
+        &config.planner.bfgs_trust,
+        ws,
+        keep_going,
+        max_iters_this_call,
+    );
+
+    match result {
+        Some(r) => {
+            let s: SolverStatus = r.into();
+            session.status = Some(s);
+            Some(s)
+        }
+        None => None,
+    }
+}
+
+/// Build the final trajectory from the session's optimized decision vector
+/// and return the `PlannerResult`. Consumes the session.
+///
+/// `status` should be the terminal status returned by `plan_resume`; it is
+/// carried into the result verbatim. `ws` is read for the final cost and
+/// iteration count captured in workspace state.
+pub fn plan_finalize(
+    session: PlanSession,
+    ws: &BfgsWorkspace,
+    status: SolverStatus,
+) -> PlannerResult {
+    let r = session.waypoint_radius;
+    let dim_k = session.n_pieces;
+
+    // Forward stereographic map: D coords → actual waypoint positions.
+    let mut opt_times = [0.0f32; MAX_PIECES];
+    let mut opt_wp = [ZERO3; MAX_PIECES];
+    for i in 0..session.n_pieces {
+        opt_times[i] = forward_t(session.x[i]);
+    }
+    for i in 0..session.n_wp {
+        let dx = session.x[dim_k + 3 * i];
+        let dy = session.x[dim_k + 3 * i + 1];
+        let dz = session.x[dim_k + 3 * i + 2];
+        let norm_sq = dx * dx + dy * dy + dz * dz;
+        let s = 2.0 * r / (norm_sq + 1.0);
+        opt_wp[i] = [
+            session.nominal_waypoints[i][0] + s * dx,
+            session.nominal_waypoints[i][1] + s * dy,
+            session.nominal_waypoints[i][2] + s * dz,
+        ];
+    }
+
+    let mut final_minco = MincoJerk::new(&session.head, &session.tail, session.n_pieces);
+    final_minco.solve(&opt_wp[..session.n_wp], &opt_times[..session.n_pieces]);
+
+    PlannerResult {
+        trajectory: final_minco.get_trajectory(),
+        final_cost: ws.fx(),
+        iterations: ws.iter_count(),
+        status,
+        optimized_times: opt_times,
+        optimized_waypoints: opt_wp,
+        num_pieces: session.n_pieces,
     }
 }
 

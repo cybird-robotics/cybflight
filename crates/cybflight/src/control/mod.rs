@@ -1,7 +1,7 @@
 // ── Controller mode selection ────────────────────────────────────────
 //
 // outer_rate:      INDI + manual rate control (RC sticks → rate_ref)
-// outer_geometric: INDI + cascade pos→att→geometric (→ rate_ref)
+// outer_geometric: INDI + cascade pos→att→geometric (��� rate_ref)
 // outer_mpc:       INDI + SQP/MPC (→ rate_ref)
 //
 // Exactly one must be selected. outer_geometric and outer_mpc auto-enable
@@ -27,6 +27,8 @@ pub mod indi_task;
 pub mod cascade_task;
 // inner_loop.rs (legacy rate PIDs) removed — INDI is the sole inner loop.
 #[cfg(feature = "outer_mpc")]
+pub mod mission_planner;
+#[cfg(feature = "outer_mpc")]
 pub mod outer_loop;
 pub mod rc_interpreter;
 
@@ -36,6 +38,8 @@ pub mod flight_mode;
 use cybflight_msgs as msgs;
 
 use core::cell::Cell;
+#[cfg(feature = "outer_mpc")]
+use core::cell::RefCell;
 use embassy_sync::{
     blocking_mutex::{self, raw::CriticalSectionRawMutex},
     pubsub::PubSubChannel,
@@ -61,10 +65,6 @@ pub static ATTITUDE_CONTROL_SETPOINT: PubSubChannel<
     3,
     2,
 > = PubSubChannel::new();
-
-/// Auto setpoint signal (used by outer_loop in MPC mode pre-planner).
-#[cfg(feature = "est_eskf")]
-pub static AUTO_SETPOINT: Signal<CriticalSectionRawMutex, msgs::VehicleOdometry> = Signal::new();
 
 /// Rate command from outer loop to INDI inner loop.
 ///
@@ -99,6 +99,59 @@ pub fn read_active_setpoint() -> Option<ActiveSetpoint> {
 
 #[cfg(feature = "est_eskf")]
 pub static ACTIVE_SETPOINT_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+// ─���───────────────────────────────────────────────────────────────────
+// Mission planner (outer_mpc only)
+// ────────────────────────────────────────────────��────────────────────
+
+#[cfg(feature = "outer_mpc")]
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissionState {
+    Idle = 0,
+    Planning = 1,
+    Executing = 2,
+}
+
+#[cfg(feature = "outer_mpc")]
+impl MissionState {
+    #[inline]
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Planning,
+            2 => Self::Executing,
+            _ => Self::Idle,
+        }
+    }
+}
+
+#[cfg(feature = "outer_mpc")]
+pub static MISSION_STATE: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(MissionState::Idle as u8);
+
+#[cfg(feature = "outer_mpc")]
+pub static MISSION_ABORT_REQUESTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "outer_mpc")]
+pub static PLAN_REQUEST: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+#[cfg(feature = "outer_mpc")]
+pub struct MissionTrajectory {
+    pub traj: cybflight_core::trajectory_planning::piecewise_polynomial::PiecewisePolynomial,
+    pub t_start: Instant,
+    pub total_duration_s: f32,
+}
+
+#[cfg(feature = "outer_mpc")]
+pub static MISSION_STATUS: PubSubChannel<CriticalSectionRawMutex, msgs::MissionStatus, 2, 2, 1> =
+    PubSubChannel::new();
+
+#[cfg(feature = "outer_mpc")]
+pub static MISSION_TRAJECTORY_SLOT: blocking_mutex::Mutex<
+    CriticalSectionRawMutex,
+    RefCell<Option<MissionTrajectory>>,
+> = blocking_mutex::Mutex::new(RefCell::new(None));
 
 #[cfg(feature = "est_eskf")]
 pub static POSITION_CONTROL_SETPOINT: PubSubChannel<

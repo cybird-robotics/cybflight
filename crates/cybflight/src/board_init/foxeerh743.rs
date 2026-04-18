@@ -47,7 +47,15 @@ hal::bind_interrupts!(struct Usart6Irqs {
     USART6 => hal::usart::InterruptHandler<hal::peripherals::USART6>;
 });
 
-pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Board) {
+/// Board initialization (see `sakurah743::init` for routing rationale).
+/// IMU readers run on `ctrl_spawner` (interrupt P10) so the
+/// sensor→estimation→control chain is never starved by thread work.
+pub async fn init(
+    spawner: &Spawner,
+    ctrl_spawner: &SendSpawner,
+    high_spawner: &SendSpawner,
+    board: bsp::Board,
+) {
     // --- Load vehicle parameters from flash (or defaults) ---
     crate::params::init_from_flash(board.internal_flash);
 
@@ -104,7 +112,9 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
             match Icm426xx::new(dev2, board.sensors.gyro1_drdy, &mut delay).await {
                 Ok(imu1) => {
                     defmt::info!("IMU1 init OK (ICM)");
-                    spawner
+                    // IMU reader → control executor so fresh samples
+                    // preempt thread work (e.g. planner BFGS solve).
+                    ctrl_spawner
                         .spawn(icm_reader_task(
                             ImuReader::new(
                                 imu1,
@@ -123,7 +133,8 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
             match Mpu6x00::new(dev2, board.sensors.gyro1_drdy, &mut delay).await {
                 Ok(imu1) => {
                     defmt::info!("IMU1 init OK (MPU)");
-                    spawner
+                    // IMU reader → control executor (see ICM branch).
+                    ctrl_spawner
                         .spawn(mpu_reader_task(
                             ImuReader::new(
                                 imu1,
@@ -167,7 +178,11 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
             ) {
                 Ok(uart) => {
                     defmt::info!("CRSF USART2 init OK (T2=PA2, R2=PA3)");
-                    spawner
+                    // CRSF parser on ctrl_spawner (P10) — arm-switch edge
+                    // detection lives inside the parser, so this keeps
+                    // emergency-disarm response sub-5 ms even while the
+                    // thread executor is blocked by a planner solve.
+                    ctrl_spawner
                         .spawn(crate::sensors::rc::crsf_runner::crsf_task(uart))
                         .unwrap_or_else(|e| defmt::error!("Failed to spawn CRSF task: {}", e));
                 }
@@ -186,7 +201,11 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
             ) {
                 Ok(uart) => {
                     defmt::info!("CRSF USART1 init OK (T1=PA9, R1=PA10)");
-                    spawner
+                    // CRSF parser on ctrl_spawner (P10) — arm-switch edge
+                    // detection lives inside the parser, so this keeps
+                    // emergency-disarm response sub-5 ms even while the
+                    // thread executor is blocked by a planner solve.
+                    ctrl_spawner
                         .spawn(crate::sensors::rc::crsf_runner::crsf_task(uart))
                         .unwrap_or_else(|e| defmt::error!("Failed to spawn CRSF task: {}", e));
                 }
@@ -210,7 +229,8 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
             ) {
                 Ok(uart) => {
                     defmt::info!("GHST USART2 half-duplex init OK (T2 pad = PA2)");
-                    spawner
+                    // GHST parser on ctrl_spawner — see CRSF rationale.
+                    ctrl_spawner
                         .spawn(crate::sensors::rc::ghst_runner::ghst_task(uart))
                         .unwrap_or_else(|e| defmt::error!("Failed to spawn GHST task: {}", e));
                 }
@@ -229,7 +249,8 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
             ) {
                 Ok(uart) => {
                     defmt::info!("GHST USART1 half-duplex init OK (T1 pad = PA9)");
-                    spawner
+                    // GHST parser on ctrl_spawner — see CRSF rationale.
+                    ctrl_spawner
                         .spawn(crate::sensors::rc::ghst_runner::ghst_task(uart))
                         .unwrap_or_else(|e| defmt::error!("Failed to spawn GHST task: {}", e));
                 }

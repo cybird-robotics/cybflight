@@ -51,7 +51,25 @@ hal::bind_interrupts!(struct Usart6Irqs {
     USART6 => hal::usart::InterruptHandler<hal::peripherals::USART6>;
 });
 
-pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Board) {
+/// Board initialization.
+///
+/// Spawner routing:
+/// - `spawner` (thread): LED, USB, RC reader, mag, baro, GPS, ESP bridge.
+///   These tolerate latency; they run alongside the mission planner.
+/// - `ctrl_spawner` (interrupt P10): **IMU readers**. Same executor as
+///   the downstream attitude filter, ESKF, INDI and MPC — so the whole
+///   sensor→estimation→control chain preempts any thread work (notably
+///   the trajectory planner's BFGS solve). The SPI bus mutex type
+///   (`SpiBusMtx`) was upgraded from `NoopRawMutex` to
+///   `CriticalSectionRawMutex` to make the task `Send` for the
+///   interrupt-executor spawn.
+/// - `high_spawner` (interrupt P6): DShot motor output.
+pub async fn init(
+    spawner: &Spawner,
+    ctrl_spawner: &SendSpawner,
+    high_spawner: &SendSpawner,
+    board: bsp::Board,
+) {
     // --- Load vehicle parameters from flash (or defaults) ---
     crate::params::init_from_flash(board.internal_flash);
 
@@ -97,7 +115,10 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
     match Icm426xx::new(dev4, board.sensors.gyro1_drdy, &mut delay).await {
         Ok(imu1) => {
             defmt::info!("IMU1 init OK");
-            spawner
+            // IMU reader → control executor (P10). Fresh gyro/accel
+            // samples preempt any thread-executor work, including the
+            // trajectory planner's BFGS solve.
+            ctrl_spawner
                 .spawn(icm_reader_task(
                     ImuReader::new(imu1, board.sensors.gyro1_align, 80.0, 200.0),
                     &crate::sensors::IMU_1,
@@ -127,7 +148,12 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
             ) {
                 Ok(uart) => {
                     defmt::info!("CRSF UART4 init OK");
-                    spawner
+                    // CRSF parser on ctrl_spawner (P10): disarm-switch
+                    // edge detection lives here (sensors/rc.rs:91-108),
+                    // so running on P10 means the emergency-disarm path
+                    // cannot be blocked by a thread-resident planner
+                    // solve. Worst-case disarm latency ~2-3 ms.
+                    ctrl_spawner
                         .spawn(crate::sensors::rc::crsf_runner::crsf_task(uart))
                         .unwrap_or_else(|e| defmt::error!("Failed to spawn CRSF task: {}", e));
                 }
@@ -155,7 +181,8 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
             ) {
                 Ok(uart) => {
                     defmt::info!("GHST UART4 half-duplex init OK");
-                    spawner
+                    // GHST parser on ctrl_spawner — see CRSF rationale.
+                    ctrl_spawner
                         .spawn(crate::sensors::rc::ghst_runner::ghst_task(uart))
                         .unwrap_or_else(|e| defmt::error!("Failed to spawn GHST task: {}", e));
                 }
@@ -388,7 +415,8 @@ pub async fn init(spawner: &Spawner, high_spawner: &SendSpawner, board: bsp::Boa
         match Icm426xx::new(dev_imu2, board.sensors.gyro2_drdy, &mut delay).await {
             Ok(imu2) => {
                 defmt::info!("IMU2 (IIM42652) init OK");
-                spawner
+                // IMU2 reader → control executor (see IMU1 rationale).
+                ctrl_spawner
                     .spawn(icm_reader_task(
                         ImuReader::new(imu2, board.sensors.gyro2_align, 80.0, 200.0),
                         &crate::sensors::IMU_2,

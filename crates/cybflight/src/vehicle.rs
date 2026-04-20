@@ -21,7 +21,7 @@ pub const QUADROTOR_BODY: RigidBodyParams = RigidBodyParams {
     // Diagonal inertia [Ixx, Ixy, Ixz, Iyx, Iyy, Iyz, Izx, Izy, Izz] (kg·m²).
     // Roll/pitch symmetric (Ixx = Iyy = 0.02), yaw larger (Izz = 0.04).
     // Calibrate from a bifilar pendulum test or CAD model.
-    inertia_kg_m2: [0.0025, 0.0, 0.0, 0.0, 0.0021, 0.0, 0.0, 0.0, 0.0043],
+    inertia_kg_m2: [0.0021, 0.0, 0.0, 0.0, 0.0018, 0.0, 0.0, 0.0, 0.003],
     max_rate_rad_s: [10.0, 10.0, 6.0],
 };
 

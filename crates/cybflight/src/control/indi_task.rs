@@ -49,26 +49,28 @@ use crate::{
 static LEARNED_SAVE_PENDING: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+const MAX_RPM: f32 = 27000.0;
+const TIME_CONSTANT: f32 = 0.015;
 /// Default INDI motor parameters.
 const INDI_MOTOR_PARAMS: [IndiMotorParams; NU] = [
     IndiMotorParams {
-        time_const_s: 0.025,
-        max_rpm: 40000.0,
+        time_const_s: TIME_CONSTANT,
+        max_rpm: MAX_RPM,
         g2_yaw: 0.0,
     },
     IndiMotorParams {
-        time_const_s: 0.025,
-        max_rpm: 40000.0,
+        time_const_s: TIME_CONSTANT,
+        max_rpm: MAX_RPM,
         g2_yaw: 0.0,
     },
     IndiMotorParams {
-        time_const_s: 0.025,
-        max_rpm: 40000.0,
+        time_const_s: TIME_CONSTANT,
+        max_rpm: MAX_RPM,
         g2_yaw: 0.0,
     },
     IndiMotorParams {
-        time_const_s: 0.025,
-        max_rpm: 40000.0,
+        time_const_s: TIME_CONSTANT,
+        max_rpm: MAX_RPM,
         g2_yaw: 0.0,
     },
 ];
@@ -152,9 +154,9 @@ pub async fn indi_task() {
     let config = IndiConfig {
         rate_gains: ic.rate_gains.into(),
         sync_filter_hz: ic.sync_filter_hz,
-        rate_dot_sg_window_size: 7,
+        rate_dot_sg_window_size: 13,
         rate_dot_sg_order: 2,
-        rate_dot_sg_target_rate_hz: 1000.0,
+        rate_dot_sg_target_rate_hz: 8000.0,
         motors: QUADROTOR_MOTORS,
         body: QUADROTOR_BODY,
         indi_motors: INDI_MOTOR_PARAMS,

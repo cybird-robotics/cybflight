@@ -18,6 +18,7 @@ use cybflight_core::position_control::{self, pd_ff_control};
 #[cfg(not(feature = "outer_mpc"))]
 use crate::sensors::VEHICLE_ODOMETRY;
 
+use air_filters::{nonlinear::slew::SlewFilter, Filter};
 #[cfg(not(feature = "outer_mpc"))]
 use cybflight_core::attitude_control::{self, geometric_controller, AttitudeControlOutput};
 use cybflight_core::{
@@ -257,18 +258,30 @@ pub async fn indi_task() {
     // Per-motor sample-and-hold for raw eRPM (rad/s) — used when KF is off
     let mut raw_omega_hold = SVector::<f32, NU>::zeros();
 
-    // --- Slew rate limiter state (always on, protects both KF and raw path) ---
-    // Max omega bound from configured motor params (use learned if available)
-    let max_omega_bound: f32 = if let Some(ref saved) = saved_learned {
-        saved.max_omega.iter().cloned().fold(0.0f32, f32::max)
-    } else {
-        INDI_MOTOR_PARAMS[0].max_rpm / 60.0 * core::f32::consts::TAU
-    };
-    // Minimum plausible motor time constant (conservative lower bound)
-    const TAU_MIN_BOUND: f32 = 0.005;
-    let slew_max_rate: f32 = max_omega_bound / TAU_MIN_BOUND; // rad/s²
-    let mut slew_prev_omega = SVector::<f32, NU>::zeros();
-    let mut slew_prev_time: [Option<Instant>; NU] = [None; NU];
+    // --- Slew outlier filter (always on, protects both KF and raw path) ---
+    //
+    // Per-motor `SlewFilter` with a fixed max per-sample delta (ZOH on reject). The delta is
+    // derived from a physics rate bound × a worst- case inter-sample interval, NOT a live dt lookup
+    // — `SlewFilter` is intentionally time-unaware, so we pre-size the gate for the slowest
+    // tolerable telemetry cadence and accept that at nominal rates the gate is loose by that same
+    // ratio.
+    let default_max_omega = INDI_MOTOR_PARAMS[0].max_rpm / 60.0 * core::f32::consts::TAU;
+    let max_omega_bound: f32 = saved_learned
+        .as_ref()
+        .map(|s| s.max_omega.iter().cloned().fold(0.0f32, f32::max))
+        .filter(|&v| v > 0.0)
+        .unwrap_or(default_max_omega);
+    // Physics bound: max plausible dω/dt for a first-order motor with
+    // time constant TAU_MIN_S driven toward max_omega_bound.
+    const TAU_MIN_S: f32 = 0.005;
+    // Worst-case interval between valid per-motor telemetry frames. DShot
+    // bidir updates each motor at roughly command_rate / 4 (~2 kHz at
+    // 8 kHz commands); 1 ms is ~2× nominal — enough headroom to absorb
+    // single-frame dropouts without opening the gate to real outliers.
+    const WORST_DT_S: f32 = 0.001;
+    let slew_max_delta: f32 = (max_omega_bound / TAU_MIN_S) * WORST_DT_S;
+    let mut slew_filters: [SlewFilter<f32>; NU] =
+        core::array::from_fn(|_| SlewFilter::new(slew_max_delta).unwrap());
     // Local param version — re-read params when global version changes.
     let mut local_param_ver =
         crate::params::PARAM_VERSION.load(core::sync::atomic::Ordering::Acquire);
@@ -357,13 +370,15 @@ pub async fn indi_task() {
                 est.reset_state();
             }
 
+            // Always re-seed the slew filters to 0 so re-arm doesn't inherit stale omega from
+            // the previous flight. Motors are at rest at arm time, so 0 is the correct prior.
+            slew_filters.reset([0.0; NU]).unwrap();
+
             if learner_prearm_latched {
                 // Learner prearm: geometric G1, zero G2, reset learner
                 indi.reset_to_geometric(&QUADROTOR_MOTORS, &QUADROTOR_BODY, &INDI_MOTOR_PARAMS);
                 learner.reset();
                 raw_omega_hold = SVector::zeros();
-                slew_prev_omega = SVector::zeros();
-                slew_prev_time = [None; NU];
                 defmt::info!("INDI: learner prearm LATCHED — KF off, G2 zeroed");
             }
         }
@@ -389,14 +404,13 @@ pub async fn indi_task() {
         }
         was_armed = armed;
 
-        // ── DShot telemetry + slew rate limiter ────────────────────────
+        // ── DShot telemetry + slew outlier filter ──────────────────────
         //
-        // Decode eRPM → rad/s, then apply a physics-based slew rate limiter
-        // to reject GCR decode errors. The limiter runs always, protecting
-        // both the KF path and the raw-hold path.
+        // Decode eRPM → rad/s, then gate on a fixed per-sample delta to
+        // reject GCR decode errors (ZOH on reject, no interpolation).
+        // Always on — protects both the KF path and the raw-hold path.
         let mut y_meas: [Option<f32>; NU] = [None; NU];
         if let Some(telem) = dshot_sub.try_next_message_pure() {
-            let now = imu.timestamp;
             for i in 0..NU {
                 let raw_omega = match telem.motors[i].value {
                     TelemetryValue::Erpm(erpm) => Some(erpm as f32 * erpm_to_rads),
@@ -404,23 +418,18 @@ pub async fn indi_task() {
                     TelemetryValue::Invalid | TelemetryValue::Edt(_) => None,
                 };
 
-                // Slew rate limiter: reject if change exceeds physical limit
                 if let Some(omega) = raw_omega {
                     // Hard range gate
                     if omega < 0.0 || omega > max_omega_bound * 1.2 {
                         continue;
                     }
-                    // Rate gate
-                    if let Some(prev_t) = slew_prev_time[i] {
-                        let dt_slew = now.duration_since(prev_t).as_micros() as f32 / 1_000_000.0;
-                        let max_delta = slew_max_rate * dt_slew;
-                        if (omega - slew_prev_omega[i]).abs() > max_delta {
-                            continue;
-                        }
+                    // SlewFilter returns `input` on accept and the held state on reject; equality
+                    // to input uniquely identifies the accept branch (an equal state can only occur
+                    // with a zero-delta input, which also accepts).
+                    let out = slew_filters[i].apply(omega);
+                    if out == omega {
+                        y_meas[i] = Some(omega);
                     }
-                    slew_prev_omega[i] = omega;
-                    slew_prev_time[i] = Some(now);
-                    y_meas[i] = Some(omega);
                 }
             }
         }

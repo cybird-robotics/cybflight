@@ -16,7 +16,7 @@ use air_filters::iir::biquad::{
 use air_filters::Filter;
 use cybflight_core::indi::{
     effectiveness::{IndiEffectiveness, IndiMotorParams},
-    linearization::ThrustLinearization,
+    linearization::{ThrustLinearization, ThrustModel},
 };
 use cybflight_core::mixer::{MotorParams, RigidBodyParams, SpinDir};
 use flight_solver::cls::setup::wls::{setup_a, setup_b};
@@ -131,7 +131,7 @@ impl IndiTestState {
             rate_dot_filter: core::array::from_fn(|_| make_biquad()),
             spf_filter: core::array::from_fn(|_| make_biquad()),
             u_state_filter: core::array::from_fn(|_| make_biquad()),
-            linearization: [ThrustLinearization::new(0.5); NU],
+            linearization: [ThrustLinearization::new(0.5, ThrustModel::Quadratic); NU],
             prev_rate: SVector::zeros(),
             u_state: SVector::zeros(),
             u_state_fs: SVector::zeros(),
@@ -971,6 +971,7 @@ fn flu_controller_config() -> IndiConfig {
             max_rpm: 40000.0,
             g2_yaw: 0.0,
         }; 4],
+        thrust_model: ThrustModel::Quadratic,
         nonlinearity: SVector::from_element(0.5),
         act_limit: SVector::from_element(1.0),
         wls_wv: SVector::from_row_slice(&[1.0, 1.0, 50.0, 50.0, 50.0, 5.0]),

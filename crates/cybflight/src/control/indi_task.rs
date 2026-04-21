@@ -19,12 +19,13 @@ use cybflight_core::position_control::{self, pd_ff_control};
 use crate::sensors::VEHICLE_ODOMETRY;
 
 #[cfg(not(feature = "outer_mpc"))]
-use cybflight_core::attitude_control::{self, geometric_controller, AttitudeControlOutput};
+use cybflight_core::attitude_control::{self, AttitudeControlOutput, geometric_controller};
 use cybflight_core::{
     indi::{
         controller::{IndiConfig, IndiController, NU},
         effectiveness::IndiMotorParams,
         learner::{LearnedParams, Learner, LearnerConfig, LearnerInput},
+        linearization::ThrustModel,
         rpm_tracker::RpmInput,
     },
     params::IndiEffectivenessParams,
@@ -49,9 +50,35 @@ use crate::{
 static LEARNED_SAVE_PENDING: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Thrust-to-command model used by the INDI linearization.
+///
+/// `Quadratic`: u = k·d² + (1−k)·d  (indiflight port; firmware default).
+/// `SqrtSquared`: u = (k·d + (1−k)·√d)²  (steady-state ω mix, T ∝ ω²;
+///   often fits thrust-stand data better — see `tmp/thrust_map/`).
+///
+/// Changing this is a global decision for the airframe; the meaning of `k`
+/// differs between models, so `indi_effectiveness.nonlinearity` typically
+/// needs re-identification after switching.
+// const THRUST_MODEL: ThrustModel = ThrustModel::Quadratic;
+const THRUST_MODEL: ThrustModel = ThrustModel::SqrtSquared;
+
+/// Default motor nonlinearity `k`, matched to `THRUST_MODEL`.
+///
+/// Identified from the A2RL 6S thrust map in `tmp/thrust_map/a2rl_0114.csv`
+/// by `identify_indi_k.py` (pooled fit across 21.7–24.8 V, 2500 samples):
+///   Quadratic:    k = 0.518  (RMS 0.272 N, R² 0.9946)
+///   SqrtSquared:  k = 0.458  (RMS 0.230 N, R² 0.9961)
+///
+/// Only used when no learned params exist in flash (fresh install).
+const THRUST_NONLINEARITY: f32 = match THRUST_MODEL {
+    ThrustModel::Quadratic => 0.518,
+    ThrustModel::SqrtSquared => 0.458,
+};
+
+/// Default INDI motor parameters.
 const MAX_RPM: f32 = 27000.0;
 const TIME_CONSTANT: f32 = 0.015;
-/// Default INDI motor parameters.
+
 const INDI_MOTOR_PARAMS: [IndiMotorParams; NU] = [
     IndiMotorParams {
         time_const_s: TIME_CONSTANT,
@@ -160,7 +187,8 @@ pub async fn indi_task() {
         motors: QUADROTOR_MOTORS,
         body: QUADROTOR_BODY,
         indi_motors: INDI_MOTOR_PARAMS,
-        nonlinearity: SVector::from_element(0.5),
+        thrust_model: THRUST_MODEL,
+        nonlinearity: SVector::from_element(THRUST_NONLINEARITY),
         act_limit: SVector::from_element(1.0),
         wls_wv: ic.wls_wv.into(),
         wls_wu: ic.wls_wu.into(),
@@ -216,9 +244,10 @@ pub async fn indi_task() {
 
     // Load previously saved INDI effectiveness from vehicle params (if non-zero).
     if let Some(ref saved) = saved_learned
-        && indi.apply_learned_params(saved) {
-            defmt::info!("INDI: loaded learned G1/G2 from params");
-        }
+        && indi.apply_learned_params(saved)
+    {
+        defmt::info!("INDI: loaded learned G1/G2 from params");
+    }
 
     // Track whether we need to save learned params on disarm
     let mut was_armed = false;

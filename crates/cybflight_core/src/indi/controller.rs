@@ -14,7 +14,7 @@ use nalgebra::{SMatrix, SVector, Vector3};
 
 use super::{
     effectiveness::{IndiEffectiveness, IndiMotorParams},
-    linearization::ThrustLinearization,
+    linearization::{ThrustLinearization, ThrustModel},
     rate_dot_estimator::{RateDotEstimator, RateDotEstimatorConfig},
     rpm_tracker::{RpmInput, RpmTracker},
 };
@@ -54,6 +54,8 @@ pub struct IndiConfig {
     pub body: RigidBodyParams,
     /// Per-motor INDI parameters (time constant, max RPM, G2 yaw).
     pub indi_motors: [IndiMotorParams; NU],
+    /// Thrust-to-command model (shared across all motors).
+    pub thrust_model: ThrustModel,
     /// Motor nonlinearity for thrust linearization (0.0–1.0).
     pub nonlinearity: SVector<f32, NU>,
     /// Motor output limit per motor (0.0–1.0, typically 1.0).
@@ -90,6 +92,7 @@ type Biquad = BiquadFilter<f32, DirectForm2<f32>>;
 pub struct IndiController {
     effectiveness: IndiEffectiveness<NU>,
     linearization: [ThrustLinearization; NU],
+    thrust_model: ThrustModel,
 
     rate_gains: Vector3<f32>,
 
@@ -154,8 +157,9 @@ impl IndiController {
         let effectiveness =
             IndiEffectiveness::new(&config.motors, &config.body, &config.indi_motors);
 
-        let linearization =
-            core::array::from_fn(|i| ThrustLinearization::new(config.nonlinearity[i]));
+        let linearization = core::array::from_fn(|i| {
+            ThrustLinearization::new(config.nonlinearity[i], config.thrust_model)
+        });
 
         let make_biquad = || {
             let cfg = BiquadFilterConfigBuilder::direct_form_2()
@@ -188,6 +192,7 @@ impl IndiController {
         Self {
             effectiveness,
             linearization,
+            thrust_model: config.thrust_model,
             rate_gains: config.rate_gains,
             rate_dot_estimator,
             spf_filter: core::array::from_fn(|_| make_biquad()),
@@ -241,8 +246,10 @@ impl IndiController {
         }
         // Update linearization
         for i in 0..NU {
-            self.linearization[i] =
-                super::linearization::ThrustLinearization::new(learned.nonlinearity[i]);
+            self.linearization[i] = super::linearization::ThrustLinearization::new(
+                learned.nonlinearity[i],
+                self.thrust_model,
+            );
         }
         // Update rate gains
         if learned.rate_gain.is_finite() && learned.rate_gain > 0.0 {
@@ -498,6 +505,7 @@ mod tests {
                 max_rpm: 40000.0,
                 g2_yaw: 0.0,
             }; NU],
+            thrust_model: ThrustModel::Quadratic,
             nonlinearity: SVector::from_element(0.5),
             act_limit: SVector::from_element(1.0),
             wls_wv: [1.0, 1.0, 50.0, 50.0, 50.0, 5.0].into(),

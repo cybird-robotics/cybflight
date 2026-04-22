@@ -6,6 +6,19 @@ resolver = "3"
 members = [
   "crates/cybflight",
   "crates/cybflight_core",
+  "crates/cybflight_sim",
+  "crates/bsp/sakurah743",
+  "crates/bsp/foxeerh743",
+  "crates/bsp/types",
+  "crates/drivers",
+]
+# Host-target crates are excluded from the default `cargo build` (which
+# targets thumbv7em-none-eabihf per .cargo/config.toml). Build them with
+# --target x86_64-unknown-linux-gnu, e.g.
+#   cargo build -p cybflight-sim --target x86_64-unknown-linux-gnu
+default-members = [
+  "crates/cybflight",
+  "crates/cybflight_core",
   "crates/bsp/sakurah743",
   "crates/bsp/foxeerh743",
   "crates/bsp/types",
@@ -18,3 +31,12 @@ lto = true
 codegen-units = 1
 panic = "abort"
 overflow-checks = false
+
+# Host-side profile for cybflight-sim. Inherits optimization from `release`
+# but disables LTO and loosens codegen-units so incremental rebuilds don't
+# pay the cross-crate LTO tax that the embedded firmware needs. Use via
+# `cargo <cmd> --profile release-host`. Embedded builds still use `release`.
+[profile.release-host]
+inherits = "release"
+lto = false
+codegen-units = 16

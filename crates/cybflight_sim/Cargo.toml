@@ -1,0 +1,20 @@
+[package]
+name = "cybflight-sim"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Host-side simulation harness. Not built by the default workspace target
+# (thumbv7em-none-eabihf) — invoke with `--target x86_64-unknown-linux-gnu`.
+
+[dependencies]
+cybflight-core = { path = "../cybflight_core" }
+nalgebra = { version = "0.34.1", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rerun = { version = "0.26", default-features = false, features = ["sdk"] }
+clap = { version = "4", features = ["derive"] }
+
+[[bin]]
+name = "sim-run"
+path = "src/bin/sim_run.rs"

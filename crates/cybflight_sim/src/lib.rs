@@ -9,6 +9,7 @@
 //! not modelled here — those concerns belong in HIL. This crate tests the
 //! control and planning math end-to-end.
 
+pub mod baselines;
 pub mod controller;
 pub mod plant;
 pub mod report;

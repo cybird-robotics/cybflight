@@ -17,7 +17,7 @@
 //!   at 100 Hz. Legacy baseline; PD position control is no longer the
 //!   firmware's active path. Kept for diagnostic diffs.
 
-use cybflight_core::attitude_control::{
+use crate::baselines::{
     geometric_controller::GeometricAttitudeController, AttitudeControlSetpoint,
     AttitudeControlState,
 };

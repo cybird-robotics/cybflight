@@ -1,9 +1,9 @@
-//! Integration test: both cascade (PD+geometric) and MPC controllers
-//! converge from [0,0,0] to [1,1,1] using the same rigid-body dynamics.
+//! Integration test: MPC controller converges from [0,0,0] to [1,1,1] using
+//! the `FullQuadModel` (RK4) as the plant.
 //!
-//! The dynamics simulator is the `FullQuadModel` (RK4).  The cascade
-//! controller is the ground truth (verified on hardware) — only the MPC
-//! side may be adjusted if a mismatch is found.
+//! The cascade variant of this test retired alongside the firmware's
+//! `outer_geometric` path (see `docs/retire_geometric_cascade.md`). Sim-level
+//! cascade diagnostics live in `cybflight-sim` instead.
 //!
 //! Run with:
 //!   cargo test -p cybflight-core --target x86_64-unknown-linux-gnu \
@@ -11,16 +11,9 @@
 
 extern crate alloc;
 
-use cybflight_core::attitude_control::{
-    geometric_controller::GeometricAttitudeController, AttitudeControlSetpoint,
-    AttitudeControlState,
-};
-use cybflight_core::mixer::{LinearAllocator, MotorEffectiveness, MotorParams, SpinDir};
+use cybflight_core::mixer::{MotorEffectiveness, MotorParams, SpinDir};
 use cybflight_core::mpc::{FullQuadModel, FullQuadProblem, FullSqpSolver, N, NU, NX};
-use cybflight_core::position_control::{
-    self, pd_ff_control::PositionController, PositionControlSetpoint, PositionControlState,
-};
-use nalgebra::{Quaternion, SVector, UnitQuaternion, Vector3, Vector4};
+use nalgebra::{SVector, UnitQuaternion, Vector3, Vector4};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Vehicle parameters — single source of truth, matching vehicle.rs
@@ -151,115 +144,6 @@ fn generate_initial_orientations(count: usize) -> Vec<UnitQuaternion<f32>> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Cascade controller wrapper
-// ═══════════════════════════════════════════════════════════════════════════
-
-struct CascadeController {
-    pos_ctrl: PositionController<f32>,
-    att_ctrl: GeometricAttitudeController<f32>,
-    allocator: LinearAllocator<4>,
-    rate_kp: Vector3<f32>,
-    max_thrust: f32,
-}
-
-impl CascadeController {
-    fn new() -> Self {
-        let motors = test_motors();
-        let effectiveness = MotorEffectiveness::from_motors(&motors);
-        let allocator = LinearAllocator::new(effectiveness);
-
-        let pos_ctrl = PositionController::new(
-            Vector3::new(4.0, 4.0, 8.0),
-            Vector3::new(4.0, 4.0, 6.0),
-            position_control::VehicleParams {
-                mass: MASS as f32,
-                gravity: GRAV as f32,
-            },
-        );
-
-        let att_ctrl = GeometricAttitudeController::new(
-            Vector3::new(3.0, 3.0, 1.0),
-            Vector3::new(1.0, 1.0, 0.2),
-        )
-        .with_inertia(nalgebra::Matrix3::from_diagonal(&Vector3::new(
-            INERTIA[0] as f32,
-            INERTIA[1] as f32,
-            INERTIA[2] as f32,
-        )));
-
-        Self {
-            pos_ctrl,
-            att_ctrl,
-            allocator,
-            rate_kp: Vector3::new(0.1, 0.08, 0.05),
-            max_thrust: 4.0 * MAX_THRUST_N,
-        }
-    }
-
-    fn compute(&self, x: &SVector<f32, NX>, target: &Vector3<f32>) -> SVector<f32, NU> {
-        let pos = Vector3::new(x[0] as f32, x[1] as f32, x[2] as f32);
-        let vel = Vector3::new(x[7] as f32, x[8] as f32, x[9] as f32);
-        let quat = UnitQuaternion::from_quaternion(Quaternion::new(
-            x[6] as f32,
-            x[3] as f32,
-            x[4] as f32,
-            x[5] as f32,
-        ));
-        let omega = Vector3::new(x[10] as f32, x[11] as f32, x[12] as f32);
-
-        // 1. Position controller → desired attitude + thrust
-        let pos_out = self.pos_ctrl.compute(
-            &PositionControlState {
-                position: pos,
-                velocity: vel,
-                attitude: quat,
-            },
-            &PositionControlSetpoint {
-                position: *target,
-                velocity: Vector3::zeros(),
-                acceleration_ff: Vector3::zeros(),
-                yaw: 0.0,
-            },
-        );
-
-        // 2. Attitude controller → rate setpoint
-        let att_out = self.att_ctrl.compute(
-            &AttitudeControlState {
-                attitude_quaternion: quat,
-                body_rate_rad_s: omega,
-            },
-            &AttitudeControlSetpoint {
-                attitude_quaternion: Some(pos_out.desired_attitude_quaternion),
-                body_rate_rad_s: Vector3::zeros(),
-                angular_accel_rad_s2: Vector3::zeros(),
-            },
-        );
-
-        // 3. Rate P controller → torque (clamped)
-        let rate_error = att_out.body_rate_rad_s - omega;
-        let torque = Vector3::new(
-            (self.rate_kp.x * rate_error.x).clamp(-0.8, 0.8),
-            (self.rate_kp.y * rate_error.y).clamp(-0.6, 0.6),
-            (self.rate_kp.z * rate_error.z).clamp(-0.15, 0.15),
-        );
-
-        // 4. Mixer → throttles [0,1] → forces
-        let idle_n = 0.005 * self.max_thrust;
-        let thrust = pos_out.collective_thrust_n.max(idle_n).min(self.max_thrust);
-        let throttles = self
-            .allocator
-            .allocate(Vector4::new(thrust, torque.x, torque.y, torque.z));
-
-        Vector4::new(
-            (throttles[0] * MAX_THRUST_N) as f32,
-            (throttles[1] * MAX_THRUST_N) as f32,
-            (throttles[2] * MAX_THRUST_N) as f32,
-            (throttles[3] * MAX_THRUST_N) as f32,
-        )
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // MPC controller wrapper (runs at MPC_DT, holds control between solves)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -335,27 +219,6 @@ impl MpcController {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Controller enum — switchable via flag
-// ═══════════════════════════════════════════════════════════════════════════
-
-enum Controller {
-    Cascade(CascadeController),
-    Mpc(MpcController),
-}
-
-impl Controller {
-    fn compute(&mut self, x: &SVector<f32, NX>, target: &Vector3<f32>) -> SVector<f32, NU> {
-        match self {
-            Controller::Cascade(c) => {
-                let t32 = Vector3::new(target.x as f32, target.y as f32, target.z as f32);
-                c.compute(x, &t32)
-            }
-            Controller::Mpc(c) => c.compute(x),
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // Simulation loop
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -367,20 +230,21 @@ struct SimResult {
 }
 
 fn run_simulation(
-    controller: &mut Controller,
+    controller: &mut MpcController,
     dynamics: &dyn QuadDynamics,
     x0: &SVector<f32, NX>,
     target: &Vector3<f32>,
     max_steps: usize,
     tol: f32,
 ) -> SimResult {
+    let _ = target; // target is baked into the MPC's x_refs at construction.
     let mut x = *x0;
 
     let mut converge_count = 0usize;
     let converge_window = 100; // 100 × 0.002 s = 0.2 s sustained convergence
 
     for step in 0..max_steps {
-        let u = controller.compute(&x, target);
+        let u = controller.compute(&x);
 
         // Clamp motor forces to physical bounds
         let mut u_clamped = u;
@@ -448,52 +312,6 @@ fn initial_state(q: &UnitQuaternion<f32>) -> SVector<f32, NX> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn cascade_converges_50_orientations() {
-    let target = Vector3::new(1.0, 1.0, 1.0);
-    let dynamics = make_dynamics();
-    let orientations = generate_initial_orientations(NUM_ORIENTATIONS);
-
-    let mut failures = Vec::new();
-
-    for (i, q) in orientations.iter().enumerate() {
-        let x0 = initial_state(q);
-        let mut ctrl = Controller::Cascade(CascadeController::new());
-        let result = run_simulation(&mut ctrl, &dynamics, &x0, &target, MAX_STEPS, POS_TOL);
-
-        let angle_deg = q.angle().to_degrees();
-        if result.converged {
-            println!(
-                "  Cascade [{:2}] tilt={:5.1}° → converged in {:5} steps ({:.2}s), err={:.4}m",
-                i,
-                angle_deg,
-                result.steps,
-                result.steps as f32 * SIM_DT,
-                result.pos_error,
-            );
-        } else {
-            println!(
-                "  Cascade [{:2}] tilt={:5.1}° → FAILED, err={:.4}m, pos=({:.2},{:.2},{:.2})",
-                i,
-                angle_deg,
-                result.pos_error,
-                result.final_pos.x,
-                result.final_pos.y,
-                result.final_pos.z,
-            );
-            failures.push(i);
-        }
-    }
-
-    assert!(
-        failures.is_empty(),
-        "Cascade controller failed for {} / {} orientations: {:?}",
-        failures.len(),
-        NUM_ORIENTATIONS,
-        failures,
-    );
-}
-
-#[test]
 fn mpc_converges_50_orientations() {
     let target = Vector3::new(1.0, 1.0, 1.0);
     let dynamics = make_dynamics();
@@ -503,7 +321,7 @@ fn mpc_converges_50_orientations() {
 
     for (i, q) in orientations.iter().enumerate() {
         let x0 = initial_state(q);
-        let mut ctrl = Controller::Mpc(MpcController::new(&target, SIM_DT));
+        let mut ctrl = MpcController::new(&target, SIM_DT);
         let result = run_simulation(&mut ctrl, &dynamics, &x0, &target, MAX_STEPS, POS_TOL);
 
         let angle_deg = q.angle().to_degrees();

@@ -1,9 +1,8 @@
-use crate::rotation::vee;
-
 use super::{AttitudeControlOutput, AttitudeControlSetpoint, AttitudeControlState};
 use core::option::{Option, Option::Some};
 use core::{default::Default, marker::Copy};
 
+use cybflight_core::rotation::vee;
 use nalgebra as na;
 use num_traits::{float::FloatCore, NumCast};
 
@@ -120,10 +119,7 @@ impl<T: na::RealField + Copy + FloatCore> Default for GeometricAttitudeControlle
 }
 
 impl<T: na::RealField + Copy + NumCast + FloatCore> GeometricAttitudeController<T> {
-    pub fn new(
-        k_ang_rate: na::Vector3<T>,
-        k_ang_torque: na::Vector3<T>,
-    ) -> Self {
+    pub fn new(k_ang_rate: na::Vector3<T>, k_ang_torque: na::Vector3<T>) -> Self {
         Self {
             k_ang_rate,
             k_ang_torque,
@@ -206,12 +202,7 @@ impl<T: na::RealField + Copy + NumCast + FloatCore> GeometricAttitudeController<
                     rate_ref_body,
                 )
             } else {
-                (
-                    None,
-                    *ref_body_rate,
-                    *ref_angular_accel,
-                    *ref_body_rate,
-                )
+                (None, *ref_body_rate, *ref_angular_accel, *ref_body_rate)
             };
 
         let angle_error_feedback = angle_error.map_or(na::Vector3::<T>::zeros(), |e| {

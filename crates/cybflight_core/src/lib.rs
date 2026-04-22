@@ -1,5 +1,4 @@
 #![cfg_attr(not(test), no_std)]
-pub mod attitude_control;
 pub mod eskf;
 pub mod indi;
 pub mod mahony;

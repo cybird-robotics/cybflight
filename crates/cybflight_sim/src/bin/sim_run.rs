@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
-use cybflight_core::trajectory_planning::quad_planning_config::QuadPlanningConfig;
 use cybflight_sim::{
     controller::{CascadeController, Controller, MpcDirectController, MpcIndiController},
-    plant::{QuadPlant, VEHICLE},
-    report, runner::MissionRunner,
+    plant::QuadPlant,
+    report,
+    runner::MissionRunner,
     scenario::{Scenario, Verdict},
     viz::RerunLogger,
 };
@@ -55,15 +55,19 @@ struct Args {
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    let vp = VEHICLE.build();
-    let planner_config = QuadPlanningConfig::from_vehicle_params(&vp);
 
-    let mut scenario = build_scenario(&args.scenario, &planner_config);
-    let mut plant = QuadPlant::new(vp.clone(), 0.002);
+    let mut scenario = build_scenario(&args.scenario);
+    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), 0.002);
     let mut controller: Box<dyn Controller> = match args.controller {
-        ControllerKind::MpcIndi => Box::new(MpcIndiController::from_params(&vp)),
-        ControllerKind::MpcDirect => Box::new(MpcDirectController::from_params(&vp)),
-        ControllerKind::Cascade => Box::new(CascadeController::from_params(&vp)),
+        ControllerKind::MpcIndi => {
+            Box::new(MpcIndiController::from_params(&scenario.vehicle_params))
+        }
+        ControllerKind::MpcDirect => {
+            Box::new(MpcDirectController::from_params(&scenario.vehicle_params))
+        }
+        ControllerKind::Cascade => {
+            Box::new(CascadeController::from_params(&scenario.vehicle_params))
+        }
     };
     let controller_name = controller.name();
 
@@ -109,7 +113,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn build_scenario(name: &str, cfg: &QuadPlanningConfig) -> Scenario {
+fn build_scenario(name: &str) -> Scenario {
     match name {
         "hover_level" => Scenario::hover("hover_level", Vector3::new(0.0, 0.0, 1.0), 0.0),
         "hover_tilt30" => Scenario::hover(
@@ -121,7 +125,6 @@ fn build_scenario(name: &str, cfg: &QuadPlanningConfig) -> Scenario {
             "p2p_x3",
             Vector3::new(0.0, 0.0, 1.0),
             Vector3::new(3.0, 0.0, 1.0),
-            cfg,
         ),
         "mission_square" => Scenario::mission(
             "mission_square",
@@ -132,7 +135,6 @@ fn build_scenario(name: &str, cfg: &QuadPlanningConfig) -> Scenario {
                 Vector3::new(0.0, 3.0, 1.0),
                 Vector3::new(0.0, 0.0, 1.0),
             ],
-            cfg,
         ),
         other => panic!("unknown scenario: {other}"),
     }

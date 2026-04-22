@@ -181,6 +181,58 @@ A `GpsModel` / `ViconModel` follows the same pattern once ESKF-in-the-
 loop is wired — that's the next milestone and it will consume
 `PositionMeasurement` at ~10 Hz.
 
+## Vehicle parameters in the sim
+
+`Scenario` owns `vehicle_params: VehicleParams`. That's the **single
+source of truth** for everything downstream:
+
+- `QuadPlant::new(scenario.vehicle_params.clone(), ...)` — simulated
+  rigid body
+- `MpcIndiController::from_params(&scenario.vehicle_params)`, etc. —
+  controller gains / limits
+- `Scenario::mission(...)` internally derives a `QuadPlanningConfig`
+  from those same params, so the planned trajectory respects the
+  vehicle it will fly on
+
+Tests grab `&scenario.vehicle_params` into plant + controller factories,
+so all three stay consistent by construction. You cannot plan a
+trajectory against one set of limits and fly it on a plant with
+different mass.
+
+### Defaults + overrides
+
+`Scenario::hover`, `point_to_point`, `mission` fill
+`vehicle_params` with `default_vehicle()` (the canonical host-side
+params in `plant.rs::VEHICLE`, which mirrors the firmware's
+`QUADROTOR_BODY` / `QUADROTOR_MOTORS`).
+
+For tuning sweeps or "what if" tests, the `_with_params` variants take
+an explicit `VehicleParams`:
+
+```rust
+let vp = tweaked_vehicle(|p| p.body.mass_kg *= 1.5);
+let scenario = Scenario::mission_with_params("heavy_square", vp, start, &wps);
+let controller = MpcIndiController::from_params(&scenario.vehicle_params);
+```
+
+`tweaked_vehicle(|p| ...)` is the recommended one-field override
+helper; it starts from `default_vehicle()` and applies your closure.
+Both `default_vehicle()` and `tweaked_vehicle()` are re-exported from
+the crate root.
+
+### Why not mutable after construction?
+
+`point_to_point` and `mission` bake the trajectory into the scenario at
+construction time by running the MINCO/BFGS planner against the
+supplied params. Letting callers mutate `vehicle_params` after the fact
+would leave the trajectory stale (planned under old limits, flown under
+new ones). If you need a different vehicle, rebuild the scenario with
+the new params.
+
+`hover` has no trajectory, so in principle it could allow post-hoc
+mutation — but we keep the API uniform across all three constructors
+to avoid a "works sometimes" trap.
+
 ## Simulation runner (`just sim-compare`, `just sim-run`)
 
 `just sim-compare` runs all four sim scenarios through all three

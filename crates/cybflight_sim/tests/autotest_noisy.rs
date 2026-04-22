@@ -11,10 +11,9 @@
 
 use std::path::PathBuf;
 
-use cybflight_core::trajectory_planning::quad_planning_config::QuadPlanningConfig;
 use cybflight_sim::{
     controller::MpcIndiController,
-    plant::{QuadPlant, VEHICLE},
+    plant::QuadPlant,
     report,
     runner::MissionRunner,
     scenario::{Scenario, Verdict},
@@ -34,8 +33,6 @@ fn out_dir(name: &str) -> PathBuf {
 /// Accel similar — ≈0.3 m/s² per-axis σ is consistent with a typical
 /// ICM-42688P at flight vibration.
 fn noisy_mpc_indi_mission() -> (Scenario, MpcIndiController) {
-    let vp = VEHICLE.build();
-    let cfg = QuadPlanningConfig::from_vehicle_params(&vp);
     let scenario = Scenario::mission(
         "mission_square_noisy",
         Vector3::new(0.0, 0.0, 1.0),
@@ -45,18 +42,16 @@ fn noisy_mpc_indi_mission() -> (Scenario, MpcIndiController) {
             Vector3::new(0.0, 3.0, 1.0),
             Vector3::new(0.0, 0.0, 1.0),
         ],
-        &cfg,
     )
     .with_imu(Box::new(NoisyImu::isotropic(0xC0FFEE, 0.03, 0.3)));
-    let controller = MpcIndiController::from_params(&vp);
+    let controller = MpcIndiController::from_params(&scenario.vehicle_params);
     (scenario, controller)
 }
 
 #[test]
 fn mpc_indi_tracks_through_noisy_imu() {
     let (mut scenario, mut controller) = noisy_mpc_indi_mission();
-    let vp = VEHICLE.build();
-    let mut plant = QuadPlant::new(vp, 1.0 / 8000.0);
+    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), 1.0 / 8000.0);
     let runner = MissionRunner::new(Default::default());
     let out = runner.run(&mut scenario, &mut plant, &mut controller);
 

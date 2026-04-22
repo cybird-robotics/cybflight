@@ -17,10 +17,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use cybflight_core::trajectory_planning::quad_planning_config::QuadPlanningConfig;
 use cybflight_sim::{
     controller::{CascadeController, Controller, MpcDirectController, MpcIndiController},
-    plant::{QuadPlant, VEHICLE},
+    plant::QuadPlant,
     runner::{MissionRunner, RunOutput},
     scenario::Scenario,
     sensors::NoisyImu,
@@ -58,8 +57,6 @@ const CONTROLLERS: &[&str] = &["cascade", "mpc_direct", "mpc_indi"];
 const NOISY_SCENARIOS: &[&str] = &["mission_square_noisy"];
 
 fn build_scenario(name: &str) -> Scenario {
-    let vp = VEHICLE.build();
-    let cfg = QuadPlanningConfig::from_vehicle_params(&vp);
     match name {
         "hover_level" => Scenario::hover(name, Vector3::new(0.0, 0.0, 1.0), 0.0),
         "hover_tilt30" => Scenario::hover(name, Vector3::new(0.0, 0.0, 1.0), 30.0_f32.to_radians()),
@@ -67,7 +64,6 @@ fn build_scenario(name: &str) -> Scenario {
             name,
             Vector3::new(0.0, 0.0, 1.0),
             Vector3::new(3.0, 0.0, 1.0),
-            &cfg,
         ),
         "mission_square" => Scenario::mission(
             name,
@@ -78,7 +74,6 @@ fn build_scenario(name: &str) -> Scenario {
                 Vector3::new(0.0, 3.0, 1.0),
                 Vector3::new(0.0, 0.0, 1.0),
             ],
-            &cfg,
         ),
         "mission_square_noisy" => Scenario::mission(
             name,
@@ -89,7 +84,6 @@ fn build_scenario(name: &str) -> Scenario {
                 Vector3::new(0.0, 3.0, 1.0),
                 Vector3::new(0.0, 0.0, 1.0),
             ],
-            &cfg,
         )
         // Representative consumer-grade MEMS IMU. Seed is fixed so the
         // noise sequence is snapshot-stable across runs.
@@ -98,12 +92,12 @@ fn build_scenario(name: &str) -> Scenario {
     }
 }
 
-fn build_controller(name: &str) -> Box<dyn Controller> {
-    let vp = VEHICLE.build();
+fn build_controller(name: &str, scenario: &Scenario) -> Box<dyn Controller> {
+    let vp = &scenario.vehicle_params;
     match name {
-        "cascade" => Box::new(CascadeController::from_params(&vp)),
-        "mpc_direct" => Box::new(MpcDirectController::from_params(&vp)),
-        "mpc_indi" => Box::new(MpcIndiController::from_params(&vp)),
+        "cascade" => Box::new(CascadeController::from_params(vp)),
+        "mpc_direct" => Box::new(MpcDirectController::from_params(vp)),
+        "mpc_indi" => Box::new(MpcIndiController::from_params(vp)),
         other => panic!("unknown controller: {other}"),
     }
 }
@@ -125,8 +119,8 @@ fn compute_current() -> BTreeMap<String, Row> {
 
 fn run_one(scenario_name: &str, controller_name: &str) -> Row {
     let mut scenario = build_scenario(scenario_name);
-    let mut controller = build_controller(controller_name);
-    let mut plant = QuadPlant::new(VEHICLE.build(), 1.0 / 8000.0);
+    let mut controller = build_controller(controller_name, &scenario);
+    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), 1.0 / 8000.0);
     let runner = MissionRunner::new(Default::default());
     let run_out = runner.run(&mut scenario, &mut plant, &mut *controller);
     (&run_out).into()

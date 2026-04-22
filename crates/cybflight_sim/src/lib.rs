@@ -23,6 +23,6 @@ pub use controller::{CascadeController, Controller, MpcDirectController, MpcIndi
 pub use plant::{QuadPlant, VEHICLE};
 pub use report::SimulationReport;
 pub use runner::{MissionRunner, RunnerConfig, StepRecord};
-pub use scenario::{PassCriteria, Scenario, Verdict};
+pub use scenario::{default_vehicle, tweaked_vehicle, PassCriteria, Scenario, Verdict};
 pub use sensors::{ImuMeasurement, ImuModel, NoisyImu, PerfectImu};
 pub use trajectory::{MissionSetpoints, Setpoint, SetpointSource};

@@ -10,6 +10,7 @@
 use cybflight_core::trajectory_planning::quad_planning_config::QuadPlanningConfig;
 use nalgebra::{UnitQuaternion, Vector3};
 
+use crate::sensors::{ImuModel, PerfectImu};
 use crate::trajectory::{HoverSetpoint, MissionSetpoints, SetpointSource};
 
 /// Pass/fail gates evaluated by the runner against the final history.
@@ -51,11 +52,23 @@ pub struct Scenario {
     pub initial_velocity: Vector3<f32>,
     pub initial_attitude: UnitQuaternion<f32>,
     pub setpoints: Box<dyn SetpointSource>,
+    /// IMU synthesizer; defaults to `PerfectImu`. Swap via
+    /// [`Scenario::with_imu`] for noise / bias sweeps.
+    pub imu_model: Box<dyn ImuModel>,
     pub pass_criteria: PassCriteria,
     /// Additional wall-time to hold terminal hover after the trajectory ends
     /// (for terminal-error measurement). Ignored when the setpoint source is
     /// infinite (pure hover).
     pub terminal_hold_s: f32,
+}
+
+impl Scenario {
+    /// Replace the IMU model. Use this on any of the `hover`/
+    /// `point_to_point`/`mission` constructors to move off `PerfectImu`.
+    pub fn with_imu(mut self, imu: Box<dyn ImuModel>) -> Self {
+        self.imu_model = imu;
+        self
+    }
 }
 
 impl Scenario {
@@ -73,6 +86,7 @@ impl Scenario {
             initial_velocity: Vector3::zeros(),
             initial_attitude: UnitQuaternion::from_axis_angle(&axis, initial_tilt_rad),
             setpoints: Box::new(HoverSetpoint::new(position)),
+            imu_model: Box::new(PerfectImu),
             pass_criteria: PassCriteria::default(),
             terminal_hold_s: 3.0,
         }
@@ -93,6 +107,7 @@ impl Scenario {
             initial_velocity: Vector3::zeros(),
             initial_attitude: UnitQuaternion::identity(),
             setpoints: Box::new(sp),
+            imu_model: Box::new(PerfectImu),
             pass_criteria: PassCriteria::default(),
             terminal_hold_s: 3.0,
         }
@@ -114,6 +129,7 @@ impl Scenario {
             initial_velocity: Vector3::zeros(),
             initial_attitude: UnitQuaternion::identity(),
             setpoints: Box::new(sp),
+            imu_model: Box::new(PerfectImu),
             pass_criteria: PassCriteria::default(),
             terminal_hold_s: 3.0,
         }

@@ -142,11 +142,8 @@ impl QuadPlant {
     }
 
     pub fn attitude(&self) -> UnitQuaternion<f32> {
-        UnitQuaternion::from_quaternion(Quaternion::new(
-            self.state[6],
-            self.state[3],
-            self.state[4],
-            self.state[5],
+        UnitQuaternion::from_quaternion(Quaternion::from_vector(
+            self.state.fixed_rows::<4>(3).into(),
         ))
     }
 

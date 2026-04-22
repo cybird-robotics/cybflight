@@ -105,6 +105,82 @@ This is the intended failure mode — it's explicitly not silent.
 
 [insta]: https://insta.rs/
 
+## Sensor simulation
+
+`crates/cybflight_sim/src/sensors.rs` provides an `ImuModel` trait that
+converts plant ground truth into an `ImuMeasurement`. Two impls today:
+
+- `PerfectImu` — default. Returns `(body_rate, Σu/mass · ẑ)` with zero
+  noise or bias. Used by every scenario unless overridden.
+- `NoisyImu` — seeded ChaCha8 Gaussian noise on both channels, plus
+  optional constant biases. Deterministic across runs for a fixed seed
+  so assertions stay stable.
+
+### Which controllers see the IMU
+
+`MpcIndiController` consumes the `ImuMeasurement` (INDI is the only
+sensor-consuming block in the stack). `CascadeController` and
+`MpcDirectController` ignore it — they read perfect state from the plant
+directly. That means **noise only affects the firmware-match topology**,
+which is the interesting question. Ground-truth baselines stay as an
+upper bound.
+
+### Running the noisy autotest
+
+```
+cargo test -p cybflight-sim --target x86_64-unknown-linux-gnu \
+  --profile release-host --test autotest_noisy -- --nocapture
+```
+
+The test runs `mission_square` through `MpcIndiController` with a
+`NoisyImu` configured for representative MEMS-IMU noise (σ=0.03 rad/s
+gyro, σ=0.3 m/s² accel). Asserts only the pass criteria hold —
+tight-tolerance assertions on noisy numbers would mostly catch noise-
+seed changes, not control regressions, which isn't what you want. Use
+it to confirm INDI still rides through realistic sensor noise after
+changes to the inner loop.
+
+### Noisy scenarios and the regression snapshot
+
+Noisy rows *are* in `regression_snapshot.json` — labeled with a
+`_noisy` suffix so you can see at a glance which rows are noise-
+sensitive. The reasons it works:
+
+- `ChaCha8Rng` commits to bit-exact output across `rand_chacha`
+  versions for a fixed seed, and its algorithm is pure integer so no
+  platform-FP difference enters the stream.
+- `Cargo.lock` pins `rand`, `rand_chacha`, and everything else. This is
+  a binary workspace, so the lockfile is committed.
+- The noise → measurement transform (`ln`, `cos` in Box-Muller) is the
+  same kind of IEEE-deterministic `f32` that the control math already
+  relies on. Noisy rows inherit the control rows' fragility level; they
+  don't add a new one.
+- RMS averaged over 80 000 ticks is a central-limit statistic — it
+  moves less than the clean `peak_pos_err_m` column does under the same
+  f32 wobble.
+
+What *would* invalidate a noisy row without touching control code:
+- Replacing the Box-Muller sampler with a different algorithm.
+- Changing the `NoisyImu` draw order (e.g. alternating gyro/accel axes).
+- A rare `libm` / `rustc` intrinsic change that hits `ln`/`cos` on
+  `f32` specifically.
+
+Treat the first two as "you changed `NoisyImu`, snapshot will move —
+regenerate and document in the commit". The third is the same category
+as any tolerance-tripping environmental drift.
+
+### Adding a new sensor model
+
+1. Implement `ImuModel` (see `NoisyImu` for the Box-Muller pattern).
+2. Wire it with `Scenario::...(...).with_imu(Box::new(MyModel::new()))`.
+3. Add an autotest if the model captures a specific failure mode (e.g.
+   large bias, latency spike, dropout).
+4. Do **not** add noisy rows to the regression snapshot; see above.
+
+A `GpsModel` / `ViconModel` follows the same pattern once ESKF-in-the-
+loop is wired — that's the next milestone and it will consume
+`PositionMeasurement` at ~10 Hz.
+
 ## Simulation runner (`just sim-compare`, `just sim-run`)
 
 `just sim-compare` runs all four sim scenarios through all three

@@ -39,6 +39,7 @@ use cybflight_core::position_control::{
 use cybflight_core::trajectory_planning::flatness::reference_quaternion;
 use nalgebra::{stack, vector, Quaternion, SVector, UnitQuaternion, Vector3, Vector4};
 
+use crate::sensors::ImuMeasurement;
 use crate::trajectory::Setpoint;
 
 /// Controller stack abstraction. The runner ticks `step()` at `tick_rate_hz`
@@ -61,7 +62,17 @@ pub trait Controller {
     }
 
     /// One tick. Returns per-motor forces [N] to hand to the plant.
-    fn step(&mut self, x: &SVector<f32, NX>, horizon: &[Setpoint]) -> SVector<f32, NU>;
+    ///
+    /// `x` is ground-truth plant state (stand-in for a perfect global
+    /// estimator — will be replaced by ESKF output when sensors-in-the-
+    /// loop lands). `imu` is the scenario-provided IMU measurement;
+    /// ground-truth controllers ignore it, INDI consumes it.
+    fn step(
+        &mut self,
+        x: &SVector<f32, NX>,
+        imu: &ImuMeasurement,
+        horizon: &[Setpoint],
+    ) -> SVector<f32, NU>;
 }
 
 const MPC_SOLVE_RATE_HZ: f32 = 100.0;
@@ -92,7 +103,6 @@ pub struct MpcIndiController {
     mass: f32,
     grav: f32,
     per_motor_max_n: f32,
-    last_total_thrust_n: f32,
 }
 
 impl MpcIndiController {
@@ -163,7 +173,6 @@ impl MpcIndiController {
             mass,
             grav,
             per_motor_max_n,
-            last_total_thrust_n: hover_thrust_n,
         }
     }
 
@@ -220,7 +229,12 @@ impl Controller for MpcIndiController {
         SIMPLE_MPC_DT
     }
 
-    fn step(&mut self, x: &SVector<f32, NX>, horizon: &[Setpoint]) -> SVector<f32, NU> {
+    fn step(
+        &mut self,
+        x: &SVector<f32, NX>,
+        imu: &ImuMeasurement,
+        horizon: &[Setpoint],
+    ) -> SVector<f32, NU> {
         // Outer MPC solve every `mpc_stride` ticks.
         if self.tick_counter % self.mpc_stride == 0 {
             self.solve_mpc(x, horizon);
@@ -229,29 +243,23 @@ impl Controller for MpcIndiController {
 
         let thrust_sp_n = self.last_mpc_u[0];
         let rate_sp = Vector3::new(self.last_mpc_u[1], self.last_mpc_u[2], self.last_mpc_u[3]);
-
-        // Sensor synthesis.
-        // Gyro: perfect body-rate readout (body rates live at indices 10..13).
-        let gyro = x.fixed_rows::<3>(10).into_owned();
-        // Accelerometer: for a drag-free quadrotor plant, body-frame specific
-        // force is always [0, 0, Σu/m]. Use the sum from the previous applied
-        // motor vector — this is what a real accelerometer sees before the
-        // current tick's forces are applied.
-        let accel_body = Vector3::new(0.0, 0.0, self.last_total_thrust_n / self.mass);
         // Collective thrust setpoint expressed as specific force on body-z.
         let spf_sp_z = thrust_sp_n / self.mass;
 
         let g2_valid = [false; INDI_NU]; // no RPM telemetry in sim
-        let (out, _step_state) =
-            self.indi
-                .step(&gyro, &accel_body, &rate_sp, spf_sp_z, true, &g2_valid);
+        let (out, _step_state) = self.indi.step(
+            &imu.gyro,
+            &imu.accel,
+            &rate_sp,
+            spf_sp_z,
+            true,
+            &g2_valid,
+        );
 
         // Convert normalized commands [0,1] → per-motor thrust [N]. Plant's
         // motor model is linear (force = cmd * max_thrust); INDI was configured
         // with near-zero nonlinearity so the two match.
-        let u_motor = out.motor_commands * self.per_motor_max_n;
-        self.last_total_thrust_n = u_motor.sum();
-        u_motor
+        out.motor_commands * self.per_motor_max_n
     }
 }
 
@@ -325,7 +333,12 @@ impl Controller for MpcDirectController {
         FULL_MPC_DT
     }
 
-    fn step(&mut self, x: &SVector<f32, NX>, horizon: &[Setpoint]) -> SVector<f32, NU> {
+    fn step(
+        &mut self,
+        x: &SVector<f32, NX>,
+        _imu: &ImuMeasurement,
+        horizon: &[Setpoint],
+    ) -> SVector<f32, NU> {
         if self.tick_counter % self.mpc_stride == 0 {
             self.fill_reference(horizon);
             let _ = self.solver.solve(
@@ -415,7 +428,12 @@ impl Controller for CascadeController {
         MPC_SOLVE_RATE_HZ
     }
 
-    fn step(&mut self, x: &SVector<f32, NX>, horizon: &[Setpoint]) -> SVector<f32, NU> {
+    fn step(
+        &mut self,
+        x: &SVector<f32, NX>,
+        _imu: &ImuMeasurement,
+        horizon: &[Setpoint],
+    ) -> SVector<f32, NU> {
         let sp = &horizon[0];
         let pos = Vector3::new(x[0], x[1], x[2]);
         let quat = UnitQuaternion::from_quaternion(Quaternion::new(x[6], x[3], x[4], x[5]));

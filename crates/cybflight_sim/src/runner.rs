@@ -9,7 +9,9 @@
 //! History is decimated to ~100 Hz effective regardless of tick rate, so
 //! high-rate stacks (INDI at 8 kHz) don't bloat reports.
 
-use nalgebra::{UnitQuaternion, Vector3};
+use nalgebra::{SVector, UnitQuaternion, Vector3};
+
+use cybflight_core::mpc::NU;
 
 use crate::controller::Controller;
 use crate::plant::QuadPlant;
@@ -130,6 +132,13 @@ impl MissionRunner {
         let horizon_stride_s = controller.horizon_stride_s();
         let mut horizon: Vec<Setpoint> = Vec::with_capacity(horizon_len);
 
+        // Seed `u_last` at per-motor hover so the IMU model's first sample
+        // reports [0, 0, g] (matching a real accelerometer with the vehicle
+        // about to take off) rather than zero, which would look like free
+        // fall to INDI's takeoff detector.
+        let hover_per_motor = plant.params.body.mass_kg * 9.81 / NU as f32;
+        let mut u_last = SVector::<f32, NU>::from_element(hover_per_motor);
+
         for tick_idx in 0..max_ticks {
             let t = plant.time_s();
             horizon.clear();
@@ -139,7 +148,8 @@ impl MissionRunner {
             }
             let sp0 = horizon[0];
 
-            let u = controller.step(plant.raw_state(), &horizon);
+            let imu = scenario.imu_model.sample(plant, &u_last);
+            let u = controller.step(plant.raw_state(), &imu, &horizon);
             let motor_forces = [u[0], u[1], u[2], u[3]];
 
             if (tick_idx as u32) % history_stride == 0 {
@@ -158,6 +168,7 @@ impl MissionRunner {
             for _ in 0..substeps {
                 plant.step(&u);
             }
+            u_last = u;
 
             let pos = plant.position();
             if violates_geofence(

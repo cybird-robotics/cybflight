@@ -23,6 +23,7 @@ use cybflight_sim::{
     plant::{QuadPlant, VEHICLE},
     runner::{MissionRunner, RunOutput},
     scenario::Scenario,
+    sensors::NoisyImu,
 };
 use nalgebra::Vector3;
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,10 @@ impl From<&RunOutput> for Row {
 const SCENARIOS: &[&str] = &["hover_level", "hover_tilt30", "p2p_x3", "mission_square"];
 const CONTROLLERS: &[&str] = &["cascade", "mpc_direct", "mpc_indi"];
 
+/// Noisy sensor scenarios — run only against `mpc_indi`, the only stack
+/// that consumes the IMU. See HACKING.md for the noise/snapshot rationale.
+const NOISY_SCENARIOS: &[&str] = &["mission_square_noisy"];
+
 fn build_scenario(name: &str) -> Scenario {
     let vp = VEHICLE.build();
     let cfg = QuadPlanningConfig::from_vehicle_params(&vp);
@@ -75,6 +80,20 @@ fn build_scenario(name: &str) -> Scenario {
             ],
             &cfg,
         ),
+        "mission_square_noisy" => Scenario::mission(
+            name,
+            Vector3::new(0.0, 0.0, 1.0),
+            &[
+                Vector3::new(3.0, 0.0, 1.0),
+                Vector3::new(3.0, 3.0, 1.0),
+                Vector3::new(0.0, 3.0, 1.0),
+                Vector3::new(0.0, 0.0, 1.0),
+            ],
+            &cfg,
+        )
+        // Representative consumer-grade MEMS IMU. Seed is fixed so the
+        // noise sequence is snapshot-stable across runs.
+        .with_imu(Box::new(NoisyImu::isotropic(0xC0FFEE, 0.03, 0.3))),
         other => panic!("unknown scenario: {other}"),
     }
 }
@@ -93,15 +112,24 @@ fn compute_current() -> BTreeMap<String, Row> {
     let mut out = BTreeMap::new();
     for &s in SCENARIOS {
         for &c in CONTROLLERS {
-            let mut scenario = build_scenario(s);
-            let mut controller = build_controller(c);
-            let mut plant = QuadPlant::new(VEHICLE.build(), 1.0 / 8000.0);
-            let runner = MissionRunner::new(Default::default());
-            let run_out = runner.run(&mut scenario, &mut plant, &mut *controller);
-            out.insert(format!("{s}/{c}"), (&run_out).into());
+            out.insert(format!("{s}/{c}"), run_one(s, c));
         }
     }
+    // Noisy scenarios run only against mpc_indi (cascade / mpc_direct
+    // ignore the IMU, so noise has no effect on them).
+    for &s in NOISY_SCENARIOS {
+        out.insert(format!("{s}/mpc_indi"), run_one(s, "mpc_indi"));
+    }
     out
+}
+
+fn run_one(scenario_name: &str, controller_name: &str) -> Row {
+    let mut scenario = build_scenario(scenario_name);
+    let mut controller = build_controller(controller_name);
+    let mut plant = QuadPlant::new(VEHICLE.build(), 1.0 / 8000.0);
+    let runner = MissionRunner::new(Default::default());
+    let run_out = runner.run(&mut scenario, &mut plant, &mut *controller);
+    (&run_out).into()
 }
 
 // Tolerance: drift fails the test when the actual value moves more than

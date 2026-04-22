@@ -15,10 +15,9 @@
 //!       --features std --test rotation_convention`
 
 use cybflight_core::rotation::{
-    angle_axis_from_two_normals, angle_axis_to_quaternion, angle_axis_to_rotation_matrix,
-    euler_angles_rpy_to_quaternion, euler_angles_rpy_to_rotation_matrix, hat,
-    left_quaternion_matrix, quaternion_from_unit_z_to_v, quaternion_from_zb_and_yaw,
-    quaternion_to_angle_axis, quaternion_to_euler_angles_rpy, quaternion_to_yaw,
+    angle_axis_from_two_normals, euler_angles_rpy_to_quaternion,
+    euler_angles_rpy_to_rotation_matrix, hat, left_quaternion_matrix, quaternion_from_unit_z_to_v,
+    quaternion_from_zb_and_yaw, quaternion_to_euler_angles_rpy, quaternion_to_yaw,
     right_quaternion_matrix, rotation_matrix_to_euler_angles_rpy, should_flip_quaternion, vee,
 };
 use nalgebra::{Matrix3, Quaternion, Rotation3, UnitQuaternion, Vector3, Vector4};
@@ -49,9 +48,9 @@ fn mat_close(a: &Matrix3<f32>, b: &Matrix3<f32>, tol: f32) -> bool {
 /// Sample roll/pitch/yaw triples covering several octants and one each
 /// near the poles. Pitch deliberately stays away from ±π/2 — gimbal lock
 /// is exercised in its own dedicated test.
-fn sample_rpys() -> Vec<Vector3<f32>> {
+fn sample_rpys() -> [Vector3<f32>; 8] {
     use core::f32::consts::PI;
-    vec![
+    [
         Vector3::new(0.0, 0.0, 0.0),
         Vector3::new(0.1, 0.2, 0.3),
         Vector3::new(-0.4, 0.5, -0.6),
@@ -64,22 +63,22 @@ fn sample_rpys() -> Vec<Vector3<f32>> {
 }
 
 /// Sample rotation vectors from "essentially zero" through "near π".
-fn sample_axes() -> Vec<Vector3<f32>> {
+fn sample_axes() -> [Vector3<f32>; 9] {
     // NOTE: exact zero is deliberately omitted. The C++ source's
     // `angleAxisToQuaternion` uses `sin(half_theta)/theta` in the small-angle
     // branch, which is `0/0 = NaN` at θ = 0. Per the "do not challenge
     // rotation.hpp" instruction the Rust port preserves this verbatim, so we
     // simply avoid the singular input here.
-    vec![
+    [
         Vector3::new(1e-9, 0.0, 0.0), // tickles the small-angle branch
         Vector3::new(0.0, 1e-4, 0.0),
         Vector3::new(0.1, 0.0, 0.0),
         Vector3::new(0.0, 0.0, 0.5),
         Vector3::new(0.3, -0.4, 0.5),
         Vector3::new(-0.6, 0.7, -0.8),
-        Vector3::new(1.0, 1.0, 1.0),                              // ≈1.73 rad
-        Vector3::new(2.0, 0.0, 0.0),                              // ≈2 rad
-        Vector3::new(2.5, -1.0, 0.5).normalize() * (2.9_f32),     // close to π
+        Vector3::new(1.0, 1.0, 1.0),                          // ≈1.73 rad
+        Vector3::new(2.0, 0.0, 0.0),                          // ≈2 rad
+        Vector3::new(2.5, -1.0, 0.5).normalize() * (2.9_f32), // close to π
     ]
 }
 
@@ -110,10 +109,7 @@ fn hat_v_acts_as_cross_product() {
 
 #[test]
 fn vee_is_left_inverse_of_hat() {
-    for v in [
-        Vector3::new(1.0, 2.0, 3.0),
-        Vector3::new(-0.5, 0.7, -0.2),
-    ] {
+    for v in [Vector3::new(1.0, 2.0, 3.0), Vector3::new(-0.5, 0.7, -0.2)] {
         assert!(vec_close(&vee(&hat(&v)), &v, TOL_TIGHT));
     }
 }
@@ -171,189 +167,6 @@ fn right_quaternion_matrix_realizes_right_multiplication() {
                 rhs.as_slice(),
             );
         }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// quaternion_to_angle_axis  ↔  angle_axis_to_quaternion  ↔  nalgebra
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn aa_to_quat_is_unit_norm_for_small_angles() {
-    // The C++ source uses a 4th-order Taylor expansion in `θ²` for the
-    // exp map's real/imag scale factors as the *default* branch. The
-    // truncation error in ‖q‖ scales as `O(θ⁶)`, so the unit-norm
-    // guarantee tightens dramatically as θ shrinks. We test the regime
-    // where the firmware actually operates: |θ| ≲ 1 rad.
-    for axis in sample_axes() {
-        if axis.norm() > 1.0 {
-            continue;
-        }
-        let q = angle_axis_to_quaternion(&axis);
-        assert!(
-            (q.norm() - 1.0).abs() < TOL_TAYLOR,
-            "non-unit quat for axis={:?}: ‖q‖={}",
-            axis,
-            q.norm()
-        );
-    }
-}
-
-#[test]
-fn aa_to_quat_norm_drift_pinned_for_large_angles() {
-    // Pin (don't fight) the known Taylor-truncation drift at large angles.
-    // At ‖θ‖ = 2 rad the 4th-order series under-normalizes by ~1e-3 — this
-    // is a documented property of the C++ source's branch choice.
-    let axis = Vector3::new(2.0_f32, 0.0, 0.0);
-    let q = angle_axis_to_quaternion(&axis);
-    let drift = (q.norm() - 1.0).abs();
-    // Sanity bracket: drift is in the milli-units, not micro and not unity.
-    assert!(drift > 1e-4 && drift < 1e-2, "unexpected drift: {}", drift);
-}
-
-#[test]
-fn quat_to_aa_round_trip_through_quaternion() {
-    // ours(ours⁻¹(θ)) == θ. Restrict to ‖θ‖ ≤ 1 rad where the Taylor
-    // truncation in `angle_axis_to_quaternion` is well within tolerance.
-    for axis in sample_axes() {
-        if axis.norm() > 1.0 {
-            continue;
-        }
-        let q = angle_axis_to_quaternion(&axis);
-        let back = quaternion_to_angle_axis(&q);
-        assert!(
-            vec_close(&back, &axis, TOL_LOOSE),
-            "round trip failed: axis={:?} back={:?}",
-            axis,
-            back
-        );
-    }
-}
-
-#[test]
-fn quat_to_aa_round_trip_via_nalgebra_exp_holds_at_large_angles() {
-    // Sidestep our exp map's truncation by building the quaternion with
-    // nalgebra's exact closed-form `from_scaled_axis`, then verify our
-    // log map (`quaternion_to_angle_axis`) recovers the original axis to
-    // tight tolerance even at near-π rotations.
-    for axis in sample_axes() {
-        if axis.norm() < 1e-6 {
-            continue;
-        }
-        let q = UnitQuaternion::from_scaled_axis(axis);
-        let back = quaternion_to_angle_axis(&q);
-        assert!(
-            (back - axis).norm() < TOL_LOOSE,
-            "log-map round trip failed: axis={:?} back={:?}",
-            axis,
-            back
-        );
-    }
-}
-
-#[test]
-fn quat_to_aa_matches_nalgebra_scaled_axis() {
-    // Build the quaternion the *exact* way (nalgebra), then check our log
-    // map against nalgebra's. Avoids contaminating the comparison with the
-    // 4th-order truncation in our exp map.
-    for axis in sample_axes() {
-        if axis.norm() < 1e-6 {
-            // Near identity nalgebra returns a hard-cut zero (Unit::try_new
-            // fails); ours returns a tiny Taylor value. Pinned in its own test.
-            continue;
-        }
-        let q = UnitQuaternion::from_scaled_axis(axis);
-        let ours = quaternion_to_angle_axis(&q);
-        let theirs = q.scaled_axis();
-        assert!(
-            (ours - theirs).norm() < TOL_LOOSE,
-            "axis={:?}: ours={:?} theirs={:?}",
-            axis,
-            ours,
-            theirs
-        );
-    }
-}
-
-#[test]
-fn quat_to_aa_pins_near_identity_branch() {
-    // At the identity quaternion, both implementations return 0.
-    let id = UnitQuaternion::<f32>::identity();
-    assert!(vec_close(
-        &quaternion_to_angle_axis(&id),
-        &Vector3::zeros(),
-        TOL_TIGHT
-    ));
-    assert!(vec_close(&id.scaled_axis(), &Vector3::zeros(), TOL_TIGHT));
-
-    // For a tiny but nonzero rotation, both should be close to the input
-    // angle-axis. Ours uses a 3rd-order series; nalgebra uses the closed
-    // form. They should agree to ~1e-7.
-    let tiny = Vector3::new(1e-5, 0.0, 0.0);
-    let q = UnitQuaternion::from_scaled_axis(tiny);
-    let ours = quaternion_to_angle_axis(&q);
-    let theirs = q.scaled_axis();
-    assert!(
-        (ours - theirs).norm() < 1e-7,
-        "tiny-angle branch disagrees: ours={:?} theirs={:?}",
-        ours,
-        theirs
-    );
-}
-
-#[test]
-fn aa_to_quat_matches_nalgebra_for_small_to_moderate_angles() {
-    // Where the 4th-order Taylor truncation is well within tolerance.
-    for axis in sample_axes() {
-        if axis.norm() > 1.0 {
-            continue;
-        }
-        let ours = angle_axis_to_quaternion(&axis);
-        let theirs = UnitQuaternion::from_scaled_axis(axis);
-        assert!(
-            quat_close(&ours, &theirs, TOL),
-            "axis={:?} ours={:?} theirs={:?}",
-            axis,
-            ours.coords.as_slice(),
-            theirs.coords.as_slice(),
-        );
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// angle_axis_to_rotation_matrix
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn aa_to_rmat_matches_rotation3() {
-    for axis in sample_axes() {
-        let ours = angle_axis_to_rotation_matrix(&axis);
-        let theirs = *Rotation3::from_scaled_axis(axis).matrix();
-        assert!(
-            mat_close(&ours, &theirs, TOL_LOOSE),
-            "axis={:?}\nours=\n{}\ntheirs=\n{}",
-            axis,
-            ours,
-            theirs
-        );
-    }
-}
-
-#[test]
-fn aa_to_rmat_is_orthogonal_with_unit_determinant() {
-    for axis in sample_axes() {
-        let r = angle_axis_to_rotation_matrix(&axis);
-        let rtr = r.transpose() * r;
-        assert!(
-            mat_close(&rtr, &Matrix3::identity(), TOL_LOOSE),
-            "RᵀR ≠ I for axis={:?}",
-            axis
-        );
-        assert!(
-            (r.determinant() - 1.0).abs() < TOL_LOOSE,
-            "det(R) ≠ 1 for axis={:?}",
-            axis
-        );
     }
 }
 
@@ -698,7 +511,7 @@ fn aa_from_two_normals_rotates_a_to_b() {
     ] {
         let perp = Vector3::x(); // unused away from antiparallel case
         let rvec = angle_axis_from_two_normals(&a, &b, &perp);
-        let r = angle_axis_to_rotation_matrix(&rvec);
+        let r = UnitQuaternion::new(rvec);
         let mapped = r * a;
         assert!(
             vec_close(&mapped, &b, TOL_LOOSE),
@@ -730,7 +543,7 @@ fn aa_from_two_normals_handles_antiparallel_inputs() {
     let rvec = angle_axis_from_two_normals(&a, &b, &perp);
     assert!((rvec.norm() - PI).abs() < TOL_LOOSE);
     // And rotating by it must actually flip a → b.
-    let r = angle_axis_to_rotation_matrix(&rvec);
+    let r = UnitQuaternion::new(rvec);
     assert!(vec_close(&(r * a), &b, TOL_LOOSE));
 }
 

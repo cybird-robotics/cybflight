@@ -2,8 +2,8 @@
 
 use core::marker::Copy;
 use nalgebra::{
-    Matrix, Matrix3, Matrix4, Quaternion, RealField, Rotation3, Storage, U1, U3, UnitQuaternion,
-    Vector3,
+    Matrix, Matrix3, Matrix4, Quaternion, RealField, Rotation3, Storage, UnitQuaternion, Vector3,
+    U1, U3,
 };
 use num_traits::NumCast;
 
@@ -92,95 +92,6 @@ pub fn right_quaternion_matrix<T: RealField + Copy>(q: &UnitQuaternion<T>) -> Ma
 // `left_quaternion_matrix`/`right_quaternion_matrix`. Everything else lives
 // here.
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Logarithmic map of a unit quaternion: `q ↦ θ·n` where `q = (cos θ/2,
-/// n sin θ/2)`. Returns the rotation vector (axis times angle, in `[-π, π]`).
-///
-/// Uses a 3rd-order series in `‖vec(q)‖²` near identity to dodge the `0/0`
-/// in `2·atan2(n, w) / n`. Picks the negative-w branch via `atan2(-n, -w)`
-/// so the wrap to `(-π, π]` happens inside the trig call.
-pub fn quaternion_to_angle_axis<T: RealField + Copy + NumCast>(
-    quaternion: &UnitQuaternion<T>,
-) -> Vector3<T> {
-    let v = quaternion.vector();
-    let squared_n = v.dot(&v);
-    let w = quaternion.scalar();
-
-    let two_atan_nbyw_by_n = if is_close(squared_n, T::zero()) {
-        // n=0 ⇒ for a normalized quaternion, w=±1; series of 2·atan2(n,w)/n in n²
-        let two: T = cast(2.0);
-        let two_thirds: T = cast(2.0 / 3.0);
-        let squared_w = w * w;
-        two / w - two_thirds * squared_n / (w * squared_w)
-    } else {
-        let n = squared_n.sqrt();
-        // w<0 ⇒ θ>π; the wrap to (-π, π] is folded into atan2(-n, -w).
-        let atan_nbyw = if w < T::zero() {
-            (-n).atan2(-w)
-        } else {
-            n.atan2(w)
-        };
-        let two: T = cast(2.0);
-        two * atan_nbyw / n
-    };
-
-    v * two_atan_nbyw_by_n
-}
-
-/// Exponential map of a rotation vector to a 3×3 rotation matrix
-/// (Rodrigues' formula). Series-expanded near zero to avoid `sin θ / θ`
-/// blowing up.
-pub fn angle_axis_to_rotation_matrix<T, S>(angle_axis: &Matrix<T, U3, U1, S>) -> Matrix3<T>
-where
-    T: RealField + Copy + NumCast,
-    S: Storage<T, U3, U1>,
-{
-    let theta_sq = angle_axis.dot(angle_axis);
-    let hat_phi = hat(angle_axis);
-    let hat_phi_sq = hat_phi * hat_phi;
-    let identity = Matrix3::<T>::identity();
-
-    if is_close(theta_sq, T::zero()) {
-        let half: T = cast(0.5);
-        identity + hat_phi + hat_phi_sq * half
-    } else {
-        let theta = theta_sq.sqrt();
-        let cos_theta = theta.cos();
-        let sin_theta = theta.sin();
-        identity + hat_phi_sq * ((T::one() - cos_theta) / theta_sq) + hat_phi * (sin_theta / theta)
-    }
-}
-
-/// Exponential map of a rotation vector to a unit quaternion. Uses a
-/// 4th-order series in `‖θ‖²` near zero to dodge the `0/0` in
-/// `sin(θ/2)/θ`, and the closed form everywhere else.
-pub fn angle_axis_to_quaternion<T, S>(angle_axis: &Matrix<T, U3, U1, S>) -> UnitQuaternion<T>
-where
-    T: RealField + Copy + NumCast,
-    S: Storage<T, U3, U1>,
-{
-    let angle_sq = angle_axis.dot(angle_axis);
-    let (real_factor, imag_factor) = if is_close(angle_sq, T::zero()) {
-        let theta_po4 = angle_sq * angle_sq;
-        let imag = cast::<T>(0.5) - cast::<T>(1.0 / 48.0) * angle_sq
-            + cast::<T>(1.0 / 3840.0) * theta_po4;
-        let real = T::one() - cast::<T>(1.0 / 8.0) * angle_sq
-            + cast::<T>(1.0 / 384.0) * theta_po4;
-        (real, imag)
-    } else {
-        let theta = angle_sq.sqrt();
-        let half_theta = cast::<T>(0.5) * theta;
-        (half_theta.cos(), half_theta.sin() / theta)
-    };
-
-    let q = Quaternion::new(
-        real_factor,
-        imag_factor * angle_axis[0],
-        imag_factor * angle_axis[1],
-        imag_factor * angle_axis[2],
-    );
-    UnitQuaternion::new_unchecked(q)
-}
 
 /// Roll/pitch/yaw (XYZ intrinsic, applied as Rz·Ry·Rx) → unit quaternion.
 /// Closed form, no Euler-angle gimbal handling needed.

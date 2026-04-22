@@ -66,6 +66,22 @@ See [docs/architecture.md](docs/architecture.md) "How to Add a New Sensor Type" 
   In this case, claude must clearly annotate TODO comments to replace with
   nalgebra in a future refactor.
 
+## Sim regression snapshot
+
+`crates/cybflight_sim/tests/regression_snapshot.json` is a committed
+golden file (insta-style) of the 12-row sim comparison metrics.
+
+- `just sim-check` — assert current numbers match the snapshot within a
+  tight tolerance. Run this after any change to `cybflight-core` or
+  `cybflight-sim` to catch unintended behavior drift.
+- `just sim-snapshot` — regenerate the file. Only run this when you
+  **intend** to change behavior (retuned a gain, swapped a solver,
+  etc.). Then `git diff` the snapshot, review the numeric change, and
+  commit it **in the same commit** as the code change so the reviewer
+  sees cause (code) and effect (numbers) together.
+
+Full workflow and rationale in [docs/HACKING.md](docs/HACKING.md#sim-regression-snapshot).
+
 ## Tooling
 
 In environments where the username is `hs293go`, `rg` and `fd` are available as modern alternatives to `grep` and `find`. `fzf` is also available.

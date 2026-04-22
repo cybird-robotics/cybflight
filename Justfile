@@ -75,6 +75,21 @@ sim-compare:
         done
     done
 
+# Verify the sim comparison table matches the committed snapshot at
+# crates/cybflight_sim/tests/regression_snapshot.json. Tight-tolerance
+# regression gate for algebraic changes to controllers / plant / planner.
+# See docs/HACKING.md for the review workflow.
+sim-check:
+    cargo test -p cybflight-sim --target {{HOST}} --profile release-host \
+        --test regression_snapshot -- --nocapture
+
+# Regenerate the sim regression snapshot from the current code. Review with
+# `git diff` before committing — the snapshot IS the change log for how the
+# controllers behave, and any drift should be reviewed by a human.
+sim-snapshot:
+    UPDATE_SNAPSHOTS=1 cargo test -p cybflight-sim --target {{HOST}} \
+        --profile release-host --test regression_snapshot -- --nocapture
+
 # Run a single sim scenario end-to-end through the CLI binary. Defaults to
 # mission_square / mpc_indi. Override with SCENARIO / CONTROLLER; set VIZ=1
 # to stream to a rerun viewer.

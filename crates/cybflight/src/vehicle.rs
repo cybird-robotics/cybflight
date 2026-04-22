@@ -62,9 +62,6 @@ pub const DEFAULT_CONTROL_GAINS: cybflight_core::params::ControlGains =
         pos_kp: [4.0, 4.0, 8.0],
         pos_kd: [4.0, 4.0, 6.0],
         att_k_rate: [3.0, 3.0, 1.0],
-        rate_kp: [0.1, 0.08, 0.05],
-        rate_ki: [0.0, 0.0, 0.0],
-        rate_kd: [0.0, 0.0, 0.0],
     };
 
 /// Return the compile-time default vehicle parameters.

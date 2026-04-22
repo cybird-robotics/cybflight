@@ -369,6 +369,10 @@ impl Controller for MpcDirectController {
 // Cascade controller (legacy PD+FF baseline)
 // ───────────────────────────────────────────────────────────────────────────
 
+/// Rate-loop P-gains for the legacy cascade baseline. Sim-only — the firmware's
+/// active inner loop is INDI and does not carry rate PID gains in `ControlGains`.
+const CASCADE_RATE_KP: Vector3<f32> = Vector3::new(0.1, 0.08, 0.05);
+
 pub struct CascadeController {
     pos_ctrl: PositionController<f32>,
     att_ctrl: GeometricAttitudeController<f32>,
@@ -409,7 +413,7 @@ impl CascadeController {
             pos_ctrl,
             att_ctrl,
             allocator,
-            rate_kp: Vector3::new(g.rate_kp[0], g.rate_kp[1], g.rate_kp[2]),
+            rate_kp: CASCADE_RATE_KP,
             rate_clamp: Vector3::new(0.8, 0.6, 0.15),
             per_motor_max_n: per_motor_max,
             max_collective_n: max_collective,

@@ -1,33 +1,34 @@
 //! Persistent vehicle parameter container with manual serialization.
 //!
-//! On-flash layout (little-endian, 640 bytes, aligned to 32-byte flash words):
+//! On-flash layout (little-endian, 608 bytes, aligned to 32-byte flash words):
 //!
 //! ```text
 //! [0x00]  magic:   u32 = 0x43594250 ("CYBP")
-//! [0x04]  version: u32 = 7
-//! [0x08]  length:  u32 = PAYLOAD_SIZE (624)
+//! [0x04]  version: u32 = 8
+//! [0x08]  length:  u32 = PAYLOAD_SIZE (588)
 //! [0x0C]  crc32:   u32 (over payload only)
-//! [0x10]  payload: 624 bytes
+//! [0x10]  payload: 588 bytes
 //!   Body:               mass(4) + inertia(36) + max_rate(12) = 52 bytes
 //!   Motors (x4):        px(4) + py(4) + spin_dir(4) + max_thrust(4) + torque_coeff(4) = 80 bytes
+//!   ControlGains:       pos_kp(12) + pos_kd(12) + att_k_rate(12) = 36 bytes
 //!   INDI effectiveness: g1_force(48) + g1_torque(48) + g2(48) + max_omega(16) + time_const(16) + nonlinearity(16) = 192 bytes
 //!   INDI controller:    rate_gains(12) + sync_filter_hz(4) + wls_wv(24) + wls_wu(16) + motor_pole_count(4 as f32) = 60 bytes
 //!   Learner:            fx_filt_hz(4) + motor_filt_hz(4) + acc_offset_m(12) + rls_gamma(4) + rls_t_char_s(4) + zeta_rate(4) + zeta_attitude(4) = 36 bytes
 //!   MpcParams:          pos(12) + vel(12) + att(12) + rate(12) + thrust(4) + dt(4) + rho(4) = 60 bytes
 //!   PlannerParams:      max_vel_m_s(4) + max_tilt_rad(4) + weight_time(4) + weight_energy(4) + weight_pos(4) + weight_vel(4) + weight_tilt(4) + weight_body_rate(4) + weight_thrust(4) + smoothing_eps(4) + num_check_per_piece(4 as f32) = 44 bytes
 //!   BfgsTrustParams:    delta_init(4) + delta_max(4) + eta(4) + g_epsilon(4) + max_iterations(4 as f32) + past(4 as f32) + delta_conv(4) = 28 bytes
-//! [0x280] padding: 0 bytes
+//! [0x25C] padding: 4 bytes
 //! ```
 
 use crate::mixer::{MotorParams, RigidBodyParams, SpinDir};
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 7;
+const VERSION: u32 = 8;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
-/// Total payload: 52 + 80 + 72 + 192 + 60 + 36 + 60 + 44 + 28 = 624 bytes
-const PAYLOAD_SIZE: usize = 624;
-/// Padded to 32-byte flash word boundary: ceil((16+624)/32)*32 = 640
-pub const PADDED_SIZE: usize = 640;
+/// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 = 588 bytes
+const PAYLOAD_SIZE: usize = 588;
+/// Padded to 32-byte flash word boundary: ceil((16+588)/32)*32 = 608
+pub const PADDED_SIZE: usize = 608;
 
 /// MPC tuning parameters: cost weights, discretization, and constraint penalty.
 ///
@@ -146,15 +147,7 @@ impl Default for PlannerParams {
     }
 }
 
-/// PID gain triplet.
-#[derive(Clone, Copy, Debug)]
-pub struct PidGains {
-    pub kp: f32,
-    pub ki: f32,
-    pub kd: f32,
-}
-
-/// Control gains for position, attitude, and rate loops.
+/// Control gains for position and attitude loops.
 ///
 /// All vector gains are dimension-major: `[roll/x, pitch/y, yaw/z]`.
 #[derive(Clone, Debug)]
@@ -165,23 +158,6 @@ pub struct ControlGains {
     pub pos_kd: [f32; 3],
     /// Attitude error to body-rate gains [roll, pitch, yaw].
     pub att_k_rate: [f32; 3],
-    /// Rate PID proportional gains [roll, pitch, yaw].
-    pub rate_kp: [f32; 3],
-    /// Rate PID integral gains [roll, pitch, yaw].
-    pub rate_ki: [f32; 3],
-    /// Rate PID derivative gains [roll, pitch, yaw].
-    pub rate_kd: [f32; 3],
-}
-
-impl ControlGains {
-    /// Extract per-axis PID gains for the rate controller.
-    pub fn rate_pid(&self, axis: usize) -> PidGains {
-        PidGains {
-            kp: self.rate_kp[axis],
-            ki: self.rate_ki[axis],
-            kd: self.rate_kd[axis],
-        }
-    }
 }
 
 /// INDI effectiveness parameters (learned or manually configured).
@@ -504,9 +480,6 @@ impl VehicleParams {
             pos_kp,
             pos_kd,
             att_k_rate,
-            rate_kp,
-            rate_ki,
-            rate_kd,
         };
 
         // INDI effectiveness

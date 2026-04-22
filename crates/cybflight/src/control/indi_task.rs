@@ -171,6 +171,21 @@ fn write_learned_to_params(learned: &LearnedParams) {
     crate::params::set(params);
 }
 
+/// Convert an estimated mechanical omega (rad/s) to wire-safe eRPM (u32).
+///
+/// Guards the saturating `f32 as u32` cast against non-finite and
+/// out-of-range inputs: `+inf as u32` saturates to `u32::MAX`, which would
+/// otherwise leak through telemetry as a ~4.3 billion eRPM spike. Anything
+/// non-finite, non-positive, or beyond `max_omega * 1.2` (the range-gate
+/// headroom used elsewhere) collapses to 0.
+fn omega_to_safe_erpm(omega: f32, erpm_to_rads: f32, max_omega: f32) -> u32 {
+    if omega.is_finite() && omega > 0.0 && omega <= max_omega * 1.2 {
+        libm::roundf(omega / erpm_to_rads) as u32
+    } else {
+        0
+    }
+}
+
 #[embassy_executor::task]
 pub async fn indi_task() {
     // --- Load params for INDI controller and learner ---
@@ -445,7 +460,11 @@ pub async fn indi_task() {
                 rpm_estimators[i].step(est_current_ts, est_dt, y_meas[i]);
             }
             let estimated_inputs: [RpmInput; NU] = core::array::from_fn(|i| {
-                let erpm = libm::roundf(rpm_estimators[i].state().omega() / erpm_to_rads) as u32;
+                let erpm = omega_to_safe_erpm(
+                    rpm_estimators[i].state().omega(),
+                    erpm_to_rads,
+                    max_omega_bound,
+                );
                 RpmInput::Erpm(erpm)
             });
             let (valid, _rpm_failsafe) = indi.update_rpm(&estimated_inputs);
@@ -620,11 +639,7 @@ pub async fn indi_task() {
                 } else {
                     0.0
                 };
-                let erpm = if omega > 0.0 {
-                    libm::roundf(omega / erpm_to_rads) as u32
-                } else {
-                    0
-                };
+                let erpm = omega_to_safe_erpm(omega, erpm_to_rads, max_omega_bound);
                 msgs::DshotMotorTelemetry {
                     value: if erpm > 0 {
                         TelemetryValue::Erpm(erpm)

@@ -22,7 +22,7 @@
 //! Each helper carries a `const { assert!(NX >= 7) }` (or 10 / 13 as needed)
 //! so calling it with an incompatible state size is a compile-time error.
 
-use nalgebra::{SMatrix, SVector, Vector3};
+use nalgebra::{matrix, SMatrix, SVector, Vector3};
 
 // ───────────────────────────────────────────────────────────────────────────
 // Quaternion projection
@@ -97,30 +97,28 @@ pub fn attitude_error<const NX: usize>(
     let dd2 = qa[2] * inv_d;
     let dd3 = qa[3] * inv_d;
 
-    let de = SMatrix::<f32, 3, 4>::from_row_slice(&[
+    let de = matrix![
         2.0 * qa[3] * inv_d,
-        2.0 * (-qa[2]) * inv_d,
-        2.0 * (-qa[1] * inv_d - nr * dd2 * inv_d2),
-        2.0 * (qa[0] * inv_d - nr * dd3 * inv_d2),
-        //
+            2.0 * (-qa[2]) * inv_d,
+            2.0 * (-qa[1] * inv_d - nr * dd2 * inv_d2),
+            2.0 * (qa[0] * inv_d - nr * dd3 * inv_d2);
         2.0 * qa[2] * inv_d,
-        2.0 * qa[3] * inv_d,
-        2.0 * (qa[0] * inv_d - np_ * dd2 * inv_d2),
-        2.0 * (qa[1] * inv_d - np_ * dd3 * inv_d2),
-        //
+            2.0 * qa[3] * inv_d,
+            2.0 * (qa[0] * inv_d - np_ * dd2 * inv_d2),
+            2.0 * (qa[1] * inv_d - np_ * dd3 * inv_d2);
         0.0,
-        0.0,
-        2.0 * (inv_d - ny * dd2 * inv_d2),
-        2.0 * (-ny * dd3 * inv_d2),
-    ]);
+            0.0,
+            2.0 * (inv_d - ny * dd2 * inv_d2),
+            2.0 * (-ny * dd3 * inv_d2);
+    ];
 
     let sf = sign_flip;
-    let dqa_dq = SMatrix::<f32, 4, 4>::from_row_slice(&[
-        -rw * sf, -rz * sf, ry * sf, rx * sf, //
-        rz * sf, -rw * sf, -rx * sf, ry * sf, //
-        -ry * sf, rx * sf, -rw * sf, rz * sf, //
-        rx * sf, ry * sf, rz * sf, rw * sf,
-    ]);
+    let dqa_dq = matrix![
+        -rw * sf, -rz * sf,  ry * sf, rx * sf;
+         rz * sf, -rw * sf, -rx * sf, ry * sf;
+        -ry * sf,  rx * sf, -rw * sf, rz * sf;
+         rx * sf,  ry * sf,  rz * sf, rw * sf;
+    ];
 
     (ea, de, dqa_dq)
 }

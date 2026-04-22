@@ -37,7 +37,7 @@ use cybflight_core::position_control::{
     self, pd_ff_control::PositionController, PositionControlSetpoint, PositionControlState,
 };
 use cybflight_core::trajectory_planning::flatness::reference_quaternion;
-use nalgebra::{stack, Quaternion, SVector, UnitQuaternion, Vector3, Vector4};
+use nalgebra::{stack, vector, Quaternion, SVector, UnitQuaternion, Vector3, Vector4};
 
 use crate::trajectory::Setpoint;
 
@@ -110,7 +110,7 @@ impl MpcIndiController {
             .fold(0.0f32, f32::max);
 
         let hover_thrust_n = mass * grav;
-        let u_ref = SVector::<f32, SIMPLE_NU>::from_row_slice(&[hover_thrust_n, 0.0, 0.0, 0.0]);
+        let u_ref = vector![hover_thrust_n, 0.0, 0.0, 0.0];
 
         let mut x_ref = SVector::<f32, SIMPLE_NX>::zeros();
         x_ref[6] = 1.0;

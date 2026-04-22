@@ -10,7 +10,7 @@ use cybflight_core::params::{
     ControlGains, IndiControllerParams, IndiEffectivenessParams, LearnerParams, MpcParams,
     PlannerParams, VehicleParams,
 };
-use nalgebra::{Quaternion, SVector, UnitQuaternion, Vector3};
+use nalgebra::{stack, Quaternion, SVector, UnitQuaternion, Vector3};
 
 /// Canonical host-side vehicle parameters. Mirrors the firmware's
 /// `QUADROTOR_BODY` / `QUADROTOR_MOTORS` / `DEFAULT_CONTROL_GAINS` in
@@ -106,9 +106,7 @@ impl QuadPlant {
     /// Overwrite the integrator state. Quaternion is re-normalized.
     pub fn reset(&mut self, pos: Vector3<f32>, vel: Vector3<f32>, attitude: UnitQuaternion<f32>) {
         let q = attitude.into_inner();
-        self.state = SVector::<f32, NX>::from_row_slice(&[
-            pos.x, pos.y, pos.z, q.i, q.j, q.k, q.w, vel.x, vel.y, vel.z, 0.0, 0.0, 0.0,
-        ]);
+        self.state = stack![pos; q.coords; vel; Vector3::zeros()];
         self.time_s = 0.0;
     }
 

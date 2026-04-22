@@ -22,7 +22,7 @@
 //! between every stage, and a public `normalize_quat` boundary helper.
 
 use super::model_utils;
-use nalgebra::{SMatrix, SVector, Vector4};
+use nalgebra::{vector, SMatrix, SVector, Vector4};
 
 pub const NX: usize = 10;
 pub const NU: usize = 4;
@@ -194,11 +194,7 @@ impl QuadModel {
         &self,
         x: &SVector<f32, NX>,
         u: &SVector<f32, NU>,
-    ) -> (
-        SVector<f32, NX>,
-        SMatrix<f32, NX, NX>,
-        SMatrix<f32, NX, NU>,
-    ) {
+    ) -> (SVector<f32, NX>, SMatrix<f32, NX, NX>, SMatrix<f32, NX, NU>) {
         let (qx, qy, qz, qw) = (x[3], x[4], x[5], x[6]);
         let (vx, vy, vz) = (x[7], x[8], x[9]);
         let (c, wx, wy, wz) = (u[0], u[1], u[2], u[3]);
@@ -206,7 +202,7 @@ impl QuadModel {
 
         let ct_m = c * m_inv;
 
-        let xdot: SVector<_, NX> = [
+        let xdot = vector![
             vx,
             vy,
             vz,
@@ -216,9 +212,8 @@ impl QuadModel {
             0.5 * (-qx * wx - qy * wy - qz * wz),
             2.0 * (qw * qy + qx * qz) * ct_m,
             2.0 * (qy * qz - qw * qx) * ct_m,
-            (1.0 - 2.0 * qx * qx - 2.0 * qy * qy) * ct_m - self.grav,
-        ]
-        .into();
+            (1.0 - 2.0 * qx * qx - 2.0 * qy * qy) * ct_m - self.grav
+        ];
 
         // df/dx (10 × 10)
         let mut jx = SMatrix::<f32, NX, NX>::zeros();

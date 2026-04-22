@@ -17,7 +17,7 @@
 
 use super::model_utils;
 
-use nalgebra::{SMatrix, SVector, Vector3};
+use nalgebra::{vector, SMatrix, SVector, Vector3};
 
 pub const NX: usize = 13;
 pub const NU: usize = 4;
@@ -227,7 +227,7 @@ impl FullQuadModel {
         let (f_total, tau_x, tau_y, tau_z) = self.alloc(u);
         let ct_m = f_total * m_inv;
 
-        let xdot: SVector<f32, NX> = [
+        let xdot = vector![
             vx,
             vy,
             vz,
@@ -240,9 +240,8 @@ impl FullQuadModel {
             (1.0 - 2.0 * qx * qx - 2.0 * qy * qy) * ct_m - self.grav,
             (tau_x - (izz - iyy) * wy * wz) * ixx_inv,
             (tau_y - (ixx - izz) * wx * wz) * iyy_inv,
-            (tau_z - (iyy - ixx) * wx * wy) * izz_inv,
-        ]
-        .into();
+            (tau_z - (iyy - ixx) * wx * wy) * izz_inv
+        ];
 
         // df/dx
         let mut jx = SMatrix::<f32, NX, NX>::zeros();

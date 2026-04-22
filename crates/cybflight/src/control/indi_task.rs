@@ -315,9 +315,6 @@ pub async fn indi_task() {
     let mut spf_sp_z: f32 = 0.0; // thrust / mass in body z
     let mut telem_attitude = UnitQuaternion::<f32>::identity();
 
-    // armed is read from IS_ARMED atomic each frame (no channel subscription needed)
-    let mut g2_valid = [false; NU];
-
     // --- Rate command tracking ---
     // Cache the latest RATE_COMMAND from the outer loop (cascade, MPC, or
     // RC rate mode) plus its arrival time for the staleness gate.

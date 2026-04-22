@@ -19,7 +19,6 @@ use super::mpc_problem::MpcProblem;
 use super::quad_model;
 use super::QuadDynamicsModel;
 use nalgebra::{SMatrix, SVector};
-use num_traits::Float;
 
 /// Result metadata from the SQP solver.
 ///
@@ -54,7 +53,7 @@ fn cholesky_inv_4x4<const NU: usize>(m: &SMatrix<f32, NU, NU>) -> SMatrix<f32, N
         if d0 <= 0.0 {
             continue;
         }
-        l[(0, 0)] = d0.sqrt();
+        l[(0, 0)] = libm::sqrtf(d0);
         let l00i = 1.0 / l[(0, 0)];
         l[(1, 0)] = mr[(1, 0)] * l00i;
         l[(2, 0)] = mr[(2, 0)] * l00i;
@@ -64,7 +63,7 @@ fn cholesky_inv_4x4<const NU: usize>(m: &SMatrix<f32, NU, NU>) -> SMatrix<f32, N
         if d1 <= 0.0 {
             continue;
         }
-        l[(1, 1)] = d1.sqrt();
+        l[(1, 1)] = libm::sqrtf(d1);
         let l11i = 1.0 / l[(1, 1)];
         l[(2, 1)] = (mr[(2, 1)] - l[(2, 0)] * l[(1, 0)]) * l11i;
         l[(3, 1)] = (mr[(3, 1)] - l[(3, 0)] * l[(1, 0)]) * l11i;
@@ -73,7 +72,7 @@ fn cholesky_inv_4x4<const NU: usize>(m: &SMatrix<f32, NU, NU>) -> SMatrix<f32, N
         if d2 <= 0.0 {
             continue;
         }
-        l[(2, 2)] = d2.sqrt();
+        l[(2, 2)] = libm::sqrtf(d2);
         let l22i = 1.0 / l[(2, 2)];
         l[(3, 2)] = (mr[(3, 2)] - l[(3, 0)] * l[(2, 0)] - l[(3, 1)] * l[(2, 1)]) * l22i;
 
@@ -81,7 +80,7 @@ fn cholesky_inv_4x4<const NU: usize>(m: &SMatrix<f32, NU, NU>) -> SMatrix<f32, N
         if d3 <= 0.0 {
             continue;
         }
-        l[(3, 3)] = d3.sqrt();
+        l[(3, 3)] = libm::sqrtf(d3);
 
         // Triangular inverse
         let mut li = SMatrix::<f32, NU, NU>::zeros();

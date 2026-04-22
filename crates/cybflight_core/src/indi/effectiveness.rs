@@ -173,21 +173,9 @@ impl<const N: usize> IndiEffectiveness<N> {
         // Max plausible motor speed: ~191k RPM mechanical.
         const OMEGA_MAX: f32 = 20_000.0;
 
-        for row in 0..6 {
-            for col in 0..N {
-                let v = g1[(row, col)];
-                if !v.is_finite() || v > G_MAG_MAX || v < -G_MAG_MAX {
-                    return false;
-                }
-            }
-        }
-        for row in 0..3 {
-            for col in 0..N {
-                let v = g2[(row, col)];
-                if !v.is_finite() || v > G_MAG_MAX || v < -G_MAG_MAX {
-                    return false;
-                }
-            }
+        let g_valid = |&v: &f32| v.is_finite() && v.abs() <= G_MAG_MAX;
+        if !g1.iter().all(g_valid) || !g2.iter().all(g_valid) {
+            return false;
         }
         for i in 0..N {
             if !max_omega[i].is_finite() || max_omega[i] <= 0.0 || max_omega[i] > OMEGA_MAX {

@@ -22,7 +22,7 @@
 //! Each helper carries a `const { assert!(NX >= 7) }` (or 10 / 13 as needed)
 //! so calling it with an incompatible state size is a compile-time error.
 
-use nalgebra::{SMatrix, SVector};
+use nalgebra::{SMatrix, SVector, Vector3};
 
 // ───────────────────────────────────────────────────────────────────────────
 // Quaternion projection
@@ -68,25 +68,22 @@ pub fn normalize_quat<const NX: usize>(x: &mut SVector<f32, NX>) {
 pub fn attitude_error<const NX: usize>(
     x: &SVector<f32, NX>,
     xref: &SVector<f32, NX>,
-) -> ([f32; 3], [[f32; 4]; 3], [[f32; 4]; 4]) {
+) -> (Vector3<f32>, SMatrix<f32, 3, 4>, SMatrix<f32, 4, 4>) {
     const { assert!(NX >= 7, "attitude_error requires NX >= 7") };
     let (qx, qy, qz, qw) = (x[3], x[4], x[5], x[6]);
     let (rx, ry, rz, rw) = (xref[3], xref[4], xref[5], xref[6]);
 
-    let mut qa = [
+    let qa_raw = nalgebra::Vector4::new(
         -qx * rw + qw * rx + qz * ry - qy * rz,
         -qy * rw - qz * rx + qw * ry + qx * rz,
         -qz * rw + qy * rx - qx * ry + qw * rz,
         qw * rw + qx * rx + qy * ry + qz * rz,
-    ];
-
-    let mut sign_flip = 1.0f32;
-    if qa[3] < 0.0 {
-        for v in qa.iter_mut() {
-            *v = -*v;
-        }
-        sign_flip = -1.0;
-    }
+    );
+    let (qa, sign_flip) = if qa_raw[3] < 0.0 {
+        (-qa_raw, -1.0_f32)
+    } else {
+        (qa_raw, 1.0_f32)
+    };
 
     const EPS: f32 = 1e-3;
     let denom = libm::sqrtf(qa[3] * qa[3] + qa[2] * qa[2] + EPS);
@@ -94,40 +91,36 @@ pub fn attitude_error<const NX: usize>(
     let nr = qa[3] * qa[0] - qa[1] * qa[2];
     let np_ = qa[3] * qa[1] + qa[0] * qa[2];
     let ny = qa[2];
-    let ea = [2.0 * nr * inv_d, 2.0 * np_ * inv_d, 2.0 * ny * inv_d];
+    let ea = Vector3::new(2.0 * nr * inv_d, 2.0 * np_ * inv_d, 2.0 * ny * inv_d);
 
     let inv_d2 = inv_d * inv_d;
     let dd2 = qa[2] * inv_d;
     let dd3 = qa[3] * inv_d;
 
-    let de: [[f32; 4]; 3] = [
-        [
-            2.0 * qa[3] * inv_d,
-            2.0 * (-qa[2]) * inv_d,
-            2.0 * (-qa[1] * inv_d - nr * dd2 * inv_d2),
-            2.0 * (qa[0] * inv_d - nr * dd3 * inv_d2),
-        ],
-        [
-            2.0 * qa[2] * inv_d,
-            2.0 * qa[3] * inv_d,
-            2.0 * (qa[0] * inv_d - np_ * dd2 * inv_d2),
-            2.0 * (qa[1] * inv_d - np_ * dd3 * inv_d2),
-        ],
-        [
-            0.0,
-            0.0,
-            2.0 * (inv_d - ny * dd2 * inv_d2),
-            2.0 * (-ny * dd3 * inv_d2),
-        ],
-    ];
+    let de = SMatrix::<f32, 3, 4>::from_row_slice(&[
+        2.0 * qa[3] * inv_d,
+        2.0 * (-qa[2]) * inv_d,
+        2.0 * (-qa[1] * inv_d - nr * dd2 * inv_d2),
+        2.0 * (qa[0] * inv_d - nr * dd3 * inv_d2),
+        //
+        2.0 * qa[2] * inv_d,
+        2.0 * qa[3] * inv_d,
+        2.0 * (qa[0] * inv_d - np_ * dd2 * inv_d2),
+        2.0 * (qa[1] * inv_d - np_ * dd3 * inv_d2),
+        //
+        0.0,
+        0.0,
+        2.0 * (inv_d - ny * dd2 * inv_d2),
+        2.0 * (-ny * dd3 * inv_d2),
+    ]);
 
     let sf = sign_flip;
-    let dqa_dq: [[f32; 4]; 4] = [
-        [-rw * sf, -rz * sf, ry * sf, rx * sf],
-        [rz * sf, -rw * sf, -rx * sf, ry * sf],
-        [-ry * sf, rx * sf, -rw * sf, rz * sf],
-        [rx * sf, ry * sf, rz * sf, rw * sf],
-    ];
+    let dqa_dq = SMatrix::<f32, 4, 4>::from_row_slice(&[
+        -rw * sf, -rz * sf, ry * sf, rx * sf, //
+        rz * sf, -rw * sf, -rx * sf, ry * sf, //
+        -ry * sf, rx * sf, -rw * sf, rz * sf, //
+        rx * sf, ry * sf, rz * sf, rw * sf,
+    ]);
 
     (ea, de, dqa_dq)
 }
@@ -150,16 +143,18 @@ pub fn write_pos_vel_cost_grad<const NX: usize>(
     grad_x: &mut SVector<f32, NX>,
 ) -> f32 {
     const { assert!(NX >= 10, "write_pos_vel_cost_grad requires NX >= 10") };
-    let mut cost = 0.0;
-    for i in 0..3 {
-        let ep = x[i] - xref[i];
-        cost += dt * ep * ep * w_pos[i];
-        grad_x[i] = 2.0 * ep * w_pos[i] * dt;
-        let ev = x[7 + i] - xref[7 + i];
-        cost += dt * ev * ev * w_vel[i];
-        grad_x[7 + i] = 2.0 * ev * w_vel[i] * dt;
-    }
-    cost
+    let w_pos_v = Vector3::from(*w_pos);
+    let w_vel_v = Vector3::from(*w_vel);
+    let pos_err = x.fixed_rows::<3>(0) - xref.fixed_rows::<3>(0);
+    let vel_err = x.fixed_rows::<3>(7) - xref.fixed_rows::<3>(7);
+    grad_x
+        .fixed_rows_mut::<3>(0)
+        .copy_from(&(pos_err.component_mul(&w_pos_v) * (2.0 * dt)));
+    grad_x
+        .fixed_rows_mut::<3>(7)
+        .copy_from(&(vel_err.component_mul(&w_vel_v) * (2.0 * dt)));
+    dt * (pos_err.component_mul(&pos_err).dot(&w_pos_v)
+        + vel_err.component_mul(&vel_err).dot(&w_vel_v))
 }
 
 /// Write the position and velocity diagonal Hessian entries into
@@ -189,36 +184,20 @@ pub fn write_pos_vel_hess<const NX: usize>(
 /// into `grad_x[3..7]`. Returns the cost contribution.
 #[inline]
 pub fn write_quat_cost_grad<const NX: usize>(
-    ea: &[f32; 3],
-    de: &[[f32; 4]; 3],
-    dqa_dq: &[[f32; 4]; 4],
+    ea: &Vector3<f32>,
+    de: &SMatrix<f32, 3, 4>,
+    dqa_dq: &SMatrix<f32, 4, 4>,
     w_att: &[f32; 3],
     dt: f32,
     grad_x: &mut SVector<f32, NX>,
 ) -> f32 {
     const { assert!(NX >= 7, "write_quat_cost_grad requires NX >= 7") };
-    let mut cost = 0.0;
-    let mut wea = [0.0f32; 3];
-    for i in 0..3 {
-        cost += dt * ea[i] * ea[i] * w_att[i];
-        wea[i] = ea[i] * w_att[i];
-    }
-    // gqa = de^T @ wea (4-vector)
-    let mut gqa = [0.0f32; 4];
-    for j in 0..4 {
-        for i in 0..3 {
-            gqa[j] += de[i][j] * wea[i];
-        }
-    }
-    // grad_x[3..7] = 2·dt · dqa_dq^T @ gqa
-    for i in 0..4 {
-        let mut s = 0.0;
-        for j in 0..4 {
-            s += dqa_dq[j][i] * gqa[j];
-        }
-        grad_x[3 + i] = 2.0 * dt * s;
-    }
-    cost
+    let w = Vector3::from(*w_att);
+    let wea = ea.component_mul(&w);
+    // grad_x[3..7] = 2·dt · dqa_dq^T · (de^T · wea)
+    let grad_quat = (dqa_dq.transpose() * (de.transpose() * wea)) * (2.0 * dt);
+    grad_x.fixed_rows_mut::<4>(3).copy_from(&grad_quat);
+    dt * ea.component_mul(ea).dot(&w)
 }
 
 /// Write the Gauss-Newton quaternion Hessian block
@@ -226,32 +205,17 @@ pub fn write_quat_cost_grad<const NX: usize>(
 /// where `J_att = de · dqa_dq` (3×4).
 #[inline]
 pub fn write_quat_hess<const NX: usize>(
-    de: &[[f32; 4]; 3],
-    dqa_dq: &[[f32; 4]; 4],
+    de: &SMatrix<f32, 3, 4>,
+    dqa_dq: &SMatrix<f32, 4, 4>,
     w_att: &[f32; 3],
     dt: f32,
     hess_xx: &mut SMatrix<f32, NX, NX>,
 ) {
     const { assert!(NX >= 7, "write_quat_hess requires NX >= 7") };
-    // J_att (3×4) = de @ dqa_dq
-    let mut j_att = [[0.0f32; 4]; 3];
-    for i in 0..3 {
-        for j in 0..4 {
-            for k in 0..4 {
-                j_att[i][j] += de[i][k] * dqa_dq[k][j];
-            }
-        }
-    }
-    // hess[3..7][3..7] = 2·dt · J_att^T · diag(w_att) · J_att
-    for i in 0..4 {
-        for j in 0..4 {
-            let mut s = 0.0;
-            for k in 0..3 {
-                s += j_att[k][i] * w_att[k] * j_att[k][j];
-            }
-            hess_xx[(3 + i, 3 + j)] = 2.0 * dt * s;
-        }
-    }
+    let j_att = de * dqa_dq; // 3×4
+    let w_diag = nalgebra::Matrix3::from_diagonal(&Vector3::from(*w_att));
+    let hess_block = j_att.transpose() * w_diag * j_att * (2.0 * dt);
+    hess_xx.fixed_view_mut::<4, 4>(3, 3).copy_from(&hess_block);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -264,11 +228,7 @@ pub fn clamp_control<const NU: usize>(
     u: &SVector<f32, NU>,
     bounds: &[[f32; 2]; NU],
 ) -> SVector<f32, NU> {
-    let mut result = *u;
-    for i in 0..NU {
-        result[i] = result[i].clamp(bounds[i][0], bounds[i][1]);
-    }
-    result
+    SVector::<f32, NU>::from_fn(|i, _| u[i].clamp(bounds[i][0], bounds[i][1]))
 }
 
 /// Cubic box-constraint penalty + gradient + Hessian-diagonal contribution.

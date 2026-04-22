@@ -301,32 +301,22 @@ impl QuadModel {
     /// compound across the four sub-steps.
     pub fn propagate_rk4(&self, xk: &SVector<f32, NX>, uk: &SVector<f32, NU>) -> SVector<f32, NX> {
         let dt = self.dt;
-        let k0 = self.dynamics(xk, uk);
+        let half_dt = 0.5 * dt;
 
-        let mut x1 = SVector::<f32, NX>::zeros();
-        for i in 0..NX {
-            x1[i] = xk[i] + k0[i] * (dt * 0.5);
-        }
+        let k0 = self.dynamics(xk, uk);
+        let mut x1 = xk + k0 * half_dt;
         normalize_quat(&mut x1);
         let k1 = self.dynamics(&x1, uk);
 
-        for i in 0..NX {
-            x1[i] = xk[i] + k1[i] * (dt * 0.5);
-        }
+        x1 = xk + k1 * half_dt;
         normalize_quat(&mut x1);
         let k2 = self.dynamics(&x1, uk);
 
-        for i in 0..NX {
-            x1[i] = xk[i] + k2[i] * dt;
-        }
+        x1 = xk + k2 * dt;
         normalize_quat(&mut x1);
         let k3 = self.dynamics(&x1, uk);
 
-        let mut result = SVector::<f32, NX>::zeros();
-        let s = dt / 6.0;
-        for i in 0..NX {
-            result[i] = xk[i] + (k0[i] + 2.0 * k1[i] + 2.0 * k2[i] + k3[i]) * s;
-        }
+        let mut result = xk + (k0 + 2.0 * k1 + 2.0 * k2 + k3) * (dt / 6.0);
         normalize_quat(&mut result);
         result
     }
@@ -338,10 +328,7 @@ impl QuadModel {
         uk: &SVector<f32, NU>,
     ) -> SVector<f32, NX> {
         let xdot = self.dynamics(xk, uk);
-        let mut result = SVector::<f32, NX>::zeros();
-        for i in 0..NX {
-            result[i] = xk[i] + self.dt * xdot[i];
-        }
+        let mut result = xk + xdot * self.dt;
         normalize_quat(&mut result);
         result
     }
@@ -354,10 +341,7 @@ impl QuadModel {
     ) -> (SMatrix<f32, NX, NX>, SMatrix<f32, NX, NU>) {
         let (_, jac_x, jac_u) = self.dynamics_jac(xk, uk);
         let dt = self.dt;
-        let mut fx = jac_x * dt;
-        for i in 0..NX {
-            fx[(i, i)] += 1.0; // I + dt*Jx
-        }
+        let fx = SMatrix::<f32, NX, NX>::identity() + jac_x * dt;
         let fu = jac_u * dt;
         (fx, fu)
     }
@@ -417,13 +401,9 @@ impl QuadModel {
         grad_u: &mut SVector<f32, NU>,
     ) -> f32 {
         let dt = self.dt;
-        let mut cost = 0.0;
-        for i in 0..NU {
-            let eu = u[i] - uref[i];
-            cost += dt * eu * eu * self.w_input[i];
-            grad_u[i] = 2.0 * eu * self.w_input[i] * dt;
-        }
-        cost
+        let eu = u - uref;
+        *grad_u = eu.component_mul(&self.w_input) * (2.0 * dt);
+        dt * eu.component_mul(&eu).dot(&self.w_input)
     }
 
     /// Cubic box-constraint penalty.
@@ -451,12 +431,10 @@ impl QuadModel {
         let dt = self.dt;
         let mut cost = self.state_cost_hess_grad(x, xref, grad_x, hess_xx);
 
-        for i in 0..NU {
-            let eu = u[i] - uref[i];
-            cost += dt * eu * eu * self.w_input[i];
-            grad_u[i] = 2.0 * eu * self.w_input[i] * dt;
-            r_diag[i] = 2.0 * dt * self.w_input[i];
-        }
+        let eu = u - uref;
+        *grad_u = eu.component_mul(&self.w_input) * (2.0 * dt);
+        *r_diag = self.w_input * (2.0 * dt);
+        cost += dt * eu.component_mul(&eu).dot(&self.w_input);
 
         cost += self.constraint_hess_grad(u, grad_u, r_diag);
         cost

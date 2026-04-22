@@ -17,7 +17,7 @@
 
 use super::model_utils;
 
-use nalgebra::{SMatrix, SVector};
+use nalgebra::{SMatrix, SVector, Vector3};
 
 pub const NX: usize = 13;
 pub const NU: usize = 4;
@@ -167,16 +167,12 @@ impl FullQuadModel {
     /// `tau = r × F`:  tau\_x = py·T,  tau\_y = −px·T,  tau\_z = yaw\_coeff·T.
     #[inline]
     pub fn alloc(&self, u: &SVector<f32, NU>) -> (f32, f32, f32, f32) {
-        let mut f_total = 0.0;
-        let mut tau_x = 0.0;
-        let mut tau_y = 0.0;
-        let mut tau_z = 0.0;
-        for i in 0..NU {
-            f_total += u[i];
-            tau_x += self.motor_pos[i][1] * u[i];
-            tau_y += -self.motor_pos[i][0] * u[i];
-            tau_z += self.motor_yaw_coeff[i] * u[i];
-        }
+        let pos_x = SVector::<f32, NU>::from_fn(|i, _| self.motor_pos[i][0]);
+        let pos_y = SVector::<f32, NU>::from_fn(|i, _| self.motor_pos[i][1]);
+        let f_total = u.sum();
+        let tau_x = pos_y.dot(u);
+        let tau_y = -pos_x.dot(u);
+        let tau_z = self.motor_yaw_coeff.dot(u);
         (f_total, tau_x, tau_y, tau_z)
     }
 
@@ -220,11 +216,7 @@ impl FullQuadModel {
         &self,
         x: &SVector<f32, NX>,
         u: &SVector<f32, NU>,
-    ) -> (
-        SVector<f32, NX>,
-        SMatrix<f32, NX, NX>,
-        SMatrix<f32, NX, NU>,
-    ) {
+    ) -> (SVector<f32, NX>, SMatrix<f32, NX, NX>, SMatrix<f32, NX, NU>) {
         let (qx, qy, qz, qw) = (x[3], x[4], x[5], x[6]);
         let (vx, vy, vz) = (x[7], x[8], x[9]);
         let (wx, wy, wz) = (x[10], x[11], x[12]);
@@ -321,17 +313,17 @@ impl FullQuadModel {
         let a1_m = 2.0 * (qw * qy + qx * qz) * m_inv;
         let a2_m = 2.0 * (qy * qz - qw * qx) * m_inv;
         let a3_m = (1.0 - 2.0 * qx * qx - 2.0 * qy * qy) * m_inv;
-        for j in 0..NU {
-            ju[(7, j)] = a1_m;
-            ju[(8, j)] = a2_m;
-            ju[(9, j)] = a3_m;
-        }
-        // Torque allocation rows (per-motor, consistent with alloc())
-        for j in 0..NU {
-            ju[(10, j)] = self.motor_pos[j][1] * ixx_inv;
-            ju[(11, j)] = -self.motor_pos[j][0] * iyy_inv;
-            ju[(12, j)] = self.motor_yaw_coeff[j] * izz_inv;
-        }
+        // Translation thrust rows — constant across motors (collective thrust only).
+        ju.row_mut(7).fill(a1_m);
+        ju.row_mut(8).fill(a2_m);
+        ju.row_mut(9).fill(a3_m);
+        // Torque allocation rows (per-motor, consistent with alloc()).
+        let pos_x = SVector::<f32, NU>::from_fn(|i, _| self.motor_pos[i][0]);
+        let pos_y = SVector::<f32, NU>::from_fn(|i, _| self.motor_pos[i][1]);
+        ju.row_mut(10).copy_from(&(pos_y * ixx_inv).transpose());
+        ju.row_mut(11).copy_from(&(pos_x * -iyy_inv).transpose());
+        ju.row_mut(12)
+            .copy_from(&(self.motor_yaw_coeff * izz_inv).transpose());
 
         (xdot, jx, ju)
     }
@@ -345,32 +337,22 @@ impl FullQuadModel {
     /// compound across the four sub-steps.
     pub fn propagate_rk4(&self, xk: &SVector<f32, NX>, uk: &SVector<f32, NU>) -> SVector<f32, NX> {
         let dt = self.dt;
-        let k0 = self.dynamics(xk, uk);
+        let half_dt = 0.5 * dt;
 
-        let mut x1 = SVector::<f32, NX>::zeros();
-        for i in 0..NX {
-            x1[i] = xk[i] + k0[i] * (dt * 0.5);
-        }
+        let k0 = self.dynamics(xk, uk);
+        let mut x1 = xk + k0 * half_dt;
         normalize_quat(&mut x1);
         let k1 = self.dynamics(&x1, uk);
 
-        for i in 0..NX {
-            x1[i] = xk[i] + k1[i] * (dt * 0.5);
-        }
+        x1 = xk + k1 * half_dt;
         normalize_quat(&mut x1);
         let k2 = self.dynamics(&x1, uk);
 
-        for i in 0..NX {
-            x1[i] = xk[i] + k2[i] * dt;
-        }
+        x1 = xk + k2 * dt;
         normalize_quat(&mut x1);
         let k3 = self.dynamics(&x1, uk);
 
-        let mut result = SVector::<f32, NX>::zeros();
-        let s = dt / 6.0;
-        for i in 0..NX {
-            result[i] = xk[i] + (k0[i] + 2.0 * k1[i] + 2.0 * k2[i] + k3[i]) * s;
-        }
+        let mut result = xk + (k0 + 2.0 * k1 + 2.0 * k2 + k3) * (dt / 6.0);
         normalize_quat(&mut result);
         result
     }
@@ -382,10 +364,7 @@ impl FullQuadModel {
         uk: &SVector<f32, NU>,
     ) -> SVector<f32, NX> {
         let xdot = self.dynamics(xk, uk);
-        let mut result = SVector::<f32, NX>::zeros();
-        for i in 0..NX {
-            result[i] = xk[i] + self.dt * xdot[i];
-        }
+        let mut result = xk + xdot * self.dt;
         normalize_quat(&mut result);
         result
     }
@@ -398,10 +377,7 @@ impl FullQuadModel {
     ) -> (SMatrix<f32, NX, NX>, SMatrix<f32, NX, NU>) {
         let (_, jac_x, jac_u) = self.dynamics_jac(xk, uk);
         let dt = self.dt;
-        let mut fx = jac_x * dt;
-        for i in 0..NX {
-            fx[(i, i)] += 1.0; // I + dt*Jx
-        }
+        let fx = SMatrix::<f32, NX, NX>::identity() + jac_x * dt;
         let fu = jac_u * dt;
         (fx, fu)
     }
@@ -425,11 +401,12 @@ impl FullQuadModel {
         let mut cost =
             model_utils::write_pos_vel_cost_grad(x, xref, &self.w_pos, &self.w_vel, dt, grad_x);
         // Body-rate cost/gradient — full-model only (rates are STATE here).
-        for i in 0..3 {
-            let er = x[10 + i] - xref[10 + i];
-            cost += dt * er * er * self.w_rate[i];
-            grad_x[10 + i] = 2.0 * er * self.w_rate[i] * dt;
-        }
+        let w_rate = Vector3::from(self.w_rate);
+        let rate_err = x.fixed_rows::<3>(10) - xref.fixed_rows::<3>(10);
+        cost += dt * rate_err.component_mul(&rate_err).dot(&w_rate);
+        grad_x
+            .fixed_rows_mut::<3>(10)
+            .copy_from(&(rate_err.component_mul(&w_rate) * (2.0 * dt)));
         // Quaternion cost/gradient via shared helpers.
         let (ea, de, dqa_dq) = model_utils::attitude_error(x, xref);
         cost += model_utils::write_quat_cost_grad(&ea, &de, &dqa_dq, &self.w_att, dt, grad_x);
@@ -451,11 +428,12 @@ impl FullQuadModel {
             model_utils::write_pos_vel_cost_grad(x, xref, &self.w_pos, &self.w_vel, dt, grad_x);
 
         // ── Body-rate cost/gradient (full-model only) ──
-        for i in 0..3 {
-            let er = x[10 + i] - xref[10 + i];
-            cost += dt * er * er * self.w_rate[i];
-            grad_x[10 + i] = 2.0 * er * self.w_rate[i] * dt;
-        }
+        let w_rate = Vector3::from(self.w_rate);
+        let rate_err = x.fixed_rows::<3>(10) - xref.fixed_rows::<3>(10);
+        cost += dt * rate_err.component_mul(&rate_err).dot(&w_rate);
+        grad_x
+            .fixed_rows_mut::<3>(10)
+            .copy_from(&(rate_err.component_mul(&w_rate) * (2.0 * dt)));
 
         // ── Quaternion cost/gradient via shared helpers ──
         let (ea, de, dqa_dq) = model_utils::attitude_error(x, xref);
@@ -466,8 +444,9 @@ impl FullQuadModel {
         // Pos + vel diagonal block via shared helper.
         model_utils::write_pos_vel_hess(&self.w_pos, &self.w_vel, dt, hess_xx);
         // Body-rate diagonal block — full-model only.
-        for i in 0..3 {
-            hess_xx[(10 + i, 10 + i)] = 2.0 * dt * self.w_rate[i];
+        let rate_diag = w_rate * (2.0 * dt);
+        for (offset, &v) in rate_diag.iter().enumerate() {
+            hess_xx[(10 + offset, 10 + offset)] = v;
         }
         // Quaternion Hessian block via shared helper.
         model_utils::write_quat_hess(&de, &dqa_dq, &self.w_att, dt, hess_xx);
@@ -483,13 +462,9 @@ impl FullQuadModel {
         grad_u: &mut SVector<f32, NU>,
     ) -> f32 {
         let dt = self.dt;
-        let mut cost = 0.0;
-        for i in 0..NU {
-            let eu = u[i] - uref[i];
-            cost += dt * eu * eu * self.w_thrust;
-            grad_u[i] = 2.0 * eu * self.w_thrust * dt;
-        }
-        cost
+        let eu = u - uref;
+        *grad_u = eu * (2.0 * self.w_thrust * dt);
+        dt * self.w_thrust * eu.norm_squared()
     }
 
     /// Cubic box-constraint penalty.
@@ -517,12 +492,10 @@ impl FullQuadModel {
         let dt = self.dt;
         let mut cost = self.state_cost_hess_grad(x, xref, grad_x, hess_xx);
 
-        for i in 0..NU {
-            let eu = u[i] - uref[i];
-            cost += dt * eu * eu * self.w_thrust;
-            grad_u[i] = 2.0 * eu * self.w_thrust * dt;
-            r_diag[i] = 2.0 * dt * self.w_thrust;
-        }
+        let eu = u - uref;
+        *grad_u = eu * (2.0 * self.w_thrust * dt);
+        r_diag.fill(2.0 * dt * self.w_thrust);
+        cost += dt * self.w_thrust * eu.norm_squared();
 
         cost += self.constraint_hess_grad(u, grad_u, r_diag);
         cost

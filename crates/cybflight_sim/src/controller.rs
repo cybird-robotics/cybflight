@@ -181,10 +181,7 @@ impl MpcIndiController {
         // Extract the 10-state slice (position, quaternion, velocity) from
         // the plant's 13-state. The remaining 3 (body rates) are not part of
         // the simple MPC's state.
-        let mut x0 = SVector::<f32, SIMPLE_NX>::zeros();
-        for i in 0..10 {
-            x0[i] = x_full[i];
-        }
+        let x0: SVector<f32, SIMPLE_NX> = x_full.fixed_rows::<SIMPLE_NX>(0).into_owned();
         self.fill_reference(horizon);
 
         let _ = self.solver.solve(
@@ -197,15 +194,11 @@ impl MpcIndiController {
             1e-3,
         );
         let u_bar = self.solver.u_bar();
-        let mut u0 = u_bar[0];
-        // Clamp to the model's per-channel bounds.
-        for i in 0..SIMPLE_NU {
-            u0[i] = u0[i].clamp(
-                self.problem.model.u_bounds[i][0],
-                self.problem.model.u_bounds[i][1],
-            );
-        }
-        self.last_mpc_u = u0;
+        let u0 = u_bar[0];
+        let bounds = self.problem.model.u_bounds;
+        self.last_mpc_u = SVector::<f32, SIMPLE_NU>::from_fn(|i, _| {
+            u0[i].clamp(bounds[i][0], bounds[i][1])
+        });
         self.u_warm = *u_bar;
     }
 }
@@ -238,8 +231,8 @@ impl Controller for MpcIndiController {
         let rate_sp = Vector3::new(self.last_mpc_u[1], self.last_mpc_u[2], self.last_mpc_u[3]);
 
         // Sensor synthesis.
-        // Gyro: perfect body-rate readout.
-        let gyro = Vector3::new(x[10], x[11], x[12]);
+        // Gyro: perfect body-rate readout (body rates live at indices 10..13).
+        let gyro = x.fixed_rows::<3>(10).into_owned();
         // Accelerometer: for a drag-free quadrotor plant, body-frame specific
         // force is always [0, 0, Σu/m]. Use the sum from the previous applied
         // motor vector — this is what a real accelerometer sees before the
@@ -256,13 +249,8 @@ impl Controller for MpcIndiController {
         // Convert normalized commands [0,1] → per-motor thrust [N]. Plant's
         // motor model is linear (force = cmd * max_thrust); INDI was configured
         // with near-zero nonlinearity so the two match.
-        let mut u_motor = SVector::<f32, NU>::zeros();
-        let mut total = 0.0f32;
-        for i in 0..NU {
-            u_motor[i] = out.motor_commands[i] * self.per_motor_max_n;
-            total += u_motor[i];
-        }
-        self.last_total_thrust_n = total;
+        let u_motor = out.motor_commands * self.per_motor_max_n;
+        self.last_total_thrust_n = u_motor.sum();
         u_motor
     }
 }
@@ -350,14 +338,10 @@ impl Controller for MpcDirectController {
                 1e-3,
             );
             let u_bar = self.solver.u_bar();
-            let mut u0 = u_bar[0];
-            for i in 0..NU {
-                u0[i] = u0[i].clamp(
-                    self.problem.model.u_bounds[i][0],
-                    self.problem.model.u_bounds[i][1],
-                );
-            }
-            self.last_u = u0;
+            let u0 = u_bar[0];
+            let bounds = self.problem.model.u_bounds;
+            self.last_u =
+                SVector::<f32, NU>::from_fn(|i, _| u0[i].clamp(bounds[i][0], bounds[i][1]));
             self.u_warm = *u_bar;
         }
         self.tick_counter = self.tick_counter.wrapping_add(1);

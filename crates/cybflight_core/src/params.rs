@@ -10,7 +10,6 @@
 //! [0x10]  payload: 624 bytes
 //!   Body:               mass(4) + inertia(36) + max_rate(12) = 52 bytes
 //!   Motors (x4):        px(4) + py(4) + spin_dir(4) + max_thrust(4) + torque_coeff(4) = 80 bytes
-//!   Control gains:      pos_kp(12) + pos_kd(12) + att_k_rate(12) + rate_kp(12) + rate_ki(12) + rate_kd(12) = 72 bytes
 //!   INDI effectiveness: g1_force(48) + g1_torque(48) + g2(48) + max_omega(16) + time_const(16) + nonlinearity(16) = 192 bytes
 //!   INDI controller:    rate_gains(12) + sync_filter_hz(4) + wls_wv(24) + wls_wu(16) + motor_pole_count(4 as f32) = 60 bytes
 //!   Learner:            fx_filt_hz(4) + motor_filt_hz(4) + acc_offset_m(12) + rls_gamma(4) + rls_t_char_s(4) + zeta_rate(4) + zeta_attitude(4) = 36 bytes
@@ -327,15 +326,7 @@ impl VehicleParams {
         for &v in &self.control.att_k_rate {
             off = put_f32(&mut buf, off, v);
         }
-        for &v in &self.control.rate_kp {
-            off = put_f32(&mut buf, off, v);
-        }
-        for &v in &self.control.rate_ki {
-            off = put_f32(&mut buf, off, v);
-        }
-        for &v in &self.control.rate_kd {
-            off = put_f32(&mut buf, off, v);
-        }
+
         // INDI effectiveness
         for m in &self.indi_effectiveness.g1_force {
             for &v in m {
@@ -508,21 +499,7 @@ impl VehicleParams {
             *slot = get_f32(buf, off);
             off += 4;
         }
-        let mut rate_kp = [0.0f32; 3];
-        for slot in &mut rate_kp {
-            *slot = get_f32(buf, off);
-            off += 4;
-        }
-        let mut rate_ki = [0.0f32; 3];
-        for slot in &mut rate_ki {
-            *slot = get_f32(buf, off);
-            off += 4;
-        }
-        let mut rate_kd = [0.0f32; 3];
-        for slot in &mut rate_kd {
-            *slot = get_f32(buf, off);
-            off += 4;
-        }
+
         let control = ControlGains {
             pos_kp,
             pos_kd,
@@ -785,18 +762,6 @@ impl VehicleParams {
             ParamKey::PosKdX => self.control.pos_kd[0],
             ParamKey::PosKdY => self.control.pos_kd[1],
             ParamKey::PosKdZ => self.control.pos_kd[2],
-            ParamKey::AttKrX => self.control.att_k_rate[0],
-            ParamKey::AttKrY => self.control.att_k_rate[1],
-            ParamKey::AttKrZ => self.control.att_k_rate[2],
-            ParamKey::RateKpR => self.control.rate_kp[0],
-            ParamKey::RateKpP => self.control.rate_kp[1],
-            ParamKey::RateKpY => self.control.rate_kp[2],
-            ParamKey::RateKiR => self.control.rate_ki[0],
-            ParamKey::RateKiP => self.control.rate_ki[1],
-            ParamKey::RateKiY => self.control.rate_ki[2],
-            ParamKey::RateKdR => self.control.rate_kd[0],
-            ParamKey::RateKdP => self.control.rate_kd[1],
-            ParamKey::RateKdY => self.control.rate_kd[2],
             // INDI effectiveness — G1 force
             ParamKey::G1FxM0 => self.indi_effectiveness.g1_force[0][0],
             ParamKey::G1FxM1 => self.indi_effectiveness.g1_force[1][0],
@@ -925,18 +890,7 @@ impl VehicleParams {
             ParamKey::PosKdX => self.control.pos_kd[0] = val,
             ParamKey::PosKdY => self.control.pos_kd[1] = val,
             ParamKey::PosKdZ => self.control.pos_kd[2] = val,
-            ParamKey::AttKrX => self.control.att_k_rate[0] = val,
-            ParamKey::AttKrY => self.control.att_k_rate[1] = val,
-            ParamKey::AttKrZ => self.control.att_k_rate[2] = val,
-            ParamKey::RateKpR => self.control.rate_kp[0] = val,
-            ParamKey::RateKpP => self.control.rate_kp[1] = val,
-            ParamKey::RateKpY => self.control.rate_kp[2] = val,
-            ParamKey::RateKiR => self.control.rate_ki[0] = val,
-            ParamKey::RateKiP => self.control.rate_ki[1] = val,
-            ParamKey::RateKiY => self.control.rate_ki[2] = val,
-            ParamKey::RateKdR => self.control.rate_kd[0] = val,
-            ParamKey::RateKdP => self.control.rate_kd[1] = val,
-            ParamKey::RateKdY => self.control.rate_kd[2] = val,
+
             // INDI effectiveness — G1 force
             ParamKey::G1FxM0 => self.indi_effectiveness.g1_force[0][0] = val,
             ParamKey::G1FxM1 => self.indi_effectiveness.g1_force[1][0] = val,
@@ -1059,20 +1013,7 @@ pub enum ParamKey {
     PosKdX,
     PosKdY,
     PosKdZ,
-    // Attitude control gains
-    AttKrX,
-    AttKrY,
-    AttKrZ,
-    // Rate PID gains (dimension-major)
-    RateKpR,
-    RateKpP,
-    RateKpY,
-    RateKiR,
-    RateKiP,
-    RateKiY,
-    RateKdR,
-    RateKdP,
-    RateKdY,
+
     // INDI effectiveness — G1 force [fx, fy, fz] per motor
     G1FxM0,
     G1FxM1,
@@ -1191,18 +1132,6 @@ pub const ALL_KEYS: &[ParamKey] = &[
     ParamKey::PosKdX,
     ParamKey::PosKdY,
     ParamKey::PosKdZ,
-    ParamKey::AttKrX,
-    ParamKey::AttKrY,
-    ParamKey::AttKrZ,
-    ParamKey::RateKpR,
-    ParamKey::RateKpP,
-    ParamKey::RateKpY,
-    ParamKey::RateKiR,
-    ParamKey::RateKiP,
-    ParamKey::RateKiY,
-    ParamKey::RateKdR,
-    ParamKey::RateKdP,
-    ParamKey::RateKdY,
     // INDI effectiveness — G1 force
     ParamKey::G1FxM0,
     ParamKey::G1FxM1,
@@ -1323,18 +1252,6 @@ impl ParamKey {
             "pos_kd_x" => Some(Self::PosKdX),
             "pos_kd_y" => Some(Self::PosKdY),
             "pos_kd_z" => Some(Self::PosKdZ),
-            "att_kr_x" => Some(Self::AttKrX),
-            "att_kr_y" => Some(Self::AttKrY),
-            "att_kr_z" => Some(Self::AttKrZ),
-            "rate_kp_r" => Some(Self::RateKpR),
-            "rate_kp_p" => Some(Self::RateKpP),
-            "rate_kp_y" => Some(Self::RateKpY),
-            "rate_ki_r" => Some(Self::RateKiR),
-            "rate_ki_p" => Some(Self::RateKiP),
-            "rate_ki_y" => Some(Self::RateKiY),
-            "rate_kd_r" => Some(Self::RateKdR),
-            "rate_kd_p" => Some(Self::RateKdP),
-            "rate_kd_y" => Some(Self::RateKdY),
             // INDI effectiveness — G1 force
             "g1_fx_m0" => Some(Self::G1FxM0),
             "g1_fx_m1" => Some(Self::G1FxM1),
@@ -1456,18 +1373,6 @@ impl ParamKey {
             Self::PosKdX => "pos_kd_x",
             Self::PosKdY => "pos_kd_y",
             Self::PosKdZ => "pos_kd_z",
-            Self::AttKrX => "att_kr_x",
-            Self::AttKrY => "att_kr_y",
-            Self::AttKrZ => "att_kr_z",
-            Self::RateKpR => "rate_kp_r",
-            Self::RateKpP => "rate_kp_p",
-            Self::RateKpY => "rate_kp_y",
-            Self::RateKiR => "rate_ki_r",
-            Self::RateKiP => "rate_ki_p",
-            Self::RateKiY => "rate_ki_y",
-            Self::RateKdR => "rate_kd_r",
-            Self::RateKdP => "rate_kd_p",
-            Self::RateKdY => "rate_kd_y",
             // INDI effectiveness — G1 force
             Self::G1FxM0 => "g1_fx_m0",
             Self::G1FxM1 => "g1_fx_m1",
@@ -1612,9 +1517,6 @@ mod tests {
                 pos_kp: [4.0, 4.0, 5.0],
                 pos_kd: [4.0, 4.0, 4.0],
                 att_k_rate: [3.0, 3.0, 1.0],
-                rate_kp: [0.1, 0.08, 0.05],
-                rate_ki: [0.0, 0.0, 0.0],
-                rate_kd: [0.0, 0.0, 0.0],
             },
             indi_effectiveness: IndiEffectivenessParams::default(),
             indi_controller: IndiControllerParams::default(),

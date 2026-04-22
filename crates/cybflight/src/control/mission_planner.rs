@@ -52,13 +52,22 @@ use cybflight_core::trajectory_planning::planner::{
 use cybflight_core::trajectory_planning::quad_planning_config::QuadPlanningConfig;
 use cybflight_core::trajectory_planning::types::Vec3;
 
+use crate::msgs;
+
 use super::{
     read_active_setpoint, MissionState, MissionTrajectory, MISSION_ABORT_REQUESTED,
-    MISSION_STATE, MISSION_TRAJECTORY_SLOT, PLAN_REQUEST,
+    MISSION_STATE, MISSION_STATUS, MISSION_TRAJECTORY_SLOT, PLAN_REQUEST,
 };
 
 /// BFGS scratch memory (~35 KB). BSS-resident; init-once on first plan.
 static WORKSPACE: StaticCell<BfgsWorkspace> = StaticCell::new();
+
+/// Heartbeat cadence for `MISSION_STATUS` during Planning. The outer loop
+/// owns the heartbeat when it is the authoritative state-writer (Idle /
+/// Executing), but while we hold state=Planning it may early-continue on
+/// stale odometry — so the planner publishes its own status. ~100 ms
+/// matches the outer loop's own publish decimation.
+const PLANNING_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Number of intermediate waypoints on the test circle. Total trajectory
 /// pieces = `NUM_CIRCLE_WAYPOINTS + 1` (≤ `MAX_PIECES` = 16).
@@ -87,14 +96,18 @@ const MIN_TRAJECTORY_DURATION_S: f32 = 0.5;
 /// Wall-clock budget for a single solve. If the BFGS solver has not
 /// converged within this window, it is aborted gracefully and the
 /// mission returns to Idle with the drone continuing to hover on its
-/// prior setpoint — **no watchdog reset**. The budget is deliberately
-/// well under the IWDG timeout (500 ms) *even without* the timeout
-/// extension below, so the abort path takes effect first.
+/// prior setpoint — **no watchdog reset**.
 ///
-/// Value chosen so that (budget + ~1 iteration slop) + IWDG feed
-/// interval (200 ms) stays comfortably below the 500 ms IWDG timeout
-/// if the extension is ever missed (e.g. a bug path).
-const SOLVE_BUDGET: Duration = Duration::from_millis(250);
+/// With cooperative yielding (yield_now() between every BFGS burst), the
+/// IWDG feed task runs freely between iterations, so the budget is no
+/// longer constrained by the 500 ms IWDG timeout. The binding constraint
+/// is the outer_loop MPC tick: at ~4 ms per solve and a 10 ms timer
+/// period, the outer_loop occupies ~40% of the Thread executor, leaving
+/// mission_planner ~6 ms per window → ~3 BFGS iterations per 10 ms.
+/// With max_iterations = 500, worst-case wall time ≈ 500 / 3 × 10 ms
+/// ≈ 1670 ms. 3000 ms gives comfortable headroom; the drone hovers
+/// safely in Planning while the pilot waits.
+const SOLVE_BUDGET: Duration = Duration::from_millis(3000);
 
 /// Outer BFGS iterations per cooperative-yield burst. After this many
 /// iterations the solver returns to the async context so peer thread-
@@ -102,10 +115,15 @@ const SOLVE_BUDGET: Duration = Duration::from_millis(250);
 /// then `yield_now().await` and resume the solve.
 ///
 /// Set to 1: one outer iteration of MINCO + cost eval is ~1–3 ms on
-/// STM32H743. Yielding every iteration keeps any single uninterrupted
-/// CPU window under ~3 ms, well within the MPC's 10 ms tick period so
-/// MPC doesn't miss ticks while a plan is being solved. Yield overhead
-/// (~2–5 μs per yield) is negligible compared to iteration cost.
+/// STM32H743. Yielding every iteration limits the uninterrupted CPU
+/// window to ~3 ms — the MPC outer loop (10 ms timer, ~4 ms tick body)
+/// is therefore delayed by at most one burst duration, keeping its
+/// effective rate close to the intended 100 Hz.
+///
+/// Note: the effective yield overhead is NOT the bare yield_now() cost
+/// (~2–5 μs). When the outer_loop timer fires during a yield, the
+/// ~4 ms MPC solve runs before mission_planner resumes, producing an
+/// average ~1.6 ms overhead per yield. SOLVE_BUDGET accounts for this.
 const BFGS_ITERS_PER_YIELD: usize = 1;
 
 /// Build the hardcoded circular waypoint list returning to `start`.
@@ -170,6 +188,7 @@ fn try_snapshot_setpoint() -> Option<nalgebra::Vector3<f32>> {
 #[embassy_executor::task]
 pub async fn mission_planner_task() {
     let workspace: &mut BfgsWorkspace = WORKSPACE.init(BfgsWorkspace::new());
+    let mission_status_pub = MISSION_STATUS.immediate_publisher();
     // Build the planner config from the *live* vehicle params (mass,
     // inertia, motor thrust caps, planner tunables) rather than the
     // hardcoded `default()` — otherwise the trajectory is solved for a
@@ -282,6 +301,7 @@ pub async fn mission_planner_task() {
                 && crate::motors::IS_ARMED.load(Ordering::Acquire)
         };
         let mut session = plan_init(&input, &config, workspace);
+        let mut last_heartbeat = t0;
         let status = loop {
             match plan_resume(
                 &mut session,
@@ -299,10 +319,27 @@ pub async fn mission_planner_task() {
                     if !keep_going() {
                         break SolverStatus::TimeExceeded;
                     }
+                    let now = Instant::now();
+                    if now.duration_since(last_heartbeat) >= PLANNING_HEARTBEAT_INTERVAL {
+                        last_heartbeat = now;
+                        mission_status_pub.publish_immediate(msgs::MissionStatus {
+                            timestamp: now,
+                            state: MissionState::Planning as u8,
+                            tau_s: 0.0,
+                            total_duration_s: 0.0,
+                            target_position: start_position,
+                        });
+                    }
                     embassy_futures::yield_now().await;
                 }
             }
         };
+        // Yield once before plan_finalize so the IWDG feed task and any
+        // other pending thread-executor tasks (ESKF, GPS) can run. The
+        // finalize call is synchronous and potentially several ms long;
+        // a single yield ensures the last-fed timestamp stays fresh even
+        // if the disarm path gets here with the IWDG nearly exhausted.
+        embassy_futures::yield_now().await;
         let result = plan_finalize(session, workspace, status);
         let elapsed_ms = Instant::now().duration_since(t0).as_millis();
 
@@ -440,8 +477,18 @@ pub async fn mission_planner_task() {
             continue;
         }
         defmt::info!(
-            "mission_planner: trajectory published (duration={}s)",
+            "mission_planner: → Executing (duration={}s)",
             dur
         );
+        // Publish the Executing state immediately so the ground station sees
+        // state=2 without waiting up to 100 ms for the outer_loop's decimated
+        // MissionStatus heartbeat.
+        mission_status_pub.publish_immediate(msgs::MissionStatus {
+            timestamp: t_start,
+            state: MissionState::Executing as u8,
+            tau_s: 0.0,
+            total_duration_s: dur,
+            target_position: start_position,
+        });
     }
 }

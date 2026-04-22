@@ -297,29 +297,23 @@ pub async fn rc_interpreter_task() {
     const MISSION_TRIGGER_CHANNEL: usize = 4;
     const SWITCH_THRESHOLD: u16 = 1500;
 
-    // Mission-trigger Schmitt trigger + frame-count debounce. A single bad
-    // RC frame (channel value dipping near the threshold, or a short frame
-    // where the AUX slot reads as 0) would otherwise produce a spurious
-    // falling edge and abort the mission one tick after it started.
-    //
-    // Hysteresis: stay high unless value drops below LOW; stay low unless
-    // value climbs above HIGH. Debounce: the disagreeing level must hold
-    // for `MISSION_DEBOUNCE_FRAMES` consecutive frames before the
-    // confirmed level flips and an edge is emitted.
+    // Mission-trigger Schmitt trigger. The 400 µs band between LOW and
+    // HIGH is wider than any physical switch's noise floor, so hysteresis
+    // alone rejects spurious flips. No frame-count debounce: the earlier
+    // 3-frame counter counted task *observations* (the backlog-collapse
+    // loop means this task may see fewer frames than the RC link sends),
+    // making trigger timing depend on executor scheduling rather than
+    // switch physics.
     #[cfg(feature = "outer_mpc")]
     const MISSION_SWITCH_HIGH: u16 = 1700;
     #[cfg(feature = "outer_mpc")]
     const MISSION_SWITCH_LOW: u16 = 1300;
-    #[cfg(feature = "outer_mpc")]
-    const MISSION_DEBOUNCE_FRAMES: u8 = 3;
 
     // `None` = not yet synced (first RC frame seeds the confirmed level,
     // so a switch-high at boot does NOT register as a rising edge and
-    // spuriously fire a plan). After sync, holds the debounced level.
+    // spuriously fire a plan). After sync, holds the current hysteretic level.
     #[cfg(feature = "outer_mpc")]
     let mut mission_level_confirmed: Option<bool> = None;
-    #[cfg(feature = "outer_mpc")]
-    let mut mission_debounce_count: u8 = 0;
 
     loop {
         // Wait for any RC frame, then drain the subscriber to its latest
@@ -427,31 +421,18 @@ pub async fn rc_interpreter_task() {
 
             let state = super::MissionState::from_u8(super::MISSION_STATE.load(Ordering::Acquire));
 
-            // Debounced edge detection. First-frame sync seeds the
-            // confirmed level without emitting an edge. Afterwards, a
-            // disagreeing raw level must persist for
-            // `MISSION_DEBOUNCE_FRAMES` consecutive frames before the
-            // confirmed level flips and an edge fires — any in-between
-            // frame at the prior level resets the counter.
+            // Schmitt-hysteretic edge detection. First-frame sync seeds
+            // the confirmed level without emitting an edge; any subsequent
+            // disagreement with the hysteretic raw level fires immediately.
             let (rising, falling) = match (mission_level_confirmed, raw_level) {
                 (None, Some(l)) => {
                     mission_level_confirmed = Some(l);
-                    mission_debounce_count = 0;
                     (false, false)
                 }
-                (Some(c), Some(r)) if c == r => {
-                    mission_debounce_count = 0;
-                    (false, false)
-                }
+                (Some(c), Some(r)) if c == r => (false, false),
                 (Some(c), Some(r)) => {
-                    mission_debounce_count = mission_debounce_count.saturating_add(1);
-                    if mission_debounce_count >= MISSION_DEBOUNCE_FRAMES {
-                        mission_debounce_count = 0;
-                        mission_level_confirmed = Some(r);
-                        (r && !c, !r && c)
-                    } else {
-                        (false, false)
-                    }
+                    mission_level_confirmed = Some(r);
+                    (r && !c, !r && c)
                 }
                 (_, None) => (false, false),
             };
@@ -476,14 +457,25 @@ pub async fn rc_interpreter_task() {
                 }
             }
 
-            // Falling edge while mission in flight → request graceful
-            // abort. We DO NOT directly clear state or slot here: that is
-            // the outer loop's responsibility so it can capture the
-            // drone's current pose as the hover fallback point (safety:
-            // prevents snap-back to stale pre-mission `pos_setpoint`).
-            if falling && state != super::MissionState::Idle {
+            // Falling edge while EXECUTING → request graceful abort.
+            //
+            // Abort is intentionally NOT signaled during Planning: the
+            // BFGS solve is already running, and the mission_planner clears
+            // MISSION_ABORT_REQUESTED at the start of each plan cycle. A
+            // falling edge that arrives after that clear (i.e. the switch
+            // goes LOW while the solve is still running) would cancel the
+            // result even if the pilot intended only a brief toggle. Keeping
+            // the abort scoped to Executing means the pilot's "switch LOW"
+            // intent is honored once the vehicle has actually started moving
+            // — the natural and safe abort window.
+            //
+            // We DO NOT directly clear state or slot here: that is the outer
+            // loop's responsibility so it can capture the drone's current
+            // pose as the hover fallback point (safety: prevents snap-back
+            // to stale pre-mission `pos_setpoint`).
+            if falling && state == super::MissionState::Executing {
                 defmt::warn!(
-                    "RC: mission abort requested (ch{} falling)",
+                    "RC: mission abort requested (ch{} falling, Executing)",
                     MISSION_TRIGGER_CHANNEL
                 );
                 super::MISSION_ABORT_REQUESTED.store(true, Ordering::Release);

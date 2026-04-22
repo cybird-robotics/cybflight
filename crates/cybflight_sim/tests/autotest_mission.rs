@@ -1,7 +1,7 @@
 //! Integration autotest: run hover, point-to-point, and mission scenarios
-//! through the MPC controller and assert the pass criteria hold. A side-by-
-//! side cascade comparison is included so regression / tuning work has a
-//! fixed baseline to diff against — but MPC is the authoritative path.
+//! through the MPC+INDI stack and assert the pass criteria hold.
+//! Diagnostic baselines for MpcDirect and cascade are emitted as non-
+//! asserting tests so regression deltas can be read off the same reports.
 //!
 //! Run:
 //!   cargo test -p cybflight-sim --target x86_64-unknown-linux-gnu \
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use cybflight_core::trajectory_planning::quad_planning_config::QuadPlanningConfig;
 use cybflight_sim::{
-    controller::{CascadeController, Controller, MpcController},
+    controller::{CascadeController, Controller, MpcDirectController, MpcIndiController},
     plant::{QuadPlant, VEHICLE},
     report,
     runner::{MissionRunner, RunOutput},
@@ -27,20 +27,21 @@ fn out_dir(name: &str) -> PathBuf {
 
 fn run_with<C: Controller>(mut scenario: Scenario, mut controller: C) -> RunOutput {
     let vp = VEHICLE.build();
-    let mut plant = QuadPlant::new(vp, 0.002);
+    let mut plant = QuadPlant::new(vp, 1.0 / 8000.0);
     let runner = MissionRunner::new(Default::default());
     let out = runner.run(&mut scenario, &mut plant, &mut controller);
 
     let dir = out_dir(&format!("{}_{}", scenario.name, controller.name()));
     let json = report::write_json(&dir, &scenario, controller.name(), &out).expect("write json");
     println!(
-        "{:<18} [{:<7}] rms={:.4}m peak={:.4}m term={:.4}m tilt={:.1}° {:?} ({})",
+        "{:<18} [{:<10}] rms={:.4}m peak={:.4}m term={:.4}m tilt={:.1}° sat={:.0}% {:?} ({})",
         scenario.name,
         controller.name(),
         out.summary.rms_pos_err_m,
         out.summary.peak_pos_err_m,
         out.summary.terminal_pos_err_m,
         out.summary.peak_tilt_rad.to_degrees(),
+        out.summary.peak_motor_saturation_pct,
         out.verdict,
         json.display(),
     );
@@ -89,48 +90,56 @@ fn make_mission_square() -> Scenario {
     )
 }
 
-fn mpc() -> MpcController {
-    MpcController::from_params(&VEHICLE.build())
+fn mpc_indi() -> MpcIndiController {
+    MpcIndiController::from_params(&VEHICLE.build())
+}
+
+fn mpc_direct() -> MpcDirectController {
+    MpcDirectController::from_params(&VEHICLE.build())
 }
 
 fn cascade() -> CascadeController {
     CascadeController::from_params(&VEHICLE.build())
 }
 
-// ── Authoritative MPC tests ─────────────────────────────────────────────────
+// ── Authoritative MPC+INDI tests (firmware-match topology) ──────────────────
 
 #[test]
-fn mpc_hover_level_converges() {
-    let out = run_with(make_hover_level(), mpc());
+fn mpc_indi_hover_level_converges() {
+    let out = run_with(make_hover_level(), mpc_indi());
     assert_eq!(out.verdict, Verdict::Pass, "{:?}", out.failure_reasons);
 }
 
 #[test]
-fn mpc_hover_with_initial_tilt_recovers() {
-    let out = run_with(make_hover_tilt30(), mpc());
+fn mpc_indi_hover_with_initial_tilt_recovers() {
+    let out = run_with(make_hover_tilt30(), mpc_indi());
     assert_eq!(out.verdict, Verdict::Pass, "{:?}", out.failure_reasons);
 }
 
 #[test]
-fn mpc_point_to_point_x3() {
-    let out = run_with(make_p2p(), mpc());
+fn mpc_indi_point_to_point_x3() {
+    let out = run_with(make_p2p(), mpc_indi());
     assert_eq!(out.verdict, Verdict::Pass, "{:?}", out.failure_reasons);
 }
 
 #[test]
-fn mpc_mission_square() {
-    let out = run_with(make_mission_square(), mpc());
+fn mpc_indi_mission_square() {
+    let out = run_with(make_mission_square(), mpc_indi());
     assert_eq!(out.verdict, Verdict::Pass, "{:?}", out.failure_reasons);
 }
 
-// ── Cascade (legacy PD+FF) baseline — diagnostic only, non-asserting ────────
+// ── Diagnostic baselines — non-asserting ────────────────────────────────────
+
+#[test]
+fn mpc_direct_baseline_all_scenarios() {
+    let _ = run_with(make_hover_level(), mpc_direct());
+    let _ = run_with(make_hover_tilt30(), mpc_direct());
+    let _ = run_with(make_p2p(), mpc_direct());
+    let _ = run_with(make_mission_square(), mpc_direct());
+}
 
 #[test]
 fn cascade_baseline_all_scenarios() {
-    // Emits reports for each scenario under the cascade controller so the
-    // MPC numbers can be compared against the prior baseline without
-    // rebuilding. Does NOT assert — cascade is the legacy path; PRs
-    // improving MPC are not gated on cascade regression.
     let _ = run_with(make_hover_level(), cascade());
     let _ = run_with(make_hover_tilt30(), cascade());
     let _ = run_with(make_p2p(), cascade());

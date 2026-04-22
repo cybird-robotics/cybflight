@@ -19,7 +19,7 @@ use cybflight_core::position_control::{self, pd_ff_control};
 use crate::sensors::VEHICLE_ODOMETRY;
 
 #[cfg(not(feature = "outer_mpc"))]
-use cybflight_core::attitude_control::{self, AttitudeControlOutput, geometric_controller};
+use cybflight_core::attitude_control::{self, geometric_controller, AttitudeControlOutput};
 use cybflight_core::{
     indi::{
         controller::{IndiConfig, IndiController, NU},

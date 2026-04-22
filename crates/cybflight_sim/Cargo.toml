@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 cybflight-core = { path = "../cybflight_core" }
-nalgebra = { version = "0.34.1", features = ["std"] }
+nalgebra = { version = "0.34.1", features = ["std", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rerun = { version = "0.26", default-features = false, features = ["sdk"] }

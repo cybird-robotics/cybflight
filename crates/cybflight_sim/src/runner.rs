@@ -1,9 +1,13 @@
-//! MissionRunner equivalent: drives the plant/controller/setpoint loop and
-//! produces a structured history + verdict. Mirrors the C++
-//! `autopilot::MissionRunner` in spirit (see
-//! `/home/hs293go/src/autopilot/validation/src/mission_runner.cpp`) but
-//! without the estimator stage — state is taken as perfect truth from the
-//! plant for the first (mission-level) milestone.
+//! MissionRunner: drives plant/controller/setpoint loop and produces a
+//! structured history + verdict.
+//!
+//! The controller declares its own `tick_rate_hz()`. The runner ticks the
+//! controller at that rate and integrates the plant in substeps of
+//! `cfg.dt_sim` per controller tick. This matches the firmware model where
+//! the outer + inner loops run at different rates.
+//!
+//! History is decimated to ~100 Hz effective regardless of tick rate, so
+//! high-rate stacks (INDI at 8 kHz) don't bloat reports.
 
 use nalgebra::{UnitQuaternion, Vector3};
 
@@ -14,20 +18,22 @@ use crate::trajectory::Setpoint;
 
 #[derive(Clone, Debug)]
 pub struct RunnerConfig {
-    /// Simulation integration timestep [s].
+    /// Plant integration timestep [s].
     pub dt_sim: f32,
-    /// Controller update timestep [s]. Must satisfy `dt_ctrl >= dt_sim`.
-    pub dt_ctrl: f32,
-    /// Hard cap on total simulation time [s] — prevents runaway tests.
+    /// Hard cap on total simulation time [s].
     pub max_sim_time_s: f32,
+    /// Target effective history sample rate [Hz]. Runner decimates tick-by-
+    /// tick records to ≈ this rate.
+    pub history_rate_hz: f32,
 }
 
 impl Default for RunnerConfig {
     fn default() -> Self {
+        // 8 kHz matches the INDI stack; higher-level stacks use fewer substeps.
         Self {
-            dt_sim: 0.002,
-            dt_ctrl: 0.01,
+            dt_sim: 1.0 / 8000.0,
             max_sim_time_s: 60.0,
+            history_rate_hz: 100.0,
         }
     }
 }
@@ -79,10 +85,11 @@ impl MissionRunner {
         plant: &mut QuadPlant,
         controller: &mut C,
     ) -> RunOutput {
+        let tick_dt = 1.0 / controller.tick_rate_hz();
         assert!(
-            self.cfg.dt_ctrl >= self.cfg.dt_sim,
-            "dt_ctrl ({}) must be >= dt_sim ({})",
-            self.cfg.dt_ctrl,
+            tick_dt >= self.cfg.dt_sim - 1e-9,
+            "tick_dt ({}) must be >= dt_sim ({})",
+            tick_dt,
             self.cfg.dt_sim
         );
 
@@ -92,7 +99,11 @@ impl MissionRunner {
             scenario.initial_attitude,
         );
 
-        let substeps = (self.cfg.dt_ctrl / self.cfg.dt_sim).round().max(1.0) as usize;
+        let substeps = (tick_dt / self.cfg.dt_sim).round().max(1.0) as usize;
+        let history_stride = ((controller.tick_rate_hz() / self.cfg.history_rate_hz)
+            .round()
+            .max(1.0)) as u32;
+
         let trajectory_s = scenario.setpoints.duration_s();
         let terminal_time_s = if trajectory_s.is_finite() {
             trajectory_s + scenario.terminal_hold_s
@@ -100,9 +111,10 @@ impl MissionRunner {
             scenario.terminal_hold_s.max(5.0)
         };
         let sim_deadline_s = terminal_time_s.min(self.cfg.max_sim_time_s);
-        let max_ctrl_steps = ((sim_deadline_s / self.cfg.dt_ctrl).ceil() as usize).max(1);
+        let max_ticks = ((sim_deadline_s * controller.tick_rate_hz()).ceil() as usize).max(1);
 
-        let mut history = Vec::with_capacity(max_ctrl_steps);
+        let expected_records = (max_ticks / history_stride as usize) + 2;
+        let mut history = Vec::with_capacity(expected_records);
         let mut early_exit: Option<String> = None;
         let mut geofence_violation = false;
 
@@ -114,33 +126,34 @@ impl MissionRunner {
             .fold(0.0f32, f32::max)
             .max(1e-6);
 
-        // Pre-allocate a horizon buffer sized to the controller's request.
         let horizon_len = controller.horizon_samples().max(1);
-        let horizon_stride = controller.horizon_stride_s();
+        let horizon_stride_s = controller.horizon_stride_s();
         let mut horizon: Vec<Setpoint> = Vec::with_capacity(horizon_len);
 
-        for _ in 0..max_ctrl_steps {
+        for tick_idx in 0..max_ticks {
             let t = plant.time_s();
             horizon.clear();
             for k in 0..horizon_len {
-                let tk = t + k as f32 * horizon_stride;
+                let tk = t + k as f32 * horizon_stride_s;
                 horizon.push(scenario.setpoints.sample(tk));
             }
-            let sp = horizon[0];
+            let sp0 = horizon[0];
 
-            let u = controller.compute(plant.raw_state(), &horizon, self.cfg.dt_ctrl);
+            let u = controller.step(plant.raw_state(), &horizon);
             let motor_forces = [u[0], u[1], u[2], u[3]];
 
-            history.push(StepRecord {
-                t,
-                position: plant.position(),
-                velocity: plant.velocity(),
-                attitude: plant.attitude(),
-                body_rate: plant.body_rate(),
-                tilt_rad: plant.tilt_rad(),
-                setpoint: sp,
-                motor_forces,
-            });
+            if (tick_idx as u32) % history_stride == 0 {
+                history.push(StepRecord {
+                    t,
+                    position: plant.position(),
+                    velocity: plant.velocity(),
+                    attitude: plant.attitude(),
+                    body_rate: plant.body_rate(),
+                    tilt_rad: plant.tilt_rad(),
+                    setpoint: sp0,
+                    motor_forces,
+                });
+            }
 
             for _ in 0..substeps {
                 plant.step(&u);

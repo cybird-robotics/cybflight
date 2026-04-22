@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use clap::{Parser, ValueEnum};
 use cybflight_core::trajectory_planning::quad_planning_config::QuadPlanningConfig;
 use cybflight_sim::{
-    controller::{CascadeController, Controller, MpcController},
+    controller::{CascadeController, Controller, MpcDirectController, MpcIndiController},
     plant::{QuadPlant, VEHICLE},
     report, runner::MissionRunner,
     scenario::{Scenario, Verdict},
@@ -17,7 +17,11 @@ use nalgebra::Vector3;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum ControllerKind {
-    Mpc,
+    /// 10-state MPC at 100 Hz + INDI at 8 kHz (firmware-match topology).
+    MpcIndi,
+    /// 13-state MPC at 100 Hz, per-motor output (diagnostic upper bound).
+    MpcDirect,
+    /// PD position + geometric attitude + rate-P + mixer (legacy baseline).
     Cascade,
 }
 
@@ -28,8 +32,8 @@ struct Args {
     #[arg(long, default_value = "mission_square")]
     scenario: String,
 
-    /// Controller: MPC (default) or cascade (PD+FF legacy baseline).
-    #[arg(long, value_enum, default_value_t = ControllerKind::Mpc)]
+    /// Controller: mpc-indi (default, firmware-match), mpc-direct, or cascade.
+    #[arg(long, value_enum, default_value_t = ControllerKind::MpcIndi)]
     controller: ControllerKind,
 
     /// Output directory for JSON/MD/CSV artifacts.
@@ -57,7 +61,8 @@ fn main() -> ExitCode {
     let mut scenario = build_scenario(&args.scenario, &planner_config);
     let mut plant = QuadPlant::new(vp.clone(), 0.002);
     let mut controller: Box<dyn Controller> = match args.controller {
-        ControllerKind::Mpc => Box::new(MpcController::from_params(&vp)),
+        ControllerKind::MpcIndi => Box::new(MpcIndiController::from_params(&vp)),
+        ControllerKind::MpcDirect => Box::new(MpcDirectController::from_params(&vp)),
         ControllerKind::Cascade => Box::new(CascadeController::from_params(&vp)),
     };
     let controller_name = controller.name();

@@ -17,7 +17,7 @@ pub mod scenario;
 pub mod trajectory;
 pub mod viz;
 
-pub use controller::{CascadeController, Controller};
+pub use controller::{CascadeController, Controller, MpcDirectController, MpcIndiController};
 pub use plant::{QuadPlant, VEHICLE};
 pub use report::SimulationReport;
 pub use runner::{MissionRunner, RunnerConfig, StepRecord};

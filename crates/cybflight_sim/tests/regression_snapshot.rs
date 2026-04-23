@@ -22,7 +22,7 @@ use cybflight_sim::{
     plant::QuadPlant,
     runner::{MissionRunner, RunOutput},
     scenario::Scenario,
-    sensors::NoisyImu,
+    sensors::{NoisyGps, NoisyImu},
 };
 use nalgebra::Vector3;
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,11 @@ const CONTROLLERS: &[&str] = &["cascade", "mpc_direct", "mpc_indi"];
 /// that consumes the IMU. See HACKING.md for the noise/snapshot rationale.
 const NOISY_SCENARIOS: &[&str] = &["mission_square_noisy"];
 
+/// GPS-in-the-loop scenarios — ESKF-in-sim drives the controller, fed by
+/// a `NoisyGps` with a fixed seed. Also mpc_indi-only (matches the
+/// firmware `outer_mpc + est_pos_gps` topology).
+const GPS_SCENARIOS: &[&str] = &["mission_square_gps"];
+
 fn build_scenario(name: &str) -> Scenario {
     match name {
         "hover_level" => Scenario::hover(name, Vector3::new(0.0, 0.0, 1.0), 0.0),
@@ -88,6 +93,28 @@ fn build_scenario(name: &str) -> Scenario {
         // Representative consumer-grade MEMS IMU. Seed is fixed so the
         // noise sequence is snapshot-stable across runs.
         .with_imu(Box::new(NoisyImu::isotropic(0xC0FFEE, 0.03, 0.3))),
+        "mission_square_gps" => {
+            let mut s = Scenario::mission(
+                name,
+                Vector3::new(0.0, 0.0, 1.0),
+                &[
+                    Vector3::new(3.0, 0.0, 1.0),
+                    Vector3::new(3.0, 3.0, 1.0),
+                    Vector3::new(0.0, 3.0, 1.0),
+                    Vector3::new(0.0, 0.0, 1.0),
+                ],
+            )
+            // Fixed seed + deterministic ChaCha8 keeps the ESKF-in-sim
+            // trajectory snapshot-stable. 5 Hz, σ=0.5 m / σ=0.2 m/s
+            // roughly matches open-sky u-blox M10 with SBAS aiding.
+            .with_gps(Box::new(NoisyGps::isotropic(0xDEADBEEF, 5.0, 0.5, 0.2)));
+            // Same looser pass_criteria as the autotest — but the
+            // snapshot test itself doesn't gate on verdict, so these
+            // only matter for the occasional sim-run inspection.
+            s.pass_criteria.terminal_pos_err_m = 0.35;
+            s.pass_criteria.rms_pos_err_m = 0.80;
+            s
+        }
         other => panic!("unknown scenario: {other}"),
     }
 }
@@ -114,6 +141,11 @@ fn compute_current() -> BTreeMap<String, Row> {
     for &s in NOISY_SCENARIOS {
         out.insert(format!("{s}/mpc_indi"), run_one(s, "mpc_indi"));
     }
+    // GPS scenarios — same rationale (firmware outer_mpc + est_pos_gps
+    // path is MpcIndi only).
+    for &s in GPS_SCENARIOS {
+        out.insert(format!("{s}/mpc_indi"), run_one(s, "mpc_indi"));
+    }
     out
 }
 
@@ -135,9 +167,18 @@ struct Tol {
     abs: f32,
 }
 
-const TOL_POS: Tol = Tol { rel: 0.01, abs: 1e-4 }; // 1 % or 0.1 mm
-const TOL_TILT: Tol = Tol { rel: 0.01, abs: 1e-3 }; // 1 % or ~0.057°
-const TOL_SAT: Tol = Tol { rel: 0.01, abs: 0.5 }; //  1 % or 0.5 %-point
+const TOL_POS: Tol = Tol {
+    rel: 0.01,
+    abs: 1e-4,
+}; // 1 % or 0.1 mm
+const TOL_TILT: Tol = Tol {
+    rel: 0.01,
+    abs: 1e-3,
+}; // 1 % or ~0.057°
+const TOL_SAT: Tol = Tol {
+    rel: 0.01,
+    abs: 0.5,
+}; //  1 % or 0.5 %-point
 
 fn drift(exp: f32, got: f32, tol: Tol) -> Option<f32> {
     let d = (got - exp).abs();
@@ -225,7 +266,9 @@ fn regression_snapshot() {
     }
     for key in expected.keys() {
         if !current.contains_key(key) {
-            failures.push(format!("  {key}: REMOVED row (in snapshot but not produced)"));
+            failures.push(format!(
+                "  {key}: REMOVED row (in snapshot but not produced)"
+            ));
         }
     }
 

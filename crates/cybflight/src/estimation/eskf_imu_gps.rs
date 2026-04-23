@@ -1,96 +1,135 @@
-//! Motion-capture/INS state estimation task.
+//! GNSS/INS state estimation task — mirror of `eskf_imu_mocap` with GPS
+//! replacing motion capture.
 //!
-//! Fuses IMU and motion capture pose (~100–360 Hz) into a 15-state
-//! Error-State Kalman Filter (ESKF) and publishes `VehicleOdometry`.
+//! The first good fix (fix_type ≥ 3, num_sv ≥ `GPS_MIN_SV`) anchors the
+//! ENU origin; subsequent fixes are converted to ENU and fed into the
+//! ESKF via `update_pos` + `update_vel`. Measurement σ is derived per
+//! fix from u-blox's h_acc / v_acc / s_acc estimates, floored so the
+//! filter cannot get over-confident when the receiver reports impossibly
+//! tight bounds.
 //!
-//! The ESKF predict step runs at `PREDICT_RATE_HZ` (1 kHz) rather than the
-//! full IMU rate (8 kHz) to keep CPU usage low enough for the attitude control
-//! loop to run unimpeded on the single-threaded executor.
+//! GPS-only builds have no attitude measurement — the ESKF leans on IMU
+//! gravity-aided tilt + gyro integration alone, so yaw is observable only
+//! through accel-coupled motion or (future work) a magnetometer. Expect
+//! yaw drift in still hover; tracking degrades on turning legs but stays
+//! bounded. See docs/HACKING.md GPS section (to be added) for the gap.
 //!
 //! # State machine
-//! 1. **Init** — waits for first mocap pose, initialises ESKF with zero biases.
-//! 2. **Converging** — predict/update loop is active; gyro-bias covariance is
-//!    still above the convergence threshold.  Arming is blocked.
-//! 3. **Running** — covariance has converged; `ESTIMATOR_READY` is set and
-//!    arming is permitted.
+//! 1. **Init** — waits for first good GPS fix, anchors `LlhOrigin`,
+//!    initialises ESKF with zero position / identity attitude / zero
+//!    biases.
+//! 2. **Converging** — predict/update loop active; gyro-bias covariance
+//!    is above threshold.  Arming blocked.
+//! 3. **Running** — covariance converged; `ESTIMATOR_READY` set.
 
 use embassy_futures::select::{select, Either};
 use embassy_sync::pubsub::WaitResult;
 use embassy_time::Instant;
-use nalgebra::Vector3;
+use nalgebra::{UnitQuaternion, Vector3};
 
 use cybflight_core::eskf::{Eskf, EskfConfig};
+use cybflight_core::geodetic::{ned_to_enu, LlhOrigin};
 
+use core::f64::consts::PI;
 use core::sync::atomic::Ordering;
 
 use crate::estimation::{EstimatorPhase, ESTIMATOR_READY, ESTIMATOR_STATUS};
 use crate::sensors;
+use crate::sensors::gps::GpsNavPvt;
 use cybflight_msgs as msgs;
 
 /// ESKF predict rate after decimation.  8 kHz IMU / 8 = 1 kHz.
 const PREDICT_DECIMATION: u32 = 8;
 
-/// Odometry publish decimation relative to predict rate.  1 kHz / 10 = 100 Hz.
+/// Odometry publish decimation relative to predict rate. 1 kHz / 10 = 100 Hz.
 const ODOM_DECIMATION: u32 = 1;
 
-/// Mocap position noise std-dev [m].
-const MOCAP_POS_STD: f32 = 0.01;
-/// Mocap attitude noise std-dev [rad].
-const MOCAP_ATT_STD: f32 = 0.03;
+/// Minimum SV count for a fix to initialise the filter or drive an update.
+const GPS_MIN_SV: u8 = 6;
+
+/// Drop fixes with horizontal accuracy estimates above this — they are
+/// noise masquerading as data. 50 m covers degraded-but-useful conditions
+/// without letting obvious garbage through.
+const GPS_H_ACC_MAX_MM: u32 = 50_000;
+
+/// Measurement σ floors so the filter cannot run with unrealistic
+/// confidence when u-blox reports a < cm accuracy (which happens on a
+/// stationary receiver with good geometry but doesn't reflect real
+/// in-flight error).
+const GPS_POS_SIGMA_FLOOR_M: f32 = 0.05;
+const GPS_VEL_SIGMA_FLOOR_M_S: f32 = 0.10;
 
 /// Gyro-bias covariance trace threshold for convergence.
 /// Initial trace = 3 × 0.01 = 0.03; this requires roughly a 10× reduction.
 const GYRO_BIAS_COV_TRACE_THRESH: f32 = 0.003;
 
-/// Reject IMU samples with any non-finite component — they cascade straight
-/// into the filter's predict step and produce NaN state in one call.
 fn imu_is_valid(accel: &Vector3<f32>, gyro: &Vector3<f32>) -> bool {
     accel.iter().all(|v| v.is_finite()) && gyro.iter().all(|v| v.is_finite())
 }
 
-/// Reject mocap frames with any non-finite component. One bad frame from the
-/// transport pipeline (ESP bridge / COBS decode) would otherwise be absorbed
-/// directly into the filter via `update_pos`/`update_att`.
-fn mocap_is_valid(pose: &msgs::ViconPose) -> bool {
-    let q = pose.orientation.as_vector();
-    pose.position.iter().all(|v| v.is_finite())
-        && q.x.is_finite()
-        && q.y.is_finite()
-        && q.z.is_finite()
-        && q.w.is_finite()
+fn pvt_is_usable(pvt: &GpsNavPvt) -> bool {
+    pvt.fix_type >= 3
+        && pvt.num_sv >= GPS_MIN_SV
+        && pvt.h_acc_mm <= GPS_H_ACC_MAX_MM
+        && pvt.lat_deg.is_finite()
+        && pvt.lon_deg.is_finite()
+}
+
+fn pvt_enu(pvt: &GpsNavPvt, origin: &LlhOrigin) -> (Vector3<f32>, Vector3<f32>) {
+    let pos = origin.llh_to_enu(
+        pvt.lat_deg * PI / 180.0,
+        pvt.lon_deg * PI / 180.0,
+        pvt.alt_msl_mm as f32 * 1e-3,
+    );
+    let vel_ned = Vector3::new(
+        pvt.vel_north_mm_s as f32 * 1e-3,
+        pvt.vel_east_mm_s as f32 * 1e-3,
+        pvt.vel_down_mm_s as f32 * 1e-3,
+    );
+    (pos, ned_to_enu(vel_ned))
 }
 
 #[embassy_executor::task]
 pub async fn estimation_task() {
     let mut imu_sub = sensors::IMU_1.subscriber().unwrap();
-    let mut mocap_sub = sensors::VICON_POSE.subscriber().unwrap();
+    let gps_signal = &sensors::GPS_NAV_PVT;
     let odom_pub = sensors::VEHICLE_ODOMETRY.immediate_publisher();
-    // Attitude telemetry (formerly published by mahony_task). Downstream
-    // consumers: CRSF telemetry, ESP bridge, USB streaming — all cosmetic.
     let att_pub = sensors::VEHICLE_ATTITUDE.immediate_publisher();
 
-    // --- Wait for first mocap pose ---
-    let first_pose = loop {
-        match mocap_sub.next_message().await {
-            WaitResult::Message(p) => break p,
-            WaitResult::Lagged(_) => continue,
+    // --- Wait for first good fix ---
+    let origin = loop {
+        let pvt = gps_signal.wait().await;
+        if pvt_is_usable(&pvt) {
+            defmt::info!(
+                "GPS origin: lat={} lon={} alt_msl_mm={} num_sv={} h_acc_mm={}",
+                pvt.lat_deg,
+                pvt.lon_deg,
+                pvt.alt_msl_mm,
+                pvt.num_sv,
+                pvt.h_acc_mm,
+            );
+            break LlhOrigin::new(
+                pvt.lat_deg * PI / 180.0,
+                pvt.lon_deg * PI / 180.0,
+                pvt.alt_msl_mm as f32 * 1e-3,
+            );
+        } else {
+            defmt::info!(
+                "GPS waiting: fix_type={} num_sv={} h_acc_mm={}",
+                pvt.fix_type,
+                pvt.num_sv,
+                pvt.h_acc_mm,
+            );
         }
     };
 
-    // --- Initialise ESKF from mocap pose, zero biases ---
+    // --- Initialise ESKF at origin, identity orientation, zero biases ---
     let mut eskf = Eskf::new(EskfConfig::default());
     eskf.init(
-        first_pose.position,
-        first_pose.orientation,
-        Vector3::zeros(), // gyro bias — let filter estimate
-        Vector3::zeros(), // accel bias — let filter estimate
-    );
-
-    defmt::info!(
-        "ESKF init: pos=[{},{},{}]",
-        first_pose.position.x,
-        first_pose.position.y,
-        first_pose.position.z,
+        Vector3::zeros(),
+        UnitQuaternion::identity(),
+        Vector3::zeros(),
+        Vector3::zeros(),
     );
 
     let state_fields = |eskf: &Eskf| {
@@ -131,7 +170,7 @@ pub async fn estimation_task() {
     let mut converged = false;
 
     loop {
-        match select(imu_sub.next_message(), mocap_sub.next_message()).await {
+        match select(imu_sub.next_message(), gps_signal.wait()).await {
             Either::First(result) => {
                 let sample = match result {
                     WaitResult::Message(m) => m,
@@ -141,19 +180,15 @@ pub async fn estimation_task() {
                     }
                 };
 
-                // Reject non-finite IMU samples before they enter the filter.
                 if !imu_is_valid(&sample.accel_m_s2, &sample.gyro_rad_s) {
                     defmt::warn!("estimation: non-finite IMU sample, skipping");
                     continue;
                 }
 
-                // If the filter reset itself (NaN guard tripped), wait for a
-                // fresh mocap frame to re-seed instead of running predict.
                 if !eskf.is_initialized() {
                     continue;
                 }
 
-                // Decimate: only run predict every PREDICT_DECIMATION IMU samples.
                 imu_skip += 1;
                 if imu_skip < PREDICT_DECIMATION {
                     continue;
@@ -164,26 +199,21 @@ pub async fn estimation_task() {
                 let dt = now.duration_since(last_predict_ts).as_micros() as f32 / 1_000_000.0;
                 last_predict_ts = now;
 
-                // Reject implausible dt (first sample after init, or huge gap)
                 if dt <= 0.0 || dt > 0.05 {
                     continue;
                 }
 
                 eskf.predict(sample.accel_m_s2, sample.gyro_rad_s, dt);
 
-                // predict() clears `initialized` if it produced NaN. Report
-                // it and drop the convergence flag so downstream consumers
-                // know the estimate is no longer trusted.
                 if !eskf.is_initialized() {
                     defmt::error!(
-                        "ESKF: non-finite state after predict — awaiting re-init from mocap"
+                        "ESKF: non-finite state after predict — awaiting re-init from GPS"
                     );
                     converged = false;
                     ESTIMATOR_READY.store(false, Ordering::Release);
                     continue;
                 }
 
-                // Publish IMU biases for INDI bias correction (every predict step)
                 super::ESKF_GYRO_BIAS.signal(eskf.gyro_bias());
                 super::ESKF_ACCEL_BIAS.signal(eskf.accel_bias());
 
@@ -192,7 +222,6 @@ pub async fn estimation_task() {
                     let (roll_deg, pitch_deg, yaw_deg, pos, vel, gyro_bias, accel_bias) =
                         state_fields(&eskf);
 
-                    // Check convergence transition
                     if !converged && eskf.gyro_bias_cov_trace() < GYRO_BIAS_COV_TRACE_THRESH {
                         converged = true;
                         ESTIMATOR_READY.store(true, Ordering::Release);
@@ -249,24 +278,22 @@ pub async fn estimation_task() {
                 }
             }
 
-            Either::Second(result) => {
-                let pose = match result {
-                    WaitResult::Message(m) => m,
-                    WaitResult::Lagged(_) => continue,
-                };
-
-                // Reject non-finite mocap frames before they enter the filter.
-                if !mocap_is_valid(&pose) {
-                    defmt::warn!("estimation: non-finite mocap frame, rejecting");
+            Either::Second(pvt) => {
+                if !pvt_is_usable(&pvt) {
+                    defmt::warn!(
+                        "GPS fix dropped: fix_type={} num_sv={} h_acc_mm={}",
+                        pvt.fix_type,
+                        pvt.num_sv,
+                        pvt.h_acc_mm,
+                    );
                     continue;
                 }
 
-                // If the filter reset (NaN guard), re-seed from this pose.
                 if !eskf.is_initialized() {
-                    defmt::error!("ESKF: re-initializing from mocap after NaN reset");
+                    defmt::error!("ESKF: re-initializing at origin after NaN reset");
                     eskf.init(
-                        pose.position,
-                        pose.orientation,
+                        Vector3::zeros(),
+                        UnitQuaternion::identity(),
                         Vector3::zeros(),
                         Vector3::zeros(),
                     );
@@ -276,13 +303,16 @@ pub async fn estimation_task() {
                     continue;
                 }
 
-                eskf.update_pos(pose.position, MOCAP_POS_STD);
-                eskf.update_att(pose.orientation, MOCAP_ATT_STD);
+                let (enu_pos, enu_vel) = pvt_enu(&pvt, &origin);
+                let sigma_pos =
+                    (pvt.h_acc_mm.max(pvt.v_acc_mm) as f32 * 1e-3).max(GPS_POS_SIGMA_FLOOR_M);
+                let sigma_vel = (pvt.s_acc_mm_s as f32 * 1e-3).max(GPS_VEL_SIGMA_FLOOR_M_S);
 
-                // If an update produced NaN, drop convergence so the next
-                // mocap frame re-seeds the filter.
+                eskf.update_pos(enu_pos, sigma_pos);
+                eskf.update_vel(enu_vel, sigma_vel);
+
                 if !eskf.is_initialized() {
-                    defmt::error!("ESKF: non-finite state after mocap update — awaiting re-init");
+                    defmt::error!("ESKF: non-finite state after GPS update — awaiting re-init");
                     converged = false;
                     ESTIMATOR_READY.store(false, Ordering::Release);
                 }

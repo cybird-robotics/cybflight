@@ -21,10 +21,10 @@ compile_error!("one of outer_rate, outer_geometric, or outer_mpc must be selecte
 ))]
 compile_error!("at most one of outer_rate, outer_geometric, outer_mpc may be selected");
 
-pub mod failsafe;
-pub mod indi_task;
 #[cfg(feature = "outer_geometric")]
 pub mod cascade_task;
+pub mod failsafe;
+pub mod indi_task;
 // inner_loop.rs (legacy rate PIDs) removed — INDI is the sole inner loop.
 #[cfg(feature = "outer_mpc")]
 pub mod mission_planner;

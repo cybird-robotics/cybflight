@@ -116,9 +116,13 @@ async fn main(spawner: embassy_executor::Spawner) {
     // consumers (CRSF, ESP bridge, USB stream).
     // Cross-executor communication (ESKF_GYRO_BIAS, ESKF_ACCEL_BIAS Signals and
     // VEHICLE_ODOMETRY PubSub) is lock-free by construction.
-    #[cfg(feature = "est_eskf")]
+    #[cfg(feature = "est_pos_mocap")]
     spawner
         .spawn(cybflight::estimation::eskf_imu_mocap::estimation_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn estimation task"));
+    #[cfg(feature = "est_pos_gps")]
+    spawner
+        .spawn(cybflight::estimation::eskf_imu_gps::estimation_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn estimation task"));
 
     // spawner

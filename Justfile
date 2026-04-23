@@ -16,14 +16,18 @@ ESTIMATOR := env_var_or_default("ESTIMATOR", "eskf")
 # lives in inner_loop.rs and is selected automatically.
 OUTER_LOOP := env_var_or_default("OUTER_LOOP", "cascade")
 
+# ESKF position source: "mocap" (default, ESP bridge + VICON_POSE) or
+# "gps" (u-blox M10 NAV-PVT → LLH→ENU). Mutually exclusive via compile_error.
+POS_SOURCE := env_var_or_default("POS_SOURCE", "mocap")
+
 # Compose the feature list for `cargo build`. The `outer_mpc` feature is
 # appended only when OUTER_LOOP=mpc; otherwise the cascade is used (the
 # `outer_mpc` feature is gated on est_eskf via a compile_error guard, so
 # misuse with est_mahony fails fast at build time).
 FEATURES := if OUTER_LOOP == "mpc" {
-    "board_" + BOARD + ",rx_" + RC_PROTOCOL + ",est_" + ESTIMATOR + ",outer_mpc"
+    "board_" + BOARD + ",rx_" + RC_PROTOCOL + ",est_" + ESTIMATOR + ",est_pos_" + POS_SOURCE + ",outer_mpc"
 } else {
-    "board_" + BOARD + ",rx_" + RC_PROTOCOL + ",est_" + ESTIMATOR
+    "board_" + BOARD + ",rx_" + RC_PROTOCOL + ",est_" + ESTIMATOR + ",est_pos_" + POS_SOURCE
 }
 
 build:
@@ -39,7 +43,7 @@ build-cascade:
 
 # Print the resolved feature list (useful for debugging the build matrix).
 print-features:
-    @echo "BOARD={{BOARD}} RC_PROTOCOL={{RC_PROTOCOL}} ESTIMATOR={{ESTIMATOR}} OUTER_LOOP={{OUTER_LOOP}}"
+    @echo "BOARD={{BOARD}} RC_PROTOCOL={{RC_PROTOCOL}} ESTIMATOR={{ESTIMATOR}} OUTER_LOOP={{OUTER_LOOP}} POS_SOURCE={{POS_SOURCE}}"
     @echo "FEATURES={{FEATURES}}"
 
 # Run all host-side tests (cybflight-core convergence + benchmark suite).
@@ -62,7 +66,7 @@ sim-compare:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo test -p cybflight-sim --target {{HOST}} --profile release-host \
-        --test autotest_mission --test autotest_noisy \
+        --test autotest_mission --test autotest_noisy --test autotest_gps \
         -- --nocapture --test-threads=1 2>&1 | \
         tee /tmp/cybflight-sim-compare.log
     TMP_DIR="target/{{HOST}}/tmp"
@@ -76,8 +80,9 @@ sim-compare:
             SCEN="$scenario" CTRL="$controller" REPORT="$report" python3 tools/sim_summary_row.py
         done
     done
-    # Noisy rows: only MpcIndi consumes the IMU, so only that column is emitted.
-    for scenario in mission_square_noisy; do
+    # Sensors-in-the-loop rows: only MpcIndi is firmware-representative,
+    # so only that column is emitted.
+    for scenario in mission_square_noisy mission_square_gps; do
         for controller in mpc_indi; do
             report="${TMP_DIR}/${scenario}_${controller}/report.json"
             [ -f "$report" ] || continue
@@ -106,11 +111,12 @@ sim-snapshot:
 SCENARIO := env_var_or_default("SCENARIO", "mission_square")
 CONTROLLER := env_var_or_default("CONTROLLER", "mpc-indi")
 NOISE := env_var_or_default("NOISE", "none")
+GPS := env_var_or_default("GPS", "none")
 VIZ := env_var_or_default("VIZ", "0")
 
 sim-run:
     cargo run -p cybflight-sim --target {{HOST}} --profile release-host --bin sim-run -- \
-        --scenario {{SCENARIO}} --controller {{CONTROLLER}} --noise {{NOISE}} \
+        --scenario {{SCENARIO}} --controller {{CONTROLLER}} --noise {{NOISE}} --gps {{GPS}} \
         {{ if VIZ == "1" { "--viz" } else { "" } }}
 
 # Compile-check every supported build configuration without flashing.
@@ -118,11 +124,15 @@ sim-run:
 check-all:
     cargo check -p cybflight
     cargo check -p cybflight --no-default-features \
-        --features board_sakurah743,est_eskf,rx_crsf,defmt_uart
+        --features board_sakurah743,est_pos_mocap,rx_crsf,defmt_uart
     cargo check -p cybflight --no-default-features \
-        --features board_sakurah743,est_eskf,rx_crsf,defmt_uart,outer_mpc
+        --features board_sakurah743,est_pos_mocap,rx_crsf,defmt_uart,outer_mpc
     cargo check -p cybflight --no-default-features \
-        --features board_foxeerh743,est_eskf,rx_crsf,defmt_uart,outer_mpc
+        --features board_foxeerh743,est_pos_mocap,rx_crsf,defmt_uart,outer_mpc
+    cargo check -p cybflight --no-default-features \
+        --features board_sakurah743,est_pos_gps,rx_crsf,defmt_uart,outer_mpc
+    cargo check -p cybflight --no-default-features \
+        --features board_foxeerh743,est_pos_gps,rx_crsf,defmt_uart,outer_mpc
 
 flash: build
     #!/usr/bin/env bash

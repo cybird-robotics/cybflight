@@ -29,10 +29,9 @@ impl RerunLogger {
     }
 
     pub fn log_scenario(&self, name: &str) {
-        let _ = self.rec.log_static(
-            "scenario",
-            &rerun::TextDocument::new(name.to_string()),
-        );
+        let _ = self
+            .rec
+            .log_static("scenario", &rerun::TextDocument::new(name.to_string()));
     }
 
     /// Log a history vector. Time axis = simulation time [s].
@@ -44,7 +43,13 @@ impl RerunLogger {
     pub fn log_history(&self, history: &[StepRecord]) {
         let planned: Vec<[f32; 3]> = history
             .iter()
-            .map(|r| [r.setpoint.position.x, r.setpoint.position.y, r.setpoint.position.z])
+            .map(|r| {
+                [
+                    r.setpoint.position.x,
+                    r.setpoint.position.y,
+                    r.setpoint.position.z,
+                ]
+            })
             .collect();
         let actual: Vec<[f32; 3]> = history
             .iter()
@@ -98,10 +103,9 @@ impl RerunLogger {
             );
 
             for (i, f) in rec.motor_forces.iter().enumerate() {
-                let _ = self.rec.log(
-                    format!("motors/m{i}"),
-                    &rerun::Scalars::new([*f as f64]),
-                );
+                let _ = self
+                    .rec
+                    .log(format!("motors/m{i}"), &rerun::Scalars::new([*f as f64]));
             }
         }
     }

@@ -24,5 +24,7 @@ pub use plant::{QuadPlant, VEHICLE};
 pub use report::SimulationReport;
 pub use runner::{MissionRunner, RunnerConfig, StepRecord};
 pub use scenario::{default_vehicle, tweaked_vehicle, PassCriteria, Scenario, Verdict};
-pub use sensors::{ImuMeasurement, ImuModel, NoisyImu, PerfectImu};
+pub use sensors::{
+    GpsMeasurement, GpsModel, ImuMeasurement, ImuModel, NoisyGps, NoisyImu, PerfectGps, PerfectImu,
+};
 pub use trajectory::{MissionSetpoints, Setpoint, SetpointSource};

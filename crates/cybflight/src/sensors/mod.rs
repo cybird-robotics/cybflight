@@ -5,7 +5,9 @@ pub mod mag;
 pub mod rc;
 use cybflight_msgs as msgs;
 
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, pubsub::PubSubChannel};
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex, pubsub::PubSubChannel, signal::Signal,
+};
 
 // IMU 1: CAP=4 (small queue, fresh data preferred),
 // SUBS=6 (attitude + estimation + attitude_control + esp_bridge + shell stream + oneshot), PUBS=1.
@@ -45,6 +47,11 @@ pub static DSHOT_TELEMETRY: PubSubChannel<CriticalSectionRawMutex, msgs::DshotTe
 // GPS fix: CAP=2 (5 Hz, low rate), SUBS=4 (telemetry + shell + 2 spare), PUBS=1.
 pub static GPS_FIX: PubSubChannel<CriticalSectionRawMutex, msgs::GpsFix, 2, 4, 1> =
     PubSubChannel::new();
+
+// Full NAV-PVT fix (local, carries NED velocity + s_acc for estimator use).
+// Signal (latest-wins) — 5 Hz cadence, only the ESKF GPS task consumes it,
+// and missing a stale fix is preferable to queuing up old ones.
+pub static GPS_NAV_PVT: Signal<CriticalSectionRawMutex, gps::GpsNavPvt> = Signal::new();
 
 // Vehicle odometry (ESKF output): CAP=8 (1 kHz),
 // SUBS=6 (indi_task + rc_interpreter + esp_bridge + outer_loop + mission_planner + spare),

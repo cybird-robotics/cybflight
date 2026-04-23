@@ -123,3 +123,127 @@ impl ImuModel for NoisyImu {
         }
     }
 }
+
+// ── GPS ─────────────────────────────────────────────────────────────────────
+
+/// One GPS fix in the sim's ENU frame (the sim bypasses LLH — the
+/// geodetic conversion is unit-tested separately in `cybflight_core`).
+/// `sigma_*` values are the σ the firmware-side ESKF would derive from
+/// u-blox accuracy estimates, plumbed through so the in-sim ESKF uses the
+/// same calibration story as the real thing.
+#[derive(Clone, Copy, Debug)]
+pub struct GpsMeasurement {
+    pub position: Vector3<f32>,
+    pub velocity: Vector3<f32>,
+    pub sigma_pos: f32,
+    pub sigma_vel: f32,
+}
+
+/// Publish GPS measurements at a controller-independent rate (the runner
+/// resamples based on `rate_hz()`; at 5 Hz, an 8 kHz substep loop fires
+/// an update every 1600 substeps).
+pub trait GpsModel: Send {
+    fn rate_hz(&self) -> f32;
+    fn sample(&mut self, plant: &QuadPlant) -> GpsMeasurement;
+}
+
+/// Truth GPS for pre-snapshot baselines — σ=0, 5 Hz.
+pub struct PerfectGps {
+    pub rate_hz: f32,
+    pub sigma_pos: f32,
+    pub sigma_vel: f32,
+}
+
+impl Default for PerfectGps {
+    fn default() -> Self {
+        Self {
+            rate_hz: 5.0,
+            sigma_pos: 0.0,
+            sigma_vel: 0.0,
+        }
+    }
+}
+
+impl GpsModel for PerfectGps {
+    fn rate_hz(&self) -> f32 {
+        self.rate_hz
+    }
+    fn sample(&mut self, plant: &QuadPlant) -> GpsMeasurement {
+        GpsMeasurement {
+            position: plant.position(),
+            velocity: plant.velocity(),
+            // Report a small σ so the ESKF doesn't lock at near-zero
+            // variance in perfect-truth mode (which would produce a
+            // numerically brittle information matrix).
+            sigma_pos: self.sigma_pos.max(0.05),
+            sigma_vel: self.sigma_vel.max(0.10),
+        }
+    }
+}
+
+/// Noisy GPS: per-axis Gaussian noise + constant bias, deterministic for
+/// a given seed. Matches the `NoisyImu` pattern so snapshot rows stay
+/// reproducible.
+pub struct NoisyGps {
+    rng: ChaCha8Rng,
+    rate_hz: f32,
+    pub sigma_pos_m: Vector3<f32>,
+    pub sigma_vel_m_s: Vector3<f32>,
+    pub bias_pos_m: Vector3<f32>,
+    /// σ reported to the ESKF (may differ from the actual noise σ to
+    /// exercise mis-tuned filters).
+    pub reported_sigma_pos: f32,
+    pub reported_sigma_vel: f32,
+}
+
+impl NoisyGps {
+    /// Isotropic horizontal+vertical σ, zero bias, configurable rate.
+    /// `sigma_pos_m` ≈ 0.5 m and `sigma_vel_m_s` ≈ 0.2 m/s roughly mirror
+    /// u-blox M10 open-sky SBAS-aided performance.
+    pub fn isotropic(seed: u64, rate_hz: f32, sigma_pos_m: f32, sigma_vel_m_s: f32) -> Self {
+        Self {
+            rng: ChaCha8Rng::seed_from_u64(seed),
+            rate_hz,
+            sigma_pos_m: Vector3::repeat(sigma_pos_m),
+            sigma_vel_m_s: Vector3::repeat(sigma_vel_m_s),
+            bias_pos_m: Vector3::zeros(),
+            reported_sigma_pos: sigma_pos_m,
+            reported_sigma_vel: sigma_vel_m_s,
+        }
+    }
+
+    pub fn with_bias(mut self, bias_pos_m: Vector3<f32>) -> Self {
+        self.bias_pos_m = bias_pos_m;
+        self
+    }
+
+    fn normal(&mut self) -> f32 {
+        let u1 = self.rng.random::<f32>().max(1e-10);
+        let u2 = self.rng.random::<f32>();
+        (-2.0 * u1.ln()).sqrt() * (TAU * u2).cos()
+    }
+
+    fn noise(&mut self, sigma: &Vector3<f32>) -> Vector3<f32> {
+        Vector3::new(
+            sigma.x * self.normal(),
+            sigma.y * self.normal(),
+            sigma.z * self.normal(),
+        )
+    }
+}
+
+impl GpsModel for NoisyGps {
+    fn rate_hz(&self) -> f32 {
+        self.rate_hz
+    }
+    fn sample(&mut self, plant: &QuadPlant) -> GpsMeasurement {
+        let pos_noise = self.noise(&self.sigma_pos_m.clone());
+        let vel_noise = self.noise(&self.sigma_vel_m_s.clone());
+        GpsMeasurement {
+            position: plant.position() + self.bias_pos_m + pos_noise,
+            velocity: plant.velocity() + vel_noise,
+            sigma_pos: self.reported_sigma_pos.max(0.05),
+            sigma_vel: self.reported_sigma_vel.max(0.10),
+        }
+    }
+}

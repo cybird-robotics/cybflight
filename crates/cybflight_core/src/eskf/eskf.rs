@@ -408,8 +408,7 @@ impl Eskf {
     /// Re-normalize the orientation quaternion.
     /// Protects against magnitude drift from many multiplications in float32.
     fn renormalize_orientation(&mut self) {
-        self.state.orientation =
-            UnitQuaternion::new_normalize(self.state.orientation.into_inner());
+        self.state.orientation = UnitQuaternion::new_normalize(self.state.orientation.into_inner());
     }
 
     /// `true` iff every component of the nominal state is finite.

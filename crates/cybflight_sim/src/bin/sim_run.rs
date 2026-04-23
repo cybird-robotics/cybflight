@@ -11,7 +11,7 @@ use cybflight_sim::{
     report,
     runner::MissionRunner,
     scenario::{Scenario, Verdict},
-    sensors::{ImuModel, NoisyImu},
+    sensors::{GpsModel, ImuModel, NoisyGps, NoisyImu},
     viz::RerunLogger,
 };
 use nalgebra::Vector3;
@@ -46,6 +46,29 @@ impl NoisePreset {
             Self::None => None,
             Self::Mems => Some(Box::new(NoisyImu::isotropic(seed, 0.03, 0.3))),
             Self::Aggressive => Some(Box::new(NoisyImu::isotropic(seed, 0.1, 1.0))),
+        }
+    }
+}
+
+/// GPS presets. Attaching any non-`None` preset activates the in-sim ESKF
+/// (runner feeds GPS updates + IMU predict), so controllers see estimator
+/// output instead of plant truth — mirroring firmware `est_pos_gps`.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum GpsPreset {
+    /// No GPS — runner uses plant ground truth (default).
+    None,
+    /// Open-sky u-blox M10 with SBAS: 5 Hz, σ_pos=0.5 m, σ_vel=0.2 m/s.
+    Sbas,
+    /// Degraded GPS: 5 Hz, σ_pos=2.0 m, σ_vel=0.5 m/s.
+    Degraded,
+}
+
+impl GpsPreset {
+    fn build_gps(self, seed: u64) -> Option<Box<dyn GpsModel>> {
+        match self {
+            Self::None => None,
+            Self::Sbas => Some(Box::new(NoisyGps::isotropic(seed, 5.0, 0.5, 0.2))),
+            Self::Degraded => Some(Box::new(NoisyGps::isotropic(seed, 5.0, 2.0, 0.5))),
         }
     }
 }
@@ -86,6 +109,16 @@ struct Args {
     /// Seed for the noise PRNG. Deterministic across runs.
     #[arg(long, default_value_t = 0xC0FFEE)]
     noise_seed: u64,
+
+    /// GPS model. Non-none activates the in-sim ESKF, so the controller
+    /// sees estimator output instead of plant truth (matches firmware
+    /// `est_pos_gps` topology).
+    #[arg(long, value_enum, default_value_t = GpsPreset::None)]
+    gps: GpsPreset,
+
+    /// Seed for the GPS noise PRNG. Deterministic across runs.
+    #[arg(long, default_value_t = 0xDEADBEEF)]
+    gps_seed: u64,
 }
 
 fn main() -> ExitCode {
@@ -94,6 +127,9 @@ fn main() -> ExitCode {
     let mut scenario = build_scenario(&args.scenario);
     if let Some(imu) = args.noise.build_imu(args.noise_seed) {
         scenario = scenario.with_imu(imu);
+    }
+    if let Some(gps) = args.gps.build_gps(args.gps_seed) {
+        scenario = scenario.with_gps(gps);
     }
     // Plant dt must match the runner's dt_sim (default 1/8000) so the
     // runner's tick accounting and the plant's integration clock stay in
@@ -119,8 +155,7 @@ fn main() -> ExitCode {
     let json = report::write_json(&dir, &scenario, controller_name, &out).expect("write json");
     println!("wrote {}", json.display());
     if args.markdown {
-        let md = report::write_markdown(&dir, &scenario, controller_name, &out)
-            .expect("write md");
+        let md = report::write_markdown(&dir, &scenario, controller_name, &out).expect("write md");
         println!("wrote {}", md.display());
     }
     if args.csv {

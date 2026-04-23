@@ -8,15 +8,29 @@
 //!
 //! History is decimated to ~100 Hz effective regardless of tick rate, so
 //! high-rate stacks (INDI at 8 kHz) don't bloat reports.
+//!
+//! When the scenario attaches a [`GpsModel`](crate::sensors::GpsModel),
+//! the runner spins up an in-loop ESKF (`cybflight_core::eskf::Eskf`) and
+//! feeds the controller **estimator-derived state** instead of plant
+//! ground truth — mirroring the firmware's `eskf_imu_gps` task. Clean
+//! scenarios (no GPS) keep the truth-state code path bit-for-bit so
+//! snapshot numbers don't drift.
 
 use nalgebra::{SVector, UnitQuaternion, Vector3};
 
-use cybflight_core::mpc::NU;
+use cybflight_core::eskf::{Eskf, EskfConfig};
+use cybflight_core::mpc::{NU, NX};
 
 use crate::controller::Controller;
 use crate::plant::QuadPlant;
 use crate::scenario::{PassCriteria, Scenario, Verdict};
+use crate::sensors::ImuMeasurement;
 use crate::trajectory::Setpoint;
+
+/// Match firmware: 8 IMU samples per predict. At 8 kHz IMU this is 1 kHz;
+/// at 100 Hz controller ticks it reduces to ~12.5 Hz — still above GPS
+/// rate, and still representative of IMU-aided filtering.
+const PREDICT_DECIMATION: u32 = 8;
 
 #[derive(Clone, Debug)]
 pub struct RunnerConfig {
@@ -74,6 +88,14 @@ pub struct RunOutput {
 
 pub struct MissionRunner {
     pub cfg: RunnerConfig,
+}
+
+struct InSimEskf {
+    eskf: Eskf,
+    gps_rate_hz: f32,
+    next_gps_t: f32,
+    last_predict_t: f32,
+    predict_counter: u32,
 }
 
 impl MissionRunner {
@@ -139,6 +161,26 @@ impl MissionRunner {
         let hover_per_motor = plant.params.body.mass_kg * 9.81 / NU as f32;
         let mut u_last = SVector::<f32, NU>::from_element(hover_per_motor);
 
+        // Spin up the in-sim ESKF if a GPS model is attached. Initialise
+        // from plant truth — mirrors the firmware `init(pos, orient, zero
+        // biases)` that `eskf_imu_mocap` does on the first mocap frame.
+        let mut eskf_state: Option<InSimEskf> = scenario.gps_model.as_ref().map(|gps| {
+            let mut eskf = Eskf::new(EskfConfig::default());
+            eskf.init(
+                plant.position(),
+                plant.attitude(),
+                Vector3::zeros(),
+                Vector3::zeros(),
+            );
+            InSimEskf {
+                eskf,
+                gps_rate_hz: gps.rate_hz(),
+                next_gps_t: plant.time_s(),
+                last_predict_t: plant.time_s(),
+                predict_counter: 0,
+            }
+        });
+
         for tick_idx in 0..max_ticks {
             let t = plant.time_s();
             horizon.clear();
@@ -149,7 +191,42 @@ impl MissionRunner {
             let sp0 = horizon[0];
 
             let imu = scenario.imu_model.sample(plant, &u_last);
-            let u = controller.step(plant.raw_state(), &imu, &horizon);
+
+            // Decide the state vector the controller sees. Two branches:
+            //   - GPS attached: run the ESKF in-loop, feed it IMU and GPS
+            //     exactly as the firmware task does, hand the controller
+            //     an estimator-derived state.
+            //   - Otherwise: plant ground truth (unchanged code path, so
+            //     existing snapshot rows remain bit-stable).
+            let owned_state: SVector<f32, NX>;
+            let controller_state: &SVector<f32, NX> = if let Some(es) = eskf_state.as_mut() {
+                // ESKF predict — decimated to ~1 kHz (PREDICT_DECIMATION=8
+                // matches the firmware decimation from 8 kHz IMU).
+                es.predict_counter += 1;
+                if es.predict_counter >= PREDICT_DECIMATION {
+                    let dt = t - es.last_predict_t;
+                    if dt > 0.0 && dt < 0.05 {
+                        es.eskf.predict(imu.accel, imu.gyro, dt);
+                    }
+                    es.last_predict_t = t;
+                    es.predict_counter = 0;
+                }
+                // GPS update at its configured rate.
+                if t >= es.next_gps_t {
+                    if let Some(gps_model) = scenario.gps_model.as_mut() {
+                        let fix = gps_model.sample(plant);
+                        es.eskf.update_pos(fix.position, fix.sigma_pos);
+                        es.eskf.update_vel(fix.velocity, fix.sigma_vel);
+                    }
+                    es.next_gps_t += 1.0 / es.gps_rate_hz;
+                }
+                owned_state = build_state_from_eskf(&es.eskf, &imu);
+                &owned_state
+            } else {
+                plant.raw_state()
+            };
+
+            let u = controller.step(controller_state, &imu, &horizon);
             let motor_forces = [u[0], u[1], u[2], u[3]];
 
             if (tick_idx as u32) % history_stride == 0 {
@@ -187,10 +264,7 @@ impl MissionRunner {
                 break;
             }
             if !pos.x.is_finite() || !pos.y.is_finite() || !pos.z.is_finite() {
-                early_exit = Some(format!(
-                    "non-finite state at t={:.2}s",
-                    plant.time_s()
-                ));
+                early_exit = Some(format!("non-finite state at t={:.2}s", plant.time_s()));
                 break;
             }
             if plant.time_s() >= sim_deadline_s {
@@ -214,6 +288,20 @@ impl MissionRunner {
             failure_reasons,
         }
     }
+}
+
+/// Build the FullQuadModel state vector the controllers expect (layout
+/// `[px py pz | qx qy qz qw | vx vy vz | wx wy wz]`) from ESKF outputs.
+/// Body rate = raw gyro minus the ESKF's gyro-bias estimate — the same
+/// bias-corrected signal the firmware's INDI loop sees.
+fn build_state_from_eskf(eskf: &Eskf, imu: &ImuMeasurement) -> SVector<f32, NX> {
+    let pos = eskf.position();
+    let vel = eskf.velocity();
+    let q = eskf.orientation();
+    let w = imu.gyro - eskf.gyro_bias();
+    SVector::<f32, NX>::from_column_slice(&[
+        pos.x, pos.y, pos.z, q.i, q.j, q.k, q.w, vel.x, vel.y, vel.z, w.x, w.y, w.z,
+    ])
 }
 
 fn violates_geofence(p: Vector3<f32>, lo: Vector3<f32>, hi: Vector3<f32>) -> bool {

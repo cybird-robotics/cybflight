@@ -31,7 +31,7 @@ use cybflight_core::trajectory_planning::quad_planning_config::QuadPlanningConfi
 use nalgebra::{UnitQuaternion, Vector3};
 
 use crate::plant::VEHICLE;
-use crate::sensors::{ImuModel, PerfectImu};
+use crate::sensors::{GpsModel, ImuModel, PerfectImu};
 use crate::trajectory::{HoverSetpoint, MissionSetpoints, SetpointSource};
 
 /// Return a fresh copy of the canonical host-side vehicle parameters.
@@ -100,6 +100,12 @@ pub struct Scenario {
     /// IMU synthesizer; defaults to `PerfectImu`. Swap via
     /// [`Scenario::with_imu`] for noise / bias sweeps.
     pub imu_model: Box<dyn ImuModel>,
+    /// Optional GPS synthesizer. When `Some`, the runner activates the
+    /// in-sim ESKF (fed by `imu_model` predict + this model's
+    /// position/velocity updates) and hands ESKF-derived state to the
+    /// controller. When `None`, the runner uses plant ground truth —
+    /// this is the existing behaviour and preserves snapshot numbers.
+    pub gps_model: Option<Box<dyn GpsModel>>,
     pub pass_criteria: PassCriteria,
     /// Additional wall-time to hold terminal hover after the trajectory
     /// ends (for terminal-error measurement). Ignored when the setpoint
@@ -114,6 +120,16 @@ impl Scenario {
         self.imu_model = imu;
         self
     }
+
+    /// Attach a GPS model. Presence switches the runner into
+    /// ESKF-in-the-loop mode — controllers then read ESKF-estimated
+    /// state instead of plant ground truth. Removing this call (the
+    /// default `None`) keeps the existing truth-state code path, which
+    /// is what the clean snapshot rows assume.
+    pub fn with_gps(mut self, gps: Box<dyn GpsModel>) -> Self {
+        self.gps_model = Some(gps);
+        self
+    }
 }
 
 // ── Hover ───────────────────────────────────────────────────────────────────
@@ -121,11 +137,7 @@ impl Scenario {
 impl Scenario {
     /// Hover in place from the specified pose. `initial_tilt` is applied as
     /// a yaw-free tilt around the (1,1,0) axis so the plant starts off-level.
-    pub fn hover(
-        name: impl Into<String>,
-        position: Vector3<f32>,
-        initial_tilt_rad: f32,
-    ) -> Self {
+    pub fn hover(name: impl Into<String>, position: Vector3<f32>, initial_tilt_rad: f32) -> Self {
         Self::hover_with_params(name, default_vehicle(), position, initial_tilt_rad)
     }
 
@@ -144,6 +156,7 @@ impl Scenario {
             initial_attitude: UnitQuaternion::from_axis_angle(&axis, initial_tilt_rad),
             setpoints: Box::new(HoverSetpoint::new(position)),
             imu_model: Box::new(PerfectImu),
+            gps_model: None,
             pass_criteria: PassCriteria::default(),
             terminal_hold_s: 3.0,
         }
@@ -180,6 +193,7 @@ impl Scenario {
             initial_attitude: UnitQuaternion::identity(),
             setpoints: Box::new(sp),
             imu_model: Box::new(PerfectImu),
+            gps_model: None,
             pass_criteria: PassCriteria::default(),
             terminal_hold_s: 3.0,
         }
@@ -192,11 +206,7 @@ impl Scenario {
     /// Multi-waypoint mission. The last entry in `targets` becomes the
     /// terminal hover position. Planner config is derived from the
     /// default vehicle params.
-    pub fn mission(
-        name: impl Into<String>,
-        start: Vector3<f32>,
-        targets: &[Vector3<f32>],
-    ) -> Self {
+    pub fn mission(name: impl Into<String>, start: Vector3<f32>, targets: &[Vector3<f32>]) -> Self {
         Self::mission_with_params(name, default_vehicle(), start, targets)
     }
 
@@ -217,6 +227,7 @@ impl Scenario {
             initial_attitude: UnitQuaternion::identity(),
             setpoints: Box::new(sp),
             imu_model: Box::new(PerfectImu),
+            gps_model: None,
             pass_criteria: PassCriteria::default(),
             terminal_hold_s: 3.0,
         }

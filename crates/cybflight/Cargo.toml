@@ -6,7 +6,7 @@ publish = false
 
 [features]
 # Pick one board by default; enable CRSF RC and UART logging by default
-default = ["board_foxeerh743", "rx_crsf", "defmt_uart", "outer_mpc"]
+default = ["board_foxeerh743", "rx_crsf", "defmt_uart", "outer_mpc", "est_pos_mocap"]
 
 board_sakurah743 = ["dep:bsp-sakurah743"]
 board_foxeerh743 = ["dep:bsp-foxeerh743"]
@@ -25,7 +25,15 @@ defmt_uart = []
 # Mahony attitude filter always runs (gyro bias for INDI).
 # outer_geometric and outer_mpc auto-enable est_eskf (ESKF position/velocity
 # estimation required for their outer loops).
+#
+# Position source for the ESKF — exactly one must be selected when est_eskf
+# is on (outer_geometric and outer_mpc default to est_pos_mocap so existing
+# bench configurations keep working unchanged):
+#   est_pos_mocap:  VICON_POSE channel (ESP32 bridge, lab / HIL).
+#   est_pos_gps:    GPS_FIX channel (u-blox M10 NAV-PVT, outdoor flight).
 est_eskf = []
+est_pos_mocap = ["est_eskf"]
+est_pos_gps = ["est_eskf"]
 outer_rate = []
 outer_geometric = ["est_eskf"]
 outer_mpc = ["est_eskf"]

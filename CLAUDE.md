@@ -26,6 +26,14 @@ Key rules:
 
 ## Building
 
+Prefer `just` first
+
+```
+just build
+just check
+just test
+```
+
 ```sh
 # Default board (sakurah743) + default RC protocol (CRSF):
 cargo build -p cybflight

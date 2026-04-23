@@ -55,6 +55,13 @@ cargo run --release -p cybflight --no-default-features --features board_sakurah7
 cargo run --release -p cybflight --no-default-features --features board_sakurah743,rx_crsf,est_eskf
 ```
 
+If `just` is installed, prefer using `just` for more concise commands:
+
+```bash
+just build
+just check
+```
+
 ### Cargo Features
 
 | Feature | Default | Description |

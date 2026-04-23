@@ -182,7 +182,7 @@ const LAND_RATE_M_PER_S: f32 = 0.4;
 /// Prevents the setpoint from ever leaving a fixed safety box regardless
 /// of where the drone was armed. Sized for bench/indoor flight.
 #[cfg(any(feature = "outer_geometric", feature = "outer_mpc"))]
-const XY_ENVELOPE_M: f32 = 2.0;
+const XY_ENVELOPE_M: f32 = 3.0;
 #[cfg(any(feature = "outer_geometric", feature = "outer_mpc"))]
 const Z_CEILING_M: f32 = 1.8;
 /// Upper bound on the per-frame integration step. Guards against RC frame

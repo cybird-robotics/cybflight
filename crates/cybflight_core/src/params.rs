@@ -134,7 +134,7 @@ impl Default for PlannerParams {
             // BFGS landscape and typically speeds convergence by an order of
             // magnitude vs we=0. The ball-shape waypoint parameterization
             // prevents this from collapsing the path.
-            weight_energy: 0.01,
+            weight_energy: 0.0,
             weight_pos: 0.0,
             weight_vel: 0.0,
             weight_tilt: 0.0,

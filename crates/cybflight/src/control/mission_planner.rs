@@ -42,6 +42,7 @@
 
 use core::sync::atomic::Ordering;
 
+use cybflight_core::trajectory_planning::MAX_PIECES;
 use embassy_time::{Duration, Instant};
 use static_cell::StaticCell;
 
@@ -55,8 +56,8 @@ use cybflight_core::trajectory_planning::types::Vec3;
 use crate::msgs;
 
 use super::{
-    read_active_setpoint, MissionState, MissionTrajectory, MISSION_ABORT_REQUESTED,
-    MISSION_STATE, MISSION_STATUS, MISSION_TRAJECTORY_SLOT, PLAN_REQUEST,
+    read_active_setpoint, MissionState, MissionTrajectory, MISSION_ABORT_REQUESTED, MISSION_STATE,
+    MISSION_STATUS, MISSION_TRAJECTORY_SLOT, PLAN_REQUEST,
 };
 
 /// BFGS scratch memory (~35 KB). BSS-resident; init-once on first plan.
@@ -107,7 +108,7 @@ const MIN_TRAJECTORY_DURATION_S: f32 = 0.5;
 /// With max_iterations = 500, worst-case wall time ≈ 500 / 3 × 10 ms
 /// ≈ 1670 ms. 3000 ms gives comfortable headroom; the drone hovers
 /// safely in Planning while the pilot waits.
-const SOLVE_BUDGET: Duration = Duration::from_millis(3000);
+const SOLVE_BUDGET: Duration = Duration::from_millis(5000);
 
 /// Outer BFGS iterations per cooperative-yield burst. After this many
 /// iterations the solver returns to the async context so peer thread-
@@ -136,27 +137,27 @@ const BFGS_ITERS_PER_YIELD: usize = 1;
 ///   center = start + [r, 0, 0]
 ///   wp_i   = center + [-r·cos(θ_i), r·sin(θ_i), 0], i = 1..N
 ///   tail   = start  (returned as the final element)
-fn circular_waypoints_return_home(start: [f32; 3]) -> [Vec3; NUM_CIRCLE_WAYPOINTS + 1] {
-    let mut out = [[0.0_f32; 3]; NUM_CIRCLE_WAYPOINTS + 1];
-    let cx = start[0] + CIRCLE_RADIUS_M;
-    let cy = start[1];
-    let cz = start[2];
-    for i in 0..NUM_CIRCLE_WAYPOINTS {
-        // Phase 0 is at the start point itself; we want the first waypoint
-        // to be 2π/(N+1) past phase 0 so we land on `start` again at the
-        // final (return-home) waypoint.
-        let theta = (i + 1) as f32 * core::f32::consts::TAU
-            / (NUM_CIRCLE_WAYPOINTS as f32 + 1.0);
-        out[i] = [
-            cx - CIRCLE_RADIUS_M * libm::cosf(theta),
-            cy + CIRCLE_RADIUS_M * libm::sinf(theta),
-            cz,
-        ];
-    }
-    // Final target: exact start position (return home).
-    out[NUM_CIRCLE_WAYPOINTS] = start;
-    out
-}
+// fn circular_waypoints_return_home(start: [f32; 3]) -> [Vec3; NUM_CIRCLE_WAYPOINTS + 1] {
+//     let mut out = [[0.0_f32; 3]; NUM_CIRCLE_WAYPOINTS + 1];
+//     let cx = start[0] + CIRCLE_RADIUS_M;
+//     let cy = start[1];
+//     let cz = start[2];
+//     for i in 0..NUM_CIRCLE_WAYPOINTS {
+//         // Phase 0 is at the start point itself; we want the first waypoint
+//         // to be 2π/(N+1) past phase 0 so we land on `start` again at the
+//         // final (return-home) waypoint.
+//         let theta =
+//             (i + 1) as f32 * core::f32::consts::TAU * 2.0 / (NUM_CIRCLE_WAYPOINTS as f32 + 1.0);
+//         out[i] = [
+//             cx - CIRCLE_RADIUS_M * libm::cosf(theta),
+//             cy + CIRCLE_RADIUS_M * libm::sinf(theta),
+//             cz,
+//         ];
+//     }
+//     // Final target: exact start position (return home).
+//     out[NUM_CIRCLE_WAYPOINTS] = start;
+//     out
+// }
 
 /// Atomically read `ACTIVE_POSITION_SETPOINT` and validate it as a plan seed.
 ///
@@ -198,8 +199,7 @@ pub async fn mission_planner_task() {
     // Refreshed per PLAN_REQUEST so a between-mission param edit takes
     // effect on the next solve.
     let mut config = QuadPlanningConfig::from_vehicle_params(&crate::params::get());
-    let mut local_param_ver =
-        crate::params::PARAM_VERSION.load(Ordering::Acquire);
+    let mut local_param_ver = crate::params::PARAM_VERSION.load(Ordering::Acquire);
 
     defmt::info!("mission_planner: ready (idle)");
 
@@ -260,7 +260,24 @@ pub async fn mission_planner_task() {
         // the moment it sent the trigger, but make the state machine honest.
         MISSION_STATE.store(MissionState::Planning as u8, Ordering::Release);
 
-        let targets = circular_waypoints_return_home(start_pos);
+        let targets = [
+            [-0.3267, -2.231, 1.6],
+            [-1.845, 1.942, 1.0],
+            [2.292, 1.637, 1.0],
+            [2.547, -2.108, 1.8],
+            [2.547, -2.108, 0.8],
+            [0.3099, 0.3554, 1.0],
+            [-2.396, -2.214, 1.0],
+            [-0.3267, -2.231, 1.6],
+            [-1.845, 1.942, 1.0],
+            [2.292, 1.637, 1.0],
+            [2.547, -2.108, 1.8],
+            [2.547, -2.108, 0.8],
+            [0.3099, 0.3554, 1.0],
+            [-2.396, -2.214, 1.0],
+            [-0.3267, -2.231, 1.6],
+        ];
+
         let input = PlannerInput::waypoints(start_pos, start_vel, &targets);
 
         defmt::info!(
@@ -296,10 +313,8 @@ pub async fn mission_planner_task() {
         // them for the full 250 ms budget.
         let t0 = Instant::now();
         let deadline = t0 + SOLVE_BUDGET;
-        let mut keep_going = || {
-            Instant::now() < deadline
-                && crate::motors::IS_ARMED.load(Ordering::Acquire)
-        };
+        let mut keep_going =
+            || Instant::now() < deadline && crate::motors::IS_ARMED.load(Ordering::Acquire);
         let mut session = plan_init(&input, &config, workspace);
         let mut last_heartbeat = t0;
         let status = loop {
@@ -406,9 +421,7 @@ pub async fn mission_planner_task() {
         // will not pick up the abort flag because the state never leaves
         // Idle, so we clear the flag here ourselves.
         if MISSION_ABORT_REQUESTED.load(Ordering::Acquire) {
-            defmt::info!(
-                "mission_planner: user aborted during solve, trajectory discarded"
-            );
+            defmt::info!("mission_planner: user aborted during solve, trajectory discarded");
             MISSION_ABORT_REQUESTED.store(false, Ordering::Release);
             MISSION_STATE.store(MissionState::Idle as u8, Ordering::Release);
             continue;
@@ -476,10 +489,7 @@ pub async fn mission_planner_task() {
             );
             continue;
         }
-        defmt::info!(
-            "mission_planner: → Executing (duration={}s)",
-            dur
-        );
+        defmt::info!("mission_planner: → Executing (duration={}s)", dur);
         // Publish the Executing state immediately so the ground station sees
         // state=2 without waiting up to 100 ms for the outer_loop's decimated
         // MissionStatus heartbeat.

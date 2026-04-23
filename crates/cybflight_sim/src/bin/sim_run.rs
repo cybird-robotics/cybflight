@@ -11,6 +11,7 @@ use cybflight_sim::{
     report,
     runner::MissionRunner,
     scenario::{Scenario, Verdict},
+    sensors::{ImuModel, NoisyImu},
     viz::RerunLogger,
 };
 use nalgebra::Vector3;
@@ -23,6 +24,30 @@ enum ControllerKind {
     MpcDirect,
     /// PD position + geometric attitude + rate-P + mixer (legacy baseline).
     Cascade,
+}
+
+/// IMU-noise presets. Only `MpcIndi` actually consumes the IMU; ground-
+/// truth controllers (cascade, mpc_direct) read perfect state and ignore
+/// the noise setting. CLI accepts the flag for any controller so sweeps
+/// stay uniform.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum NoisePreset {
+    /// Zero noise — `PerfectImu` (default).
+    None,
+    /// Consumer-grade MEMS IMU: σ_gyro=0.03 rad/s, σ_accel=0.3 m/s².
+    Mems,
+    /// Aggressive: σ_gyro=0.1 rad/s, σ_accel=1.0 m/s² — stresses INDI.
+    Aggressive,
+}
+
+impl NoisePreset {
+    fn build_imu(self, seed: u64) -> Option<Box<dyn ImuModel>> {
+        match self {
+            Self::None => None,
+            Self::Mems => Some(Box::new(NoisyImu::isotropic(seed, 0.03, 0.3))),
+            Self::Aggressive => Some(Box::new(NoisyImu::isotropic(seed, 0.1, 1.0))),
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -51,13 +76,29 @@ struct Args {
     /// Stream to a running rerun viewer (spawns one if available).
     #[arg(long)]
     viz: bool,
+
+    /// IMU noise model. Applied as an overlay on the scenario's default
+    /// `PerfectImu`. Only affects controllers that consume the IMU (MpcIndi);
+    /// ground-truth controllers silently ignore it.
+    #[arg(long, value_enum, default_value_t = NoisePreset::None)]
+    noise: NoisePreset,
+
+    /// Seed for the noise PRNG. Deterministic across runs.
+    #[arg(long, default_value_t = 0xC0FFEE)]
+    noise_seed: u64,
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
 
     let mut scenario = build_scenario(&args.scenario);
-    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), 0.002);
+    if let Some(imu) = args.noise.build_imu(args.noise_seed) {
+        scenario = scenario.with_imu(imu);
+    }
+    // Plant dt must match the runner's dt_sim (default 1/8000) so the
+    // runner's tick accounting and the plant's integration clock stay in
+    // lockstep. Matches what autotest_mission and autotest_noisy use.
+    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), 1.0 / 8000.0);
     let mut controller: Box<dyn Controller> = match args.controller {
         ControllerKind::MpcIndi => {
             Box::new(MpcIndiController::from_params(&scenario.vehicle_params))
@@ -96,9 +137,10 @@ fn main() -> ExitCode {
     }
 
     println!(
-        "{:?} [{}]: verdict={:?} rms_err={:.3}m terminal_err={:.3}m peak_tilt={:.1}°",
+        "{:?} [{} noise={:?}]: verdict={:?} rms_err={:.3}m terminal_err={:.3}m peak_tilt={:.1}°",
         scenario.name,
         controller_name,
+        args.noise,
         out.verdict,
         out.summary.rms_pos_err_m,
         out.summary.terminal_pos_err_m,

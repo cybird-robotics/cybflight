@@ -14,7 +14,7 @@ def main() -> int:
     with open(os.environ["REPORT"]) as f:
         r = json.load(f)["summary"]
     print(
-        f"{scen:<16} {ctrl:<11} "
+        f"{scen:<22} {ctrl:<11} "
         f"{r['rms_pos_err_m']:10.4f} "
         f"{r['peak_pos_err_m']:10.4f} "
         f"{r['terminal_pos_err_m']:10.4f} "

@@ -55,20 +55,30 @@ test-drivers:
     cargo test -p cybflight-drivers --target {{HOST}}
 
 # Run the sim autotest: hover + p2p + mission through MPC+INDI (authoritative)
-# plus MpcDirect and cascade as diagnostic baselines. Prints a comparison
-# table and leaves JSON reports in
+# plus MpcDirect and cascade as diagnostic baselines, and the noisy variant
+# through MPC+INDI. Prints a comparison table and leaves JSON reports in
 # target/{{HOST}}/tmp/<scenario>_<controller>/report.json.
 sim-compare:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo test -p cybflight-sim --target {{HOST}} --profile release-host \
-        --test autotest_mission -- --nocapture --test-threads=1 2>&1 | \
+        --test autotest_mission --test autotest_noisy \
+        -- --nocapture --test-threads=1 2>&1 | \
         tee /tmp/cybflight-sim-compare.log
     TMP_DIR="target/{{HOST}}/tmp"
-    printf '\n%-16s %-11s %10s %10s %10s %8s %7s\n' scenario controller rms_err_m peak_err_m term_err_m tilt_deg sat_pct
-    printf '%-16s %-11s %10s %10s %10s %8s %7s\n' ---------------- ----------- ---------- ---------- ---------- -------- -------
+    printf '\n%-22s %-11s %10s %10s %10s %8s %7s\n' scenario controller rms_err_m peak_err_m term_err_m tilt_deg sat_pct
+    printf '%-22s %-11s %10s %10s %10s %8s %7s\n' ---------------------- ----------- ---------- ---------- ---------- -------- -------
+    # Clean rows: all scenarios × all controllers (rows missing on disk skipped).
     for scenario in hover_level hover_tilt30 p2p_x3 mission_square; do
         for controller in cascade mpc_direct mpc_indi; do
+            report="${TMP_DIR}/${scenario}_${controller}/report.json"
+            [ -f "$report" ] || continue
+            SCEN="$scenario" CTRL="$controller" REPORT="$report" python3 tools/sim_summary_row.py
+        done
+    done
+    # Noisy rows: only MpcIndi consumes the IMU, so only that column is emitted.
+    for scenario in mission_square_noisy; do
+        for controller in mpc_indi; do
             report="${TMP_DIR}/${scenario}_${controller}/report.json"
             [ -f "$report" ] || continue
             SCEN="$scenario" CTRL="$controller" REPORT="$report" python3 tools/sim_summary_row.py
@@ -95,11 +105,12 @@ sim-snapshot:
 # to stream to a rerun viewer.
 SCENARIO := env_var_or_default("SCENARIO", "mission_square")
 CONTROLLER := env_var_or_default("CONTROLLER", "mpc-indi")
+NOISE := env_var_or_default("NOISE", "none")
 VIZ := env_var_or_default("VIZ", "0")
 
 sim-run:
     cargo run -p cybflight-sim --target {{HOST}} --profile release-host --bin sim-run -- \
-        --scenario {{SCENARIO}} --controller {{CONTROLLER}} \
+        --scenario {{SCENARIO}} --controller {{CONTROLLER}} --noise {{NOISE}} \
         {{ if VIZ == "1" { "--viz" } else { "" } }}
 
 # Compile-check every supported build configuration without flashing.

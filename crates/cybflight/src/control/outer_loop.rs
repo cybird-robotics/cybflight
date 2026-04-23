@@ -350,6 +350,7 @@ pub async fn control_loop_task() {
         let mut mission_done_final: Option<[f32; 3]> = None;
         // Captured for MISSION_STATUS telemetry publish below.
         let mut tau_and_duration: Option<(f32, f32)> = None;
+        let mut solve_diag: Option<msgs::SolveDiagnostics> = None;
         if mission_state == super::MissionState::Executing {
             // Hold the mutex across all horizon samples to avoid cloning
             // the ~2 KB polynomial. The slot is written at most once per
@@ -411,6 +412,7 @@ pub async fn control_loop_task() {
 
                 sampled_from_trajectory = true;
                 tau_and_duration = Some((tau0, traj.total_duration_s));
+                solve_diag = Some(traj.solve);
 
                 // Snapshot the τ₀ sample — this is the "currently tracked
                 // point" we must publish to ACTIVE_POSITION_SETPOINT each
@@ -578,6 +580,7 @@ pub async fn control_loop_task() {
                 tau_s: tau_pub,
                 total_duration_s: dur_pub,
                 target_position: target_pub,
+                solve: solve_diag.unwrap_or(msgs::SolveDiagnostics::NONE),
             });
         }
     }

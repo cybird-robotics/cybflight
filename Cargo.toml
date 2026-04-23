@@ -40,3 +40,9 @@ overflow-checks = false
 inherits = "release"
 lto = false
 codegen-units = 16
+
+# Local override so edits to the cybflight-msgs source tree take effect
+# without requiring a registry republish. Revert (or replace with a version
+# bump + registry push) once the protocol changes are ready to ship.
+[patch.utadr]
+cybflight-msgs = { path = "/home/hs293go/src/cybflight-msgs" }

@@ -1497,6 +1497,59 @@ fn production_regime_repeatability() {
     );
 }
 
+/// Equispaced waypoints around a 2 m circle at z=1 m — a clean geometric
+/// family parameterized only by n so that the only variable between runs
+/// is the piece count. No near-duplicate waypoints, no sharp reversals.
+fn circle_targets(n_targets: usize, buf: &mut [Vec3; MAX_PIECES_TEST]) -> &[Vec3] {
+    use core::f32::consts::TAU;
+    assert!(n_targets >= 1 && n_targets <= MAX_PIECES_TEST);
+    let radius = 2.0f32;
+    for i in 0..n_targets {
+        let theta = TAU * (i + 1) as f32 / n_targets as f32;
+        buf[i] = [radius * libm::cosf(theta), radius * libm::sinf(theta), 1.0];
+    }
+    &buf[..n_targets]
+}
+
+/// Scratch buffer size for `circuit_targets`. Sized to the larger of the
+/// two MAX_PIECES values we've been running with so the same test code
+/// works whether the planner is compiled at 16 or 20.
+const MAX_PIECES_TEST: usize = 24;
+
+/// Walk piece counts from 8 up to the compiled `MAX_PIECES` on the same
+/// repeating circuit geometry. Surfaces any sharp transition in solver
+/// behavior — status flip, iteration explosion, compression-ratio
+/// collapse — that would explain the observed "some counts converge,
+/// some don't" coupling on device.
+#[test]
+#[ignore] // diagnostic — run with `--release --ignored -- --nocapture`
+fn production_regime_piece_count_sweep_to_max() {
+    use cybflight_core::trajectory_planning::MAX_PIECES;
+    let config = production_regime_config();
+    println!(
+        "\n=== Production-regime sweep: n ∈ [8, {MAX_PIECES}] (repeating 7-point circuit) ==="
+    );
+    let mut buf = [[0.0f32; 3]; MAX_PIECES_TEST];
+    for n_targets in 8..=MAX_PIECES {
+        let targets = circle_targets(n_targets, &mut buf);
+        let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, targets);
+        let init_dur: f32 = input.init_times[..n_targets].iter().sum();
+        let result = plan(&input, &config);
+        let final_dur = result.trajectory.total_duration();
+        let ratio = if init_dur > 0.0 {
+            final_dur / init_dur
+        } else {
+            0.0
+        };
+        let peaks = sample_kinematic_peaks(&result, &config);
+        println!(
+            "  n={:2}  status={:?}  iters={:3}  init={:.2}s  final={:.2}s  ratio={:.2}  peak_v={:.2}m/s  cost={:.2}",
+            n_targets, result.status, result.iterations,
+            init_dur, final_dur, ratio, peaks.v_max, result.final_cost,
+        );
+    }
+}
+
 /// Does turning on `weight_vel` (and only that — no other change to the
 /// production regime) rescue convergence on the full 15-waypoint circuit?
 /// If yes, the fix for the live failure is a one-line param bump.
@@ -1521,6 +1574,36 @@ fn production_regime_with_weight_vel_sweep() {
         let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, &PRODUCTION_WAYPOINTS);
         let result = plan(&input, &config);
         print_piece_diagnostics(&format!("wv={wv:.1}"), &result, &config);
+    }
+}
+
+/// Vary the BFGS iteration cap on the exact production regime — simulates
+/// what an STM32 solve sees if it hits `max_iterations` before converging.
+/// Correlates the in-flight trajectory duration with the iteration count
+/// at which the solver was actually cut off.
+#[test]
+#[ignore] // diagnostic — run with `--release --ignored -- --nocapture`
+fn production_regime_max_iterations_sweep() {
+    println!(
+        "\n=== Production-regime + max_iterations sweep (wv=0, wtilt=0, we=0) ==="
+    );
+    for &max_iters in &[0_usize, 1, 2, 5, 10, 25, 50, 100, 150, 172, 500, 2000] {
+        let mut vp = test_vehicle_params();
+        vp.planner.max_vel_m_s = 5.0;
+        vp.planner.max_tilt_rad = core::f32::consts::FRAC_PI_3;
+        vp.planner.weight_time = 1.0;
+        vp.planner.weight_energy = 0.0;
+        vp.planner.weight_vel = 0.0;
+        vp.planner.weight_tilt = 0.0;
+        vp.planner.weight_body_rate = 10.0;
+        vp.planner.weight_thrust = 10.0;
+        vp.planner.smoothing_eps = 0.01;
+        vp.planner.num_check_per_piece = 8;
+        vp.planner.bfgs_trust.max_iterations = max_iters;
+        let config = QuadPlanningConfig::from_vehicle_params(&vp);
+        let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, &PRODUCTION_WAYPOINTS);
+        let result = plan(&input, &config);
+        print_piece_diagnostics(&format!("max_it={max_iters}"), &result, &config);
     }
 }
 

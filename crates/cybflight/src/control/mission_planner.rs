@@ -276,9 +276,19 @@ pub async fn mission_planner_task() {
             [0.3099, 0.3554, 1.0],
             [-2.396, -2.214, 1.0],
             [-0.3267, -2.231, 1.6],
+            // [-1.845, 1.942, 1.0],
+            // [2.292, 1.637, 1.0],
+            // [2.547, -2.108, 1.8],
+            // [2.547, -2.108, 0.8],
         ];
 
         let input = PlannerInput::waypoints(start_pos, start_vel, &targets);
+
+        // Snapshot the pre-BFGS time allocation so the ground station can
+        // compare it against the optimized total duration — a ratio ≈ 1
+        // means BFGS made no progress.
+        let n_pieces_input = input.num_waypoints + 1;
+        let init_duration_s: f32 = input.init_times[..n_pieces_input].iter().sum();
 
         defmt::info!(
             "mission_planner: solving (start=[{},{},{}], {} waypoints + return)",
@@ -343,6 +353,7 @@ pub async fn mission_planner_task() {
                             tau_s: 0.0,
                             total_duration_s: 0.0,
                             target_position: start_position,
+                            solve: msgs::SolveDiagnostics::NONE,
                         });
                     }
                     embassy_futures::yield_now().await;
@@ -400,17 +411,27 @@ pub async fn mission_planner_task() {
             SolverStatus::Convergence | SolverStatus::Stop | SolverStatus::MaxIterations
         );
         let dur = result.trajectory.total_duration();
+        // "Under-compressed" guard: if the optimizer claims convergence but
+        // the total duration is ≥ 90% of the pre-BFGS init allocation, it
+        // didn't actually compress the trajectory. Observed on STM32 when
+        // the trust region collapses after a first penalty-relieving
+        // expansion step — BFGS reports `Convergence` via the `delta < 1e-7`
+        // exit at a cost far from the true optimum. Rejecting here keeps
+        // the pilot hovering on the pre-mission setpoint.
+        let compression_ok = dur < 0.9 * init_duration_s;
         let valid = converged
             && dur.is_finite()
             && dur >= MIN_TRAJECTORY_DURATION_S
             && dur <= MAX_TRAJECTORY_DURATION_S
-            && result.final_cost.is_finite();
+            && result.final_cost.is_finite()
+            && compression_ok;
 
         if !valid {
             defmt::warn!(
-                "mission_planner: rejecting trajectory (status={}, dur={})",
+                "mission_planner: rejecting trajectory (status={}, dur={}, init_dur={})",
                 result.status as u8,
-                dur
+                dur,
+                init_duration_s,
             );
             MISSION_STATE.store(MissionState::Idle as u8, Ordering::Release);
             continue;
@@ -464,6 +485,33 @@ pub async fn mission_planner_task() {
         //   - planner acquires lock and overwrites with state=Executing.
         // We `swap(false)` rather than `load` so this consumes the
         // intent symmetrically with the outer_loop abort branch.
+        // Sample peak velocity on the final trajectory for downlink
+        // diagnostics. 200 uniform samples is plenty to catch the peak of
+        // a smooth quintic spline.
+        let peak_vel_m_s = {
+            let mut v_max = 0.0f32;
+            let n_samples = 200;
+            for i in 0..=n_samples {
+                let t = dur * i as f32 / n_samples as f32;
+                let v = result.trajectory.get_vel(t);
+                let v2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+                if v2 > v_max {
+                    v_max = v2;
+                }
+            }
+            libm::sqrtf(v_max)
+        };
+
+        let solve = msgs::SolveDiagnostics {
+            status: result.status as u8,
+            iterations: result.iterations.min(u16::MAX as usize) as u16,
+            solve_time_ms: elapsed_ms.min(u16::MAX as u64) as u16,
+            num_pieces: result.num_pieces.min(u8::MAX as usize) as u8,
+            init_duration_s,
+            final_cost: result.final_cost,
+            peak_vel_m_s,
+        };
+
         let t_start = Instant::now();
         let mut published = false;
         MISSION_TRAJECTORY_SLOT.lock(|slot| {
@@ -479,6 +527,7 @@ pub async fn mission_planner_task() {
                 traj: result.trajectory,
                 t_start,
                 total_duration_s: dur,
+                solve,
             });
             MISSION_STATE.store(MissionState::Executing as u8, Ordering::Release);
             published = true;
@@ -489,7 +538,13 @@ pub async fn mission_planner_task() {
             );
             continue;
         }
-        defmt::info!("mission_planner: → Executing (duration={}s)", dur);
+        defmt::info!(
+            "mission_planner: → Executing (dur={}s, init_dur={}s, iters={}, peak_v={}m/s)",
+            dur,
+            init_duration_s,
+            result.iterations,
+            peak_vel_m_s,
+        );
         // Publish the Executing state immediately so the ground station sees
         // state=2 without waiting up to 100 ms for the outer_loop's decimated
         // MissionStatus heartbeat.
@@ -499,6 +554,7 @@ pub async fn mission_planner_task() {
             tau_s: 0.0,
             total_duration_s: dur,
             target_position: start_position,
+            solve,
         });
     }
 }

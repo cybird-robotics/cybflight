@@ -141,6 +141,10 @@ pub struct MissionTrajectory {
     pub traj: cybflight_core::trajectory_planning::piecewise_polynomial::PiecewisePolynomial,
     pub t_start: Instant,
     pub total_duration_s: f32,
+    /// Solve diagnostics from the planner, propagated verbatim into every
+    /// Executing-state `MissionStatus` heartbeat so the ground station can
+    /// inspect the last solve at any point during the mission.
+    pub solve: msgs::SolveDiagnostics,
 }
 
 #[cfg(feature = "outer_mpc")]

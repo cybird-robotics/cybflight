@@ -87,7 +87,12 @@ impl PlannerInput {
         let tail: PVA3D = [target_pos, ZERO3, ZERO3];
         let dist = norm_sq3(sub3(start_pos, target_pos)).sqrt();
         let mut init_times = [0.0f32; MAX_PIECES];
-        init_times[0] = (dist / 2.0).max(0.5);
+        // Seed segment time generously so the init trajectory stays inside
+        // the body-rate and thrust penalty knees. Starting inside an active
+        // penalty region has been observed to trap BFGS: its first step
+        // *expands* Tᵢ to relieve the penalty, which poisons the Hessian
+        // for subsequent compression steps and the trust region collapses.
+        init_times[0] = dist.max(1.0);
         Self {
             head,
             tail,
@@ -135,7 +140,10 @@ impl PlannerInput {
                 tail_pos
             };
             let d = norm_sq3(sub3(prev, next)).sqrt();
-            init_times[i] = (d / 2.0).max(0.5);
+            // See the comment in `goto`: seed segment time generously so
+            // the init trajectory stays inside the body-rate / thrust
+            // penalty knees.
+            init_times[i] = d.max(1.0);
             prev = next;
         }
 
@@ -250,9 +258,7 @@ where
     );
 
     // Wrap as closure for the optimizer
-    let mut eval_fn = |xv: &[f32], grad: &mut [f32]| -> f32 {
-        evaluator.evaluate(xv, grad)
-    };
+    let mut eval_fn = |xv: &[f32], grad: &mut [f32]| -> f32 { evaluator.evaluate(xv, grad) };
 
     let (result, final_cost, iterations) = bfgs_trust_optimize_budgeted(
         &mut x[..dim_total],
@@ -370,9 +376,7 @@ pub fn plan_init(
 
     // Seed the solver: evaluate initial cost, set up Hessian, past-f ring.
     let init_result = {
-        let mut eval_fn = |xv: &[f32], grad: &mut [f32]| -> f32 {
-            evaluator.evaluate(xv, grad)
-        };
+        let mut eval_fn = |xv: &[f32], grad: &mut [f32]| -> f32 { evaluator.evaluate(xv, grad) };
         bfgs_trust_init(
             &mut x[..dim_total],
             &mut eval_fn,
@@ -434,9 +438,7 @@ where
         ..
     } = session;
 
-    let mut eval_fn = |xv: &[f32], grad: &mut [f32]| -> f32 {
-        evaluator.evaluate(xv, grad)
-    };
+    let mut eval_fn = |xv: &[f32], grad: &mut [f32]| -> f32 { evaluator.evaluate(xv, grad) };
 
     let result = bfgs_trust_resume(
         &mut x[..*dim_total],
@@ -506,8 +508,8 @@ pub fn plan_finalize(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::quad_planning_config::QuadPlanningConfig;
+    use super::*;
 
     #[test]
     fn plan_goto_converges() {
@@ -525,7 +527,9 @@ mod tests {
 
         // Trajectory should start near start_pos and end near target_pos
         let p0 = result.trajectory.get_pos(0.0);
-        let pf = result.trajectory.get_pos(result.trajectory.total_duration());
+        let pf = result
+            .trajectory
+            .get_pos(result.trajectory.total_duration());
         for d in 0..3 {
             assert!(p0[d].is_finite());
             assert!(pf[d].is_finite());

@@ -127,14 +127,14 @@ pub struct PlannerParams {
 impl Default for PlannerParams {
     fn default() -> Self {
         Self {
-            max_vel_m_s: 5.0,
+            max_vel_m_s: 15.0,
             max_tilt_rad: core::f32::consts::FRAC_PI_3,
             weight_time: 1.0,
             // A small amount of jerk-integral regularization conditions the
             // BFGS landscape and typically speeds convergence by an order of
             // magnitude vs we=0. The ball-shape waypoint parameterization
             // prevents this from collapsing the path.
-            weight_energy: 0.0,
+            weight_energy: 0.01,
             weight_pos: 0.0,
             weight_vel: 0.0,
             weight_tilt: 0.0,
@@ -813,6 +813,26 @@ impl VehicleParams {
             ParamKey::LearnTchar => self.learner.rls_t_char_s,
             ParamKey::LearnZetaRate => self.learner.zeta_rate,
             ParamKey::LearnZetaAtt => self.learner.zeta_attitude,
+            // Planner
+            ParamKey::PlanMaxVel => self.planner.max_vel_m_s,
+            ParamKey::PlanMaxTilt => self.planner.max_tilt_rad,
+            ParamKey::PlanWTime => self.planner.weight_time,
+            ParamKey::PlanWEnergy => self.planner.weight_energy,
+            ParamKey::PlanWPos => self.planner.weight_pos,
+            ParamKey::PlanWVel => self.planner.weight_vel,
+            ParamKey::PlanWTilt => self.planner.weight_tilt,
+            ParamKey::PlanWBodyRate => self.planner.weight_body_rate,
+            ParamKey::PlanWThrust => self.planner.weight_thrust,
+            ParamKey::PlanSmoothEps => self.planner.smoothing_eps,
+            ParamKey::PlanNumCheck => self.planner.num_check_per_piece as f32,
+            // Planner — BFGS
+            ParamKey::PlanBfgsDeltaInit => self.planner.bfgs_trust.delta_init,
+            ParamKey::PlanBfgsDeltaMax => self.planner.bfgs_trust.delta_max,
+            ParamKey::PlanBfgsEta => self.planner.bfgs_trust.eta,
+            ParamKey::PlanBfgsGEps => self.planner.bfgs_trust.g_epsilon,
+            ParamKey::PlanBfgsMaxIter => self.planner.bfgs_trust.max_iterations as f32,
+            ParamKey::PlanBfgsPast => self.planner.bfgs_trust.past as f32,
+            ParamKey::PlanBfgsDeltaConv => self.planner.bfgs_trust.delta_conv,
         }
     }
 
@@ -942,6 +962,26 @@ impl VehicleParams {
             ParamKey::LearnTchar => self.learner.rls_t_char_s = val,
             ParamKey::LearnZetaRate => self.learner.zeta_rate = val,
             ParamKey::LearnZetaAtt => self.learner.zeta_attitude = val,
+            // Planner
+            ParamKey::PlanMaxVel => self.planner.max_vel_m_s = val,
+            ParamKey::PlanMaxTilt => self.planner.max_tilt_rad = val,
+            ParamKey::PlanWTime => self.planner.weight_time = val,
+            ParamKey::PlanWEnergy => self.planner.weight_energy = val,
+            ParamKey::PlanWPos => self.planner.weight_pos = val,
+            ParamKey::PlanWVel => self.planner.weight_vel = val,
+            ParamKey::PlanWTilt => self.planner.weight_tilt = val,
+            ParamKey::PlanWBodyRate => self.planner.weight_body_rate = val,
+            ParamKey::PlanWThrust => self.planner.weight_thrust = val,
+            ParamKey::PlanSmoothEps => self.planner.smoothing_eps = val,
+            ParamKey::PlanNumCheck => self.planner.num_check_per_piece = val as usize,
+            // Planner — BFGS
+            ParamKey::PlanBfgsDeltaInit => self.planner.bfgs_trust.delta_init = val,
+            ParamKey::PlanBfgsDeltaMax => self.planner.bfgs_trust.delta_max = val,
+            ParamKey::PlanBfgsEta => self.planner.bfgs_trust.eta = val,
+            ParamKey::PlanBfgsGEps => self.planner.bfgs_trust.g_epsilon = val,
+            ParamKey::PlanBfgsMaxIter => self.planner.bfgs_trust.max_iterations = val as usize,
+            ParamKey::PlanBfgsPast => self.planner.bfgs_trust.past = val as usize,
+            ParamKey::PlanBfgsDeltaConv => self.planner.bfgs_trust.delta_conv = val,
         }
     }
 }
@@ -1065,6 +1105,26 @@ pub enum ParamKey {
     LearnTchar,
     LearnZetaRate,
     LearnZetaAtt,
+    // Planner
+    PlanMaxVel,
+    PlanMaxTilt,
+    PlanWTime,
+    PlanWEnergy,
+    PlanWPos,
+    PlanWVel,
+    PlanWTilt,
+    PlanWBodyRate,
+    PlanWThrust,
+    PlanSmoothEps,
+    PlanNumCheck,
+    // Planner — BFGS trust-region solver
+    PlanBfgsDeltaInit,
+    PlanBfgsDeltaMax,
+    PlanBfgsEta,
+    PlanBfgsGEps,
+    PlanBfgsMaxIter,
+    PlanBfgsPast,
+    PlanBfgsDeltaConv,
 }
 
 /// All parameter keys in order, for iteration.
@@ -1183,6 +1243,26 @@ pub const ALL_KEYS: &[ParamKey] = &[
     ParamKey::LearnTchar,
     ParamKey::LearnZetaRate,
     ParamKey::LearnZetaAtt,
+    // Planner
+    ParamKey::PlanMaxVel,
+    ParamKey::PlanMaxTilt,
+    ParamKey::PlanWTime,
+    ParamKey::PlanWEnergy,
+    ParamKey::PlanWPos,
+    ParamKey::PlanWVel,
+    ParamKey::PlanWTilt,
+    ParamKey::PlanWBodyRate,
+    ParamKey::PlanWThrust,
+    ParamKey::PlanSmoothEps,
+    ParamKey::PlanNumCheck,
+    // Planner — BFGS trust-region solver
+    ParamKey::PlanBfgsDeltaInit,
+    ParamKey::PlanBfgsDeltaMax,
+    ParamKey::PlanBfgsEta,
+    ParamKey::PlanBfgsGEps,
+    ParamKey::PlanBfgsMaxIter,
+    ParamKey::PlanBfgsPast,
+    ParamKey::PlanBfgsDeltaConv,
 ];
 
 impl ParamKey {
@@ -1303,6 +1383,26 @@ impl ParamKey {
             "learn_tchar" => Some(Self::LearnTchar),
             "learn_zeta_rate" => Some(Self::LearnZetaRate),
             "learn_zeta_att" => Some(Self::LearnZetaAtt),
+            // Planner
+            "plan_max_vel" => Some(Self::PlanMaxVel),
+            "plan_max_tilt" => Some(Self::PlanMaxTilt),
+            "plan_w_time" => Some(Self::PlanWTime),
+            "plan_w_energy" => Some(Self::PlanWEnergy),
+            "plan_w_pos" => Some(Self::PlanWPos),
+            "plan_w_vel" => Some(Self::PlanWVel),
+            "plan_w_tilt" => Some(Self::PlanWTilt),
+            "plan_w_body_rate" => Some(Self::PlanWBodyRate),
+            "plan_w_thrust" => Some(Self::PlanWThrust),
+            "plan_smooth_eps" => Some(Self::PlanSmoothEps),
+            "plan_num_check" => Some(Self::PlanNumCheck),
+            // Planner — BFGS
+            "plan_bfgs_delta_init" => Some(Self::PlanBfgsDeltaInit),
+            "plan_bfgs_delta_max" => Some(Self::PlanBfgsDeltaMax),
+            "plan_bfgs_eta" => Some(Self::PlanBfgsEta),
+            "plan_bfgs_g_eps" => Some(Self::PlanBfgsGEps),
+            "plan_bfgs_max_iter" => Some(Self::PlanBfgsMaxIter),
+            "plan_bfgs_past" => Some(Self::PlanBfgsPast),
+            "plan_bfgs_delta_conv" => Some(Self::PlanBfgsDeltaConv),
             _ => None,
         }
     }
@@ -1424,6 +1524,26 @@ impl ParamKey {
             Self::LearnTchar => "learn_tchar",
             Self::LearnZetaRate => "learn_zeta_rate",
             Self::LearnZetaAtt => "learn_zeta_att",
+            // Planner
+            Self::PlanMaxVel => "plan_max_vel",
+            Self::PlanMaxTilt => "plan_max_tilt",
+            Self::PlanWTime => "plan_w_time",
+            Self::PlanWEnergy => "plan_w_energy",
+            Self::PlanWPos => "plan_w_pos",
+            Self::PlanWVel => "plan_w_vel",
+            Self::PlanWTilt => "plan_w_tilt",
+            Self::PlanWBodyRate => "plan_w_body_rate",
+            Self::PlanWThrust => "plan_w_thrust",
+            Self::PlanSmoothEps => "plan_smooth_eps",
+            Self::PlanNumCheck => "plan_num_check",
+            // Planner — BFGS
+            Self::PlanBfgsDeltaInit => "plan_bfgs_delta_init",
+            Self::PlanBfgsDeltaMax => "plan_bfgs_delta_max",
+            Self::PlanBfgsEta => "plan_bfgs_eta",
+            Self::PlanBfgsGEps => "plan_bfgs_g_eps",
+            Self::PlanBfgsMaxIter => "plan_bfgs_max_iter",
+            Self::PlanBfgsPast => "plan_bfgs_past",
+            Self::PlanBfgsDeltaConv => "plan_bfgs_delta_conv",
         }
     }
 }

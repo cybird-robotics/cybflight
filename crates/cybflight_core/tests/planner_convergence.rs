@@ -1240,6 +1240,339 @@ fn save_circular_energy_heavy_trajectory_csv() {
     assert!(path.exists());
 }
 
+// ─── PRODUCTION-REGIME TORTURE TESTS ────────────────────────────────────────
+//
+// Reproduce the live `PlannerParams` used by `crates/cybflight/src/control/
+// mission_planner.rs` — no velocity / tilt / position penalties, only
+// body-rate + thrust soft penalties against `weight_time = 1.0`, and the
+// actual 15-waypoint circuit the firmware issues.
+//
+// This exercises the regime where flight tests show the planner publishing
+// degenerate trajectories: MaxIterations status with over-compressed early
+// segment times → MPC thrashes the Z-axis at the start of execution.
+
+/// Mirror of `PlannerParams::default()` in `crates/cybflight_core/src/params.rs`.
+/// Keep in sync with the production defaults.
+fn production_regime_config() -> QuadPlanningConfig {
+    let mut vp = test_vehicle_params();
+    vp.planner.max_vel_m_s = 5.0;
+    vp.planner.max_tilt_rad = core::f32::consts::FRAC_PI_3;
+    vp.planner.weight_time = 1.0;
+    vp.planner.weight_energy = 0.0;
+    vp.planner.weight_pos = 0.0;
+    vp.planner.weight_vel = 0.0;
+    vp.planner.weight_tilt = 0.0;
+    vp.planner.weight_body_rate = 10.0;
+    vp.planner.weight_thrust = 10.0;
+    vp.planner.smoothing_eps = 0.01;
+    vp.planner.num_check_per_piece = 8;
+    vp.planner.bfgs_trust.max_iterations = 500;
+    QuadPlanningConfig::from_vehicle_params(&vp)
+}
+
+/// The exact target list hardcoded in `mission_planner.rs` (~line 263).
+const PRODUCTION_WAYPOINTS: [Vec3; 15] = [
+    [-0.3267, -2.231, 1.6],
+    [-1.845, 1.942, 1.0],
+    [2.292, 1.637, 1.0],
+    [2.547, -2.108, 1.8],
+    [2.547, -2.108, 0.8],
+    [0.3099, 0.3554, 1.0],
+    [-2.396, -2.214, 1.0],
+    [-0.3267, -2.231, 1.6],
+    [-1.845, 1.942, 1.0],
+    [2.292, 1.637, 1.0],
+    [2.547, -2.108, 1.8],
+    [2.547, -2.108, 0.8],
+    [0.3099, 0.3554, 1.0],
+    [-2.396, -2.214, 1.0],
+    [-0.3267, -2.231, 1.6],
+];
+
+/// Nominal hover seed used when the firmware issues a plan request.
+const PRODUCTION_START: Vec3 = [0.0, 0.0, 1.0];
+
+/// Summary of kinematic peaks sampled densely across a trajectory.
+struct KinematicPeaks {
+    v_max: f32,
+    a_max: f32,
+    omega_xy_max: f32,
+    omega_z_max: f32,
+}
+
+fn sample_kinematic_peaks(
+    result: &PlannerResult,
+    config: &QuadPlanningConfig,
+) -> KinematicPeaks {
+    let dur = result.trajectory.total_duration();
+    let g = config.grav;
+    let n = 1000;
+    let mut v_max = 0.0f32;
+    let mut a_max = 0.0f32;
+    let mut omega_xy_max = 0.0f32;
+    let mut omega_z_max = 0.0f32;
+    for i in 0..=n {
+        let t = dur * i as f32 / n as f32;
+        let v = result.trajectory.get_vel(t);
+        let a = result.trajectory.get_acc(t);
+        let j = result.trajectory.get_jerk(t);
+        v_max = v_max.max(vec_norm(v));
+        a_max = a_max.max(vec_norm(a));
+        let alpha = [a[0], a[1], a[2] + g];
+        let na = vec_norm(alpha).max(1e-8);
+        let zb = [alpha[0] / na, alpha[1] / na, alpha[2] / na];
+        if zb[2] <= -0.9 {
+            continue;
+        }
+        let dot_zj = zb[0] * j[0] + zb[1] * j[1] + zb[2] * j[2];
+        let dzb = [
+            (j[0] - zb[0] * dot_zj) / na,
+            (j[1] - zb[1] * dot_zj) / na,
+            (j[2] - zb[2] * dot_zj) / na,
+        ];
+        let s_inv = 1.0 / (1.0 + zb[2]).max(0.01);
+        let omega = [
+            -dzb[1] + s_inv * zb[1] * dzb[2],
+            dzb[0] - s_inv * zb[0] * dzb[2],
+            s_inv * (zb[1] * dzb[0] - zb[0] * dzb[1]),
+        ];
+        let omega_xy = (omega[0] * omega[0] + omega[1] * omega[1]).sqrt();
+        omega_xy_max = omega_xy_max.max(omega_xy);
+        omega_z_max = omega_z_max.max(omega[2].abs());
+    }
+    KinematicPeaks {
+        v_max,
+        a_max,
+        omega_xy_max,
+        omega_z_max,
+    }
+}
+
+fn print_piece_diagnostics(label: &str, result: &PlannerResult, config: &QuadPlanningConfig) {
+    let n = result.num_pieces;
+    let times = &result.optimized_times[..n];
+    let min_t = times.iter().copied().fold(f32::INFINITY, f32::min);
+    let max_t = times.iter().copied().fold(0.0f32, f32::max);
+    let peaks = sample_kinematic_peaks(result, config);
+    println!(
+        "  [{label}] status={:?} iters={} pieces={} dur={:.3}s cost={:.3}",
+        result.status, result.iterations, n, result.trajectory.total_duration(),
+        result.final_cost,
+    );
+    println!(
+        "    per-piece T: min={:.3}s max={:.3}s  peaks: v={:.2}m/s a={:.2}m/s² ωxy={:.2}rad/s ωz={:.2}rad/s",
+        min_t, max_t, peaks.v_max, peaks.a_max, peaks.omega_xy_max, peaks.omega_z_max,
+    );
+    print!("    times=[");
+    for (i, t) in times.iter().enumerate() {
+        if i > 0 { print!(", "); }
+        print!("{:.2}", t);
+    }
+    println!("]");
+}
+
+/// Baseline: the firmware's exact plan request (15 targets → 15 pieces)
+/// must converge cleanly. If BFGS returns `MaxIterations`, the published
+/// trajectory carries unresolved body-rate/thrust penalties and sends the
+/// drone into the failure mode observed in flight.
+#[test]
+fn production_regime_full_circuit_converges() {
+    let config = production_regime_config();
+    let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, &PRODUCTION_WAYPOINTS);
+    let result = plan(&input, &config);
+    print_piece_diagnostics("full 15wp", &result, &config);
+    assert!(result.final_cost.is_finite(), "non-finite cost");
+    assert!(
+        matches!(result.status, SolverStatus::Convergence | SolverStatus::Stop),
+        "under-converged: {:?} at iter {}",
+        result.status, result.iterations,
+    );
+}
+
+/// If the min segment time collapses below 0.3 s, the piece's polynomial
+/// commands accelerations and jerks that the MPC cannot realize at 100 Hz.
+/// This is the direct signature of "jumps up and down at start" failures.
+#[test]
+fn production_regime_min_segment_time_feasible() {
+    let config = production_regime_config();
+    let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, &PRODUCTION_WAYPOINTS);
+    let result = plan(&input, &config);
+    print_piece_diagnostics("min-T gate", &result, &config);
+    let n = result.num_pieces;
+    let min_t = result.optimized_times[..n]
+        .iter()
+        .copied()
+        .fold(f32::INFINITY, f32::min);
+    assert!(
+        min_t >= 0.3,
+        "min segment time {min_t:.3}s < 0.3s — trajectory over-compressed",
+    );
+}
+
+/// The trajectory must be physically realizable: velocity under the 5 m/s
+/// planner bound with a 15% slack, body rates under the vehicle limits.
+/// These are the soft-constraint knees the solver is supposed to honor.
+#[test]
+fn production_regime_kinematics_feasible() {
+    let config = production_regime_config();
+    let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, &PRODUCTION_WAYPOINTS);
+    let result = plan(&input, &config);
+    print_piece_diagnostics("kinematics", &result, &config);
+    let peaks = sample_kinematic_peaks(&result, &config);
+    let max_vel = config.planner.max_vel_m_s * CONSTRAINT_SLACK;
+    let max_omega_xy = config.max_rate_rad_s[0] * CONSTRAINT_SLACK;
+    let max_omega_z = config.max_rate_rad_s[2] * CONSTRAINT_SLACK;
+    assert!(
+        peaks.v_max <= max_vel,
+        "peak velocity {:.2} > {:.2} (max_vel {} × {})",
+        peaks.v_max, max_vel, config.planner.max_vel_m_s, CONSTRAINT_SLACK,
+    );
+    assert!(
+        peaks.omega_xy_max <= max_omega_xy,
+        "peak ω_xy {:.2} > {:.2} (limit {} × {})",
+        peaks.omega_xy_max, max_omega_xy, config.max_rate_rad_s[0], CONSTRAINT_SLACK,
+    );
+    assert!(
+        peaks.omega_z_max <= max_omega_z,
+        "peak ω_z {:.2} > {:.2} (limit {} × {})",
+        peaks.omega_z_max, max_omega_z, config.max_rate_rad_s[2], CONSTRAINT_SLACK,
+    );
+}
+
+/// Walk the prefix of PRODUCTION_WAYPOINTS and report how the solver
+/// behaves as the piece count grows. Surfaces the exact count at which
+/// convergence / segment-time feasibility break under production weights.
+#[test]
+#[ignore] // diagnostic — run with `--release --ignored -- --nocapture`
+fn production_regime_piece_count_sweep() {
+    let config = production_regime_config();
+    println!(
+        "\n=== Production-regime sweep: n targets → n pieces (wv=0, wtilt=0, we=0) ==="
+    );
+    for n_targets in 1..=PRODUCTION_WAYPOINTS.len() {
+        let targets = &PRODUCTION_WAYPOINTS[..n_targets];
+        let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, targets);
+        let result = plan(&input, &config);
+        print_piece_diagnostics(&format!("{n_targets} tgts"), &result, &config);
+    }
+}
+
+/// Repeat-seed stability test: re-plan the same circuit many times. Any
+/// dependence of the outcome on float accumulation order (e.g. a stochastic
+/// trust-region trigger) would show up as differing iterations/status.
+/// In the production regime at high piece count, "converged" runs
+/// intermixed with "MaxIterations" runs from identical inputs is the
+/// hallmark of sitting on a convergence knife-edge.
+#[test]
+#[ignore] // diagnostic — run with `--release --ignored -- --nocapture`
+fn production_regime_repeatability() {
+    let config = production_regime_config();
+    println!("\n=== Production-regime repeatability (20 runs, same inputs) ===");
+    let mut statuses = [0usize; 5]; // Convergence, Stop, MaxIterations, InvalidValue, TimeExceeded
+    for run in 0..20 {
+        let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, &PRODUCTION_WAYPOINTS);
+        let result = plan(&input, &config);
+        let idx = match result.status {
+            SolverStatus::Convergence => 0,
+            SolverStatus::Stop => 1,
+            SolverStatus::MaxIterations => 2,
+            SolverStatus::InvalidValue => 3,
+            SolverStatus::TimeExceeded => 4,
+        };
+        statuses[idx] += 1;
+        let n = result.num_pieces;
+        let min_t = result.optimized_times[..n]
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        println!(
+            "  run {:02}: status={:?} iters={:3} min_T={:.3}s dur={:.3}s",
+            run, result.status, result.iterations, min_t,
+            result.trajectory.total_duration(),
+        );
+    }
+    println!(
+        "  tallies: Convergence={} Stop={} MaxIter={} Invalid={} Timeout={}",
+        statuses[0], statuses[1], statuses[2], statuses[3], statuses[4],
+    );
+}
+
+/// Does turning on `weight_vel` (and only that — no other change to the
+/// production regime) rescue convergence on the full 15-waypoint circuit?
+/// If yes, the fix for the live failure is a one-line param bump.
+#[test]
+#[ignore] // diagnostic — run with `--release --ignored -- --nocapture`
+fn production_regime_with_weight_vel_sweep() {
+    println!("\n=== Production-regime + weight_vel sweep (full 15 wp) ===");
+    for &wv in &[0.0_f32, 1.0, 10.0, 50.0, 100.0] {
+        let mut vp = test_vehicle_params();
+        vp.planner.max_vel_m_s = 5.0;
+        vp.planner.max_tilt_rad = core::f32::consts::FRAC_PI_3;
+        vp.planner.weight_time = 1.0;
+        vp.planner.weight_energy = 0.0;
+        vp.planner.weight_vel = wv;
+        vp.planner.weight_tilt = 0.0;
+        vp.planner.weight_body_rate = 10.0;
+        vp.planner.weight_thrust = 10.0;
+        vp.planner.smoothing_eps = 0.01;
+        vp.planner.num_check_per_piece = 8;
+        vp.planner.bfgs_trust.max_iterations = 500;
+        let config = QuadPlanningConfig::from_vehicle_params(&vp);
+        let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, &PRODUCTION_WAYPOINTS);
+        let result = plan(&input, &config);
+        print_piece_diagnostics(&format!("wv={wv:.1}"), &result, &config);
+    }
+}
+
+/// Sweep `weight_energy` while keeping everything else at the production
+/// regime (in particular `weight_vel = 0`, `weight_tilt = 0`). Answers the
+/// question "in this configuration, does raising we change peak speed or
+/// trajectory duration at all?". If peak v and duration are flat across
+/// we ∈ [0, 0.1], the we knob is doing nothing useful in production.
+#[test]
+#[ignore] // diagnostic — run with `--release --ignored -- --nocapture`
+fn production_regime_with_weight_energy_sweep() {
+    println!("\n=== Production-regime + weight_energy sweep (wv=0, wtilt=0) ===");
+    for &we in &[0.0_f32, 0.001, 0.003, 0.01, 0.03, 0.1] {
+        let mut vp = test_vehicle_params();
+        vp.planner.max_vel_m_s = 5.0;
+        vp.planner.max_tilt_rad = core::f32::consts::FRAC_PI_3;
+        vp.planner.weight_time = 1.0;
+        vp.planner.weight_energy = we;
+        vp.planner.weight_vel = 0.0;
+        vp.planner.weight_tilt = 0.0;
+        vp.planner.weight_body_rate = 10.0;
+        vp.planner.weight_thrust = 10.0;
+        vp.planner.smoothing_eps = 0.01;
+        vp.planner.num_check_per_piece = 8;
+        vp.planner.bfgs_trust.max_iterations = 500;
+        let config = QuadPlanningConfig::from_vehicle_params(&vp);
+        let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, &PRODUCTION_WAYPOINTS);
+        let result = plan(&input, &config);
+        print_piece_diagnostics(&format!("we={we:.4}"), &result, &config);
+    }
+}
+
+/// Dump the production-regime trajectory to CSV for offline inspection
+/// (plot the Z axis over time — if the first 1–2 seconds show Z exceeding
+/// the hover setpoint by more than a few tens of cm, that's the reference
+/// the MPC is being told to chase).
+#[test]
+fn save_production_regime_trajectory_csv() {
+    let config = production_regime_config();
+    let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, &PRODUCTION_WAYPOINTS);
+    let result = plan(&input, &config);
+    let path = output_path("planner_production_regime.csv");
+    write_trajectory_csv(&result, &config, &path, 0.01);
+    println!(
+        "wrote production-regime trajectory: status={:?} iters={} dur={:.3}s path={}",
+        result.status,
+        result.iterations,
+        result.trajectory.total_duration(),
+        path.display(),
+    );
+}
+
 #[test]
 fn trajectory_is_finite_everywhere() {
     // Defensive: ensure no NaN/Inf anywhere in pos/vel/acc/jerk for a

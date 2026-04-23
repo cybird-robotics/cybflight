@@ -30,28 +30,28 @@ pub const QUADROTOR_MOTORS: [MotorParams; 4] = [
     MotorParams {
         position_m: [-0.075, -0.1],
         spin_dir: SpinDir::Cw,
-        max_thrust_n: 8.5, // ~600 g per motor for a 5" prop. Calibrate from test stand.
+        max_thrust_n: 12.0, // ~600 g per motor for a 5" prop. Calibrate from test stand.
         torque_coeff_m: 0.022,
     },
     // M1: FRONT_RIGHT — CCW, position (+d, −d) in FLU.
     MotorParams {
         position_m: [0.075, -0.1],
         spin_dir: SpinDir::Ccw,
-        max_thrust_n: 8.5,
+        max_thrust_n: 12.0,
         torque_coeff_m: 0.022,
     },
     // M2: REAR_LEFT — CCW, position (−d, +d) in FLU (left = +y).
     MotorParams {
         position_m: [-0.075, 0.1],
         spin_dir: SpinDir::Ccw,
-        max_thrust_n: 8.5,
+        max_thrust_n: 12.0,
         torque_coeff_m: 0.022,
     },
     // M3: FRONT_LEFT — CW, position (+d, +d) in FLU.
     MotorParams {
         position_m: [0.075, 0.1],
         spin_dir: SpinDir::Cw,
-        max_thrust_n: 8.5,
+        max_thrust_n: 12.0,
         torque_coeff_m: 0.022,
     },
 ];

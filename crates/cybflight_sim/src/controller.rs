@@ -139,7 +139,7 @@ impl MpcIndiController {
             body: vp.body,
             indi_motors: [IndiMotorParams {
                 time_const_s: 0.015,
-                max_rpm: 27000.0,
+                max_rpm: 33000.0,
                 g2_yaw: 0.0,
             }; INDI_NU],
             thrust_model: ThrustModel::Quadratic,

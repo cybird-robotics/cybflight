@@ -10,6 +10,7 @@ use crate::hal;
 use crate::motors::ACTUATOR_MOTORS;
 use crate::msgs;
 use crate::platform;
+use crate::sensors::gps::GPS_HEALTH;
 use crate::sensors::{
     BARO_1, BARO_2, DSHOT_TELEMETRY, GPS_FIX, IMU_1, IMU_2, MAG_EXT, MAG_INT, RC_INPUT,
     RC_LINK_STATUS, VEHICLE_ATTITUDE, VICON_POSE,
@@ -41,6 +42,7 @@ const HELP_TEXT: &[u8] = b"\
   rcstats              one-shot RC link status\r\n\
   dshot                one-shot DShot telemetry\r\n\
   gps                  one-shot GPS fix\r\n\
+  gpshealth            one-shot GPS init/fix health\r\n\
   magext               one-shot external compass\r\n\
   magint               one-shot internal compass\r\n\
   baro1                one-shot barometer 1\r\n\
@@ -583,6 +585,13 @@ async fn dispatch<'d>(
                 Err(_) => return write_all(class, b"error: no subscriber slot\r\n").await,
             };
             oneshot(class, &mut sub, 256).await?;
+        }
+        "gpshealth" => {
+            let health = GPS_HEALTH.lock(|c| c.get());
+            let mut buf = [0u8; 192];
+            let mut w = WriteBuf::new(&mut buf);
+            write!(w, "{}\r\n", health).ok();
+            write_all(class, w.as_slice()).await?;
         }
         "vicon" => {
             let mut sub = match VICON_POSE.subscriber() {

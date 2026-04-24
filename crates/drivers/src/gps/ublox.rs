@@ -1,7 +1,16 @@
-//! u-blox M10 GNSS receiver driver — UBX binary protocol.
+//! u-blox GNSS receiver driver — UBX binary protocol, legacy CFG-* commands.
 //!
-//! Generic over `embedded_io_async::Read + Write`. Configures the receiver for
-//! UBX-only output with NAV-PVT at 5 Hz and all constellations enabled.
+//! Compatible with M8 (incl. SAM-M8Q), M9 / M9P, and ZED-F9P RTK.
+//! NOT compatible with M10, which removed legacy CFG-MSG/CFG-RATE/CFG-PRT
+//! in favour of the CFG-VALSET key-database. If M10 support is needed
+//! later, dispatch on UBX-MON-VER and add a separate init path.
+//!
+//! Init sends `CFG-MSG NAV-PVT 1` and waits for the matching ACK-ACK,
+//! retrying up to `MAX_ATTEMPTS` times. Retries cover the F9P cold-boot
+//! window (~1–3 s), during which the receiver silently drops UBX
+//! commands; duplicate CFG-MSGs are harmless because the receiver re-ACKs
+//! each one. NMEA is left enabled — caller is expected to provide enough
+//! UART bandwidth (≥38400 baud) for the receiver's default output.
 
 use embedded_io_async::{Read, Write};
 
@@ -12,31 +21,17 @@ use embedded_io_async::{Read, Write};
 const UBX_SYNC_1: u8 = 0xB5;
 const UBX_SYNC_2: u8 = 0x62;
 
-// Message classes
 const UBX_CLASS_NAV: u8 = 0x01;
 const UBX_CLASS_ACK: u8 = 0x05;
 const UBX_CLASS_CFG: u8 = 0x06;
 
-// Message IDs
 const UBX_NAV_PVT: u8 = 0x07;
 const UBX_ACK_ACK: u8 = 0x01;
 const UBX_ACK_NAK: u8 = 0x00;
-const UBX_CFG_VALSET: u8 = 0x8A;
 
-// NAV-PVT payload length
+const UBX_CFG_MSG: u8 = 0x01;
+
 const NAV_PVT_LEN: u16 = 92;
-
-// CFG-VALSET config keys (u-blox M10 configuration system)
-const CFG_UART1OUTPROT_NMEA: u32 = 0x10740002;
-const CFG_UART1OUTPROT_UBX: u32 = 0x10740001;
-const CFG_MSGOUT_UBX_NAV_PVT_UART1: u32 = 0x20910007;
-const CFG_RATE_MEAS: u32 = 0x30210001;
-const CFG_SIGNAL_GPS_ENA: u32 = 0x1031001F;
-const CFG_SIGNAL_GAL_ENA: u32 = 0x10310021;
-const CFG_SIGNAL_GLO_ENA: u32 = 0x10310025;
-const CFG_SIGNAL_BDS_ENA: u32 = 0x10310022;
-const CFG_SIGNAL_SBAS_ENA: u32 = 0x10310020;
-const CFG_SIGNAL_QZSS_ENA: u32 = 0x10310024;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -46,6 +41,13 @@ const CFG_SIGNAL_QZSS_ENA: u32 = 0x10310024;
 #[derive(Clone, Debug)]
 pub struct NavPvt {
     pub fix_type: u8,
+    /// Flags byte bit 0: receiver believes the fix is valid.
+    pub gnss_fix_ok: bool,
+    /// Flags byte bit 1: differential corrections were applied.
+    pub diff_soln: bool,
+    /// Flags byte bits 6-7: RTK carrier-phase solution status.
+    /// 0 = none, 1 = float, 2 = fixed. Always 0 on M8 (no RTK hardware).
+    pub carr_soln: u8,
     pub num_sv: u8,
     pub lon_1e7: i32,
     pub lat_1e7: i32,
@@ -72,6 +74,13 @@ pub enum Error<E> {
     Timeout,
 }
 
+/// Outcome of a single ACK-scan attempt.
+enum AckOutcome {
+    Acked,
+    Naked,
+    Exhausted,
+}
+
 impl<E: defmt::Format> defmt::Format for Error<E> {
     fn format(&self, f: defmt::Formatter) {
         match self {
@@ -84,7 +93,7 @@ impl<E: defmt::Format> defmt::Format for Error<E> {
 }
 
 // ---------------------------------------------------------------------------
-// Checksum
+// Checksum + frame builder
 // ---------------------------------------------------------------------------
 
 /// UBX Fletcher-16 checksum over a byte slice.
@@ -97,10 +106,6 @@ fn fletcher16(data: &[u8]) -> (u8, u8) {
     }
     (ck_a, ck_b)
 }
-
-// ---------------------------------------------------------------------------
-// Frame builder
-// ---------------------------------------------------------------------------
 
 /// Build a complete UBX frame into `buf`. Returns the number of bytes written.
 fn build_frame(buf: &mut [u8], class: u8, id: u8, payload: &[u8]) -> usize {
@@ -119,29 +124,11 @@ fn build_frame(buf: &mut [u8], class: u8, id: u8, payload: &[u8]) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// CFG-VALSET payload builder
-// ---------------------------------------------------------------------------
-
-/// Append a key-value pair to a CFG-VALSET payload buffer.
-/// Returns the new offset.
-fn append_kv_u8(buf: &mut [u8], offset: usize, key: u32, val: u8) -> usize {
-    buf[offset..offset + 4].copy_from_slice(&key.to_le_bytes());
-    buf[offset + 4] = val;
-    offset + 5
-}
-
-fn append_kv_u16(buf: &mut [u8], offset: usize, key: u32, val: u16) -> usize {
-    buf[offset..offset + 4].copy_from_slice(&key.to_le_bytes());
-    buf[offset + 4..offset + 6].copy_from_slice(&val.to_le_bytes());
-    offset + 6
-}
-
-// ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
 
-/// u-blox M10 GNSS driver.
-pub struct UbloxM10<RW> {
+/// u-blox M8/M9/F9P GNSS driver.
+pub struct Ublox<RW> {
     rw: RW,
 }
 
@@ -153,118 +140,88 @@ fn map_read_err<E>(e: embedded_io_async::ReadExactError<E>) -> Error<E> {
     }
 }
 
-impl<RW> UbloxM10<RW>
+impl<RW> Ublox<RW>
 where
     RW: Read + Write,
 {
-    /// Initialize the u-blox M10 receiver.
+    /// Initialise the receiver.
     ///
-    /// Waits for module boot, then sends a single CFG-VALSET configuring:
-    /// - UBX-only output (NMEA off)
-    /// - NAV-PVT on UART1 at rate 1 (every measurement)
-    /// - 5 Hz measurement rate (200 ms)
-    /// - All constellations enabled (GPS, Galileo, GLONASS, BeiDou)
+    /// Repeatedly sends `CFG-MSG NAV-PVT 1` and watches for the matching
+    /// ACK-ACK; retrying covers the F9P's variable cold-boot window
+    /// during which the receiver silently drops UBX commands. Returns
+    /// `Error::Nak` if the receiver explicitly rejects the request, or
+    /// `Error::Timeout` if no attempt is acknowledged.
     pub async fn new(
         rw: RW,
         delay: &mut impl embedded_hal_async::delay::DelayNs,
     ) -> Result<Self, Error<RW::Error>> {
+        // Short prime delay; the bulk of the cold-boot tolerance comes
+        // from the retry loop below, not this delay.
         delay.delay_ms(500).await;
 
         let mut driver = Self { rw };
 
-        // --- Essential config: UART protocol + NAV-PVT + rate ---
-        {
-            let mut payload = [0u8; 64];
-            payload[0] = 0x00; // version
-            payload[1] = 0x01; // RAM layer
-            payload[2] = 0x00; // reserved
-            payload[3] = 0x00; // reserved
-            let mut off = 4;
+        let payload = [UBX_CLASS_NAV, UBX_NAV_PVT, 1];
+        let mut frame = [0u8; 16];
+        let frame_len = build_frame(&mut frame, UBX_CLASS_CFG, UBX_CFG_MSG, &payload);
 
-            // Disable NMEA output on UART1
-            off = append_kv_u8(&mut payload, off, CFG_UART1OUTPROT_NMEA, 0);
-            // Ensure UBX output enabled
-            off = append_kv_u8(&mut payload, off, CFG_UART1OUTPROT_UBX, 1);
-            // Enable NAV-PVT on UART1 (rate=1 means every measurement cycle)
-            off = append_kv_u8(&mut payload, off, CFG_MSGOUT_UBX_NAV_PVT_UART1, 1);
-            // 5 Hz nav rate = 200 ms measurement period
-            off = append_kv_u16(&mut payload, off, CFG_RATE_MEAS, 200);
-
-            let mut frame = [0u8; 80];
-            let frame_len = build_frame(&mut frame, UBX_CLASS_CFG, UBX_CFG_VALSET, &payload[..off]);
+        // F9P cold-boot can run anywhere from ~1 s to >3 s. Rather than
+        // pick a single delay that covers the worst case, send CFG-MSG
+        // and watch for ACK over a short window; if absent, resend. The
+        // receiver tolerates duplicate CFG-MSG (each one re-ACKs).
+        const MAX_ATTEMPTS: u8 = 5;
+        const FRAMES_PER_ATTEMPT: u8 = 30;
+        for attempt in 0..MAX_ATTEMPTS {
             driver
                 .rw
                 .write_all(&frame[..frame_len])
                 .await
                 .map_err(Error::Io)?;
-            driver.wait_ack(UBX_CLASS_CFG, UBX_CFG_VALSET).await?;
-            defmt::info!("UBX: essential config ACKed");
-        }
-
-        // --- Optional: enable constellations (send individually, ignore NAKs) ---
-        let constellations: &[(u32, &str)] = &[
-            (CFG_SIGNAL_GPS_ENA, "GPS"),
-            (CFG_SIGNAL_GAL_ENA, "Galileo"),
-            (CFG_SIGNAL_BDS_ENA, "BeiDou"),
-            (CFG_SIGNAL_GLO_ENA, "GLONASS"),
-            (CFG_SIGNAL_SBAS_ENA, "SBAS"),
-            (CFG_SIGNAL_QZSS_ENA, "QZSS"),
-        ];
-        for &(key, name) in constellations {
-            let mut payload = [0u8; 16];
-            payload[0] = 0x00;
-            payload[1] = 0x01;
-            payload[2] = 0x00;
-            payload[3] = 0x00;
-            let off = append_kv_u8(&mut payload, 4, key, 1);
-
-            let mut frame = [0u8; 32];
-            let frame_len = build_frame(&mut frame, UBX_CLASS_CFG, UBX_CFG_VALSET, &payload[..off]);
-            driver
-                .rw
-                .write_all(&frame[..frame_len])
-                .await
-                .map_err(Error::Io)?;
-            match driver.wait_ack(UBX_CLASS_CFG, UBX_CFG_VALSET).await {
-                Ok(()) => defmt::info!("UBX: {} enabled", name),
-                Err(Error::Nak) => defmt::warn!("UBX: {} not supported (NAK)", name),
-                Err(_) => defmt::warn!("UBX: {} config error", name),
+            match driver
+                .scan_for_ack(UBX_CLASS_CFG, UBX_CFG_MSG, FRAMES_PER_ATTEMPT)
+                .await?
+            {
+                AckOutcome::Acked => {
+                    defmt::info!("UBX: NAV-PVT enabled (attempt {})", attempt);
+                    return Ok(driver);
+                }
+                AckOutcome::Naked => return Err(Error::Nak),
+                AckOutcome::Exhausted => {
+                    // Receiver wasn't ready; pause and retry.
+                    delay.delay_ms(500).await;
+                }
             }
         }
-
-        Ok(driver)
+        Err(Error::Timeout)
     }
 
-    /// Wait for an ACK-ACK matching the given class/id. Discards other messages.
-    async fn wait_ack(
+    /// Read up to `budget` UBX frames looking for ACK-ACK / ACK-NAK matching
+    /// the given class/id.
+    async fn scan_for_ack(
         &mut self,
         expected_class: u8,
         expected_id: u8,
-    ) -> Result<(), Error<RW::Error>> {
-        for _ in 0..20u8 {
+        budget: u8,
+    ) -> Result<AckOutcome, Error<RW::Error>> {
+        for _ in 0..budget {
             let (class, id, payload_len) = self.read_header().await?;
 
             if class == UBX_CLASS_ACK && payload_len == 2 {
                 let mut ack_payload = [0u8; 2];
                 self.read_payload(&mut ack_payload, 2).await?;
-                if id == UBX_ACK_ACK
-                    && ack_payload[0] == expected_class
-                    && ack_payload[1] == expected_id
-                {
-                    return Ok(());
-                }
-                if id == UBX_ACK_NAK
-                    && ack_payload[0] == expected_class
-                    && ack_payload[1] == expected_id
-                {
-                    return Err(Error::Nak);
+                if ack_payload[0] == expected_class && ack_payload[1] == expected_id {
+                    if id == UBX_ACK_ACK {
+                        return Ok(AckOutcome::Acked);
+                    }
+                    if id == UBX_ACK_NAK {
+                        return Ok(AckOutcome::Naked);
+                    }
                 }
             } else {
-                // Skip this message's payload + checksum
                 self.skip_payload(payload_len).await?;
             }
         }
-        Err(Error::Timeout)
+        Ok(AckOutcome::Exhausted)
     }
 
     /// Read the next NAV-PVT fix. Blocks until a valid NAV-PVT frame arrives.
@@ -303,7 +260,8 @@ where
         Ok((hdr[0], hdr[1], payload_len))
     }
 
-    /// Read payload + checksum, validate Fletcher-16.
+    /// Read payload + checksum. Checksum bytes are consumed but not validated;
+    /// the GPS module is treated as a trusted source on a wired bus.
     async fn read_payload(&mut self, buf: &mut [u8], len: u16) -> Result<(), Error<RW::Error>> {
         let len = len as usize;
         self.rw
@@ -313,18 +271,13 @@ where
 
         let mut ck = [0u8; 2];
         self.rw.read_exact(&mut ck).await.map_err(map_read_err)?;
-
-        // We need to checksum class+id+len+payload — but we only have payload here.
-        // The caller should ideally pass the header too. For simplicity, we'll skip
-        // checksum validation on read_payload (the GPS module is a trusted source
-        // on a wired bus). If needed, we can add full validation later.
         let _ = ck;
         Ok(())
     }
 
     /// Skip a message payload + 2-byte checksum.
     async fn skip_payload(&mut self, len: u16) -> Result<(), Error<RW::Error>> {
-        let total = len as usize + 2; // payload + CK_A + CK_B
+        let total = len as usize + 2;
         let mut discard = [0u8; 32];
         let mut remaining = total;
         while remaining > 0 {
@@ -344,8 +297,12 @@ where
 // ---------------------------------------------------------------------------
 
 fn parse_nav_pvt(p: &[u8; 92]) -> NavPvt {
+    let flags = p[21];
     NavPvt {
         fix_type: p[20],
+        gnss_fix_ok: (flags & 0x01) != 0,
+        diff_soln: (flags & 0x02) != 0,
+        carr_soln: (flags >> 6) & 0x03,
         num_sv: p[23],
         lon_1e7: i32::from_le_bytes([p[24], p[25], p[26], p[27]]),
         lat_1e7: i32::from_le_bytes([p[28], p[29], p[30], p[31]]),

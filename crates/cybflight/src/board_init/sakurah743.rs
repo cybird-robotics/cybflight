@@ -1,6 +1,6 @@
 use cybflight_drivers::baro::dps310::Dps310;
 use cybflight_drivers::baro::icp20100::Icp20100;
-use cybflight_drivers::gps::UbloxM10;
+use cybflight_drivers::gps::Ublox;
 use cybflight_drivers::imu::icm426xx::Icm426xx;
 use cybflight_drivers::led::Led;
 use cybflight_drivers::mag::{Ist8310, Qmc5883l};
@@ -9,15 +9,15 @@ use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::{SendSpawner, Spawner};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::{Duration, Timer, with_timeout};
+use embassy_time::{with_timeout, Duration, Timer};
 use static_cell::StaticCell;
 
 use crate::bsp;
 use crate::hal;
 use crate::motors::{DshotQuadConfig, MotorTimerConfig};
 use crate::sensors::baro::BaroReader;
-use crate::sensors::gps::GpsRunner;
-use crate::sensors::imu::{ImuReader, SpiBusMtx, icm_reader_task};
+use crate::sensors::gps::{err_kind, GpsHealth, GpsRunner, GPS_HEALTH};
+use crate::sensors::imu::{icm_reader_task, ImuReader, SpiBusMtx};
 use crate::sensors::mag::{I2cBusMtx, MagReader};
 use crate::status;
 use crate::usb_serial;
@@ -33,6 +33,7 @@ use hal::timer::low_level::Timer as LLTimer;
 hal::bind_interrupts!(struct SerialIrqs {
     UART4 => hal::usart::BufferedInterruptHandler<hal::peripherals::UART4>;
     USART3 => hal::usart::BufferedInterruptHandler<hal::peripherals::USART3>;
+    UART7 => hal::usart::BufferedInterruptHandler<hal::peripherals::UART7>;
 });
 
 // Bind I2C1 interrupts for onboard IST8310
@@ -145,7 +146,10 @@ pub async fn init(
                 board.serial.uart4,
                 board.serial.uart4_rx,
                 board.serial.uart4_tx,
-                tx_buf, rx_buf, SerialIrqs, uart_config,
+                tx_buf,
+                rx_buf,
+                SerialIrqs,
+                uart_config,
             ) {
                 Ok(uart) => {
                     defmt::info!("CRSF UART4 init OK");
@@ -177,7 +181,9 @@ pub async fn init(
                 board.serial.uart4,
                 board.serial.uart4_tx,
                 SerialIrqs,
-                tx_buf, rx_buf, uart_config,
+                tx_buf,
+                rx_buf,
+                uart_config,
                 hal::usart::HalfDuplexReadback::NoReadback,
             ) {
                 Ok(uart) => {
@@ -194,39 +200,59 @@ pub async fn init(
     }
 
     // --- GPS: bsp::PORT_GPS selects the UART. ---
+    const GPS_BAUD: u32 = 230_400;
+    GPS_HEALTH.lock(|c| c.set(GpsHealth::Initializing));
     match bsp::PORT_GPS {
         bsp::SerialPortId::Usart3 => {
             defmt::info!("GPS: starting USART3 init");
             static GPS_TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-            static GPS_RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+            static GPS_RX_BUF: StaticCell<[u8; 1024]> = StaticCell::new();
             let tx_buf = &mut GPS_TX_BUF.init([0u8; 256])[..];
-            let rx_buf = &mut GPS_RX_BUF.init([0u8; 256])[..];
+            let rx_buf = &mut GPS_RX_BUF.init([0u8; 1024])[..];
             let mut uart_config = hal::usart::Config::default();
-            uart_config.baudrate = 115_200;
+            uart_config.baudrate = GPS_BAUD;
             match hal::usart::BufferedUart::new(
                 board.serial.usart3,
                 board.serial.usart3_rx,
                 board.serial.usart3_tx,
-                tx_buf, rx_buf, SerialIrqs, uart_config,
+                tx_buf,
+                rx_buf,
+                SerialIrqs,
+                uart_config,
             ) {
                 Ok(uart) => {
-                    defmt::info!("GPS: USART3 OK, sending CFG-VALSET...");
+                    defmt::info!("GPS: USART3 OK, sending CFG-MSG...");
                     let mut delay = embassy_time::Delay;
-                    match with_timeout(Duration::from_secs(3), UbloxM10::new(uart, &mut delay)).await {
+                    match with_timeout(Duration::from_secs(30), Ublox::new(uart, &mut delay)).await
+                    {
                         Ok(Ok(gps)) => {
-                            defmt::info!("GPS u-blox M10 init OK");
+                            defmt::info!("GPS u-blox init OK");
                             spawner
                                 .spawn(crate::sensors::gps::ublox_gps_task(GpsRunner::new(gps)))
-                                .unwrap_or_else(|e| defmt::error!("Failed to spawn GPS task: {}", e));
+                                .unwrap_or_else(|e| {
+                                    defmt::error!("Failed to spawn GPS task: {}", e)
+                                });
                         }
-                        Ok(Err(e)) => defmt::warn!("GPS init failed: {}", e),
-                        Err(_) => defmt::warn!("GPS init timed out (no module?)"),
+                        Ok(Err(e)) => {
+                            GPS_HEALTH.lock(|c| c.set(GpsHealth::InitFailed(err_kind(&e))));
+                            defmt::warn!("GPS init failed: {}", e);
+                        }
+                        Err(_) => {
+                            GPS_HEALTH.lock(|c| c.set(GpsHealth::InitTimedOut));
+                            defmt::warn!("GPS init timed out (no module?)");
+                        }
                     }
                 }
-                Err(e) => defmt::error!("GPS USART3 init failed: {}", e),
+                Err(e) => {
+                    GPS_HEALTH.lock(|c| c.set(GpsHealth::UartInitFailed));
+                    defmt::error!("GPS USART3 init failed: {}", e);
+                }
             }
         }
-        _ => defmt::warn!("GPS: PORT_GPS is not a supported GPS port on this board"),
+        _ => {
+            GPS_HEALTH.lock(|c| c.set(GpsHealth::UartInitFailed));
+            defmt::warn!("GPS: PORT_GPS is not a supported GPS port on this board");
+        }
     }
 
     // --- I2C2 shared bus (PB10 SCL, PB11 SDA) for external QMC5883L ---
@@ -456,9 +482,7 @@ pub async fn init(
                 Err(e) => defmt::error!("ESP bridge USART1 init failed: {}", e),
             }
         }
-        _ => defmt::warn!(
-            "ESP bridge: PORT_ESP_BRIDGE is not a supported port on this board"
-        ),
+        _ => defmt::warn!("ESP bridge: PORT_ESP_BRIDGE is not a supported port on this board"),
     }
 
     // --- DShot motor output ---

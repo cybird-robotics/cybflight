@@ -1,5 +1,5 @@
 use cybflight_drivers::baro::dps310::Dps310;
-use cybflight_drivers::gps::UbloxM10;
+use cybflight_drivers::gps::Ublox;
 use cybflight_drivers::imu::icm426xx::Icm426xx;
 use cybflight_drivers::imu::mpu6x00::Mpu6x00;
 use cybflight_drivers::imu::{probe_imu_raw, DetectedImu};
@@ -283,11 +283,11 @@ pub async fn init(
                 Ok(uart) => {
                     defmt::info!("GPS: UART4 OK, sending CFG-VALSET...");
                     let mut delay = embassy_time::Delay;
-                    match with_timeout(Duration::from_secs(3), UbloxM10::new(uart, &mut delay))
+                    match with_timeout(Duration::from_secs(3), Ublox::new(uart, &mut delay))
                         .await
                     {
                         Ok(Ok(gps)) => {
-                            defmt::info!("GPS u-blox M10 init OK");
+                            defmt::info!("GPS u-blox init OK");
                             spawner
                                 .spawn(crate::sensors::gps::ublox_gps_task(GpsRunner::new(gps)))
                                 .unwrap_or_else(|e| {

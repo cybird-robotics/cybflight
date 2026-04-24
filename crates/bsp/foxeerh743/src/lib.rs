@@ -34,7 +34,7 @@ pub const LED_COUNT: usize = 1;
 //
 // Role        Port    Pins              Notes
 // SerialRx    USART2  PA2 TX / PA3 RX   CRSF/GHST receiver
-// GPS         UART4   PA0 TX / PA1 RX   u-blox M10
+// GPS         UART4   PA0 TX / PA1 RX   u-blox (M8/M9/F9P)
 // ESP bridge  USART6  PC6 TX / PC7 RX   WiFi/companion link, DMA
 // =====================================================================
 pub const PORT_SERIAL_RX: SerialPortId = SerialPortId::Usart2;

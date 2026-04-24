@@ -1,14 +1,122 @@
-//! GPS sensor task — reads NAV-PVT frames from a u-blox M10 receiver and
-//! fans them out to both `GPS_FIX` (trimmed, for telemetry) and
-//! `GPS_NAV_PVT` (full NAV-PVT signal used by the ESKF GPS path).
+//! GPS sensor task — reads NAV-PVT frames from a u-blox receiver
+//! (M8/M9/F9P) and fans them out to both `GPS_FIX` (trimmed, for
+//! telemetry) and `GPS_NAV_PVT` (full NAV-PVT signal used by the ESKF
+//! GPS path).
 
-use cybflight_drivers::gps::UbloxM10;
+use core::cell::Cell;
+
+use cybflight_drivers::gps::Ublox;
+use cybflight_drivers::gps::ublox::Error as UbxError;
+use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_time::Instant;
 
 use crate::hal;
 use cybflight_msgs as msgs;
 
 pub type GpsUart = hal::usart::BufferedUart<'static>;
+
+/// Tag for the four error variants of `cybflight_drivers::gps::ublox::Error`.
+/// Stripped of the `Io(E)` payload so the snapshot stays `Copy` and lock-free.
+#[derive(Clone, Copy)]
+pub enum GpsErrKind {
+    Io,
+    BadChecksum,
+    Nak,
+    Timeout,
+}
+
+/// Operator-facing GPS health snapshot. Updated by `board_init` during the
+/// init handshake and by `GpsRunner::run` thereafter. Read by the shell's
+/// `gpshealth` command.
+///
+/// All variants are `Copy` so the value lives in a `Cell` and can be set
+/// from any task without allocation.
+#[derive(Clone, Copy)]
+pub enum GpsHealth {
+    /// Initial state — UART not yet opened, or init in progress.
+    Initializing,
+    /// `BufferedUart::new` failed (pin/peripheral conflict, bad config).
+    UartInitFailed,
+    /// Outer 3-second `with_timeout` tripped — no bytes from the module.
+    /// Most common cause is a baud-rate mismatch.
+    InitTimedOut,
+    /// `Ublox::new` returned an error after receiving some bytes.
+    InitFailed(GpsErrKind),
+    /// Module is responding with NAV-PVT frames but no valid fix yet.
+    Waiting {
+        fix_type: u8,
+        num_sv: u8,
+        h_acc_mm: u32,
+    },
+    /// Module has a 3D fix; `last_fix_at` lets the shell display age.
+    Locked {
+        fix_type: u8,
+        num_sv: u8,
+        h_acc_mm: u32,
+        last_fix_at: Instant,
+    },
+    /// `read_fix` returned an error after init succeeded.
+    ReadError(GpsErrKind),
+}
+
+pub static GPS_HEALTH: Mutex<CriticalSectionRawMutex, Cell<GpsHealth>> =
+    Mutex::new(Cell::new(GpsHealth::Initializing));
+
+/// Convert a u-blox driver error into the variant tag stored in `GpsHealth`.
+pub fn err_kind<E>(e: &UbxError<E>) -> GpsErrKind {
+    match e {
+        UbxError::Io(_) => GpsErrKind::Io,
+        UbxError::BadChecksum => GpsErrKind::BadChecksum,
+        UbxError::Nak => GpsErrKind::Nak,
+        UbxError::Timeout => GpsErrKind::Timeout,
+    }
+}
+
+fn err_kind_str(k: GpsErrKind) -> &'static str {
+    match k {
+        GpsErrKind::Io => "io",
+        GpsErrKind::BadChecksum => "bad checksum",
+        GpsErrKind::Nak => "NAK",
+        GpsErrKind::Timeout => "timeout (no ACK)",
+    }
+}
+
+impl core::fmt::Display for GpsHealth {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            GpsHealth::Initializing => write!(f, "GPS: initializing"),
+            GpsHealth::UartInitFailed => write!(f, "GPS: UART init failed"),
+            GpsHealth::InitTimedOut => write!(
+                f,
+                "GPS: init timed out (no response from module — check baud/wiring/power)"
+            ),
+            GpsHealth::InitFailed(k) => write!(f, "GPS: init failed ({})", err_kind_str(*k)),
+            GpsHealth::Waiting {
+                fix_type,
+                num_sv,
+                h_acc_mm,
+            } => write!(
+                f,
+                "GPS: waiting for lock (fix_type={}, num_sv={}, h_acc={}mm)",
+                fix_type, num_sv, h_acc_mm
+            ),
+            GpsHealth::Locked {
+                fix_type,
+                num_sv,
+                h_acc_mm,
+                last_fix_at,
+            } => {
+                let age_ms = Instant::now().duration_since(*last_fix_at).as_millis();
+                write!(
+                    f,
+                    "GPS: locked (fix_type={}, num_sv={}, h_acc={}mm, age={}ms)",
+                    fix_type, num_sv, h_acc_mm, age_ms
+                )
+            }
+            GpsHealth::ReadError(k) => write!(f, "GPS: read error ({})", err_kind_str(*k)),
+        }
+    }
+}
 
 /// Full NAV-PVT fix used by `eskf_imu_gps` for position + velocity updates.
 /// Kept local until `cybflight-msgs::GpsFix` grows NED velocity and
@@ -31,11 +139,11 @@ pub struct GpsNavPvt {
 }
 
 pub struct GpsRunner {
-    gps: UbloxM10<GpsUart>,
+    gps: Ublox<GpsUart>,
 }
 
 impl GpsRunner {
-    pub fn new(gps: UbloxM10<GpsUart>) -> Self {
+    pub fn new(gps: Ublox<GpsUart>) -> Self {
         Self { gps }
     }
 
@@ -48,6 +156,21 @@ impl GpsRunner {
                     let now = Instant::now();
                     let lat_deg = pvt.lat_1e7 as f64 * 1e-7;
                     let lon_deg = pvt.lon_1e7 as f64 * 1e-7;
+                    let health = if pvt.fix_type >= 3 {
+                        GpsHealth::Locked {
+                            fix_type: pvt.fix_type,
+                            num_sv: pvt.num_sv,
+                            h_acc_mm: pvt.h_acc_mm,
+                            last_fix_at: now,
+                        }
+                    } else {
+                        GpsHealth::Waiting {
+                            fix_type: pvt.fix_type,
+                            num_sv: pvt.num_sv,
+                            h_acc_mm: pvt.h_acc_mm,
+                        }
+                    };
+                    GPS_HEALTH.lock(|c| c.set(health));
                     publisher.publish_immediate(msgs::GpsFix {
                         timestamp: now,
                         lat_deg,
@@ -77,6 +200,7 @@ impl GpsRunner {
                     });
                 }
                 Err(e) => {
+                    GPS_HEALTH.lock(|c| c.set(GpsHealth::ReadError(err_kind(&e))));
                     defmt::warn!("GPS read error: {}", e);
                 }
             }

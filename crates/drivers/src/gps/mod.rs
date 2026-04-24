@@ -1,3 +1,3 @@
-pub mod ublox_m10;
+pub mod ublox;
 
-pub use ublox_m10::UbloxM10;
+pub use ublox::Ublox;

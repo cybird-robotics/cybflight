@@ -1,5 +1,5 @@
 use super::polynomial::Polynomial;
-use super::types::Vec3;
+use super::types::{Vec3, ZERO3};
 use super::MAX_PIECES;
 
 /// A piecewise polynomial trajectory in 3D with zero heap allocations.
@@ -21,7 +21,7 @@ impl PiecewisePolynomial {
             pieces: [Polynomial {
                 degree: 0,
                 duration: 0.0,
-                coeffs: [[0.0; 3]; super::polynomial::MAX_COEFFS],
+                coeffs: [ZERO3; super::polynomial::MAX_COEFFS],
             }; MAX_PIECES],
             n: 0,
             cum_dur: [0.0; MAX_PIECES],
@@ -131,7 +131,7 @@ impl PiecewisePolynomial {
 
     /// Get all boundary points (start of each piece + end of last piece).
     /// Returns the number of points written and the buffer.
-    pub fn get_points(&self, out: &mut [[f32; 3]]) -> usize {
+    pub fn get_points(&self, out: &mut [Vec3]) -> usize {
         let count = self.n + 1;
         for i in 0..self.n {
             out[i] = self.pieces[i].get_pos(0.0);

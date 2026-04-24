@@ -277,7 +277,7 @@ pub async fn control_loop_task() {
         if mission_state != super::MissionState::Idle
             && super::MISSION_ABORT_REQUESTED.swap(false, core::sync::atomic::Ordering::AcqRel)
         {
-            let captured: Option<[f32; 3]> = super::MISSION_TRAJECTORY_SLOT.lock(|slot| {
+            let captured: Option<Vector3<f32>> = super::MISSION_TRAJECTORY_SLOT.lock(|slot| {
                 let mut out = None;
                 {
                     let cell = slot.borrow();
@@ -346,8 +346,8 @@ pub async fn control_loop_task() {
         // the slot lock and consumed below to (a) refresh
         // `ACTIVE_POSITION_SETPOINT` with the τ₀ sample and (b) decide
         // whether to end the mission.
-        let mut tau0_sample: Option<[f32; 3]> = None;
-        let mut mission_done_final: Option<[f32; 3]> = None;
+        let mut tau0_sample: Option<Vector3<f32>> = None;
+        let mut mission_done_final: Option<Vector3<f32>> = None;
         // Captured for MISSION_STATUS telemetry publish below.
         let mut tau_and_duration: Option<(f32, f32)> = None;
         let mut solve_diag: Option<msgs::SolveDiagnostics> = None;
@@ -382,7 +382,7 @@ pub async fn control_loop_task() {
                     let past_end = t_k >= traj.total_duration_s;
                     let (p, v) = if past_end {
                         // Clamp to terminal pose, zero velocity.
-                        (traj.traj.get_pos(traj.total_duration_s), [0.0_f32; 3])
+                        (traj.traj.get_pos(traj.total_duration_s), Vector3::zeros())
                     } else {
                         (traj.traj.get_pos(t_k), traj.traj.get_vel(t_k))
                     };

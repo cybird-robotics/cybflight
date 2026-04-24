@@ -301,7 +301,7 @@ pub async fn mission_planner_task() {
             [2.547, -2.108, 0.8],
         ];
 
-        let input = PlannerInput::waypoints(start_pos, start_vel, &targets);
+        let input = PlannerInput::waypoints(start_pos, start_vel, &targets.map(Vec3::from));
 
         // Snapshot the pre-BFGS time allocation so the ground station can
         // compare it against the optimized total duration — a ratio ≈ 1

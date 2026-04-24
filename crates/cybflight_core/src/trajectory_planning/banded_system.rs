@@ -1,3 +1,5 @@
+use nalgebra::Vector3;
+
 /// Maximum banded storage size.
 ///
 /// Sized for the MINCO min-jerk solver (only consumer): system size = 6·N,
@@ -39,16 +41,12 @@ impl BandedSystem {
     /// Reset all entries to zero.
     #[inline]
     pub fn reset(&mut self) {
-        // Only zero the portion we actually use
         let used = self.n * (self.lower_bw + self.upper_bw + 1);
         self.data[..used].fill(0.0);
     }
 
     #[inline(always)]
     fn idx(&self, i: usize, j: usize) -> usize {
-        // Wrapping arithmetic avoids branch for the unsigned underflow case.
-        // This is safe because (i - j + upper_bw) is always non-negative
-        // for valid banded indices.
         ((i + self.upper_bw) - j) * self.n + j
     }
 
@@ -75,10 +73,6 @@ impl BandedSystem {
     ///
     /// Tiny pivots are clamped to ±1e-6 to prevent NaN/Inf propagation
     /// from near-singular systems.
-    ///
-    /// Inner loops are unconditional multiply-adds: for the MINCO-jerk
-    /// structure, the band is structurally dense, so adding `!= 0.0`
-    /// guards costs more in branch mispredicts than it saves in skipped FMAs.
     pub fn factorize_lu(&mut self) {
         let n = self.n;
         for k in 0..n - 1 {
@@ -109,75 +103,49 @@ impl BandedSystem {
     }
 
     /// Solve Ax = b in-place where b has 3 columns (x/y/z).
-    ///
-    /// `b` is a slice of `[f32; 3]` with length N.
-    /// After solve, `b` contains the solution x.
-    ///
-    /// This operates directly on the [f32; 3] rows, avoiding
-    /// the need to flatten/unflatten between the solver and the caller.
-    pub fn solve3(&self, b: &mut [[f32; 3]]) {
+    pub fn solve3(&self, b: &mut [Vector3<f32>]) {
         let n = self.n;
-        // Forward substitution (L). Inner FMA is unconditional — see the
-        // comment on `factorize_lu` for why we drop the zero-skip.
+        // Forward substitution (L).
         for j in 0..n {
             let i_max = (j + self.lower_bw).min(n - 1);
             for i in (j + 1)..=i_max {
                 let lij = self.get(i, j);
                 let bj = b[j];
-                let bi = &mut b[i];
-                bi[0] -= lij * bj[0];
-                bi[1] -= lij * bj[1];
-                bi[2] -= lij * bj[2];
+                b[i] -= bj * lij;
             }
         }
         // Backward substitution (U).
         for j in (0..n).rev() {
             let inv_diag = 1.0 / self.get(j, j);
-            b[j][0] *= inv_diag;
-            b[j][1] *= inv_diag;
-            b[j][2] *= inv_diag;
+            b[j] *= inv_diag;
             let i_min = j.saturating_sub(self.upper_bw);
             for i in i_min..j {
                 let uij = self.get(i, j);
                 let bj = b[j];
-                let bi = &mut b[i];
-                bi[0] -= uij * bj[0];
-                bi[1] -= uij * bj[1];
-                bi[2] -= uij * bj[2];
+                b[i] -= bj * uij;
             }
         }
     }
 
     /// Solve A^T x = b in-place (adjoint/transpose solve).
-    /// Used for gradient backpropagation through the MINCO system.
-    pub fn solve3_adj(&self, b: &mut [[f32; 3]]) {
+    pub fn solve3_adj(&self, b: &mut [Vector3<f32>]) {
         let n = self.n;
-        // Forward pass: solve U^T part.
         for j in 0..n {
             let inv_diag = 1.0 / self.get(j, j);
-            b[j][0] *= inv_diag;
-            b[j][1] *= inv_diag;
-            b[j][2] *= inv_diag;
+            b[j] *= inv_diag;
             let i_max = (j + self.upper_bw).min(n - 1);
             for i in (j + 1)..=i_max {
                 let aji = self.get(j, i);
                 let bj = b[j];
-                let bi = &mut b[i];
-                bi[0] -= aji * bj[0];
-                bi[1] -= aji * bj[1];
-                bi[2] -= aji * bj[2];
+                b[i] -= bj * aji;
             }
         }
-        // Backward pass: solve L^T part.
         for j in (0..n).rev() {
             let i_min = j.saturating_sub(self.lower_bw);
             for i in i_min..j {
                 let aji = self.get(j, i);
                 let bj = b[j];
-                let bi = &mut b[i];
-                bi[0] -= aji * bj[0];
-                bi[1] -= aji * bj[1];
-                bi[2] -= aji * bj[2];
+                b[i] -= bj * aji;
             }
         }
     }
@@ -200,7 +168,11 @@ mod tests {
 
         a.factorize_lu();
 
-        let mut b: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0]];
+        let mut b = [
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(2.0, 0.0, 0.0),
+            Vector3::new(3.0, 0.0, 0.0),
+        ];
         a.solve3(&mut b);
 
         let a_dense = [
@@ -212,7 +184,7 @@ mod tests {
         for i in 0..3 {
             let mut sum = 0.0;
             for j in 0..3 {
-                sum += a_dense[i][j] * b[j][0];
+                sum += a_dense[i][j] * b[j].x;
             }
             assert!((sum - rhs[i]).abs() < 1e-5, "Row {i}: {sum} != {}", rhs[i]);
         }

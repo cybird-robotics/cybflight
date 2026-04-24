@@ -14,7 +14,7 @@
 use cybflight_core::params::{PlannerParams, VehicleParams};
 use cybflight_core::trajectory_planning::planner::{plan, PlannerInput, PlannerResult, SolverStatus};
 use cybflight_core::trajectory_planning::quad_planning_config::QuadPlanningConfig;
-use cybflight_core::trajectory_planning::types::{norm_sq3, sub3, Vec3, ZERO3};
+use cybflight_core::trajectory_planning::types::{Vec3, ZERO3};
 use std::fs;
 use std::path::PathBuf;
 
@@ -31,7 +31,7 @@ const BOUNDARY_VEL_TOL: f32 = 1e-3;
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 fn vec_norm(v: Vec3) -> f32 {
-    norm_sq3(v).sqrt()
+    v.norm()
 }
 
 fn assert_converged(status: SolverStatus, final_cost: f32) {
@@ -182,8 +182,8 @@ fn test_vehicle_params() -> VehicleParams {
 #[test]
 fn goto_converges_and_matches_boundary() {
     let config = test_config();
-    let start = [0.0, 0.0, 1.0];
-    let target = [3.0, 0.0, 1.0];
+    let start: Vec3 = [0.0, 0.0, 1.0].into();
+    let target: Vec3 = [3.0, 0.0, 1.0].into();
     let input = PlannerInput::goto(start, ZERO3, target);
 
     let result = plan(&input, &config);
@@ -197,7 +197,7 @@ fn goto_converges_and_matches_boundary() {
     let p0 = result.trajectory.get_pos(0.0);
     let v0 = result.trajectory.get_vel(0.0);
     assert!(
-        vec_norm(sub3(p0, start)) < BOUNDARY_POS_TOL,
+        vec_norm((p0 - start)) < BOUNDARY_POS_TOL,
         "start pos mismatch: {p0:?} vs {start:?}"
     );
     assert!(
@@ -209,7 +209,7 @@ fn goto_converges_and_matches_boundary() {
     let pf = result.trajectory.get_pos(dur);
     let vf = result.trajectory.get_vel(dur);
     assert!(
-        vec_norm(sub3(pf, target)) < BOUNDARY_POS_TOL,
+        vec_norm((pf - target)) < BOUNDARY_POS_TOL,
         "end pos mismatch: {pf:?} vs {target:?}"
     );
     assert!(
@@ -221,8 +221,12 @@ fn goto_converges_and_matches_boundary() {
 #[test]
 fn waypoints_converges_and_passes_through() {
     let config = test_config();
-    let start = [0.0, 0.0, 1.0];
-    let targets: [Vec3; 3] = [[2.0, 1.0, 1.0], [4.0, -1.0, 1.0], [6.0, 0.0, 1.0]];
+    let start: Vec3 = [0.0, 0.0, 1.0].into();
+    let targets: [Vec3; 3] = [
+        Vec3::new(2.0, 1.0, 1.0),
+        Vec3::new(4.0, -1.0, 1.0),
+        Vec3::new(6.0, 0.0, 1.0),
+    ];
     let input = PlannerInput::waypoints(start, ZERO3, &targets);
 
     let result = plan(&input, &config);
@@ -233,8 +237,8 @@ fn waypoints_converges_and_passes_through() {
     let dur = result.trajectory.total_duration();
     let p0 = result.trajectory.get_pos(0.0);
     let pf = result.trajectory.get_pos(dur);
-    assert!(vec_norm(sub3(p0, start)) < BOUNDARY_POS_TOL);
-    assert!(vec_norm(sub3(pf, targets[2])) < BOUNDARY_POS_TOL);
+    assert!(vec_norm((p0 - start)) < BOUNDARY_POS_TOL);
+    assert!(vec_norm((pf - targets[2])) < BOUNDARY_POS_TOL);
 
     // Intermediate waypoints: the trajectory should pass through the
     // optimized waypoints (which may differ from the initial waypoints)
@@ -245,7 +249,7 @@ fn waypoints_converges_and_passes_through() {
         let p_at = result.trajectory.get_pos(t_boundary);
         let wp = result.optimized_waypoints[i];
         assert!(
-            vec_norm(sub3(p_at, wp)) < BOUNDARY_POS_TOL,
+            vec_norm((p_at - wp)) < BOUNDARY_POS_TOL,
             "waypoint {i} not hit: {p_at:?} vs {wp:?}"
         );
     }
@@ -292,7 +296,7 @@ fn peak_tilt_rad(result: &PlannerResult, config: &QuadPlanningConfig) -> (f32, f
     let g = config.grav;
     max_along(dur, 500, |t| {
         let a = result.trajectory.get_acc(t);
-        let alpha = [a[0], a[1], a[2] + g];
+        let alpha = a + Vec3::new(0.0, 0.0, g);
         let na = vec_norm(alpha).max(1e-8);
         (alpha[2] / na).clamp(-1.0, 1.0).acos()
     })
@@ -406,7 +410,7 @@ fn tilt_constraint_respected() {
     let dur = result.trajectory.total_duration();
     let (tilt_max, t_at) = max_along(dur, 200, |t| {
         let a = result.trajectory.get_acc(t);
-        let alpha = [a[0], a[1], a[2] + g];
+        let alpha = a + Vec3::new(0.0, 0.0, g);
         let n = vec_norm(alpha).max(1e-8);
         let cos_tilt = alpha[2] / n;
         cos_tilt.clamp(-1.0, 1.0).acos()
@@ -442,7 +446,7 @@ fn collective_thrust_constraint_respected() {
     for i in 0..=200 {
         let t = dur * i as f32 / 200.0;
         let a = result.trajectory.get_acc(t);
-        let alpha = [a[0], a[1], a[2] + g];
+        let alpha = a + Vec3::new(0.0, 0.0, g);
         let f = mass * vec_norm(alpha);
         assert!(
             f >= min_bound && f <= max_bound,
@@ -473,25 +477,21 @@ fn body_rate_constraint_respected() {
         let t = dur * i as f32 / 200.0;
         let a = result.trajectory.get_acc(t);
         let j = result.trajectory.get_jerk(t);
-        let alpha = [a[0], a[1], a[2] + g];
+        let alpha = a + Vec3::new(0.0, 0.0, g);
         let na = vec_norm(alpha).max(1e-8);
-        let zb = [alpha[0] / na, alpha[1] / na, alpha[2] / na];
+        let zb = alpha / na;
         // Skip near-inverted samples (model undefined).
         if zb[2] <= -0.9 {
             continue;
         }
-        let dot_zj = zb[0] * j[0] + zb[1] * j[1] + zb[2] * j[2];
-        let dzb = [
-            (j[0] - zb[0] * dot_zj) / na,
-            (j[1] - zb[1] * dot_zj) / na,
-            (j[2] - zb[2] * dot_zj) / na,
-        ];
+        let dot_zj = zb.dot(&j);
+        let dzb = (j - zb * dot_zj) / na;
         let s_inv = 1.0 / (1.0 + zb[2]).max(0.01);
-        let omega = [
+        let omega = Vec3::new(
             -dzb[1] + s_inv * zb[1] * dzb[2],
             dzb[0] - s_inv * zb[0] * dzb[2],
             s_inv * (zb[1] * dzb[0] - zb[0] * dzb[1]),
-        ];
+        );
         let omega_xy = (omega[0] * omega[0] + omega[1] * omega[1]).sqrt();
         let omega_z = omega[2].abs();
 
@@ -545,12 +545,10 @@ fn write_trajectory_csv(
         let s = result.trajectory.get_snap(t);
 
         // Thrust vector and body z-axis.
-        let alpha = [a[0], a[1], a[2] + g];
-        let na = (alpha[0] * alpha[0] + alpha[1] * alpha[1] + alpha[2] * alpha[2])
-            .sqrt()
-            .max(1e-8);
+        let alpha = a + Vec3::new(0.0, 0.0, g);
+        let na = alpha.norm().max(1e-8);
         let inv_na = 1.0 / na;
-        let zb = [alpha[0] * inv_na, alpha[1] * inv_na, alpha[2] * inv_na];
+        let zb = alpha * inv_na;
 
         // Quaternion (tilt only, ψ=0):
         //   q_w = √(2(1+zb_z))/2,  q_x = -zb_y/√(2(1+zb_z)),
@@ -565,20 +563,16 @@ fn write_trajectory_csv(
 
         // Body rates from flatness at ψ=0.
         let omega = if zb[2] > -0.9 {
-            let dot_zj = zb[0] * j[0] + zb[1] * j[1] + zb[2] * j[2];
-            let dzb = [
-                (j[0] - zb[0] * dot_zj) * inv_na,
-                (j[1] - zb[1] * dot_zj) * inv_na,
-                (j[2] - zb[2] * dot_zj) * inv_na,
-            ];
+            let dot_zj = zb.dot(&j);
+            let dzb = (j - zb * dot_zj) * inv_na;
             let s_inv = 1.0 / (1.0 + zb[2]).max(0.01);
-            [
+            Vec3::new(
                 -dzb[1] + s_inv * zb[1] * dzb[2],
                 dzb[0] - s_inv * zb[0] * dzb[2],
                 s_inv * (zb[1] * dzb[0] - zb[0] * dzb[1]),
-            ]
+            )
         } else {
-            [0.0; 3]
+            ZERO3
         };
 
         let thrust = mass * na;
@@ -652,7 +646,11 @@ fn save_goto_trajectory_csv() {
 fn save_waypoints_trajectory_csv() {
     let config = test_config();
     let start = [0.0, 0.0, 1.0];
-    let targets: [Vec3; 3] = [[2.0, 1.0, 1.5], [4.0, -1.0, 2.0], [6.0, 0.0, 1.0]];
+    let targets: [Vec3; 3] = [
+        Vec3::new(2.0, 1.0, 1.5),
+        Vec3::new(4.0, -1.0, 2.0),
+        Vec3::new(6.0, 0.0, 1.0),
+    ];
     let input = PlannerInput::waypoints(start, ZERO3, &targets);
     let result = plan(&input, &config);
     assert_converged(result.status, result.final_cost);
@@ -666,11 +664,11 @@ fn save_waypoints_trajectory_csv() {
 /// Closed-loop stress path: start = end = [-2, -2, 1], visit a 4-point
 /// radius-1.8 circle three times (12 intermediate waypoints → 13 pieces).
 fn circular_input() -> PlannerInput {
-    let start = [-2.0, -2.0, 1.0];
-    let a = [-1.8, 0.0, 1.0];
-    let b = [0.0, 1.8, 1.0];
-    let c = [1.8, 0.0, 1.0];
-    let d = [0.0, -1.8, 1.0];
+    let start: Vec3 = Vec3::new(-2.0, -2.0, 1.0);
+    let a = Vec3::new(-1.8, 0.0, 1.0);
+    let b = Vec3::new(0.0, 1.8, 1.0);
+    let c = Vec3::new(1.8, 0.0, 1.0);
+    let d = Vec3::new(0.0, -1.8, 1.0);
     // 13 targets: 12 intermediate waypoints + return-to-start as the tail.
     let targets: [Vec3; 13] = [a, b, c, d, a, b, c, d, a, b, c, d, start];
     PlannerInput::waypoints(start, ZERO3, &targets)
@@ -780,21 +778,21 @@ fn bench_runtime_across_tasks() {
     run!("waypoints (1 wp)", 2, || {
         PlannerInput::waypoints(
             [0.0, 0.0, 1.0], ZERO3,
-            &[[2.0, 1.0, 1.0], [4.0, 0.0, 1.0]])
+            &[Vec3::new(2.0, 1.0, 1.0), Vec3::new(4.0, 0.0, 1.0)])
     });
 
     // 3 pieces: zig-zag
     run!("waypoints (2 wp zig-zag)", 3, || {
         PlannerInput::waypoints(
             [0.0, 0.0, 1.0], ZERO3,
-            &[[2.0, 1.0, 1.0], [4.0, -1.0, 1.0], [6.0, 0.0, 1.0]])
+            &[Vec3::new(2.0, 1.0, 1.0), Vec3::new(4.0, -1.0, 1.0), Vec3::new(6.0, 0.0, 1.0)])
     });
 
     // 5 pieces
     run!("waypoints (4 wp)", 5, || {
         let pts: [Vec3; 5] = [
-            [1.0, 1.0, 1.0], [2.0, 0.0, 1.0],
-            [3.0, -1.0, 1.0], [4.0, 0.0, 1.0], [5.0, 1.0, 1.0],
+            Vec3::new(1.0, 1.0, 1.0), Vec3::new(2.0, 0.0, 1.0),
+            Vec3::new(3.0, -1.0, 1.0), Vec3::new(4.0, 0.0, 1.0), Vec3::new(5.0, 1.0, 1.0),
         ];
         PlannerInput::waypoints([0.0, 0.0, 1.0], ZERO3, &pts)
     });
@@ -802,8 +800,8 @@ fn bench_runtime_across_tasks() {
     // 8 pieces: medium
     run!("waypoints (7 wp)", 8, || {
         let pts: [Vec3; 7] = [
-            [1.0, 1.0, 1.0], [2.0, -1.0, 1.2], [3.0, 1.0, 1.0],
-            [4.0, -1.0, 0.8], [5.0, 1.0, 1.0], [6.0, -1.0, 1.2], [7.0, 0.0, 1.0],
+            Vec3::new(1.0, 1.0, 1.0), Vec3::new(2.0, -1.0, 1.2), Vec3::new(3.0, 1.0, 1.0),
+            Vec3::new(4.0, -1.0, 0.8), Vec3::new(5.0, 1.0, 1.0), Vec3::new(6.0, -1.0, 1.2), Vec3::new(7.0, 0.0, 1.0),
         ];
         PlannerInput::waypoints([0.0, 0.0, 1.0], ZERO3, &pts)
     });
@@ -932,11 +930,11 @@ fn bench_runtime_vs_weight_energy() {
         "WAYPOINTS (5 pieces)",
         || {
             let pts: [Vec3; 5] = [
-                [1.0, 1.0, 1.0],
-                [2.0, 0.0, 1.0],
-                [3.0, -1.0, 1.0],
-                [4.0, 0.0, 1.0],
-                [5.0, 1.0, 1.0],
+                Vec3::new(1.0, 1.0, 1.0),
+                Vec3::new(2.0, 0.0, 1.0),
+                Vec3::new(3.0, -1.0, 1.0),
+                Vec3::new(4.0, 0.0, 1.0),
+                Vec3::new(5.0, 1.0, 1.0),
             ];
             PlannerInput::waypoints([0.0, 0.0, 1.0], ZERO3, &pts)
         },
@@ -1034,7 +1032,7 @@ fn bench_planner_scaling_by_piece_count() {
         PlannerInput::waypoints(
             [0.0, 0.0, 1.0],
             ZERO3,
-            &[[2.0, 1.0, 1.0], [4.0, 0.0, 1.0]],
+            &[Vec3::new(2.0, 1.0, 1.0), Vec3::new(4.0, 0.0, 1.0)],
         )
     });
 
@@ -1043,18 +1041,18 @@ fn bench_planner_scaling_by_piece_count() {
         PlannerInput::waypoints(
             [0.0, 0.0, 1.0],
             ZERO3,
-            &[[2.0, 1.0, 1.0], [4.0, -1.0, 1.0], [6.0, 0.0, 1.0]],
+            &[Vec3::new(2.0, 1.0, 1.0), Vec3::new(4.0, -1.0, 1.0), Vec3::new(6.0, 0.0, 1.0)],
         )
     });
 
     // 5 pieces: 4 intermediate waypoints
     time_case("waypoints (4 wp)", 5, || {
         let pts: [Vec3; 5] = [
-            [1.0, 1.0, 1.0],
-            [2.0, 0.0, 1.0],
-            [3.0, -1.0, 1.0],
-            [4.0, 0.0, 1.0],
-            [5.0, 1.0, 1.0],
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::new(2.0, 0.0, 1.0),
+            Vec3::new(3.0, -1.0, 1.0),
+            Vec3::new(4.0, 0.0, 1.0),
+            Vec3::new(5.0, 1.0, 1.0),
         ];
         PlannerInput::waypoints([0.0, 0.0, 1.0], ZERO3, &pts)
     });
@@ -1272,25 +1270,25 @@ fn production_regime_config() -> QuadPlanningConfig {
 
 /// The exact target list hardcoded in `mission_planner.rs` (~line 263).
 const PRODUCTION_WAYPOINTS: [Vec3; 15] = [
-    [-0.3267, -2.231, 1.6],
-    [-1.845, 1.942, 1.0],
-    [2.292, 1.637, 1.0],
-    [2.547, -2.108, 1.8],
-    [2.547, -2.108, 0.8],
-    [0.3099, 0.3554, 1.0],
-    [-2.396, -2.214, 1.0],
-    [-0.3267, -2.231, 1.6],
-    [-1.845, 1.942, 1.0],
-    [2.292, 1.637, 1.0],
-    [2.547, -2.108, 1.8],
-    [2.547, -2.108, 0.8],
-    [0.3099, 0.3554, 1.0],
-    [-2.396, -2.214, 1.0],
-    [-0.3267, -2.231, 1.6],
+    Vec3::new(-0.3267, -2.231, 1.6),
+    Vec3::new(-1.845, 1.942, 1.0),
+    Vec3::new(2.292, 1.637, 1.0),
+    Vec3::new(2.547, -2.108, 1.8),
+    Vec3::new(2.547, -2.108, 0.8),
+    Vec3::new(0.3099, 0.3554, 1.0),
+    Vec3::new(-2.396, -2.214, 1.0),
+    Vec3::new(-0.3267, -2.231, 1.6),
+    Vec3::new(-1.845, 1.942, 1.0),
+    Vec3::new(2.292, 1.637, 1.0),
+    Vec3::new(2.547, -2.108, 1.8),
+    Vec3::new(2.547, -2.108, 0.8),
+    Vec3::new(0.3099, 0.3554, 1.0),
+    Vec3::new(-2.396, -2.214, 1.0),
+    Vec3::new(-0.3267, -2.231, 1.6),
 ];
 
 /// Nominal hover seed used when the firmware issues a plan request.
-const PRODUCTION_START: Vec3 = [0.0, 0.0, 1.0];
+const PRODUCTION_START: Vec3 = Vec3::new(0.0, 0.0, 1.0);
 
 /// Summary of kinematic peaks sampled densely across a trajectory.
 struct KinematicPeaks {
@@ -1318,24 +1316,20 @@ fn sample_kinematic_peaks(
         let j = result.trajectory.get_jerk(t);
         v_max = v_max.max(vec_norm(v));
         a_max = a_max.max(vec_norm(a));
-        let alpha = [a[0], a[1], a[2] + g];
+        let alpha = a + Vec3::new(0.0, 0.0, g);
         let na = vec_norm(alpha).max(1e-8);
-        let zb = [alpha[0] / na, alpha[1] / na, alpha[2] / na];
+        let zb = alpha / na;
         if zb[2] <= -0.9 {
             continue;
         }
-        let dot_zj = zb[0] * j[0] + zb[1] * j[1] + zb[2] * j[2];
-        let dzb = [
-            (j[0] - zb[0] * dot_zj) / na,
-            (j[1] - zb[1] * dot_zj) / na,
-            (j[2] - zb[2] * dot_zj) / na,
-        ];
+        let dot_zj = zb.dot(&j);
+        let dzb = (j - zb * dot_zj) / na;
         let s_inv = 1.0 / (1.0 + zb[2]).max(0.01);
-        let omega = [
+        let omega = Vec3::new(
             -dzb[1] + s_inv * zb[1] * dzb[2],
             dzb[0] - s_inv * zb[0] * dzb[2],
             s_inv * (zb[1] * dzb[0] - zb[0] * dzb[1]),
-        ];
+        );
         let omega_xy = (omega[0] * omega[0] + omega[1] * omega[1]).sqrt();
         omega_xy_max = omega_xy_max.max(omega_xy);
         omega_z_max = omega_z_max.max(omega[2].abs());
@@ -1506,7 +1500,7 @@ fn circle_targets(n_targets: usize, buf: &mut [Vec3; MAX_PIECES_TEST]) -> &[Vec3
     let radius = 2.0f32;
     for i in 0..n_targets {
         let theta = TAU * (i + 1) as f32 / n_targets as f32;
-        buf[i] = [radius * libm::cosf(theta), radius * libm::sinf(theta), 1.0];
+        buf[i] = Vec3::new(radius * libm::cosf(theta), radius * libm::sinf(theta), 1.0);
     }
     &buf[..n_targets]
 }
@@ -1529,7 +1523,7 @@ fn production_regime_piece_count_sweep_to_max() {
     println!(
         "\n=== Production-regime sweep: n ∈ [8, {MAX_PIECES}] (repeating 7-point circuit) ==="
     );
-    let mut buf = [[0.0f32; 3]; MAX_PIECES_TEST];
+    let mut buf = [ZERO3; MAX_PIECES_TEST];
     for n_targets in 8..=MAX_PIECES {
         let targets = circle_targets(n_targets, &mut buf);
         let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, targets);
@@ -1663,10 +1657,10 @@ fn trajectory_is_finite_everywhere() {
     let config = test_config();
     let start = [0.0, 0.0, 1.0];
     let targets: [Vec3; 4] = [
-        [1.0, 2.0, 1.5],
-        [3.0, -1.0, 2.0],
-        [5.0, 1.0, 1.5],
-        [6.0, 0.0, 1.0],
+        Vec3::new(1.0, 2.0, 1.5),
+        Vec3::new(3.0, -1.0, 2.0),
+        Vec3::new(5.0, 1.0, 1.5),
+        Vec3::new(6.0, 0.0, 1.0),
     ];
     let input = PlannerInput::waypoints(start, ZERO3, &targets);
     let result = plan(&input, &config);

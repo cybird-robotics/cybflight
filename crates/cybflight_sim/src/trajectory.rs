@@ -11,7 +11,7 @@ use cybflight_core::trajectory_planning::piecewise_polynomial::PiecewisePolynomi
 use cybflight_core::trajectory_planning::planner::{plan_with_workspace, PlannerInput, SolverStatus};
 use cybflight_core::trajectory_planning::bfgs_trust::BfgsWorkspace;
 use cybflight_core::trajectory_planning::quad_planning_config::QuadPlanningConfig;
-use cybflight_core::trajectory_planning::types::{Vec3, ZERO3};
+use cybflight_core::trajectory_planning::types::ZERO3;
 use nalgebra::Vector3;
 
 /// One reference sample handed to the controller at each tick.
@@ -97,13 +97,10 @@ impl MissionSetpoints {
         targets: &[Vector3<f32>],
         config: &QuadPlanningConfig,
     ) -> (Self, SolverStatus) {
-        let start_arr: Vec3 = [start.x, start.y, start.z];
-        let targets_arr: Vec<Vec3> = targets.iter().map(|v| [v.x, v.y, v.z]).collect();
-
-        let input = if targets_arr.len() == 1 {
-            PlannerInput::goto(start_arr, ZERO3, targets_arr[0])
+        let input = if targets.len() == 1 {
+            PlannerInput::goto(start, ZERO3, targets[0])
         } else {
-            PlannerInput::waypoints(start_arr, ZERO3, &targets_arr)
+            PlannerInput::waypoints(start, ZERO3, targets)
         };
 
         // Own the ~35 KB BFGS workspace on the heap — stack would overflow

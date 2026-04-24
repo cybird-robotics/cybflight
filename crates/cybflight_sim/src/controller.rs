@@ -180,8 +180,7 @@ impl MpcIndiController {
         debug_assert!(horizon.len() == SIMPLE_N + 1);
         for k in 0..=SIMPLE_N {
             let sp = &horizon[k];
-            let acc = [sp.acceleration.x, sp.acceleration.y, sp.acceleration.z];
-            let q_ref = reference_quaternion(acc, sp.yaw, self.grav);
+            let q_ref = reference_quaternion(sp.acceleration, sp.yaw, self.grav);
             self.x_refs[k] = stack![sp.position; q_ref.coords; sp.velocity];
         }
     }
@@ -308,8 +307,7 @@ impl MpcDirectController {
     fn fill_reference(&mut self, horizon: &[Setpoint]) {
         for k in 0..=FULL_N {
             let sp = &horizon[k];
-            let acc = [sp.acceleration.x, sp.acceleration.y, sp.acceleration.z];
-            let q_ref = reference_quaternion(acc, sp.yaw, self.grav);
+            let q_ref = reference_quaternion(sp.acceleration, sp.yaw, self.grav);
             self.x_refs[k] = stack![sp.position; q_ref.coords; sp.velocity; Vector3::zeros()];
         }
     }

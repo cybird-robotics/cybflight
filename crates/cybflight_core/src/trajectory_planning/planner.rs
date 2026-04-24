@@ -82,10 +82,17 @@ impl PlannerInput {
     ///
     /// Flies directly from `start_pos` to `target_pos` along a single polynomial
     /// segment. Initial segment time is estimated from distance.
-    pub fn goto(start_pos: Vec3, start_vel: Vec3, target_pos: Vec3) -> Self {
+    pub fn goto(
+        start_pos: impl Into<Vec3>,
+        start_vel: impl Into<Vec3>,
+        target_pos: impl Into<Vec3>,
+    ) -> Self {
+        let start_pos = start_pos.into();
+        let start_vel = start_vel.into();
+        let target_pos = target_pos.into();
         let head: PVA3D = [start_pos, start_vel, ZERO3];
         let tail: PVA3D = [target_pos, ZERO3, ZERO3];
-        let dist = norm_sq3(sub3(start_pos, target_pos)).sqrt();
+        let dist = (start_pos - target_pos).norm();
         let mut init_times = [0.0f32; MAX_PIECES];
         // Seed segment time generously so the init trajectory stays inside
         // the body-rate and thrust penalty knees. Starting inside an active
@@ -113,11 +120,17 @@ impl PlannerInput {
     /// `start → A → B → C(hover)` with 2 intermediate waypoints and 3 pieces.
     ///
     /// Panics if `targets` is empty.
-    pub fn waypoints(start_pos: Vec3, start_vel: Vec3, targets: &[Vec3]) -> Self {
+    pub fn waypoints(
+        start_pos: impl Into<Vec3>,
+        start_vel: impl Into<Vec3>,
+        targets: &[Vec3],
+    ) -> Self {
         assert!(
             !targets.is_empty(),
             "targets must have at least one position"
         );
+        let start_pos = start_pos.into();
+        let start_vel = start_vel.into();
 
         let last_idx = targets.len() - 1;
         let tail_pos = targets[last_idx];
@@ -139,10 +152,10 @@ impl PlannerInput {
             } else {
                 tail_pos
             };
-            let d = norm_sq3(sub3(prev, next)).sqrt();
             // See the comment in `goto`: seed segment time generously so
             // the init trajectory stays inside the body-rate / thrust
             // penalty knees.
+            let d = (prev - next).norm();
             init_times[i] = d.max(1.0);
             prev = next;
         }
@@ -281,11 +294,7 @@ where
         let dz = x[dim_k + 3 * i + 2];
         let norm_sq = dx * dx + dy * dy + dz * dz;
         let s = 2.0 * r / (norm_sq + 1.0);
-        opt_wp[i] = [
-            input.waypoints[i][0] + s * dx,
-            input.waypoints[i][1] + s * dy,
-            input.waypoints[i][2] + s * dz,
-        ];
+        opt_wp[i] = input.waypoints[i] + Vec3::new(dx, dy, dz) * s;
     }
 
     // Generate final trajectory
@@ -485,11 +494,7 @@ pub fn plan_finalize(
         let dz = session.x[dim_k + 3 * i + 2];
         let norm_sq = dx * dx + dy * dy + dz * dz;
         let s = 2.0 * r / (norm_sq + 1.0);
-        opt_wp[i] = [
-            session.nominal_waypoints[i][0] + s * dx,
-            session.nominal_waypoints[i][1] + s * dy,
-            session.nominal_waypoints[i][2] + s * dz,
-        ];
+        opt_wp[i] = session.nominal_waypoints[i] + Vec3::new(dx, dy, dz) * s;
     }
 
     let mut final_minco = MincoJerk::new(&session.head, &session.tail, session.n_pieces);
@@ -514,7 +519,7 @@ mod tests {
     #[test]
     fn plan_goto_converges() {
         let config = QuadPlanningConfig::default();
-        let input = PlannerInput::goto([0.0, 0.0, 1.0], ZERO3, [3.0, 0.0, 1.0]);
+        let input = PlannerInput::goto(Vec3::new(0.0, 0.0, 1.0), ZERO3, Vec3::new(3.0, 0.0, 1.0));
         let result = plan(&input, &config);
 
         assert!(
@@ -541,8 +546,12 @@ mod tests {
     #[test]
     fn plan_waypoints_converges() {
         let config = QuadPlanningConfig::default();
-        let targets = [[2.0, 0.0, 1.0], [4.0, 2.0, 1.0], [6.0, 0.0, 1.0]];
-        let input = PlannerInput::waypoints([0.0, 0.0, 1.0], ZERO3, &targets);
+        let targets = [
+            Vec3::new(2.0, 0.0, 1.0),
+            Vec3::new(4.0, 2.0, 1.0),
+            Vec3::new(6.0, 0.0, 1.0),
+        ];
+        let input = PlannerInput::waypoints(Vec3::new(0.0, 0.0, 1.0), ZERO3, &targets);
         let result = plan(&input, &config);
 
         assert!(

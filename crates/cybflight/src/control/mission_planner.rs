@@ -43,7 +43,7 @@
 use core::sync::atomic::Ordering;
 
 use cybflight_core::trajectory_planning::MAX_PIECES;
-use embassy_time::{Duration, Instant};
+use embassy_time::{Duration, Instant, Timer};
 use static_cell::StaticCell;
 
 use cybflight_core::trajectory_planning::bfgs_trust::BfgsWorkspace;
@@ -88,7 +88,15 @@ const SETPOINT_STALE_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Hard ceiling on trajectory duration. Rejects pathological solves that
 /// would leave the vehicle committed to a 10-minute mission.
-const MAX_TRAJECTORY_DURATION_S: f32 = 30.0;
+///
+/// Sized to admit legitimate long-circuit solves: a 19-piece mission with
+/// the `d.max(1.0)` seed (init ≈ 60 s) converges to ~30 s in flight, which
+/// tripped a previous 30 s cap. 120 s gives comfortable headroom for a
+/// 20-piece circuit at ~3 m/s while still catching runaway solves; the
+/// `compression_ok` guard (dur < 0.9 × init_dur) independently rejects
+/// under-compressed trajectories, so this ceiling is a belt-and-braces
+/// check rather than the primary gate.
+const MAX_TRAJECTORY_DURATION_S: f32 = 120.0;
 
 /// Hard floor on trajectory duration. A solve producing near-zero duration
 /// means the solver collapsed all segment times — almost certainly invalid.
@@ -111,21 +119,32 @@ const MIN_TRAJECTORY_DURATION_S: f32 = 0.5;
 const SOLVE_BUDGET: Duration = Duration::from_millis(5000);
 
 /// Outer BFGS iterations per cooperative-yield burst. After this many
-/// iterations the solver returns to the async context so peer thread-
-/// executor tasks (MPC outer loop, ESKF, GPS, baro, mag) can run; we
-/// then `yield_now().await` and resume the solve.
+/// iterations the solver hands control back to the async runtime so peer
+/// thread-executor tasks (MPC outer loop, ESKF, GPS, baro, mag) can run.
 ///
-/// Set to 1: one outer iteration of MINCO + cost eval is ~1–3 ms on
-/// STM32H743. Yielding every iteration limits the uninterrupted CPU
-/// window to ~3 ms — the MPC outer loop (10 ms timer, ~4 ms tick body)
-/// is therefore delayed by at most one burst duration, keeping its
-/// effective rate close to the intended 100 Hz.
-///
-/// Note: the effective yield overhead is NOT the bare yield_now() cost
-/// (~2–5 μs). When the outer_loop timer fires during a yield, the
-/// ~4 ms MPC solve runs before mission_planner resumes, producing an
-/// average ~1.6 ms overhead per yield. SOLVE_BUDGET accounts for this.
+/// Set to 1: one outer iteration of MINCO + cost eval is ~15–22 ms on
+/// STM32H743 at the current `num_check_per_piece`. Yielding every
+/// iteration keeps the uninterrupted CPU window bounded by a single iter.
 const BFGS_ITERS_PER_YIELD: usize = 1;
+
+/// Minimum wall-clock gap between BFGS bursts.
+///
+/// A bare `yield_now().await` only marks the task ready again immediately,
+/// so the scheduler will re-poll mission_planner as soon as no other task
+/// is actively runnable — which on STM32 means it usually resumes before
+/// the outer_loop's 10 ms `Ticker` fires even once. The result is that
+/// during Planning the outer_loop runs at ~40–60 Hz (one tick per BFGS
+/// iter) instead of its designed 100 Hz, which causes the MPC's 1-iter
+/// SQP warm-start to go stale and the drone to stutter / jump on the Z
+/// axis while the planner is active.
+///
+/// Using `Timer::after(INTER_BURST_DELAY)` instead of `yield_now` forces
+/// mission_planner to be *unready* for a fixed window, guaranteeing the
+/// outer_loop's pending tick gets scheduled. 1 ms is long enough to admit
+/// a 10 ms-period tick that was queued during the BFGS iter, and short
+/// enough that the extra cost per solve is ~`max_iterations × 1 ms`
+/// (≤500 ms, well inside SOLVE_BUDGET).
+const INTER_BURST_DELAY: Duration = Duration::from_millis(1);
 
 /// Build the hardcoded circular waypoint list returning to `start`.
 ///
@@ -276,10 +295,10 @@ pub async fn mission_planner_task() {
             [0.3099, 0.3554, 1.0],
             [-2.396, -2.214, 1.0],
             [-0.3267, -2.231, 1.6],
-            // [-1.845, 1.942, 1.0],
-            // [2.292, 1.637, 1.0],
-            // [2.547, -2.108, 1.8],
-            // [2.547, -2.108, 0.8],
+            [-1.845, 1.942, 1.0],
+            [2.292, 1.637, 1.0],
+            [2.547, -2.108, 1.8],
+            [2.547, -2.108, 0.8],
         ];
 
         let input = PlannerInput::waypoints(start_pos, start_vel, &targets);
@@ -317,10 +336,12 @@ pub async fn mission_planner_task() {
         // lands in `MISSION_TRAJECTORY_SLOT` from a disarmed attempt.
         //
         // Cooperative yielding: the solve runs in bursts of
-        // `BFGS_ITERS_PER_YIELD` iterations. Between bursts we
-        // `yield_now().await` so peer thread-executor tasks (GPS,
-        // baro, mag) get scheduled — a long solve no longer starves
-        // them for the full 250 ms budget.
+        // `BFGS_ITERS_PER_YIELD` iterations. Between bursts we sleep
+        // for `INTER_BURST_DELAY` so peer thread-executor tasks (MPC
+        // outer loop, ESKF, GPS, baro, mag) get a scheduling slot that
+        // mission_planner cannot immediately reclaim — without this
+        // delay, the outer_loop runs at ~40–60 Hz during Planning and
+        // the drone stutters vertically while BFGS solves.
         let t0 = Instant::now();
         let deadline = t0 + SOLVE_BUDGET;
         let mut keep_going =
@@ -338,9 +359,12 @@ pub async fn mission_planner_task() {
                 Some(s) => break s,
                 None => {
                     // Burst done but solver still running. Re-check the
-                    // abort conditions eagerly (cheap) and then yield so
-                    // GPS / baro / mag tasks can make progress before we
-                    // start the next burst.
+                    // abort conditions eagerly (cheap) and then sleep
+                    // for INTER_BURST_DELAY — a bare yield_now would let
+                    // mission_planner reclaim the CPU before the
+                    // outer_loop's 10 ms tick fires, leaving MPC running
+                    // at only ~50 Hz and causing visible motor stutter
+                    // during Planning.
                     if !keep_going() {
                         break SolverStatus::TimeExceeded;
                     }
@@ -356,7 +380,7 @@ pub async fn mission_planner_task() {
                             solve: msgs::SolveDiagnostics::NONE,
                         });
                     }
-                    embassy_futures::yield_now().await;
+                    Timer::after(INTER_BURST_DELAY).await;
                 }
             }
         };
@@ -377,6 +401,21 @@ pub async fn mission_planner_task() {
             result.status as u8
         );
 
+        // Build a `SolveDiagnostics` stamped with the given reject reason.
+        // Used by every Planning → Idle transition below to emit a
+        // breadcrumb `MissionStatus` frame so the GCS can distinguish
+        // the reject paths without RTT/defmt access.
+        let mk_reject_solve = |reason: u8| msgs::SolveDiagnostics {
+            status: result.status as u8,
+            iterations: result.iterations.min(u16::MAX as usize) as u16,
+            solve_time_ms: elapsed_ms.min(u16::MAX as u64) as u16,
+            num_pieces: result.num_pieces.min(u8::MAX as usize) as u8,
+            init_duration_s,
+            final_cost: result.final_cost,
+            peak_vel_m_s: 0.0,
+            reject_reason: reason,
+        };
+
         // Classify the outcome.
         //
         // `TimeExceeded` is the graceful-abort path: the solver hit
@@ -389,17 +428,27 @@ pub async fn mission_planner_task() {
             // Either the wall-clock budget elapsed, or IS_ARMED cleared
             // (emergency disarm). Both are graceful exits; distinguish
             // in the log so the pilot/defmt reader knows why.
-            if !crate::motors::IS_ARMED.load(Ordering::Acquire) {
+            let reject_reason = if !crate::motors::IS_ARMED.load(Ordering::Acquire) {
                 defmt::warn!(
                     "mission_planner: disarm detected mid-solve — aborting (no trajectory)"
                 );
+                msgs::SOLVE_REJECT_DISARMED
             } else {
                 defmt::warn!(
                     "mission_planner: solve exceeded {}ms budget — aborting mission cleanly",
                     SOLVE_BUDGET.as_millis()
                 );
-            }
+                msgs::SOLVE_REJECT_BUDGET_EXCEEDED
+            };
             MISSION_STATE.store(MissionState::Idle as u8, Ordering::Release);
+            mission_status_pub.publish_immediate(msgs::MissionStatus {
+                timestamp: Instant::now(),
+                state: MissionState::Idle as u8,
+                tau_s: 0.0,
+                total_duration_s: 0.0,
+                target_position: start_position,
+                solve: mk_reject_solve(reject_reason),
+            });
             continue;
         }
 
@@ -419,21 +468,38 @@ pub async fn mission_planner_task() {
         // exit at a cost far from the true optimum. Rejecting here keeps
         // the pilot hovering on the pre-mission setpoint.
         let compression_ok = dur < 0.9 * init_duration_s;
-        let valid = converged
+        // Split the `!valid` check so the reject breadcrumb can carry a
+        // specific reason (`INVALID` vs `UNDER_COMPRESSED`) instead of a
+        // generic flag.
+        let basic_valid = converged
             && dur.is_finite()
             && dur >= MIN_TRAJECTORY_DURATION_S
             && dur <= MAX_TRAJECTORY_DURATION_S
-            && result.final_cost.is_finite()
-            && compression_ok;
+            && result.final_cost.is_finite();
+        let valid = basic_valid && compression_ok;
 
         if !valid {
+            let reject_reason = if !basic_valid {
+                msgs::SOLVE_REJECT_INVALID
+            } else {
+                msgs::SOLVE_REJECT_UNDER_COMPRESSED
+            };
             defmt::warn!(
-                "mission_planner: rejecting trajectory (status={}, dur={}, init_dur={})",
+                "mission_planner: rejecting trajectory (status={}, dur={}, init_dur={}, reason={})",
                 result.status as u8,
                 dur,
                 init_duration_s,
+                reject_reason,
             );
             MISSION_STATE.store(MissionState::Idle as u8, Ordering::Release);
+            mission_status_pub.publish_immediate(msgs::MissionStatus {
+                timestamp: Instant::now(),
+                state: MissionState::Idle as u8,
+                tau_s: 0.0,
+                total_duration_s: dur,
+                target_position: start_position,
+                solve: mk_reject_solve(reject_reason),
+            });
             continue;
         }
 
@@ -445,6 +511,14 @@ pub async fn mission_planner_task() {
             defmt::info!("mission_planner: user aborted during solve, trajectory discarded");
             MISSION_ABORT_REQUESTED.store(false, Ordering::Release);
             MISSION_STATE.store(MissionState::Idle as u8, Ordering::Release);
+            mission_status_pub.publish_immediate(msgs::MissionStatus {
+                timestamp: Instant::now(),
+                state: MissionState::Idle as u8,
+                tau_s: 0.0,
+                total_duration_s: dur,
+                target_position: start_position,
+                solve: mk_reject_solve(msgs::SOLVE_REJECT_USER_ABORT),
+            });
             continue;
         }
 
@@ -460,6 +534,14 @@ pub async fn mission_planner_task() {
                 "mission_planner: state left Planning during solve ({}), discarding",
                 state_now as u8
             );
+            mission_status_pub.publish_immediate(msgs::MissionStatus {
+                timestamp: Instant::now(),
+                state: state_now as u8,
+                tau_s: 0.0,
+                total_duration_s: dur,
+                target_position: start_position,
+                solve: mk_reject_solve(msgs::SOLVE_REJECT_STATE_CHANGED),
+            });
             continue;
         }
 
@@ -510,6 +592,7 @@ pub async fn mission_planner_task() {
             init_duration_s,
             final_cost: result.final_cost,
             peak_vel_m_s,
+            reject_reason: msgs::SOLVE_REJECT_NONE,
         };
 
         let t_start = Instant::now();
@@ -536,6 +619,16 @@ pub async fn mission_planner_task() {
             defmt::warn!(
                 "mission_planner: publish suppressed (abort/state changed during lock acquisition)"
             );
+            let mut race_solve = solve;
+            race_solve.reject_reason = msgs::SOLVE_REJECT_PUBLISH_RACE;
+            mission_status_pub.publish_immediate(msgs::MissionStatus {
+                timestamp: Instant::now(),
+                state: MissionState::from_u8(MISSION_STATE.load(Ordering::Acquire)) as u8,
+                tau_s: 0.0,
+                total_duration_s: dur,
+                target_position: start_position,
+                solve: race_solve,
+            });
             continue;
         }
         defmt::info!(

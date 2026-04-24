@@ -75,7 +75,7 @@ impl Default for QuadModel {
         let mass = 0.55;
         let grav = 9.81;
         // Sum of per-motor max thrusts from QUADROTOR_MOTORS (4 × 8.5 N).
-        let max_collective_thrust_n: f32 = 4.0 * 12.0;
+        let max_collective_thrust_n: f32 = 4.0 * 12.5;
         Self {
             mass,
             grav,

@@ -77,7 +77,7 @@ const THRUST_NONLINEARITY: f32 = match THRUST_MODEL {
 };
 
 /// Default INDI motor parameters.
-const MAX_RPM: f32 = 33000.0;
+const MAX_RPM: f32 = 40000.0;
 const TIME_CONSTANT: f32 = 0.015;
 
 const INDI_MOTOR_PARAMS: [IndiMotorParams; NU] = [

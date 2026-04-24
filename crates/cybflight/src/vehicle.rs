@@ -25,33 +25,35 @@ pub const QUADROTOR_BODY: RigidBodyParams = RigidBodyParams {
     max_rate_rad_s: [10.0, 10.0, 6.0],
 };
 
+const MAX_THRUST_N: f32 = 12.5;
+
 pub const QUADROTOR_MOTORS: [MotorParams; 4] = [
     // M0: REAR_RIGHT — CW, position (−d, −d) in FLU (right = −y).
     MotorParams {
         position_m: [-0.075, -0.1],
         spin_dir: SpinDir::Cw,
-        max_thrust_n: 12.0, // ~600 g per motor for a 5" prop. Calibrate from test stand.
+        max_thrust_n: MAX_THRUST_N, // ~600 g per motor for a 5" prop. Calibrate from test stand.
         torque_coeff_m: 0.022,
     },
     // M1: FRONT_RIGHT — CCW, position (+d, −d) in FLU.
     MotorParams {
         position_m: [0.075, -0.1],
         spin_dir: SpinDir::Ccw,
-        max_thrust_n: 12.0,
+        max_thrust_n: MAX_THRUST_N,
         torque_coeff_m: 0.022,
     },
     // M2: REAR_LEFT — CCW, position (−d, +d) in FLU (left = +y).
     MotorParams {
         position_m: [-0.075, 0.1],
         spin_dir: SpinDir::Ccw,
-        max_thrust_n: 12.0,
+        max_thrust_n: MAX_THRUST_N,
         torque_coeff_m: 0.022,
     },
     // M3: FRONT_LEFT — CW, position (+d, +d) in FLU.
     MotorParams {
         position_m: [0.075, 0.1],
         spin_dir: SpinDir::Cw,
-        max_thrust_n: 12.0,
+        max_thrust_n: MAX_THRUST_N,
         torque_coeff_m: 0.022,
     },
 ];

@@ -139,7 +139,7 @@ impl MpcIndiController {
             body: vp.body,
             indi_motors: [IndiMotorParams {
                 time_const_s: 0.015,
-                max_rpm: 33000.0,
+                max_rpm: 40000.0,
                 g2_yaw: 0.0,
             }; INDI_NU],
             thrust_model: ThrustModel::Quadratic,
@@ -205,9 +205,8 @@ impl MpcIndiController {
         let u_bar = self.solver.u_bar();
         let u0 = u_bar[0];
         let bounds = self.problem.model.u_bounds;
-        self.last_mpc_u = SVector::<f32, SIMPLE_NU>::from_fn(|i, _| {
-            u0[i].clamp(bounds[i][0], bounds[i][1])
-        });
+        self.last_mpc_u =
+            SVector::<f32, SIMPLE_NU>::from_fn(|i, _| u0[i].clamp(bounds[i][0], bounds[i][1]));
         self.u_warm = *u_bar;
     }
 }

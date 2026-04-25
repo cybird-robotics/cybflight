@@ -128,6 +128,28 @@ pub struct IndiController {
     freq: f32,
 }
 
+/// Source of filtered motor speed and acceleration used inside `step`.
+///
+/// `Internal`: ω_fs comes from `update_rpm` (internal biquad on the
+///   `RpmTracker` output); ω̇_fs comes from the du-based fallback
+///   `prev_du · g2_scaler · omega_inv`.
+/// `External`: caller supplies pre-filtered ω, ω̇ (e.g. from a dshot LPF +
+///   finite difference in the task layer). The internal `update_rpm`
+///   path is bypassed for this step's `dv` and `combined_g1g2` inputs.
+///
+/// Safety: if any element of an `External` payload is non-finite, `step`
+/// silently falls back to the `Internal` computation for that call. Don't
+/// rely on this as your only line of defense — the caller should still
+/// reject obviously bad inputs upstream.
+#[derive(Clone, Copy)]
+pub enum MotorState<'a> {
+    Internal,
+    External {
+        omega_fs: &'a SVector<f32, NU>,
+        omega_dot_fs: &'a SVector<f32, NU>,
+    },
+}
+
 /// Output of one INDI iteration.
 #[derive(Clone, Copy)]
 pub struct IndiOutput {
@@ -314,6 +336,7 @@ impl IndiController {
         spf_sp_z: f32,
         armed: bool,
         g2_valid: &[bool; NU],
+        motor_state: MotorState<'_>,
     ) -> (IndiOutput, IndiStepState) {
         // --- 1. Sensor processing ---
         self.rate_dot_estimator.update(gyro_rad_s);
@@ -322,18 +345,41 @@ impl IndiController {
 
         let spf_fs = Vector3::from(self.spf_filter.apply((*accel_m_s2).into()));
 
-        // Motor acceleration via du-based fallback (matches C when no dshot RPM derivative).
-        let mut omega_dot_fs = SVector::<f32, NU>::zeros();
-
-        for i in 0..NU {
-            let inv_thresh = 0.1 * self.effectiveness.max_omega[i];
-            let omega_inv = if self.prev_omega_fs[i].abs() > inv_thresh {
-                1.0 / self.prev_omega_fs[i]
-            } else {
-                1.0 / inv_thresh
+        // Resolve filtered motor speed and acceleration. `Internal` matches the
+        // C reference (du-based fallback); `External` consumes a caller-supplied
+        // dshot-derived pair. A non-finite element in either External vector
+        // forces the same-step fallback to Internal — protects WLS from NaN
+        // injection if the upstream LPF + finite-diff produces a bad sample.
+        let used_external = matches!(motor_state, MotorState::External { .. })
+            && match motor_state {
+                MotorState::External {
+                    omega_fs,
+                    omega_dot_fs,
+                } => {
+                    omega_fs.iter().all(|v| v.is_finite())
+                        && omega_dot_fs.iter().all(|v| v.is_finite())
+                }
+                MotorState::Internal => false,
             };
-            omega_dot_fs[i] = self.prev_du[i] * self.effectiveness.g2_scaler[i] * omega_inv;
-        }
+        let (omega_fs_vec, omega_dot_fs) = match motor_state {
+            MotorState::External {
+                omega_fs,
+                omega_dot_fs,
+            } if used_external => (*omega_fs, *omega_dot_fs),
+            _ => {
+                let mut omega_dot = SVector::<f32, NU>::zeros();
+                for i in 0..NU {
+                    let inv_thresh = 0.1 * self.effectiveness.max_omega[i];
+                    let omega_inv = if self.prev_omega_fs[i].abs() > inv_thresh {
+                        1.0 / self.prev_omega_fs[i]
+                    } else {
+                        1.0 / inv_thresh
+                    };
+                    omega_dot[i] = self.prev_du[i] * self.effectiveness.g2_scaler[i] * omega_inv;
+                }
+                (self.prev_omega_fs, omega_dot)
+            }
+        };
 
         // Actuator state filtering
         self.u_state_fs = self
@@ -364,7 +410,6 @@ impl IndiController {
         ];
 
         // --- 5. Combined effectiveness matrix ---
-        let omega_fs_vec = self.prev_omega_fs;
         let g1g2: SMatrix<f32, NV, NU> = self.effectiveness.combined_g1g2(&omega_fs_vec, g2_valid);
 
         // --- 6. WLS allocation ---
@@ -414,7 +459,19 @@ impl IndiController {
 
         let motor_commands =
             SVector::<_, NU>::from_fn(|i, _| self.linearization[i].linearize(u[i]));
-        self.prev_du = u - self.u_state;
+        // `prev_du` only feeds the Internal du-based ω̇ fallback. While in
+        // External mode, ω̇ comes from telemetry and prev_du isn't read — we
+        // also zero it here so a transition back to Internal starts the next
+        // step with `omega_dot = 0` instead of a value that reflects the
+        // External-mode WLS history (which was solved with a different ω̇
+        // source). The first Internal step after a fallback then has no
+        // model-based ω̇ contribution; subsequent steps recompute prev_du
+        // normally from the latest u/u_state.
+        self.prev_du = if used_external {
+            SVector::zeros()
+        } else {
+            u - self.u_state
+        };
 
         if motor_commands.iter().all(|v| v.is_finite()) {
             self.update_actuator_state(&motor_commands);
@@ -518,9 +575,9 @@ mod tests {
         let mut ctrl = IndiController::new(&test_config(), LOOP_HZ);
         let (gyro, accel, rate_sp, spf_sp_z) = hover_inputs();
         let g2 = [false; NU];
-        let mut out = ctrl.step(&gyro, &accel, &rate_sp, spf_sp_z, true, &g2).0;
+        let mut out = ctrl.step(&gyro, &accel, &rate_sp, spf_sp_z, true, &g2, MotorState::Internal).0;
         for _ in 0..200 {
-            out = ctrl.step(&gyro, &accel, &rate_sp, spf_sp_z, true, &g2).0;
+            out = ctrl.step(&gyro, &accel, &rate_sp, spf_sp_z, true, &g2, MotorState::Internal).0;
         }
         let mean = out.motor_commands.iter().sum::<f32>() / NU as f32;
         for (i, &c) in out.motor_commands.iter().enumerate() {
@@ -551,7 +608,7 @@ mod tests {
         ];
         for (gyro, rate_sp, spf) in cases {
             for _ in 0..50 {
-                let out = ctrl.step(gyro, &accel, rate_sp, *spf, true, &g2).0;
+                let out = ctrl.step(gyro, &accel, rate_sp, *spf, true, &g2, MotorState::Internal).0;
                 for (i, &c) in out.motor_commands.iter().enumerate() {
                     assert!(c >= 0.0 && c <= 1.0, "motor {i} = {c}");
                 }
@@ -572,16 +629,17 @@ mod tests {
                 GRAVITY,
                 true,
                 &g2,
+                MotorState::Internal,
             )
             .0;
         }
         let rate_sp = Vector3::new(3.0, 0.0, 0.0);
         let mut out = ctrl
-            .step(&Vector3::zeros(), &accel, &rate_sp, GRAVITY, true, &g2)
+            .step(&Vector3::zeros(), &accel, &rate_sp, GRAVITY, true, &g2, MotorState::Internal)
             .0;
         for _ in 0..50 {
             out = ctrl
-                .step(&Vector3::zeros(), &accel, &rate_sp, GRAVITY, true, &g2)
+                .step(&Vector3::zeros(), &accel, &rate_sp, GRAVITY, true, &g2, MotorState::Internal)
                 .0;
         }
         let left = (out.motor_commands[2] + out.motor_commands[3]) / 2.0;
@@ -594,7 +652,7 @@ mod tests {
         let mut ctrl = IndiController::new(&test_config(), LOOP_HZ);
         let (g, a, r, s) = hover_inputs();
         for _ in 0..50 {
-            let out = ctrl.step(&g, &a, &r, s, false, &[false; NU]).0;
+            let out = ctrl.step(&g, &a, &r, s, false, &[false; NU], MotorState::Internal).0;
             assert!(!out.nan_failsafe);
             for &c in &out.motor_commands {
                 assert!(c.is_finite() && c >= 0.0 && c <= 1.0);
@@ -609,10 +667,10 @@ mod tests {
         let accel = Vector3::new(0.0, 0.0, GRAVITY);
         let g2 = [false; NU];
         let out1 = ctrl
-            .step(&gyro, &accel, &Vector3::zeros(), 2.0, false, &g2)
+            .step(&gyro, &accel, &Vector3::zeros(), 2.0, false, &g2, MotorState::Internal)
             .0;
         let out2 = ctrl
-            .step(&gyro, &accel, &Vector3::zeros(), 2.0, false, &g2)
+            .step(&gyro, &accel, &Vector3::zeros(), 2.0, false, &g2, MotorState::Internal)
             .0;
         for &c in &out1.motor_commands {
             assert!(c.is_finite() && c >= 0.0 && c <= 1.0);
@@ -630,10 +688,10 @@ mod tests {
         let r = Vector3::zeros();
         let g2 = [false; NU];
         for _ in 0..50 {
-            ctrl.step(&g, &a, &r, 2.0, false, &g2).0;
+            ctrl.step(&g, &a, &r, 2.0, false, &g2, MotorState::Internal).0;
         }
-        let ground = ctrl.step(&g, &a, &r, 2.0, false, &g2).0;
-        let air = ctrl.step(&g, &a, &r, GRAVITY, true, &g2).0;
+        let ground = ctrl.step(&g, &a, &r, 2.0, false, &g2, MotorState::Internal).0;
+        let air = ctrl.step(&g, &a, &r, GRAVITY, true, &g2, MotorState::Internal).0;
         for i in 0..NU {
             assert!(
                 (air.motor_commands[i] - ground.motor_commands[i]).abs() < 0.5,
@@ -694,7 +752,7 @@ mod tests {
         let g2 = [false; NU];
         for _ in 0..100 {
             let out = ctrl
-                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &g2)
+                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &g2, MotorState::Internal)
                 .0;
             assert!(
                 out.motor_commands[0] <= 0.8 + 1e-6,
@@ -711,7 +769,7 @@ mod tests {
         let g2 = [false; NU];
         let mut prev = SVector::from_element(0.0f32);
         for step in 0..500 {
-            let out = ctrl.step(&g, &a, &r, s, true, &g2).0;
+            let out = ctrl.step(&g, &a, &r, s, true, &g2, MotorState::Internal).0;
             let max_change = (out.motor_commands - prev).abs().max();
 
             if step > 100 && max_change < 1e-5 {
@@ -728,17 +786,17 @@ mod tests {
         let a = Vector3::new(0.0, 0.0, GRAVITY);
         let g2 = [false; NU];
         for _ in 0..100 {
-            ctrl.step(&Vector3::zeros(), &a, &Vector3::zeros(), GRAVITY, true, &g2)
+            ctrl.step(&Vector3::zeros(), &a, &Vector3::zeros(), GRAVITY, true, &g2, MotorState::Internal)
                 .0;
         }
         let hover = ctrl
-            .step(&Vector3::zeros(), &a, &Vector3::zeros(), GRAVITY, true, &g2)
+            .step(&Vector3::zeros(), &a, &Vector3::zeros(), GRAVITY, true, &g2, MotorState::Internal)
             .0;
         let gyro = Vector3::new(100.0f32.to_radians(), 0.0, 0.0);
         let mut spin = hover;
         for _ in 0..20 {
             spin = ctrl
-                .step(&gyro, &a, &Vector3::zeros(), GRAVITY, true, &g2)
+                .step(&gyro, &a, &Vector3::zeros(), GRAVITY, true, &g2, MotorState::Internal)
                 .0;
         }
         let diff = spin
@@ -758,7 +816,7 @@ mod tests {
         // Settle until converged (filters + actuator state)
         let mut prev = SVector::<f32, NU>::zeros();
         for step in 0..1000 {
-            let out = ctrl.step(&g, &a, &r, s, true, &g2).0;
+            let out = ctrl.step(&g, &a, &r, s, true, &g2, MotorState::Internal).0;
             let max_change = out
                 .motor_commands
                 .iter()
@@ -777,7 +835,7 @@ mod tests {
         // Now check 10 subsequent outputs are nearly identical
         let mut outputs = Vec::new();
         for _ in 0..10 {
-            outputs.push(ctrl.step(&g, &a, &r, s, true, &g2).0.motor_commands);
+            outputs.push(ctrl.step(&g, &a, &r, s, true, &g2, MotorState::Internal).0.motor_commands);
         }
         for i in 1..10 {
             let diff = outputs[i]
@@ -821,7 +879,7 @@ mod tests {
         ];
         for (gyro, rate_sp, spf, armed) in cases {
             for _ in 0..50 {
-                let out = ctrl.step(gyro, &a, rate_sp, *spf, *armed, &g2).0;
+                let out = ctrl.step(gyro, &a, rate_sp, *spf, *armed, &g2, MotorState::Internal).0;
                 for (i, &c) in out.motor_commands.iter().enumerate() {
                     assert!(c.is_finite() && c >= 0.0 && c <= 1.0, "motor {i} = {c}");
                 }
@@ -846,17 +904,17 @@ mod tests {
         for _ in 0..100 {
             ctrl_g2.update_rpm(&[RpmInput::Erpm(20000); NU]);
             ctrl_g2
-                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU])
+                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU], MotorState::Internal)
                 .0;
             ctrl_no
-                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU])
+                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU], MotorState::Internal)
                 .0;
         }
         let out_g2 = ctrl_g2
-            .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU])
+            .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU], MotorState::Internal)
             .0;
         let out_no = ctrl_no
-            .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU])
+            .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU], MotorState::Internal)
             .0;
         let diff = out_g2
             .motor_commands
@@ -908,18 +966,18 @@ mod tests {
         for _ in 0..100 {
             ctrl_g2.update_rpm(&[RpmInput::Erpm(20000); NU]);
             ctrl_g2
-                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU])
+                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU], MotorState::Internal)
                 .0;
             ctrl_no
-                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU])
+                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU], MotorState::Internal)
                 .0;
         }
 
         let out_g2 = ctrl_g2
-            .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU])
+            .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU], MotorState::Internal)
             .0;
         let out_no = ctrl_no
-            .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU])
+            .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU], MotorState::Internal)
             .0;
 
         // G2 should modify the allocation but not invert it.
@@ -944,7 +1002,7 @@ mod tests {
         ctrl.update_rpm(&[RpmInput::Erpm(20000); NU]);
 
         // First step: establishes prev_du
-        ctrl.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU])
+        ctrl.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU], MotorState::Internal)
             .0;
 
         // Second step with G2 vs without G2: the omegaDot contribution to dv
@@ -957,18 +1015,18 @@ mod tests {
         // Run both for enough steps to have meaningful prev_du
         for _ in 0..50 {
             ctrl2_g2
-                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU])
+                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU], MotorState::Internal)
                 .0;
             ctrl2_no
-                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU])
+                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU], MotorState::Internal)
                 .0;
         }
 
         let out_g2 = ctrl2_g2
-            .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU])
+            .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU], MotorState::Internal)
             .0;
         let out_no = ctrl2_no
-            .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU])
+            .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[false; NU], MotorState::Internal)
             .0;
 
         let diff = out_g2
@@ -995,11 +1053,11 @@ mod tests {
 
         // All G2 active
         for _ in 0..100 {
-            ctrl.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU])
+            ctrl.step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU], MotorState::Internal)
                 .0;
         }
         let out_all = ctrl
-            .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU])
+            .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &[true; NU], MotorState::Internal)
             .0;
 
         // Reset and run with M0 G2 disabled
@@ -1010,11 +1068,11 @@ mod tests {
 
         for _ in 0..100 {
             ctrl2
-                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &g2_partial)
+                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &g2_partial, MotorState::Internal)
                 .0;
         }
         let out_partial = ctrl2
-            .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &g2_partial)
+            .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &g2_partial, MotorState::Internal)
             .0;
 
         // Outputs should differ (M0's G2 column removed changes allocation)
@@ -1028,5 +1086,256 @@ mod tests {
             diff > 1e-6,
             "disabling one motor's G2 should change allocation: diff={diff}"
         );
+    }
+
+    #[test]
+    fn external_motor_state_matches_internal_when_fed_internal_values() {
+        // Drive two controllers in lockstep with identical Internal-mode steps.
+        // On the final step, the External branch is fed the exact same ω_fs and
+        // du-fallback ω̇_fs that Internal would compute. Outputs must match.
+        let cfg = g2_config();
+        let mut ctrl_int = IndiController::new(&cfg, LOOP_HZ);
+        let mut ctrl_ext = IndiController::new(&cfg, LOOP_HZ);
+        let a = Vector3::new(0.0, 0.0, GRAVITY);
+        let rate_sp = Vector3::new(0.0, 0.0, 3.0);
+
+        // Settle both with G2 active. Identical inputs → identical state.
+        for _ in 0..50 {
+            ctrl_int.update_rpm(&[RpmInput::Erpm(20000); NU]);
+            ctrl_ext.update_rpm(&[RpmInput::Erpm(20000); NU]);
+            ctrl_int
+                .step(
+                    &Vector3::zeros(),
+                    &a,
+                    &rate_sp,
+                    GRAVITY,
+                    true,
+                    &[true; NU],
+                    MotorState::Internal,
+                )
+                .0;
+            ctrl_ext
+                .step(
+                    &Vector3::zeros(),
+                    &a,
+                    &rate_sp,
+                    GRAVITY,
+                    true,
+                    &[true; NU],
+                    MotorState::Internal,
+                )
+                .0;
+        }
+
+        // Final update_rpm BEFORE the snapshot — Internal will see this same
+        // post-update prev_omega_fs when its own step runs.
+        ctrl_int.update_rpm(&[RpmInput::Erpm(20000); NU]);
+        ctrl_ext.update_rpm(&[RpmInput::Erpm(20000); NU]);
+
+        // Reconstruct what Internal would compute for ω_fs / ω̇_fs at the start
+        // of the next step from ctrl_ext's own state.
+        let omega_fs = ctrl_ext.prev_omega_fs;
+        let mut omega_dot_fs = SVector::<f32, NU>::zeros();
+        for i in 0..NU {
+            let inv_thresh = 0.1 * ctrl_ext.effectiveness.max_omega[i];
+            let omega_inv = if ctrl_ext.prev_omega_fs[i].abs() > inv_thresh {
+                1.0 / ctrl_ext.prev_omega_fs[i]
+            } else {
+                1.0 / inv_thresh
+            };
+            omega_dot_fs[i] =
+                ctrl_ext.prev_du[i] * ctrl_ext.effectiveness.g2_scaler[i] * omega_inv;
+        }
+
+        let out_int = ctrl_int
+            .step(
+                &Vector3::zeros(),
+                &a,
+                &rate_sp,
+                GRAVITY,
+                true,
+                &[true; NU],
+                MotorState::Internal,
+            )
+            .0;
+        let out_ext = ctrl_ext
+            .step(
+                &Vector3::zeros(),
+                &a,
+                &rate_sp,
+                GRAVITY,
+                true,
+                &[true; NU],
+                MotorState::External {
+                    omega_fs: &omega_fs,
+                    omega_dot_fs: &omega_dot_fs,
+                },
+            )
+            .0;
+        for i in 0..NU {
+            let d = (out_int.motor_commands[i] - out_ext.motor_commands[i]).abs();
+            assert!(
+                d < 1e-6,
+                "External fed Internal-equivalent values diverged on motor {i}: \
+                 int={} ext={} diff={d}",
+                out_int.motor_commands[i],
+                out_ext.motor_commands[i],
+            );
+        }
+    }
+
+    #[test]
+    fn external_non_finite_inputs_fall_back_to_internal() {
+        // A non-finite element in either External vector must NOT propagate
+        // into motor_commands. The controller silently falls back to the
+        // Internal computation for that step. WLS should not see NaN, the
+        // NaN counter should not increment, and outputs stay in [0, 1].
+        let mut ctrl = IndiController::new(&g2_config(), LOOP_HZ);
+        let a = Vector3::new(0.0, 0.0, GRAVITY);
+        let rate_sp = Vector3::new(0.0, 0.0, 3.0);
+
+        // Settle on the Internal path so prev_du / prev_omega_fs are healthy.
+        for _ in 0..100 {
+            ctrl.update_rpm(&[RpmInput::Erpm(20000); NU]);
+            ctrl.step(
+                &Vector3::zeros(),
+                &a,
+                &rate_sp,
+                GRAVITY,
+                true,
+                &[true; NU],
+                MotorState::Internal,
+            )
+            .0;
+        }
+
+        let omega_fs_clean = SVector::<f32, NU>::from_element(2000.0);
+        let omega_dot_fs_clean = SVector::<f32, NU>::zeros();
+
+        // Case 1: NaN in omega_fs.
+        let mut omega_fs_nan = omega_fs_clean;
+        omega_fs_nan[2] = f32::NAN;
+        let out = ctrl
+            .step(
+                &Vector3::zeros(),
+                &a,
+                &rate_sp,
+                GRAVITY,
+                true,
+                &[true; NU],
+                MotorState::External {
+                    omega_fs: &omega_fs_nan,
+                    omega_dot_fs: &omega_dot_fs_clean,
+                },
+            )
+            .0;
+        for (i, &c) in out.motor_commands.iter().enumerate() {
+            assert!(
+                c.is_finite() && (0.0..=1.0).contains(&c),
+                "NaN omega_fs leaked into motor {i}: {c}"
+            );
+        }
+        assert!(!out.nan_failsafe);
+
+        // Case 2: +inf in omega_dot_fs.
+        let mut omega_dot_fs_inf = omega_dot_fs_clean;
+        omega_dot_fs_inf[0] = f32::INFINITY;
+        let out2 = ctrl
+            .step(
+                &Vector3::zeros(),
+                &a,
+                &rate_sp,
+                GRAVITY,
+                true,
+                &[true; NU],
+                MotorState::External {
+                    omega_fs: &omega_fs_clean,
+                    omega_dot_fs: &omega_dot_fs_inf,
+                },
+            )
+            .0;
+        for (i, &c) in out2.motor_commands.iter().enumerate() {
+            assert!(
+                c.is_finite() && (0.0..=1.0).contains(&c),
+                "inf omega_dot_fs leaked into motor {i}: {c}"
+            );
+        }
+        assert!(!out2.nan_failsafe);
+
+        // Case 3: -inf in omega_fs.
+        let mut omega_fs_ninf = omega_fs_clean;
+        omega_fs_ninf[3] = f32::NEG_INFINITY;
+        let out3 = ctrl
+            .step(
+                &Vector3::zeros(),
+                &a,
+                &rate_sp,
+                GRAVITY,
+                true,
+                &[true; NU],
+                MotorState::External {
+                    omega_fs: &omega_fs_ninf,
+                    omega_dot_fs: &omega_dot_fs_clean,
+                },
+            )
+            .0;
+        for (i, &c) in out3.motor_commands.iter().enumerate() {
+            assert!(
+                c.is_finite() && (0.0..=1.0).contains(&c),
+                "-inf omega_fs leaked into motor {i}: {c}"
+            );
+        }
+        assert!(!out3.nan_failsafe);
+    }
+
+    #[test]
+    fn external_zeros_prev_du_for_clean_internal_fallback() {
+        // After a clean External step, prev_du must be zero so that a
+        // subsequent transition to Internal starts with no model-based ω̇
+        // from External-mode WLS history.
+        let mut ctrl = IndiController::new(&g2_config(), LOOP_HZ);
+        let a = Vector3::new(0.0, 0.0, GRAVITY);
+        let rate_sp = Vector3::new(0.0, 0.0, 3.0);
+
+        // Settle on Internal so prev_du is non-zero.
+        for _ in 0..50 {
+            ctrl.update_rpm(&[RpmInput::Erpm(20000); NU]);
+            ctrl.step(
+                &Vector3::zeros(),
+                &a,
+                &rate_sp,
+                GRAVITY,
+                true,
+                &[true; NU],
+                MotorState::Internal,
+            )
+            .0;
+        }
+        let prev_du_after_internal = ctrl.prev_du;
+        assert!(
+            prev_du_after_internal.iter().any(|&v| v.abs() > 1e-9),
+            "expected prev_du to be non-zero after Internal-mode settling"
+        );
+
+        // One External step with valid inputs.
+        let omega_fs = SVector::<f32, NU>::from_element(2000.0);
+        let omega_dot_fs = SVector::<f32, NU>::zeros();
+        ctrl.update_rpm(&[RpmInput::Erpm(20000); NU]);
+        ctrl.step(
+            &Vector3::zeros(),
+            &a,
+            &rate_sp,
+            GRAVITY,
+            true,
+            &[true; NU],
+            MotorState::External {
+                omega_fs: &omega_fs,
+                omega_dot_fs: &omega_dot_fs,
+            },
+        )
+        .0;
+        for (i, &v) in ctrl.prev_du.iter().enumerate() {
+            assert_eq!(v, 0.0, "prev_du[{i}] should be zeroed after External step, got {v}");
+        }
     }
 }

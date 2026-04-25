@@ -10,7 +10,7 @@ use crate::hal::usart::{UartRx, UartTx};
 use crate::{control, sensors};
 use cybflight_msgs::wire::{
     self, WireArmDisarm, WireAttitudeControlSetpoint, WireBaroSample, WireDshotTelemetry,
-    WireGpsFix, WireImu, WireMagSample, WireMessage,
+    WireGpsFix, WireImu, WireMagSample, WireMessage, WireMotorStateTelemetry,
     WireOcpSolverOutput, WirePing, WirePingResp, WirePose,
     WireRcInput, WireRcLinkStatus, WireTimeSync, WireTimeSyncStatus, WireVehicleAttitude,
     WireVehicleOdometry,
@@ -113,6 +113,7 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
     let mut rc_sub = sensors::RC_INPUT.subscriber().unwrap();
     let mut rc_link_sub = sensors::RC_LINK_STATUS.subscriber().unwrap();
     let mut dshot_sub = control::PROCESSED_DSHOT_TELEM.subscriber().unwrap();
+    let mut motor_state_sub = control::PROCESSED_MOTOR_STATE.subscriber().unwrap();
     let mut ocp_sub = control::OCP_SOLVER_OUTPUT.subscriber().unwrap();
     let mut gps_sub = sensors::GPS_FIX.subscriber().unwrap();
     let mut mag_ext_sub = sensors::MAG_EXT.subscriber().unwrap();
@@ -181,6 +182,11 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
         }
         if let Some(m) = drain_latest(&mut dshot_sub) {
             let mut w = WireDshotTelemetry::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+        }
+        if let Some(m) = drain_latest(&mut motor_state_sub) {
+            let mut w = WireMotorStateTelemetry::from_msg(&m);
             w.timestamp_us = utc_ts(m.timestamp);
             pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }

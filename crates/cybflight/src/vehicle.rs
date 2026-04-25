@@ -17,7 +17,7 @@ use cybflight_core::mixer::{
 // ---------------------------------------------------------------------------
 
 pub const QUADROTOR_BODY: RigidBodyParams = RigidBodyParams {
-    mass_kg: 0.55,
+    mass_kg: 0.58,
     // Diagonal inertia [Ixx, Ixy, Ixz, Iyx, Iyy, Iyz, Izx, Izy, Izz] (kg·m²).
     // Roll/pitch symmetric (Ixx = Iyy = 0.02), yaw larger (Izz = 0.04).
     // Calibrate from a bifilar pendulum test or CAD model.
@@ -25,7 +25,7 @@ pub const QUADROTOR_BODY: RigidBodyParams = RigidBodyParams {
     max_rate_rad_s: [10.0, 10.0, 6.0],
 };
 
-const MAX_THRUST_N: f32 = 12.5;
+const MAX_THRUST_N: f32 = 13.0;
 
 pub const QUADROTOR_MOTORS: [MotorParams; 4] = [
     // M0: REAR_RIGHT — CW, position (−d, −d) in FLU (right = −y).

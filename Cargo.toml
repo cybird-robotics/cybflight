@@ -41,3 +41,5 @@ inherits = "release"
 lto = false
 codegen-units = 16
 
+[patch.utadr]
+cybflight-msgs = { path = "../cybflight-msgs" }

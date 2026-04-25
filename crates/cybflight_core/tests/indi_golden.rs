@@ -925,7 +925,7 @@ fn golden_ned_flu_transform() {
 // the same output as the standalone IndiTestState with FLU G1.
 // ---------------------------------------------------------------------------
 
-use cybflight_core::indi::controller::{IndiConfig, IndiController};
+use cybflight_core::indi::controller::{IndiConfig, IndiController, MotorState};
 
 fn flu_controller_config() -> IndiConfig {
     let motors = [
@@ -1016,7 +1016,15 @@ fn run_controller_scenario(
 
     for step in 0..steps {
         let (gyro, accel, rate_sp, spf_z, armed) = input_fn(step);
-        let (out, _) = ctrl.step(&gyro, &accel, &rate_sp, spf_z, armed, &g2_valid);
+        let (out, _) = ctrl.step(
+            &gyro,
+            &accel,
+            &rate_sp,
+            spf_z,
+            armed,
+            &g2_valid,
+            MotorState::Internal,
+        );
         outputs.push(out.motor_commands);
 
         for (i, &c) in out.motor_commands.iter().enumerate() {
@@ -1301,7 +1309,15 @@ fn controller_matches_test_state_flu() {
 
         for step in 0..steps {
             let ref_out = reference.step(gyro_dps, accel_g, rate_sp, spf_z, armed);
-            let (ctrl_out, _) = ctrl.step(&gyro_v, &accel_v, &rate_sp_v, spf_z, armed, &g2_valid);
+            let (ctrl_out, _) = ctrl.step(
+                &gyro_v,
+                &accel_v,
+                &rate_sp_v,
+                spf_z,
+                armed,
+                &g2_valid,
+                MotorState::Internal,
+            );
 
             // Compare linearized motor commands (d, not u).
             // IndiTestState.d = linearize(u), IndiController.motor_commands = linearize(u).
@@ -1399,7 +1415,15 @@ fn controller_matches_test_state_flu_with_g2() {
     for _ in 0..2000 {
         ctrl.update_rpm(&[cybflight_core::indi::rpm_tracker::RpmInput::Erpm(hover_erpm); NU]);
         reference.step(gyro_dps, accel_g, rate_sp, spf_z, true);
-        ctrl.step(&gyro_v, &accel_v, &rate_sp_v, spf_z, true, &g2_valid);
+        ctrl.step(
+            &gyro_v,
+            &accel_v,
+            &rate_sp_v,
+            spf_z,
+            true,
+            &g2_valid,
+            MotorState::Internal,
+        );
     }
 
     // Compare after settling: outputs should match closely
@@ -1408,7 +1432,15 @@ fn controller_matches_test_state_flu_with_g2() {
         ctrl.update_rpm(&[cybflight_core::indi::rpm_tracker::RpmInput::Erpm(hover_erpm); NU]);
 
         let ref_out = reference.step(gyro_dps, accel_g, rate_sp, spf_z, true);
-        let (ctrl_out, _) = ctrl.step(&gyro_v, &accel_v, &rate_sp_v, spf_z, true, &g2_valid);
+        let (ctrl_out, _) = ctrl.step(
+            &gyro_v,
+            &accel_v,
+            &rate_sp_v,
+            spf_z,
+            true,
+            &g2_valid,
+            MotorState::Internal,
+        );
 
         let diff = ref_out
             .d

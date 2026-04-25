@@ -22,7 +22,7 @@
 //! between every stage, and a public `normalize_quat` boundary helper.
 
 use super::model_utils;
-use nalgebra::{vector, SMatrix, SVector, Vector4};
+use nalgebra::{SMatrix, SVector, Vector4, vector};
 
 pub const NX: usize = 10;
 pub const NU: usize = 4;
@@ -72,10 +72,10 @@ impl Default for QuadModel {
     /// - Body-rate ceiling matches `QUADROTOR_BODY.max_rate_rad_s` =
     ///   [10, 10, 6] rad/s (roll, pitch, yaw).
     fn default() -> Self {
-        let mass = 0.55;
+        let mass = 0.58;
         let grav = 9.81;
         // Sum of per-motor max thrusts from QUADROTOR_MOTORS (4 × 8.5 N).
-        let max_collective_thrust_n: f32 = 4.0 * 12.5;
+        let max_collective_thrust_n: f32 = 4.0 * 13.0;
         Self {
             mass,
             grav,

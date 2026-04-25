@@ -22,7 +22,7 @@ use crate::baselines::{
     AttitudeControlState,
 };
 use cybflight_core::indi::{
-    controller::{IndiConfig, IndiController, NU as INDI_NU, NV},
+    controller::{IndiConfig, IndiController, MotorState, NU as INDI_NU, NV},
     effectiveness::IndiMotorParams,
     linearization::ThrustModel,
 };
@@ -252,6 +252,7 @@ impl Controller for MpcIndiController {
             spf_sp_z,
             true,
             &g2_valid,
+            MotorState::Internal,
         );
 
         // Convert normalized commands [0,1] → per-motor thrust [N]. Plant's

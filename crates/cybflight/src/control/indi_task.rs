@@ -18,15 +18,19 @@ use cybflight_core::position_control::{self, pd_ff_control};
 #[cfg(not(feature = "outer_mpc"))]
 use crate::sensors::VEHICLE_ODOMETRY;
 
+use air_filters::iir::biquad::{
+    BiquadFilter, BiquadFilterConfigBuilder, BiquadFilterType, DirectForm2,
+};
 use air_filters::{nonlinear::slew::SlewFilter, Filter};
 #[cfg(not(feature = "outer_mpc"))]
 use cybflight_core::attitude_control::{self, geometric_controller, AttitudeControlOutput};
 use cybflight_core::{
     indi::{
-        controller::{IndiConfig, IndiController, NU},
+        controller::{IndiConfig, IndiController, MotorState, NU},
         effectiveness::IndiMotorParams,
         learner::{LearnedParams, Learner, LearnerConfig, LearnerInput},
         linearization::ThrustModel,
+        rpm_notch::RpmNotchBank,
         rpm_tracker::RpmInput,
     },
     params::IndiEffectivenessParams,
@@ -84,22 +88,22 @@ const INDI_MOTOR_PARAMS: [IndiMotorParams; NU] = [
     IndiMotorParams {
         time_const_s: TIME_CONSTANT,
         max_rpm: MAX_RPM,
-        g2_yaw: 0.0,
+        g2_yaw: 0.001,
     },
     IndiMotorParams {
         time_const_s: TIME_CONSTANT,
         max_rpm: MAX_RPM,
-        g2_yaw: 0.0,
+        g2_yaw: -0.001,
     },
     IndiMotorParams {
         time_const_s: TIME_CONSTANT,
         max_rpm: MAX_RPM,
-        g2_yaw: 0.0,
+        g2_yaw: -0.001,
     },
     IndiMotorParams {
         time_const_s: TIME_CONSTANT,
         max_rpm: MAX_RPM,
-        g2_yaw: 0.0,
+        g2_yaw: 0.001,
     },
 ];
 
@@ -307,6 +311,7 @@ pub async fn indi_task() {
     let att_pub = super::ATTITUDE_CONTROL_SETPOINT.immediate_publisher();
     let motor_telem_pub = super::ACTUATOR_MOTORS_TELEM.immediate_publisher();
     let processed_dshot_pub = super::PROCESSED_DSHOT_TELEM.immediate_publisher();
+    let processed_motor_pub = super::PROCESSED_MOTOR_STATE.immediate_publisher();
 
     // --- State ---
     // Rate command from outer loop (cascade, MPC, or RC rate mode).
@@ -339,6 +344,113 @@ pub async fn indi_task() {
     // the first IMU tick; the outer loop's first RATE_COMMAND activates
     // motor output.
     defmt::info!("INDI task started ({}Hz)", loop_rate_hz as u32);
+
+    /****************************/
+    let motor_filter_hz = 15.0;
+    let make_biquad = || {
+        let cfg = BiquadFilterConfigBuilder::direct_form_2()
+            .sample_frequency_hz(loop_rate_hz)
+            .filter_type(BiquadFilterType::LowPass)
+            .cutoff_frequency_hz(motor_filter_hz)
+            .build()
+            .expect("indi: biquad filter config invalid");
+        BiquadFilter::new(cfg)
+    };
+    let mut motor_omega_filter: [BiquadFilter<f32, DirectForm2<f32>>; NU] =
+        core::array::from_fn(|_| make_biquad());
+
+    let mut omega_fs = SVector::<f32, NU>::zeros();
+    let mut omega_dot_fs = SVector::<f32, NU>::zeros();
+    // True ZOH on the *input*: on a missed telemetry tick we feed the last
+    // valid raw omega, not the filter output. Feeding the output back forms
+    // a feedback loop that is only marginally stable (pole at z=1), so the
+    // filter would drift under sustained telemetry loss.
+    let mut last_y_meas_hold = SVector::<f32, NU>::zeros();
+    let mut omega_fs_has_prev = false;
+    /****************************/
+
+    // ── RPM-tracking notch filters on gyro and accel ────────────────────
+    //
+    // Each motor's known rotational frequency drives a cascade of biquad
+    // notches placed on the IMU signal *just before* INDI consumes it.
+    // Suppresses the narrow-band vibration the motors inject into gyro &
+    // accel, which would otherwise close a positive-feedback loop through
+    // INDI's high-bandwidth rate path (motor → vibration → gyro → motor)
+    // and force `sync_filter_hz` to stay too low to track aggressive
+    // trajectories.
+    //
+    // Defaults match Betaflight's `rpm_filter` defaults; promote to
+    // `params.rs` only if tuning data argues for it. NU=4, NH_GYRO=3,
+    // NH_ACCEL=1 mirrors `tmp/indi_c/rpm_filter.c` and `acceleration.c`.
+    //
+    // Safety: the bank fades to passthrough when motor freq < min_hz or
+    // is non-finite (see `RpmNotchBank::update`), so a dshot dropout or
+    // disarmed state never injects NaN or stale notches into the IMU
+    // signal — matches the silence-as-failure protocol in
+    // docs/safety_protocol.md (this stage doesn't *go silent* itself; it
+    // just degrades gracefully, leaving the upstream/downstream silence
+    // signals untouched).
+    //
+    // Test/A-B flag: flip ENABLE_RPM_NOTCH to disable the entire RPM-notch
+    // path (PT1 motor-freq tracker, bank update, bank apply, per-arm reset).
+    // When false, `gyro_corrected` / `accel_corrected` pass straight through
+    // from the IMU as before. The bank storage and PT1 state are still
+    // allocated (~10 KB BSS) but the per-loop work is dead-code eliminated
+    // by the compiler since this is a `const bool`. Recompile + reflash to
+    // toggle; matches the `THRUST_MODEL` const pattern used above.
+    const ENABLE_RPM_NOTCH: bool = true;
+    const RPM_NOTCH_Q: f32 = 5.0;
+    const RPM_NOTCH_MIN_HZ: f32 = 100.0;
+    const RPM_NOTCH_FADE_HZ: f32 = 50.0;
+    let mut gyro_rpm_notch = RpmNotchBank::<NU, 3>::new(
+        loop_rate_hz,
+        RPM_NOTCH_Q,
+        RPM_NOTCH_MIN_HZ,
+        RPM_NOTCH_FADE_HZ,
+    );
+    let mut accel_rpm_notch = RpmNotchBank::<NU, 1>::new(
+        loop_rate_hz,
+        RPM_NOTCH_Q,
+        RPM_NOTCH_MIN_HZ,
+        RPM_NOTCH_FADE_HZ,
+    );
+    // Per-motor rotational frequency in Hz, fed into both notch banks
+    // each loop after passing through the dedicated PT1 below.
+    let mut motor_freq_hz = [0.0f32; NU];
+    /// Rad/s → Hz: divide by 2π. Pre-computed as a multiply for speed.
+    const RAD_S_TO_HZ: f32 = 0.5 * core::f32::consts::FRAC_1_PI;
+
+    // ── RPM-notch frequency tracker (separate from `motor_omega_filter`) ──
+    //
+    // Mirrors Indiflight's `motorFreqLpf` in `tmp/indi_c/rpm_filter.c:75`,
+    // a 1st-order PT1 dedicated to *notch frequency tracking*. It runs in
+    // PARALLEL with `motor_omega_filter` (the 15 Hz biquad that feeds INDI's
+    // sync-required `omega_fs` / `omega_dot_fs`). The two filters have
+    // different consumers, different lag/noise tradeoffs, and so different
+    // cutoffs:
+    //
+    //   * INDI sync filter @ 15 Hz: matches the delay of `rate_dot_fs`,
+    //     `spf_fs`, `u_state_fs` so `dv = sp − fs` is computed at a
+    //     consistent time.
+    //   * Notch frequency filter @ MOTOR_FREQ_LPF_HZ: needs to track motor
+    //     1P during throttle transients without lagging more than the notch
+    //     half-width (~motor_freq / (2·Q)). Reusing the 15 Hz output here
+    //     would smear the notch off the motor harmonic for ~10–15 ms after
+    //     every throttle change, defeating the whole point of the notch.
+    //
+    // 150 Hz matches Betaflight's upstream `rpm_filter_lpf_hz` default.
+    // Hardcoded; promote to params if tuning ever needs it.
+    const MOTOR_FREQ_LPF_HZ: f32 = 150.0;
+    let motor_freq_pt1_alpha: f32 = {
+        let dt = 1.0 / loop_rate_hz;
+        let tau = 1.0 / (2.0 * core::f32::consts::PI * MOTOR_FREQ_LPF_HZ);
+        dt / (tau + dt)
+    };
+    let mut motor_freq_lpf_state = [0.0f32; NU];
+    // Mirrors `omega_fs_has_prev`: the first sample seeds the PT1 directly
+    // instead of running a step from zero, avoiding a startup transient
+    // that would tilt the first ~τ ms of notch tracking.
+    let mut motor_freq_lpf_has_prev = false;
 
     loop {
         // 1. Await IMU sample — this drives the loop at ~8 kHz.
@@ -386,6 +498,29 @@ pub async fn indi_task() {
             // the previous flight. Motors are at rest at arm time, so 0 is the correct prior.
             slew_filters.reset([0.0; NU]).unwrap();
 
+            // Reset motor-omega LPF, ZOH hold, and derivative state so re-arm
+            // starts fresh at 0. (The biquad has no in-place reset API; replace
+            // the array with freshly-constructed filters.)
+            motor_omega_filter = core::array::from_fn(|_| make_biquad());
+            last_y_meas_hold = SVector::zeros();
+            omega_fs = SVector::zeros();
+            omega_dot_fs = SVector::zeros();
+            omega_fs_has_prev = false;
+
+            if ENABLE_RPM_NOTCH {
+                // Clear RPM-notch delay lines and weights so the previous
+                // flight's coefficient state doesn't bleed into this one.
+                gyro_rpm_notch.reset();
+                accel_rpm_notch.reset();
+
+                // Re-seed the notch frequency tracker on the next valid
+                // dshot frame so a re-arm starts from the current motor
+                // state, not from a stale frequency belonging to the
+                // previous flight.
+                motor_freq_lpf_state = [0.0; NU];
+                motor_freq_lpf_has_prev = false;
+            }
+
             if learner_prearm_latched {
                 // Learner prearm: geometric G1, zero G2, reset learner
                 indi.reset_to_geometric(&QUADROTOR_MOTORS, &QUADROTOR_BODY, &INDI_MOTOR_PARAMS);
@@ -432,9 +567,13 @@ pub async fn indi_task() {
 
                 if let Some(omega) = raw_omega {
                     // Hard range gate
-                    if omega < 0.0 || omega > max_omega_bound * 1.2 {
+                    if omega < 0.0 || omega > max_omega_bound * 1.5 {
                         continue;
                     }
+                    // if omega < 0.0 {
+                    //     continue;
+                    // }
+
                     // SlewFilter returns `input` on accept and the held state on reject; equality
                     // to input uniquely identifies the accept branch (an equal state can only occur
                     // with a zero-delta input, which also accepts).
@@ -477,6 +616,89 @@ pub async fn indi_task() {
         } else {
             // Disarmed: KF idle, G2 inactive
             [false; NU]
+        };
+
+        // Step the per-motor LPF every IMU tick. On a missed telemetry sample
+        // (y_meas[i] == None) hold the last valid *input* (true ZOH), not the
+        // filter output — the filter then smoothly settles to that constant.
+        // omega_dot_fs is a finite difference of the filter output, scaled by
+        // the loop rate. Skip the first iteration to avoid a startup spike.
+        for i in 0..NU {
+            let x = match y_meas[i] {
+                Some(y) => {
+                    last_y_meas_hold[i] = y;
+                    y
+                }
+                None => last_y_meas_hold[i],
+            };
+            let new_fs = motor_omega_filter[i].apply(x);
+            omega_dot_fs[i] = if omega_fs_has_prev {
+                (new_fs - omega_fs[i]) * loop_rate_hz
+            } else {
+                0.0
+            };
+            omega_fs[i] = new_fs;
+        }
+        omega_fs_has_prev = true;
+
+        // ── RPM-tracking notches on gyro + accel ───────────────────────
+        //
+        // Gated by `ENABLE_RPM_NOTCH` (compile-time const). When false,
+        // every line in this block is dead-code eliminated and
+        // `gyro_corrected` / `accel_corrected` keep the values they had
+        // out of the IMU sub block above. Use this for A/B comparison
+        // flights against the no-notch baseline.
+        //
+        // When true:
+        //   1. Update the per-motor frequency tracker (PT1 @ 150 Hz) with
+        //      the freshest *raw* ω available — `y_meas` is the post-slew,
+        //      pre-KF dshot value, the analogue of Indiflight's
+        //      `getDshotTelemetry()` tap (rpm_filter.c:116). Feeding the
+        //      PT1 from `omega_fs` (15 Hz biquad) instead would lag notch
+        //      tracking by ~10–15 ms during throttle transients and let
+        //      the motor 1P walk out from under the notch.
+        //   2. Refresh notch coefficients (round-robin batched, full bank
+        //      in ~1 ms) and apply the cascade. Shadow `gyro_corrected`
+        //      and `accel_corrected` so the rest of the loop (INDI step,
+        //      learner) consumes the notched signals.
+        //
+        // ZOH on missed dshot frames: hold the previous filter state, do
+        // not push a stale or non-finite value. Per docs/safety_protocol.md
+        // rule 3, this stage degrades gracefully and never injects NaN
+        // into the IMU signal.
+        let (gyro_corrected, accel_corrected) = if ENABLE_RPM_NOTCH {
+            for i in 0..NU {
+                let raw_hz = match y_meas[i] {
+                    Some(omega_rad_s) if omega_rad_s.is_finite() => omega_rad_s * RAD_S_TO_HZ,
+                    _ => motor_freq_lpf_state[i], // ZOH (no fresh input)
+                };
+                if motor_freq_lpf_has_prev {
+                    motor_freq_lpf_state[i] +=
+                        motor_freq_pt1_alpha * (raw_hz - motor_freq_lpf_state[i]);
+                } else if y_meas[i].is_some() && raw_hz.is_finite() {
+                    // Seed on the first valid frame to avoid a startup
+                    // ramp that would tilt notch tracking for ~τ ms.
+                    motor_freq_lpf_state[i] = raw_hz;
+                }
+                motor_freq_hz[i] = motor_freq_lpf_state[i];
+            }
+            // Latch only after at least one motor saw a fresh frame —
+            // keeps the seed-on-first-valid path active until telemetry
+            // actually arrives.
+            if !motor_freq_lpf_has_prev && y_meas.iter().any(|s| s.is_some()) {
+                motor_freq_lpf_has_prev = true;
+            }
+
+            // Disarmed → motor_freq_hz < min_hz → notches fade to
+            // passthrough; no explicit armed gate needed.
+            gyro_rpm_notch.update(&motor_freq_hz);
+            accel_rpm_notch.update(&motor_freq_hz);
+            (
+                gyro_rpm_notch.apply_xyz(gyro_corrected),
+                accel_rpm_notch.apply_xyz(accel_corrected),
+            )
+        } else {
+            (gyro_corrected, accel_corrected)
         };
 
         // 3. Drain latest rate command from outer loop.
@@ -546,6 +768,22 @@ pub async fn indi_task() {
         }
 
         // 6. INDI step (8 kHz) — uses bias-corrected gyro.
+        //
+        // Motor-state source:
+        //   - Armed + not learner-prearm + LPF has a sample → feed dshot-derived
+        //     ω, ω̇ from the task-level biquad + finite difference. This matches
+        //     the C reference's `useRpmDotFeedback && isDshotTelemetryActive()`
+        //     branch in `tmp/indi_c/indi.c:399-408`.
+        //   - Otherwise (disarmed, learner prearm, or first iteration) fall back
+        //     to the controller's internal du-based ω̇ estimate.
+        let motor_state = if armed && !learner_prearm_latched && omega_fs_has_prev {
+            MotorState::External {
+                omega_fs: &omega_fs,
+                omega_dot_fs: &omega_dot_fs,
+            }
+        } else {
+            MotorState::Internal
+        };
         let (output, step_state) = indi.step(
             &gyro_corrected,
             &accel_corrected,
@@ -553,6 +791,7 @@ pub async fn indi_task() {
             spf_sp_z,
             armed,
             &g2_valid,
+            motor_state,
         );
 
         // 6b. Online learner.
@@ -649,6 +888,17 @@ pub async fn indi_task() {
             processed_dshot_pub.publish_immediate(msgs::DshotTelemetry {
                 timestamp: publish_time,
                 motors: processed_motors,
+            });
+
+            let processed_motor_dynamics: [msgs::MotorDynamicsTelemetry; 4] =
+                core::array::from_fn(|i| msgs::MotorDynamicsTelemetry {
+                    omega: omega_fs[i],
+                    omega_dot: omega_dot_fs[i],
+                    raw: y_meas[i],
+                });
+            processed_motor_pub.publish_immediate(msgs::MotorStateTelemetry {
+                timestamp: publish_time,
+                motors: processed_motor_dynamics,
             });
         }
     }

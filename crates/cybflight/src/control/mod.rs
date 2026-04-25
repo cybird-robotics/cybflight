@@ -198,3 +198,12 @@ pub static PROCESSED_DSHOT_TELEM: PubSubChannel<
     2,
     1,
 > = PubSubChannel::new();
+
+/// Processed motor state telemetry (filtered omega + omega_dot + raw).
+pub static PROCESSED_MOTOR_STATE: PubSubChannel<
+    CriticalSectionRawMutex,
+    msgs::MotorStateTelemetry,
+    2,
+    2,
+    1,
+> = PubSubChannel::new();

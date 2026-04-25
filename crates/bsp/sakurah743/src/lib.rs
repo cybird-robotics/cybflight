@@ -26,10 +26,20 @@ pub const HAS_GPS: bool = true;
 pub const HAS_SDCARD: bool = true;
 pub const LED_COUNT: usize = 3;
 
-/// Serial port role assignments — the single place to reassign a role to a different UART.
-/// Changing one constant here is the only edit needed to move that role to a different port.
+// =====================================================================
+// PORT MAPPING TABLE — single source of truth for UART role assignments.
+// Changing a const here is the only BSP edit needed to move that role.
+// `board_init/sakurah743.rs` dispatches on these values via `match`;
+// LLVM elides dead arms because the discriminants are compile-time consts.
+//
+// Role        Port    Pins              Notes
+// SerialRx    UART4   PB9 TX / PB8 RX   CRSF/GHST receiver
+// GPS         USART3  PD8 TX / PD9 RX   u-blox M10
+// ESP bridge  USART1  PA9 TX / PA10 RX  WiFi/companion link, DMA
+// =====================================================================
 pub const PORT_SERIAL_RX: SerialPortId = SerialPortId::Uart4;
 pub const PORT_GPS: SerialPortId = SerialPortId::Usart3;
+pub const PORT_ESP_BRIDGE: SerialPortId = SerialPortId::Usart1;
 
 /// Sensor identities from Betaflight header (no WHOAMI constants here).
 pub mod sensors {

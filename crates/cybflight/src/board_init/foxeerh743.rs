@@ -27,9 +27,10 @@ use hal::spi::{self, Spi};
 use hal::time::Hertz;
 use hal::timer::low_level::Timer as LLTimer;
 
-// Single interrupt struct covering all serial UARTs used as role candidates.
-// board_init dispatches based on bsp::PORT_SERIAL_RX / bsp::PORT_GPS; LLVM
-// eliminates dead arms since the discriminants are compile-time constants.
+// Single interrupt struct covering all buffered serial UARTs used as role
+// candidates. board_init dispatches based on the bsp::PORT_* constants
+// defined in the BSP port mapping table; LLVM eliminates dead match arms
+// since the discriminants are compile-time constants.
 hal::bind_interrupts!(struct SerialIrqs {
     USART1 => hal::usart::BufferedInterruptHandler<hal::peripherals::USART1>;
     USART2 => hal::usart::BufferedInterruptHandler<hal::peripherals::USART2>;
@@ -377,32 +378,37 @@ pub async fn init(
         }
     }
 
-    // --- ESP bridge: USART6 (PC6 TX / PC7 RX) at 921600 baud, DMA-backed ---
-    {
-        let mut uart_config = hal::usart::Config::default();
-        uart_config.baudrate = 921_600;
+    // --- ESP bridge: bsp::PORT_ESP_BRIDGE selects the UART. ---
+    match bsp::PORT_ESP_BRIDGE {
+        bsp::SerialPortId::Usart6 => {
+            let mut uart_config = hal::usart::Config::default();
+            uart_config.baudrate = 921_600;
 
-        match hal::usart::Uart::new(
-            board.serial.usart6,
-            board.serial.usart6_rx,
-            board.serial.usart6_tx,
-            Usart6Irqs,
-            board.motors.dma1_ch4,
-            board.motors.dma1_ch5,
-            uart_config,
-        ) {
-            Ok(uart) => {
-                let (tx, rx) = uart.split();
-                defmt::info!("ESP bridge USART6 init OK (DMA)");
-                spawner
-                    .spawn(crate::comm::esp_bridge::esp_bridge_rx_task(rx))
-                    .unwrap_or_else(|e| defmt::error!("Failed to spawn ESP bridge RX: {}", e));
-                spawner
-                    .spawn(crate::comm::esp_bridge::esp_bridge_tx_task(tx))
-                    .unwrap_or_else(|e| defmt::error!("Failed to spawn ESP bridge TX: {}", e));
+            match hal::usart::Uart::new(
+                board.serial.usart6,
+                board.serial.usart6_rx,
+                board.serial.usart6_tx,
+                Usart6Irqs,
+                board.motors.dma1_ch4,
+                board.motors.dma1_ch5,
+                uart_config,
+            ) {
+                Ok(uart) => {
+                    let (tx, rx) = uart.split();
+                    defmt::info!("ESP bridge USART6 init OK (DMA)");
+                    spawner
+                        .spawn(crate::comm::esp_bridge::esp_bridge_rx_task(rx))
+                        .unwrap_or_else(|e| defmt::error!("Failed to spawn ESP bridge RX: {}", e));
+                    spawner
+                        .spawn(crate::comm::esp_bridge::esp_bridge_tx_task(tx))
+                        .unwrap_or_else(|e| defmt::error!("Failed to spawn ESP bridge TX: {}", e));
+                }
+                Err(e) => defmt::error!("ESP bridge USART6 init failed: {}", e),
             }
-            Err(e) => defmt::error!("ESP bridge USART6 init failed: {}", e),
         }
+        _ => defmt::warn!(
+            "ESP bridge: PORT_ESP_BRIDGE is not a supported port on this board"
+        ),
     }
 
     // --- DShot motor output ---

@@ -32,7 +32,7 @@ pub static VICON_POSE: PubSubChannel<CriticalSectionRawMutex, msgs::ViconPose, 4
     PubSubChannel::new();
 
 // RC input: CAP=4, SUBS=4 (control + telemetry + 2 spare), PUBS=1 (single RC task).
-pub static RC_INPUT: PubSubChannel<CriticalSectionRawMutex, msgs::RcInput, 4, 4, 1> =
+pub static RC_INPUT: PubSubChannel<CriticalSectionRawMutex, msgs::RcInput, 4, 6, 1> =
     PubSubChannel::new();
 
 // RC link status: CAP=2, SUBS=4 (esp_bridge + shell stream + oneshot + spare), PUBS=1 (single RC task).
@@ -79,4 +79,3 @@ pub static BARO_1: PubSubChannel<CriticalSectionRawMutex, msgs::BaroSample, 2, 4
 // Baro 2: same sizing for dual-baro boards.
 pub static BARO_2: PubSubChannel<CriticalSectionRawMutex, msgs::BaroSample, 2, 4, 1> =
     PubSubChannel::new();
-

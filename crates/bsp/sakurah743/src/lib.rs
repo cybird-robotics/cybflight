@@ -4,7 +4,7 @@ pub use embassy_stm32 as hal;
 
 use hal::exti;
 use hal::gpio::{Input, Level, Output, Pull, Speed};
-use hal::{Config, Peripherals, bind_interrupts};
+use hal::{bind_interrupts, Config, Peripherals};
 
 pub use bsp_types::{DmaHint, MotorMeta, SensorAlign, SerialPortId, TimerChannel, TimerId};
 pub use cybflight_drivers::beeper::Beeper;
@@ -29,7 +29,7 @@ pub const LED_COUNT: usize = 3;
 /// Serial port role assignments — the single place to reassign a role to a different UART.
 /// Changing one constant here is the only edit needed to move that role to a different port.
 pub const PORT_SERIAL_RX: SerialPortId = SerialPortId::Uart4;
-pub const PORT_GPS: SerialPortId = SerialPortId::Uart7;
+pub const PORT_GPS: SerialPortId = SerialPortId::Usart3;
 
 /// Sensor identities from Betaflight header (no WHOAMI constants here).
 pub mod sensors {
@@ -215,6 +215,10 @@ pub struct SerialPins {
     pub usart1: hal::Peri<'static, hal::peripherals::USART1>,
     pub usart1_tx: hal::Peri<'static, hal::peripherals::PA9>,
     pub usart1_rx: hal::Peri<'static, hal::peripherals::PA10>,
+
+    pub usart3: hal::Peri<'static, hal::peripherals::USART3>,
+    pub usart3_tx: hal::Peri<'static, hal::peripherals::PD8>,
+    pub usart3_rx: hal::Peri<'static, hal::peripherals::PD9>,
 
     pub uart4: hal::Peri<'static, hal::peripherals::UART4>,
     pub uart4_tx: hal::Peri<'static, hal::peripherals::PB9>,
@@ -478,6 +482,10 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
         usart1_tx: p.PA9,
         usart1_rx: p.PA10,
 
+        usart3: p.USART3,
+        usart3_tx: p.PD8,
+        usart3_rx: p.PD9,
+
         uart4: p.UART4,
         uart4_tx: p.PB9,
         uart4_rx: p.PB8,
@@ -546,11 +554,11 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
     let sensors = SensorPins {
         gyro1_cs,
         gyro1_drdy,
-        gyro1_align: SensorAlign::Cw0Deg,
+        gyro1_align: SensorAlign::Cw180Deg,
 
         gyro2_cs,
         gyro2_drdy,
-        gyro2_align: SensorAlign::Cw0Deg,
+        gyro2_align: SensorAlign::Cw180Deg,
 
         baro2_cs,
 

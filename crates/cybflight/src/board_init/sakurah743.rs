@@ -31,7 +31,7 @@ use hal::timer::low_level::Timer as LLTimer;
 // eliminates dead arms since the discriminants are compile-time constants.
 hal::bind_interrupts!(struct SerialIrqs {
     UART4 => hal::usart::BufferedInterruptHandler<hal::peripherals::UART4>;
-    UART7 => hal::usart::BufferedInterruptHandler<hal::peripherals::UART7>;
+    USART3 => hal::usart::BufferedInterruptHandler<hal::peripherals::USART3>;
 });
 
 // Bind I2C1 interrupts for onboard IST8310
@@ -46,9 +46,9 @@ hal::bind_interrupts!(struct I2c2Irqs {
     I2C2_ER => hal::i2c::ErrorInterruptHandler<hal::peripherals::I2C2>;
 });
 
-// Bind USART6 interrupt for ESP bridge (DMA UART)
-hal::bind_interrupts!(struct Usart6Irqs {
-    USART6 => hal::usart::InterruptHandler<hal::peripherals::USART6>;
+// Bind USART1 interrupt for ESP bridge (DMA UART)
+hal::bind_interrupts!(struct Usart1Irqs {
+    USART1 => hal::usart::InterruptHandler<hal::peripherals::USART1>;
 });
 
 /// Board initialization.
@@ -194,8 +194,8 @@ pub async fn init(
 
     // --- GPS: bsp::PORT_GPS selects the UART. ---
     match bsp::PORT_GPS {
-        bsp::SerialPortId::Uart7 => {
-            defmt::info!("GPS: starting UART7 init");
+        bsp::SerialPortId::Usart3 => {
+            defmt::info!("GPS: starting USART3 init");
             static GPS_TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
             static GPS_RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
             let tx_buf = &mut GPS_TX_BUF.init([0u8; 256])[..];
@@ -203,13 +203,13 @@ pub async fn init(
             let mut uart_config = hal::usart::Config::default();
             uart_config.baudrate = 115_200;
             match hal::usart::BufferedUart::new(
-                board.serial.uart7,
-                board.serial.uart7_rx,
-                board.serial.uart7_tx,
+                board.serial.usart3,
+                board.serial.usart3_rx,
+                board.serial.usart3_tx,
                 tx_buf, rx_buf, SerialIrqs, uart_config,
             ) {
                 Ok(uart) => {
-                    defmt::info!("GPS: UART7 OK, sending CFG-VALSET...");
+                    defmt::info!("GPS: USART3 OK, sending CFG-VALSET...");
                     let mut delay = embassy_time::Delay;
                     match with_timeout(Duration::from_secs(3), UbloxM10::new(uart, &mut delay)).await {
                         Ok(Ok(gps)) => {
@@ -222,7 +222,7 @@ pub async fn init(
                         Err(_) => defmt::warn!("GPS init timed out (no module?)"),
                     }
                 }
-                Err(e) => defmt::error!("GPS UART7 init failed: {}", e),
+                Err(e) => defmt::error!("GPS USART3 init failed: {}", e),
             }
         }
         _ => defmt::warn!("GPS: PORT_GPS is not a supported GPS port on this board"),
@@ -427,23 +427,23 @@ pub async fn init(
         }
     }
 
-    // --- ESP bridge: USART6 (PC6 TX / PC7 RX) at 921600 baud, DMA-backed ---
+    // --- ESP bridge: USART1 (PA9 TX / PA10 RX) at 921600 baud, DMA-backed ---
     {
         let mut uart_config = hal::usart::Config::default();
         uart_config.baudrate = 921_600;
 
         match hal::usart::Uart::new(
-            board.serial.usart6,
-            board.serial.usart6_rx,
-            board.serial.usart6_tx,
-            Usart6Irqs,
+            board.serial.usart1,
+            board.serial.usart1_rx,
+            board.serial.usart1_tx,
+            Usart1Irqs,
             board.motors.dma1_ch4,
             board.motors.dma1_ch5,
             uart_config,
         ) {
             Ok(uart) => {
                 let (tx, rx) = uart.split();
-                defmt::info!("ESP bridge USART6 init OK (DMA)");
+                defmt::info!("ESP bridge USART1 init OK (DMA)");
                 spawner
                     .spawn(crate::comm::esp_bridge::esp_bridge_rx_task(rx))
                     .unwrap_or_else(|e| defmt::error!("Failed to spawn ESP bridge RX: {}", e));
@@ -451,7 +451,7 @@ pub async fn init(
                     .spawn(crate::comm::esp_bridge::esp_bridge_tx_task(tx))
                     .unwrap_or_else(|e| defmt::error!("Failed to spawn ESP bridge TX: {}", e));
             }
-            Err(e) => defmt::error!("ESP bridge USART6 init failed: {}", e),
+            Err(e) => defmt::error!("ESP bridge USART1 init failed: {}", e),
         }
     }
 

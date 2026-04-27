@@ -485,7 +485,7 @@ pub async fn indi_task() {
         //   VehicleParams → signal flash auto-save. PARAM_VERSION re-read
         //   (below) handles applying to INDI + KF on next iteration.
         if !was_armed && armed {
-            // ARM transition
+            // ARM transition; true if the PRE_ARM switch is HIGH/DOWN
             learner_prearm_latched =
                 super::LEARNER_PREARM.load(core::sync::atomic::Ordering::Acquire);
 
@@ -522,11 +522,14 @@ pub async fn indi_task() {
             }
 
             if learner_prearm_latched {
-                // Learner prearm: geometric G1, zero G2, reset learner
+                // Learner prearm: throw away any previously-learned G1/G2 so
+                // this learning flight starts from the analytic geometric
+                // model. The unstable-prearm bug was not in this reset — it
+                // was in the motor-state source (see `motor_state` below).
                 indi.reset_to_geometric(&QUADROTOR_MOTORS, &QUADROTOR_BODY, &INDI_MOTOR_PARAMS);
                 learner.reset();
                 raw_omega_hold = SVector::zeros();
-                defmt::info!("INDI: learner prearm LATCHED — KF off, G2 zeroed");
+                defmt::info!("INDI: learner prearm LATCHED — effectiveness reset to geometric");
             }
         }
         if was_armed && !armed {
@@ -770,13 +773,16 @@ pub async fn indi_task() {
         // 6. INDI step (8 kHz) — uses bias-corrected gyro.
         //
         // Motor-state source:
-        //   - Armed + not learner-prearm + LPF has a sample → feed dshot-derived
-        //     ω, ω̇ from the task-level biquad + finite difference. This matches
-        //     the C reference's `useRpmDotFeedback && isDshotTelemetryActive()`
-        //     branch in `tmp/indi_c/indi.c:399-408`.
-        //   - Otherwise (disarmed, learner prearm, or first iteration) fall back
-        //     to the controller's internal du-based ω̇ estimate.
-        let motor_state = if armed && !learner_prearm_latched && omega_fs_has_prev {
+        //   - Armed + LPF has a sample → feed dshot-derived ω, ω̇ from the
+        //     task-level biquad + finite difference. Used in both normal and
+        //     prearm flights: the LPF runs unconditionally so External data
+        //     is always available, and the Internal du-based fallback reads
+        //     `prev_du` / `prev_omega_fs` which are not zeroed by the arm
+        //     transition — feeding stale values into `effectiveness.g2 *
+        //     omega_dot_fs` inside `step`'s `dv` and destabilizing the
+        //     prearm flight on lift-off.
+        //   - Disarmed or first iteration: fall back to Internal.
+        let motor_state = if armed && omega_fs_has_prev {
             MotorState::External {
                 omega_fs: &omega_fs,
                 omega_dot_fs: &omega_dot_fs,

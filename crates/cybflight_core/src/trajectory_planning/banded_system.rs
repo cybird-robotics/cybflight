@@ -2,10 +2,11 @@ use nalgebra::Vector3;
 
 /// Maximum banded storage size.
 ///
-/// Sized for the MINCO min-jerk solver (only consumer): system size = 6·N,
-/// upper bandwidth = lower bandwidth = 6, band width = 13 rows in compact
-/// storage. Storage = 6 · MAX_PIECES · 13.
-const MAX_STORAGE: usize = 6 * super::MAX_PIECES * (6 + 6 + 1);
+/// Sized for the most demanding consumer:
+///   - MINCO min-jerk: system size = 6·N, half-bandwidth 6 → 6·N·13 floats.
+///   - MINCO min-snap: system size = 8·N, half-bandwidth 8 → 8·N·17 floats.
+/// MincoSnap dominates, so we allocate `8 · MAX_PIECES · 17` floats.
+const MAX_STORAGE: usize = 8 * super::MAX_PIECES * (8 + 8 + 1);
 
 /// A banded matrix with compact band storage (Golub & Van Loan convention).
 ///

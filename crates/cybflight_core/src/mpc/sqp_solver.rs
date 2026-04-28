@@ -186,6 +186,10 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
         // them as compile-time constants in the inner loops below.
         let bnz_start: usize = M::BNZ_START;
         let bnz_len: usize = M::BNZ_LEN;
+        // First nonzero column of df/dx. Cols `[0, jx_cs)` of dt·jac_x are
+        // zero, so cols 0..jx_cs of A and rows 0..jx_cs of A^T are pure
+        // identity — the inner products below collapse to direct copies.
+        let jx_cs: usize = M::JAC_X_NZ_COL_START;
 
         self.pp[N] = self.qm[N];
         self.pv[N] = self.q[N];
@@ -196,32 +200,54 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
 
             let bk = &self.b[k];
 
-            // H_uu = diag(rm[k]) + bk_nz^T @ psi_nz @ bk_nz  (NU x NU)
+            // H_uu = diag(rm[k]) + bk_nz^T @ psi_nz @ bk_nz  (NU x NU).
+            // Factored as `tmp = psi_nz @ bk_nz` (bnz_len × NU) followed by
+            // `bk_nz^T @ tmp` to drop the inner-product cost from
+            // O(NU² · bnz_len²) to O(bnz_len² · NU + NU² · bnz_len). The
+            // intermediate is sized NX × NU (only its first `bnz_len` rows
+            // are used) to avoid a fresh const-generic helper.
             let mut h_uu = SMatrix::<f32, NU, NU>::from_diagonal(&self.rm[k]);
+            let mut psi_b = SMatrix::<f32, NX, NU>::zeros();
+            for r in 0..bnz_len {
+                let ri = bnz_start + r;
+                for j in 0..NU {
+                    let mut s = 0.0;
+                    for c in 0..bnz_len {
+                        let ci = bnz_start + c;
+                        s += psi[(ri, ci)] * bk[(ci, j)];
+                    }
+                    psi_b[(r, j)] = s;
+                }
+            }
             for i in 0..NU {
                 for j in 0..NU {
                     let mut s = 0.0;
                     for r in 0..bnz_len {
                         let ri = bnz_start + r;
-                        for c in 0..bnz_len {
-                            let ci = bnz_start + c;
-                            s += bk[(ri, i)] * psi[(ri, ci)] * bk[(ci, j)];
-                        }
+                        s += bk[(ri, i)] * psi_b[(r, j)];
                     }
                     h_uu[(i, j)] += s;
                 }
             }
 
-            // at_psi = A^T @ psi  (NX x NX)
+            // at_psi = A^T @ psi  (NX x NX). Rows `[0, jx_cs)` of A^T are
+            // identity rows, so those output rows = the corresponding rows
+            // of psi without an inner-product loop.
             let ak = &self.a[k];
             let mut at_psi = SMatrix::<f32, NX, NX>::zeros();
             for i in 0..NX {
-                for j in 0..NX {
-                    let mut s = 0.0;
-                    for m in 0..NX {
-                        s += ak[(m, i)] * psi[(m, j)];
+                if i < jx_cs {
+                    for j in 0..NX {
+                        at_psi[(i, j)] = psi[(i, j)];
                     }
-                    at_psi[(i, j)] = s;
+                } else {
+                    for j in 0..NX {
+                        let mut s = 0.0;
+                        for m in 0..NX {
+                            s += ak[(m, i)] * psi[(m, j)];
+                        }
+                        at_psi[(i, j)] = s;
+                    }
                 }
             }
 
@@ -248,14 +274,19 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
                 h_u[i] = s;
             }
 
-            // h_x = q[k] + A^T @ pv
+            // h_x = q[k] + A^T @ pv. For i < jx_cs, A^T's i-th row is a
+            // pure-identity row, so the dot product collapses to pv[i].
             let mut h_x = SVector::<f32, NX>::zeros();
             for i in 0..NX {
-                let mut s = self.q[k][i];
-                for m in 0..NX {
-                    s += ak[(m, i)] * pv[m];
+                if i < jx_cs {
+                    h_x[i] = self.q[k][i] + pv[i];
+                } else {
+                    let mut s = self.q[k][i];
+                    for m in 0..NX {
+                        s += ak[(m, i)] * pv[m];
+                    }
+                    h_x[i] = s;
                 }
-                h_x[i] = s;
             }
 
             let h_uu_inv = cholesky_inv_4x4::<NU>(&h_uu);
@@ -280,15 +311,23 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
                 self.gain_kk[k][i] = -s;
             }
 
-            // pp[k] = qm[k] + at_psi @ A[k] + h_xu @ gain_k[k]
+            // pp[k] = qm[k] + at_psi @ A[k] + h_xu @ gain_k[k]. Cols
+            // `[0, jx_cs)` of A are pure-identity columns, so those output
+            // columns of `at_psi @ A` equal the corresponding cols of `at_psi`.
             let mut at_psi_a = SMatrix::<f32, NX, NX>::zeros();
-            for i in 0..NX {
-                for j in 0..NX {
-                    let mut s = 0.0;
-                    for m in 0..NX {
-                        s += at_psi[(i, m)] * ak[(m, j)];
+            for j in 0..NX {
+                if j < jx_cs {
+                    for i in 0..NX {
+                        at_psi_a[(i, j)] = at_psi[(i, j)];
                     }
-                    at_psi_a[(i, j)] = s;
+                } else {
+                    for i in 0..NX {
+                        let mut s = 0.0;
+                        for m in 0..NX {
+                            s += at_psi[(i, m)] * ak[(m, j)];
+                        }
+                        at_psi_a[(i, j)] = s;
+                    }
                 }
             }
             let mut hxu_gk = SMatrix::<f32, NX, NX>::zeros();
@@ -474,25 +513,34 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize> SqpSolv
             // Step 3: Backward Riccati sweep
             self.qp.backward_sweep::<M>();
 
-            // Step 4: Convergence check
+            // Step 4: Convergence check (computed before the forward sweep
+            // and re-propagation so we can elide the re-propagation when
+            // no next iteration will consume it). `kkt_norm` depends only
+            // on `gain_kk` from `backward_sweep`, which `forward_sweep`
+            // does not modify, so the check is invariant to ordering.
             let mut kkt_norm = 0.0f32;
             for k in 0..N {
                 for i in 0..NU {
                     kkt_norm = kkt_norm.max(self.qp.gain_kk[k][i].abs());
                 }
             }
+            let last_iter = iteration + 1 == max_iters || kkt_norm < kkt_tol;
 
             // Step 5: Forward sweep (full Newton, alpha=1)
             self.qp.forward_sweep::<M>(x0, 1.0, problem);
 
-            // Re-propagate x_bar with updated u_bar.
-            // Needed for: (a) x_bar() access by caller, (b) next SQP iteration.
-            // x_bar[0] is renormalized in case x0 was non-unit; downstream
-            // states are normalized inside propagate().
-            self.qp.x_bar[0] = *x0;
-            M::normalize_quat(&mut self.qp.x_bar[0]);
-            for k in 0..N {
-                self.qp.x_bar[k + 1] = problem.propagate(&self.qp.x_bar[k], &self.qp.u_bar[k]);
+            // Re-propagate x_bar with updated u_bar — only when another
+            // SQP iteration will run and consume it. After the loop exits
+            // callers read `u_bar()` (already updated by `forward_sweep`),
+            // so leaving `x_bar` inconsistent with the final `u_bar` is
+            // harmless. `x_bar[0]` is renormalized in case x0 was non-unit;
+            // downstream states are normalized inside `propagate()`.
+            if !last_iter {
+                self.qp.x_bar[0] = *x0;
+                M::normalize_quat(&mut self.qp.x_bar[0]);
+                for k in 0..N {
+                    self.qp.x_bar[k + 1] = problem.propagate(&self.qp.x_bar[k], &self.qp.u_bar[k]);
+                }
             }
 
             if kkt_norm < kkt_tol {

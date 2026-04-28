@@ -1,23 +1,33 @@
 //! Mission planner task (outer_mpc + est_eskf only).
 //!
 //! Blocks on `PLAN_REQUEST` (rising edge from `rc_interpreter_task` on the
-//! mission-trigger AUX channel). On each request:
+//! mission-trigger AUX channel). On each request the task snapshots the
+//! controller's current setpoint and dispatches to one of two planning
+//! schemas (selected at compile time by [`USE_OFFLINE_PLAN`]):
 //!
-//!   1. Reads `ACTIVE_POSITION_SETPOINT` — the shared single-source-of-truth
-//!      cell that rc_interpreter writes during Idle. Using this as the
-//!      start pose means the mission is planned from the exact reference
-//!      the drone is currently flying to, so the first trajectory sample
-//!      and the last Idle setpoint are structurally identical — no step
-//!      when the outer loop switches to the Executing branch.
-//!   2. Builds hardcoded circular waypoints at the current altitude, with
-//!      the **terminal position equal to the start position** (return home).
-//!   3. Solves a min-jerk MINCO trajectory using a **static** BFGS workspace
-//!      (~35 KB in BSS, not on the task stack).
-//!   4. Validates the result (converged status, finite duration > 0).
-//!   5. On success: stores the trajectory in `MISSION_TRAJECTORY_SLOT`,
-//!      transitions `MISSION_STATE` → `Executing`. The outer loop picks up
-//!      the trajectory on its next 100 Hz tick and samples one reference
-//!      state per MPC horizon node.
+//! - **Online** ([`plan_online`]): builds hardcoded waypoints and solves
+//!   a min-jerk MINCO trajectory with the on-device BFGS optimizer. The
+//!   solver runs cooperatively in 1-iteration bursts so peer Embassy
+//!   tasks keep their scheduling slots; convergence/validity rejects fall
+//!   back to Idle without disarming.
+//! - **Offline** ([`plan_offline`]): consumes a precomputed waypoint +
+//!   timestamp schedule from [`super::offline_mission`] (60 pieces) and
+//!   feeds it directly into the MINCO banded solver — no BFGS, no
+//!   cooperative yielding, single-digit-ms wall time.
+//!
+//! Either path returns a [`PlanOutcome`]; the outer task body validates
+//! it against an abort/state-change re-check inside the
+//! `MISSION_TRAJECTORY_SLOT` lock (the same critical section that
+//! `failsafe.rs` takes on disarm) and either publishes the trajectory
+//! and flips `MISSION_STATE → Executing`, or emits a reject breadcrumb
+//! `MissionStatus` so the GCS can diagnose without RTT/defmt.
+//!
+//! Reading `ACTIVE_POSITION_SETPOINT` as the start pose means the
+//! mission is planned from the exact reference the drone is currently
+//! flying to, so the first trajectory sample and the last Idle setpoint
+//! are structurally identical — no step when the outer loop switches to
+//! the Executing branch. The offline path can override this with
+//! [`OFFLINE_USE_YAML_START`].
 //!
 //! Solver latency (up to ~100 ms) does not block the MPC or INDI loops:
 //! they run on their own `Ticker`s on the same cooperative executor. This
@@ -42,26 +52,74 @@
 
 use core::sync::atomic::Ordering;
 
-use cybflight_core::trajectory_planning::MAX_PIECES;
+use embassy_sync::pubsub::publisher::ImmediatePublisher;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Instant, Timer};
 use static_cell::StaticCell;
 
 use cybflight_core::trajectory_planning::bfgs_trust::BfgsWorkspace;
+use cybflight_core::trajectory_planning::minco_snap::MincoSnap;
+use cybflight_core::trajectory_planning::piecewise_polynomial::PiecewisePolynomial;
 use cybflight_core::trajectory_planning::planner::{
     plan_finalize, plan_init, plan_resume, PlannerInput, SolverStatus,
 };
 use cybflight_core::trajectory_planning::quad_planning_config::QuadPlanningConfig;
-use cybflight_core::trajectory_planning::types::Vec3;
+use cybflight_core::trajectory_planning::types::{Vec3, ZERO3};
 
 use crate::msgs;
 
+use super::offline_mission::{
+    OFFLINE_NUM_PIECES, OFFLINE_START_POS, OFFLINE_TIMESTAMPS, OFFLINE_WAYPOINTS,
+};
 use super::{
     read_active_setpoint, MissionState, MissionTrajectory, MISSION_ABORT_REQUESTED, MISSION_STATE,
     MISSION_STATUS, MISSION_TRAJECTORY_SLOT, PLAN_REQUEST,
 };
 
+// ─── Planning schema flags ────────────────────────────────────────────
+//
+// Both flags are compile-time `const bool`. Flip and rebuild to switch.
+// Kept as flags (not Cargo features) so that toggling between schemas
+// doesn't require a feature recompile of `cybflight_core` and the BSP.
+
+/// Selects which planning function the task dispatches to per
+/// `PLAN_REQUEST`. `false` runs [`plan_online`] (the on-device BFGS
+/// trajectory optimizer); `true` runs [`plan_offline`] (load the
+/// precomputed waypoints + timestamps from [`super::offline_mission`]
+/// and feed them directly to a MINCO solver).
+const USE_OFFLINE_PLAN: bool = true;
+
+/// Only consulted when [`USE_OFFLINE_PLAN`] is `true`.
+/// `false` (default): the offline trajectory's head pose is the live
+///   `ACTIVE_POSITION_SETPOINT` — the same seamless-handoff semantics
+///   the online path uses, so the first trajectory sample matches the
+///   last Idle setpoint.
+/// `true`: head pose is the YAML-recorded
+///   [`OFFLINE_START_POS`]. Useful for replaying the offline solve
+///   verbatim regardless of where the drone is hovering.
+const OFFLINE_USE_YAML_START: bool = false;
+
+// Local reject reason for the offline-path "non-monotonic / non-finite
+// segment durations" guard. The added constant lives in the local
+// `cybflight-msgs` working copy (`SOLVE_REJECT_INVALID_TIMES = 8`)
+// but the firmware currently pins to the published 0.1.17 registry
+// version, which doesn't yet include it. Defined here so the build
+// works against the published crate; once a release containing the
+// new constant lands, drop this and switch to `msgs::SOLVE_REJECT_INVALID_TIMES`.
+const SOLVE_REJECT_INVALID_TIMES: u8 = 8;
+
 /// BFGS scratch memory (~35 KB). BSS-resident; init-once on first plan.
+/// Only consumed by the online planner (`plan_online`); allocation is
+/// unconditional because `StaticCell::new()` is `const` and free at
+/// rest, so no need to gate it on `USE_OFFLINE_PLAN`.
 static WORKSPACE: StaticCell<BfgsWorkspace> = StaticCell::new();
+
+/// MINCO-snap scratch memory for the offline planner. BSS-resident;
+/// init once on first plan. ~42 KB at `MAX_PIECES = 64` (8N×8N banded
+/// LU + 8N coefficient rows + seven `[f32; MAX_PIECES]` time tables).
+/// Like `WORKSPACE`, allocated unconditionally — only `plan_offline`
+/// ever touches it.
+static OFFLINE_MINCO: StaticCell<MincoSnap> = StaticCell::new();
 
 /// Heartbeat cadence for `MISSION_STATUS` during Planning. The outer loop
 /// owns the heartbeat when it is the authoritative state-writer (Idle /
@@ -70,12 +128,11 @@ static WORKSPACE: StaticCell<BfgsWorkspace> = StaticCell::new();
 /// matches the outer loop's own publish decimation.
 const PLANNING_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Number of intermediate waypoints on the test circle. Total trajectory
-/// pieces = `NUM_CIRCLE_WAYPOINTS + 1` (≤ `MAX_PIECES` = 16).
+/// Number of intermediate waypoints used by the legacy circle test —
+/// retained as a defmt log breadcrumb in `plan_online`. The actual
+/// hardcoded waypoint set there is the larger 19-target list, so this
+/// is a conservative lower bound on what gets logged, not a contract.
 const NUM_CIRCLE_WAYPOINTS: usize = 8;
-
-/// Circle radius [m].
-const CIRCLE_RADIUS_M: f32 = 1.0;
 
 /// Reject `ACTIVE_POSITION_SETPOINT` older than this when snapshotting the
 /// mission start pose. rc_interpreter refreshes the cell's timestamp on
@@ -110,11 +167,11 @@ const MIN_TRAJECTORY_DURATION_S: f32 = 0.5;
 /// With cooperative yielding (yield_now() between every BFGS burst), the
 /// IWDG feed task runs freely between iterations, so the budget is no
 /// longer constrained by the 500 ms IWDG timeout. The binding constraint
-/// is the outer_loop MPC tick: at ~4 ms per solve and a 10 ms timer
-/// period, the outer_loop occupies ~40% of the Thread executor, leaving
-/// mission_planner ~6 ms per window → ~3 BFGS iterations per 10 ms.
-/// With max_iterations = 500, worst-case wall time ≈ 500 / 3 × 10 ms
-/// ≈ 1670 ms. 3000 ms gives comfortable headroom; the drone hovers
+/// is the outer_loop MPC tick: at ~4 ms per solve and a 20 ms timer
+/// period, the outer_loop occupies ~20% of the Thread executor, leaving
+/// mission_planner ~16 ms per window → ~3 BFGS iterations per 20 ms.
+/// With max_iterations = 500, worst-case wall time ≈ 500 / 3 × 20 ms
+/// ≈ 3340 ms. 5000 ms gives comfortable headroom; the drone hovers
 /// safely in Planning while the pilot waits.
 const SOLVE_BUDGET: Duration = Duration::from_millis(5000);
 
@@ -132,16 +189,16 @@ const BFGS_ITERS_PER_YIELD: usize = 1;
 /// A bare `yield_now().await` only marks the task ready again immediately,
 /// so the scheduler will re-poll mission_planner as soon as no other task
 /// is actively runnable — which on STM32 means it usually resumes before
-/// the outer_loop's 10 ms `Ticker` fires even once. The result is that
-/// during Planning the outer_loop runs at ~40–60 Hz (one tick per BFGS
-/// iter) instead of its designed 100 Hz, which causes the MPC's 1-iter
+/// the outer_loop's 20 ms `Ticker` fires even once. The result is that
+/// during Planning the outer_loop runs at ~20–30 Hz (one tick per BFGS
+/// iter) instead of its designed 50 Hz, which causes the MPC's 1-iter
 /// SQP warm-start to go stale and the drone to stutter / jump on the Z
 /// axis while the planner is active.
 ///
 /// Using `Timer::after(INTER_BURST_DELAY)` instead of `yield_now` forces
 /// mission_planner to be *unready* for a fixed window, guaranteeing the
 /// outer_loop's pending tick gets scheduled. 1 ms is long enough to admit
-/// a 10 ms-period tick that was queued during the BFGS iter, and short
+/// a 20 ms-period tick that was queued during the BFGS iter, and short
 /// enough that the extra cost per solve is ~`max_iterations × 1 ms`
 /// (≤500 ms, well inside SOLVE_BUDGET).
 const INTER_BURST_DELAY: Duration = Duration::from_millis(1);
@@ -205,9 +262,426 @@ fn try_snapshot_setpoint() -> Option<nalgebra::Vector3<f32>> {
     Some(sp.position)
 }
 
+/// Result of one planning attempt — either a candidate trajectory ready
+/// for publication, or a rejection with a populated `SolveDiagnostics`
+/// that the outer task body forwards to the GCS as a breadcrumb.
+///
+/// Both [`plan_online`] and [`plan_offline`] return this so the outer
+/// task body has one merge point for the abort/state-change re-checks
+/// and the `MISSION_TRAJECTORY_SLOT` publish dance.
+enum PlanOutcome {
+    Ok {
+        trajectory: PiecewisePolynomial,
+        dur: f32,
+        solve: msgs::SolveDiagnostics,
+    },
+    Reject {
+        dur: f32,
+        solve: msgs::SolveDiagnostics,
+    },
+}
+
+/// Sample peak velocity on a finished trajectory. 200 uniform samples
+/// is plenty to catch the peak of a smooth quintic spline.
+fn peak_vel_m_s(traj: &PiecewisePolynomial, dur: f32) -> f32 {
+    let mut v_max = 0.0f32;
+    let n_samples = 200;
+    for i in 0..=n_samples {
+        let t = dur * i as f32 / n_samples as f32;
+        let v = traj.get_vel(t);
+        let v2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+        if v2 > v_max {
+            v_max = v2;
+        }
+    }
+    libm::sqrtf(v_max)
+}
+
+/// Online (BFGS) planning schema.
+///
+/// Builds hardcoded waypoints, runs the on-device BFGS optimizer in
+/// cooperative bursts (one outer iter per yield), classifies the
+/// outcome, and returns either an optimised trajectory or a
+/// fully-populated `Reject`. All defmt logging, heartbeat publishing
+/// during Planning, IS_ARMED interlock, and BFGS-specific reject
+/// reasons (`TimeExceeded` → DISARMED/BUDGET_EXCEEDED,
+/// UNDER_COMPRESSED) are owned here — the outer task body only sees
+/// the `PlanOutcome`.
+async fn plan_online(
+    start_position: nalgebra::Vector3<f32>,
+    workspace: &mut BfgsWorkspace,
+    config: &mut QuadPlanningConfig,
+    local_param_ver: &mut u32,
+    mission_status_pub: &ImmediatePublisher<
+        '_,
+        CriticalSectionRawMutex,
+        msgs::MissionStatus,
+        2,
+        2,
+        1,
+    >,
+) -> PlanOutcome {
+    // Refresh planner config if vehicle params changed since the last
+    // solve. Only safe between solves (no in-flight BFGS state depends
+    // on `config`).
+    let cur = crate::params::PARAM_VERSION.load(Ordering::Acquire);
+    if cur != *local_param_ver {
+        *local_param_ver = cur;
+        *config = QuadPlanningConfig::from_vehicle_params(&crate::params::get());
+        defmt::info!("mission_planner: planner config reloaded (ver {})", cur);
+    }
+
+    let start_pos: [f32; 3] = [start_position.x, start_position.y, start_position.z];
+    let start_vel: [f32; 3] = [0.0, 0.0, 0.0];
+
+    let targets = [
+        [-0.3267, -2.231, 1.6],
+        [-1.845, 1.942, 1.0],
+        [2.292, 1.637, 1.0],
+        [2.547, -2.108, 1.8],
+        [2.547, -2.108, 0.8],
+        [0.3099, 0.3554, 1.0],
+        [-2.396, -2.214, 1.0],
+        [-0.3267, -2.231, 1.6],
+        [-1.845, 1.942, 1.0],
+        [2.292, 1.637, 1.0],
+        [2.547, -2.108, 1.8],
+        [2.547, -2.108, 0.8],
+        [0.3099, 0.3554, 1.0],
+        [-2.396, -2.214, 1.0],
+        [-0.3267, -2.231, 1.6],
+        [-1.845, 1.942, 1.0],
+        [2.292, 1.637, 1.0],
+        [2.547, -2.108, 1.8],
+        [2.547, -2.108, 0.8],
+    ];
+
+    let input = PlannerInput::waypoints(start_pos, start_vel, &targets.map(Vec3::from));
+
+    // Snapshot the pre-BFGS time allocation so the ground station can
+    // compare it against the optimized total duration — a ratio ≈ 1
+    // means BFGS made no progress.
+    let n_pieces_input = input.num_waypoints + 1;
+    let init_duration_s: f32 = input.init_times[..n_pieces_input].iter().sum();
+
+    defmt::info!(
+        "mission_planner: solving (start=[{},{},{}], {} waypoints + return)",
+        start_pos[0],
+        start_pos[1],
+        start_pos[2],
+        NUM_CIRCLE_WAYPOINTS
+    );
+
+    // Wall-clock deadline for the solve. The inner BFGS polls
+    // `keep_going` at each outer iteration; returning `false`
+    // cleanly aborts with `SolverStatus::TimeExceeded`.
+    //
+    // The callback ALSO returns false when `IS_ARMED` clears. If
+    // the pilot emergency-disarms during the solve, the RC parser
+    // (on ctrl_spawner P10) detects the arm-switch edge and
+    // signals `ARM_STATE`; DShot (P6) consumes it and sets
+    // `IS_ARMED = false`. The solver sees that on its next outer
+    // iteration (≤20 ms) and exits — so no stale trajectory ever
+    // lands in `MISSION_TRAJECTORY_SLOT` from a disarmed attempt.
+    //
+    // Cooperative yielding: the solve runs in bursts of
+    // `BFGS_ITERS_PER_YIELD` iterations. Between bursts we sleep
+    // for `INTER_BURST_DELAY` so peer thread-executor tasks (MPC
+    // outer loop, ESKF, GPS, baro, mag) get a scheduling slot that
+    // mission_planner cannot immediately reclaim — without this
+    // delay, the outer_loop runs at ~20–30 Hz during Planning and
+    // the drone stutters vertically while BFGS solves.
+    let t0 = Instant::now();
+    let deadline = t0 + SOLVE_BUDGET;
+    let mut keep_going =
+        || Instant::now() < deadline && crate::motors::IS_ARMED.load(Ordering::Acquire);
+    let mut session = plan_init(&input, config, workspace);
+    let mut last_heartbeat = t0;
+    let status = loop {
+        match plan_resume(
+            &mut session,
+            config,
+            workspace,
+            &mut keep_going,
+            BFGS_ITERS_PER_YIELD,
+        ) {
+            Some(s) => break s,
+            None => {
+                // Burst done but solver still running. Re-check the
+                // abort conditions eagerly (cheap) and then sleep
+                // for INTER_BURST_DELAY — a bare yield_now would let
+                // mission_planner reclaim the CPU before the
+                // outer_loop's 20 ms tick fires, leaving MPC running
+                // at only ~25 Hz and causing visible motor stutter
+                // during Planning.
+                if !keep_going() {
+                    break SolverStatus::TimeExceeded;
+                }
+                let now = Instant::now();
+                if now.duration_since(last_heartbeat) >= PLANNING_HEARTBEAT_INTERVAL {
+                    last_heartbeat = now;
+                    mission_status_pub.publish_immediate(msgs::MissionStatus {
+                        timestamp: now,
+                        state: MissionState::Planning as u8,
+                        tau_s: 0.0,
+                        total_duration_s: 0.0,
+                        target_position: start_position,
+                        solve: msgs::SolveDiagnostics::NONE,
+                    });
+                }
+                Timer::after(INTER_BURST_DELAY).await;
+            }
+        }
+    };
+    // Yield once before plan_finalize so the IWDG feed task and any
+    // other pending thread-executor tasks (ESKF, GPS) can run. The
+    // finalize call is synchronous and potentially several ms long;
+    // a single yield ensures the last-fed timestamp stays fresh even
+    // if the disarm path gets here with the IWDG nearly exhausted.
+    embassy_futures::yield_now().await;
+    let result = plan_finalize(session, workspace, status);
+    let elapsed_ms = Instant::now().duration_since(t0).as_millis();
+
+    defmt::info!(
+        "mission_planner: solve done ({}ms, iters={}, cost={}, status={})",
+        elapsed_ms,
+        result.iterations,
+        result.final_cost,
+        result.status as u8
+    );
+
+    let mk_solve = |reason: u8, peak: f32| msgs::SolveDiagnostics {
+        status: result.status as u8,
+        iterations: result.iterations.min(u16::MAX as usize) as u16,
+        solve_time_ms: elapsed_ms.min(u16::MAX as u64) as u16,
+        num_pieces: result.num_pieces.min(u8::MAX as usize) as u8,
+        init_duration_s,
+        final_cost: result.final_cost,
+        peak_vel_m_s: peak,
+        reject_reason: reason,
+    };
+
+    // `TimeExceeded` is the graceful-abort path: the solver hit the
+    // wall-clock budget OR `IS_ARMED` cleared. Distinguish in the log
+    // so the pilot/defmt reader knows why; both yield a `Reject`.
+    if result.status == SolverStatus::TimeExceeded {
+        let reject_reason = if !crate::motors::IS_ARMED.load(Ordering::Acquire) {
+            defmt::warn!(
+                "mission_planner: disarm detected mid-solve — aborting (no trajectory)"
+            );
+            msgs::SOLVE_REJECT_DISARMED
+        } else {
+            defmt::warn!(
+                "mission_planner: solve exceeded {}ms budget — aborting mission cleanly",
+                SOLVE_BUDGET.as_millis()
+            );
+            msgs::SOLVE_REJECT_BUDGET_EXCEEDED
+        };
+        return PlanOutcome::Reject {
+            dur: 0.0,
+            solve: mk_solve(reject_reason, 0.0),
+        };
+    }
+
+    // Convergence / Stop / MaxIterations are all "solver returned a
+    // trajectory" outcomes; validate the numerical result. Reject
+    // InvalidValue outright.
+    let converged = matches!(
+        result.status,
+        SolverStatus::Convergence | SolverStatus::Stop | SolverStatus::MaxIterations
+    );
+    let dur = result.trajectory.total_duration();
+    // "Under-compressed" guard: if the optimizer claims convergence but
+    // the total duration is ≥ 90% of the pre-BFGS init allocation, it
+    // didn't actually compress the trajectory.
+    let compression_ok = dur < 0.9 * init_duration_s;
+    let basic_valid = converged
+        && dur.is_finite()
+        && dur >= MIN_TRAJECTORY_DURATION_S
+        && dur <= MAX_TRAJECTORY_DURATION_S
+        && result.final_cost.is_finite();
+    let valid = basic_valid && compression_ok;
+
+    if !valid {
+        let reject_reason = if !basic_valid {
+            msgs::SOLVE_REJECT_INVALID
+        } else {
+            msgs::SOLVE_REJECT_UNDER_COMPRESSED
+        };
+        defmt::warn!(
+            "mission_planner: rejecting trajectory (status={}, dur={}, init_dur={}, reason={})",
+            result.status as u8,
+            dur,
+            init_duration_s,
+            reject_reason,
+        );
+        return PlanOutcome::Reject {
+            dur,
+            solve: mk_solve(reject_reason, 0.0),
+        };
+    }
+
+    let peak_v = peak_vel_m_s(&result.trajectory, dur);
+    PlanOutcome::Ok {
+        trajectory: result.trajectory,
+        dur,
+        solve: mk_solve(msgs::SOLVE_REJECT_NONE, peak_v),
+    }
+}
+
+/// Offline (precomputed) planning schema.
+///
+/// Reads `OFFLINE_WAYPOINTS` + `OFFLINE_TIMESTAMPS` (60 pieces,
+/// solved offline by a heavier planner), recovers per-segment
+/// durations from consecutive timestamp differences, and feeds
+/// the schedule directly into a [`MincoSnap`] solver. No BFGS. No
+/// cooperative yielding — the banded LU completes in single-digit
+/// milliseconds, well inside any IWDG budget.
+///
+/// Honors [`OFFLINE_USE_YAML_START`] for the head pose; the rest of
+/// the trajectory (intermediate waypoints, tail) is unconditionally
+/// the YAML schedule.
+fn plan_offline(
+    start_position: nalgebra::Vector3<f32>,
+    minco: &mut MincoSnap,
+) -> PlanOutcome {
+    // Recover per-segment durations from the absolute timestamp
+    // schedule. `dur[0] = TIMESTAMPS[0]` (segment running from t=0);
+    // subsequent durations are consecutive differences. Reject on
+    // non-monotonic / non-positive / non-finite — the offline
+    // generator should never emit such a schedule, but if the YAML
+    // were ever hand-edited we don't want NaN to propagate through
+    // MINCO.
+    let mut durations = [0.0f32; OFFLINE_NUM_PIECES];
+    let mut prev_t = 0.0f32;
+    for i in 0..OFFLINE_NUM_PIECES {
+        let ts = OFFLINE_TIMESTAMPS[i];
+        let d = ts - prev_t;
+        if !d.is_finite() || d <= 0.0 {
+            defmt::warn!(
+                "mission_planner: offline timestamps invalid at i={} (d={}) — request dropped",
+                i,
+                d,
+            );
+            return PlanOutcome::Reject {
+                dur: 0.0,
+                solve: msgs::SolveDiagnostics {
+                    status: 0,
+                    iterations: 0,
+                    solve_time_ms: 0,
+                    num_pieces: OFFLINE_NUM_PIECES as u8,
+                    init_duration_s: OFFLINE_TIMESTAMPS[OFFLINE_NUM_PIECES - 1],
+                    final_cost: 0.0,
+                    peak_vel_m_s: 0.0,
+                    reject_reason: SOLVE_REJECT_INVALID_TIMES,
+                },
+            };
+        }
+        durations[i] = d;
+        prev_t = ts;
+    }
+    let init_duration_s = OFFLINE_TIMESTAMPS[OFFLINE_NUM_PIECES - 1];
+
+    // Head pose: live setpoint by default, YAML start if the flag
+    // says so. The trajectory's first segment duration is unchanged
+    // either way.
+    let head_pos: Vec3 = if OFFLINE_USE_YAML_START {
+        Vec3::from(OFFLINE_START_POS)
+    } else {
+        start_position
+    };
+
+    // MINCO-snap contract: for `n = OFFLINE_NUM_PIECES` pieces, the
+    // solver needs `n−1` intermediate waypoints and a tail boundary.
+    // The YAML provides `n` waypoints; `wp[0..n−1]` are the
+    // intermediates and `wp[n−1]` is the tail.
+    const N_INTERMEDIATE: usize = OFFLINE_NUM_PIECES - 1;
+    let mut intermediate = [ZERO3; N_INTERMEDIATE];
+    for i in 0..N_INTERMEDIATE {
+        intermediate[i] = Vec3::from(OFFLINE_WAYPOINTS[i]);
+    }
+    let tail_pos = Vec3::from(OFFLINE_WAYPOINTS[OFFLINE_NUM_PIECES - 1]);
+
+    // PVAJ boundaries: zero v, a, j at both head and tail (the drone
+    // is hovering when the mission triggers, and the offline schedule
+    // returns to rest).
+    let head: [Vec3; 4] = [head_pos, ZERO3, ZERO3, ZERO3];
+    let tail: [Vec3; 4] = [tail_pos, ZERO3, ZERO3, ZERO3];
+
+    defmt::info!(
+        "mission_planner: offline solve (head=[{},{},{}], n={}, total={}s)",
+        head_pos.x,
+        head_pos.y,
+        head_pos.z,
+        OFFLINE_NUM_PIECES,
+        init_duration_s
+    );
+
+    let t0 = Instant::now();
+    minco.set_boundary(&head, &tail);
+    minco.solve(&intermediate, &durations);
+    let trajectory = minco.get_trajectory();
+    let final_cost = minco.get_energy();
+    let elapsed_ms = Instant::now().duration_since(t0).as_millis();
+
+    let dur = trajectory.total_duration();
+    let basic_valid = dur.is_finite()
+        && dur >= MIN_TRAJECTORY_DURATION_S
+        && dur <= MAX_TRAJECTORY_DURATION_S
+        && final_cost.is_finite();
+
+    let mk_solve = |reason: u8, peak: f32| msgs::SolveDiagnostics {
+        // `status` field is BFGS-shaped; on the offline path we have
+        // no solver status to report, so the closest analogue is
+        // `Convergence` (the schedule is taken verbatim, by definition
+        // optimal under the offline cost).
+        status: SolverStatus::Convergence as u8,
+        iterations: 0,
+        solve_time_ms: elapsed_ms.min(u16::MAX as u64) as u16,
+        num_pieces: OFFLINE_NUM_PIECES as u8,
+        init_duration_s,
+        final_cost,
+        peak_vel_m_s: peak,
+        reject_reason: reason,
+    };
+
+    if !basic_valid {
+        defmt::warn!(
+            "mission_planner: offline trajectory rejected (dur={}, cost={})",
+            dur,
+            final_cost
+        );
+        return PlanOutcome::Reject {
+            dur,
+            solve: mk_solve(msgs::SOLVE_REJECT_INVALID, 0.0),
+        };
+    }
+
+    let peak_v = peak_vel_m_s(&trajectory, dur);
+    defmt::info!(
+        "mission_planner: offline solve done ({}ms, dur={}s, peak_v={}m/s)",
+        elapsed_ms,
+        dur,
+        peak_v,
+    );
+    PlanOutcome::Ok {
+        trajectory,
+        dur,
+        solve: mk_solve(msgs::SOLVE_REJECT_NONE, peak_v),
+    }
+}
+
 #[embassy_executor::task]
 pub async fn mission_planner_task() {
     let workspace: &mut BfgsWorkspace = WORKSPACE.init(BfgsWorkspace::new());
+    // Pre-allocate the offline MINCO-snap solver with the YAML's piece
+    // count. Boundary states (PVAJ) are placeholders; `plan_offline`
+    // rewrites them via `set_boundary` on every request.
+    let offline_minco: &mut MincoSnap = OFFLINE_MINCO.init(MincoSnap::new(
+        &[ZERO3, ZERO3, ZERO3, ZERO3],
+        &[ZERO3, ZERO3, ZERO3, ZERO3],
+        OFFLINE_NUM_PIECES,
+    ));
     let mission_status_pub = MISSION_STATUS.immediate_publisher();
     // Build the planner config from the *live* vehicle params (mass,
     // inertia, motor thrust caps, planner tunables) rather than the
@@ -215,26 +689,19 @@ pub async fn mission_planner_task() {
     // 0.55 kg quad regardless of what the firmware is actually flying,
     // and the outer-loop's flatness map (which uses live mass via
     // `mpc_problem`) sees a physically inconsistent acceleration profile.
-    // Refreshed per PLAN_REQUEST so a between-mission param edit takes
-    // effect on the next solve.
+    // Refreshed per PLAN_REQUEST inside `plan_online`. Unused by the
+    // offline path; left in scope for symmetry.
     let mut config = QuadPlanningConfig::from_vehicle_params(&crate::params::get());
     let mut local_param_ver = crate::params::PARAM_VERSION.load(Ordering::Acquire);
 
-    defmt::info!("mission_planner: ready (idle)");
+    defmt::info!(
+        "mission_planner: ready (idle, schema={})",
+        if USE_OFFLINE_PLAN { "offline" } else { "online" }
+    );
 
     loop {
         // Block until the RC trigger fires.
         PLAN_REQUEST.wait().await;
-
-        // Refresh planner config if vehicle params changed since the
-        // last solve. Only safe between solves (no in-flight BFGS state
-        // depends on `config`).
-        let cur = crate::params::PARAM_VERSION.load(Ordering::Acquire);
-        if cur != local_param_ver {
-            local_param_ver = cur;
-            config = QuadPlanningConfig::from_vehicle_params(&crate::params::get());
-            defmt::info!("mission_planner: planner config reloaded (ver {})", cur);
-        }
 
         // Clear any stale abort flag left over from a previous mission
         // (e.g. failsafe-on-disarm scenarios). A fresh plan request is
@@ -257,7 +724,7 @@ pub async fn mission_planner_task() {
         // tracking right now). A `None` here means `ACTIVE_POSITION_SETPOINT`
         // is uninitialized, non-finite, or its timestamp is stale — i.e.
         // rc_interpreter is not refreshing the cell. Drop the request
-        // rather than seeding BFGS with junk.
+        // rather than seeding the planner with junk.
         //
         // Start velocity is zero: the mission trigger fires with the
         // drone hovering, and rc-integrated setpoints carry no
@@ -272,256 +739,63 @@ pub async fn mission_planner_task() {
             }
         };
 
-        let start_pos: [f32; 3] = [start_position.x, start_position.y, start_position.z];
-        let start_vel: [f32; 3] = [0.0, 0.0, 0.0];
-
         // Enter Planning — sticks are already gated by rc_interpreter from
         // the moment it sent the trigger, but make the state machine honest.
         MISSION_STATE.store(MissionState::Planning as u8, Ordering::Release);
 
-        let targets = [
-            [-0.3267, -2.231, 1.6],
-            [-1.845, 1.942, 1.0],
-            [2.292, 1.637, 1.0],
-            [2.547, -2.108, 1.8],
-            [2.547, -2.108, 0.8],
-            [0.3099, 0.3554, 1.0],
-            [-2.396, -2.214, 1.0],
-            [-0.3267, -2.231, 1.6],
-            [-1.845, 1.942, 1.0],
-            [2.292, 1.637, 1.0],
-            [2.547, -2.108, 1.8],
-            [2.547, -2.108, 0.8],
-            [0.3099, 0.3554, 1.0],
-            [-2.396, -2.214, 1.0],
-            [-0.3267, -2.231, 1.6],
-            [-1.845, 1.942, 1.0],
-            [2.292, 1.637, 1.0],
-            [2.547, -2.108, 1.8],
-            [2.547, -2.108, 0.8],
-        ];
-
-        let input = PlannerInput::waypoints(
-            start_pos,
-            start_vel,
-            &targets.map(|t| Vec3::from(t) + Vec3::z_axis().scale(3.0)),
-        );
-
-        // Snapshot the pre-BFGS time allocation so the ground station can
-        // compare it against the optimized total duration — a ratio ≈ 1
-        // means BFGS made no progress.
-        let n_pieces_input = input.num_waypoints + 1;
-        let init_duration_s: f32 = input.init_times[..n_pieces_input].iter().sum();
-
-        defmt::info!(
-            "mission_planner: solving (start=[{},{},{}], {} waypoints + return)",
-            start_pos[0],
-            start_pos[1],
-            start_pos[2],
-            NUM_CIRCLE_WAYPOINTS
-        );
-
-        // Wall-clock deadline for the solve. The inner BFGS polls
-        // `keep_going` at each outer iteration; returning `false`
-        // cleanly aborts with `SolverStatus::TimeExceeded`.
-        //
-        // The 250 ms budget is chosen to stay well under the 500 ms
-        // IWDG timeout even when stacked with the worst-case 200 ms
-        // feed interval (250 + 200 = 450 ms < 500 ms). The IWDG is the
-        // sole safety net here; we intentionally do NOT extend it
-        // around the solve — see design rationale in watchdog.rs.
-        //
-        // The callback ALSO returns false when `IS_ARMED` clears. If
-        // the pilot emergency-disarms during the solve, the RC parser
-        // (on ctrl_spawner P10) detects the arm-switch edge and
-        // signals `ARM_STATE`; DShot (P6) consumes it and sets
-        // `IS_ARMED = false`. The solver sees that on its next outer
-        // iteration (≤20 ms) and exits — so no stale trajectory ever
-        // lands in `MISSION_TRAJECTORY_SLOT` from a disarmed attempt.
-        //
-        // Cooperative yielding: the solve runs in bursts of
-        // `BFGS_ITERS_PER_YIELD` iterations. Between bursts we sleep
-        // for `INTER_BURST_DELAY` so peer thread-executor tasks (MPC
-        // outer loop, ESKF, GPS, baro, mag) get a scheduling slot that
-        // mission_planner cannot immediately reclaim — without this
-        // delay, the outer_loop runs at ~40–60 Hz during Planning and
-        // the drone stutters vertically while BFGS solves.
-        let t0 = Instant::now();
-        let deadline = t0 + SOLVE_BUDGET;
-        let mut keep_going =
-            || Instant::now() < deadline && crate::motors::IS_ARMED.load(Ordering::Acquire);
-        let mut session = plan_init(&input, &config, workspace);
-        let mut last_heartbeat = t0;
-        let status = loop {
-            match plan_resume(
-                &mut session,
-                &config,
+        // Dispatch to the chosen planning schema. Both functions own
+        // their solver-specific reject reasons; the outer body only
+        // sees a `PlanOutcome`.
+        let outcome = if USE_OFFLINE_PLAN {
+            plan_offline(start_position, offline_minco)
+        } else {
+            plan_online(
+                start_position,
                 workspace,
-                &mut keep_going,
-                BFGS_ITERS_PER_YIELD,
-            ) {
-                Some(s) => break s,
-                None => {
-                    // Burst done but solver still running. Re-check the
-                    // abort conditions eagerly (cheap) and then sleep
-                    // for INTER_BURST_DELAY — a bare yield_now would let
-                    // mission_planner reclaim the CPU before the
-                    // outer_loop's 10 ms tick fires, leaving MPC running
-                    // at only ~50 Hz and causing visible motor stutter
-                    // during Planning.
-                    if !keep_going() {
-                        break SolverStatus::TimeExceeded;
-                    }
-                    let now = Instant::now();
-                    if now.duration_since(last_heartbeat) >= PLANNING_HEARTBEAT_INTERVAL {
-                        last_heartbeat = now;
-                        mission_status_pub.publish_immediate(msgs::MissionStatus {
-                            timestamp: now,
-                            state: MissionState::Planning as u8,
-                            tau_s: 0.0,
-                            total_duration_s: 0.0,
-                            target_position: start_position,
-                            solve: msgs::SolveDiagnostics::NONE,
-                        });
-                    }
-                    Timer::after(INTER_BURST_DELAY).await;
-                }
+                &mut config,
+                &mut local_param_ver,
+                &mission_status_pub,
+            )
+            .await
+        };
+
+        let (trajectory, dur, solve) = match outcome {
+            PlanOutcome::Ok {
+                trajectory,
+                dur,
+                solve,
+            } => (trajectory, dur, solve),
+            PlanOutcome::Reject { dur, solve } => {
+                MISSION_STATE.store(MissionState::Idle as u8, Ordering::Release);
+                mission_status_pub.publish_immediate(msgs::MissionStatus {
+                    timestamp: Instant::now(),
+                    state: MissionState::Idle as u8,
+                    tau_s: 0.0,
+                    total_duration_s: dur,
+                    target_position: start_position,
+                    solve,
+                });
+                continue;
             }
         };
-        // Yield once before plan_finalize so the IWDG feed task and any
-        // other pending thread-executor tasks (ESKF, GPS) can run. The
-        // finalize call is synchronous and potentially several ms long;
-        // a single yield ensures the last-fed timestamp stays fresh even
-        // if the disarm path gets here with the IWDG nearly exhausted.
-        embassy_futures::yield_now().await;
-        let result = plan_finalize(session, workspace, status);
-        let elapsed_ms = Instant::now().duration_since(t0).as_millis();
 
-        defmt::info!(
-            "mission_planner: solve done ({}ms, iters={}, cost={}, status={})",
-            elapsed_ms,
-            result.iterations,
-            result.final_cost,
-            result.status as u8
-        );
-
-        // Build a `SolveDiagnostics` stamped with the given reject reason.
-        // Used by every Planning → Idle transition below to emit a
-        // breadcrumb `MissionStatus` frame so the GCS can distinguish
-        // the reject paths without RTT/defmt access.
-        let mk_reject_solve = |reason: u8| msgs::SolveDiagnostics {
-            status: result.status as u8,
-            iterations: result.iterations.min(u16::MAX as usize) as u16,
-            solve_time_ms: elapsed_ms.min(u16::MAX as u64) as u16,
-            num_pieces: result.num_pieces.min(u8::MAX as usize) as u8,
-            init_duration_s,
-            final_cost: result.final_cost,
-            peak_vel_m_s: 0.0,
-            reject_reason: reason,
-        };
-
-        // Classify the outcome.
-        //
-        // `TimeExceeded` is the graceful-abort path: the solver hit
-        // the wall-clock budget. Treat it distinctly from a numerical
-        // failure so the pilot's defmt log shows the true cause. The
-        // drone stays on its prior setpoint (the hover position from
-        // before the mission trigger) and the pilot can either retry
-        // or keep flying manually.
-        if result.status == SolverStatus::TimeExceeded {
-            // Either the wall-clock budget elapsed, or IS_ARMED cleared
-            // (emergency disarm). Both are graceful exits; distinguish
-            // in the log so the pilot/defmt reader knows why.
-            let reject_reason = if !crate::motors::IS_ARMED.load(Ordering::Acquire) {
-                defmt::warn!(
-                    "mission_planner: disarm detected mid-solve — aborting (no trajectory)"
-                );
-                msgs::SOLVE_REJECT_DISARMED
-            } else {
-                defmt::warn!(
-                    "mission_planner: solve exceeded {}ms budget — aborting mission cleanly",
-                    SOLVE_BUDGET.as_millis()
-                );
-                msgs::SOLVE_REJECT_BUDGET_EXCEEDED
-            };
-            MISSION_STATE.store(MissionState::Idle as u8, Ordering::Release);
-            mission_status_pub.publish_immediate(msgs::MissionStatus {
-                timestamp: Instant::now(),
-                state: MissionState::Idle as u8,
-                tau_s: 0.0,
-                total_duration_s: 0.0,
-                target_position: start_position,
-                solve: mk_reject_solve(reject_reason),
-            });
-            continue;
-        }
-
-        // Convergence / Stop / MaxIterations are all "solver returned a
-        // trajectory" outcomes; validate the numerical result. Reject
-        // InvalidValue outright.
-        let converged = matches!(
-            result.status,
-            SolverStatus::Convergence | SolverStatus::Stop | SolverStatus::MaxIterations
-        );
-        let dur = result.trajectory.total_duration();
-        // "Under-compressed" guard: if the optimizer claims convergence but
-        // the total duration is ≥ 90% of the pre-BFGS init allocation, it
-        // didn't actually compress the trajectory. Observed on STM32 when
-        // the trust region collapses after a first penalty-relieving
-        // expansion step — BFGS reports `Convergence` via the `delta < 1e-7`
-        // exit at a cost far from the true optimum. Rejecting here keeps
-        // the pilot hovering on the pre-mission setpoint.
-        let compression_ok = dur < 0.9 * init_duration_s;
-        // Split the `!valid` check so the reject breadcrumb can carry a
-        // specific reason (`INVALID` vs `UNDER_COMPRESSED`) instead of a
-        // generic flag.
-        let basic_valid = converged
-            && dur.is_finite()
-            && dur >= MIN_TRAJECTORY_DURATION_S
-            && dur <= MAX_TRAJECTORY_DURATION_S
-            && result.final_cost.is_finite();
-        let valid = basic_valid && compression_ok;
-
-        if !valid {
-            let reject_reason = if !basic_valid {
-                msgs::SOLVE_REJECT_INVALID
-            } else {
-                msgs::SOLVE_REJECT_UNDER_COMPRESSED
-            };
-            defmt::warn!(
-                "mission_planner: rejecting trajectory (status={}, dur={}, init_dur={}, reason={})",
-                result.status as u8,
-                dur,
-                init_duration_s,
-                reject_reason,
-            );
-            MISSION_STATE.store(MissionState::Idle as u8, Ordering::Release);
-            mission_status_pub.publish_immediate(msgs::MissionStatus {
-                timestamp: Instant::now(),
-                state: MissionState::Idle as u8,
-                tau_s: 0.0,
-                total_duration_s: dur,
-                target_position: start_position,
-                solve: mk_reject_solve(reject_reason),
-            });
-            continue;
-        }
-
-        // If the pilot aborted during the ~100 ms solve, drop the result
-        // on the floor — do NOT transition to Executing. The outer loop
-        // will not pick up the abort flag because the state never leaves
+        // If the pilot aborted during the solve, drop the result on the
+        // floor — do NOT transition to Executing. The outer loop will
+        // not pick up the abort flag because the state never leaves
         // Idle, so we clear the flag here ourselves.
         if MISSION_ABORT_REQUESTED.load(Ordering::Acquire) {
             defmt::info!("mission_planner: user aborted during solve, trajectory discarded");
             MISSION_ABORT_REQUESTED.store(false, Ordering::Release);
             MISSION_STATE.store(MissionState::Idle as u8, Ordering::Release);
+            let mut s = solve;
+            s.reject_reason = msgs::SOLVE_REJECT_USER_ABORT;
             mission_status_pub.publish_immediate(msgs::MissionStatus {
                 timestamp: Instant::now(),
                 state: MissionState::Idle as u8,
                 tau_s: 0.0,
                 total_duration_s: dur,
                 target_position: start_position,
-                solve: mk_reject_solve(msgs::SOLVE_REJECT_USER_ABORT),
+                solve: s,
             });
             continue;
         }
@@ -538,13 +812,15 @@ pub async fn mission_planner_task() {
                 "mission_planner: state left Planning during solve ({}), discarding",
                 state_now as u8
             );
+            let mut s = solve;
+            s.reject_reason = msgs::SOLVE_REJECT_STATE_CHANGED;
             mission_status_pub.publish_immediate(msgs::MissionStatus {
                 timestamp: Instant::now(),
                 state: state_now as u8,
                 tau_s: 0.0,
                 total_duration_s: dur,
                 target_position: start_position,
-                solve: mk_reject_solve(msgs::SOLVE_REJECT_STATE_CHANGED),
+                solve: s,
             });
             continue;
         }
@@ -554,51 +830,13 @@ pub async fn mission_planner_task() {
         // Both the slot write and the `MISSION_STATE = Executing` flip
         // happen inside one `MISSION_TRAJECTORY_SLOT.lock` so that any
         // task which observes `Executing` and then takes the slot lock
-        // is guaranteed to see the trajectory. Without this, the
-        // sequence (planner unlock → failsafe takes lock, clears slot,
-        // sets Idle → planner stores Executing → outer_loop sees
-        // Executing + empty slot) was reachable. failsafe.rs writes its
+        // is guaranteed to see the trajectory. failsafe.rs writes its
         // state flip inside the same lock for the symmetric reason.
-        // Re-check abort + state INSIDE the publish lock. The outer
-        // checks above (lines 348-394) raced against any concurrent
-        // state writer (outer_loop's abort path, failsafe). Both of
-        // those writers also take this same lock to flip MISSION_STATE,
-        // so re-reading the flag and the state here serializes the
-        // publish against them — closing the window where:
-        //   - planner sees abort=false, state=Planning;
-        //   - outer_loop's tick consumes the abort flag (swap → false),
-        //     locks slot, stores state=Idle, releases;
-        //   - planner acquires lock and overwrites with state=Executing.
-        // We `swap(false)` rather than `load` so this consumes the
-        // intent symmetrically with the outer_loop abort branch.
-        // Sample peak velocity on the final trajectory for downlink
-        // diagnostics. 200 uniform samples is plenty to catch the peak of
-        // a smooth quintic spline.
-        let peak_vel_m_s = {
-            let mut v_max = 0.0f32;
-            let n_samples = 200;
-            for i in 0..=n_samples {
-                let t = dur * i as f32 / n_samples as f32;
-                let v = result.trajectory.get_vel(t);
-                let v2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-                if v2 > v_max {
-                    v_max = v2;
-                }
-            }
-            libm::sqrtf(v_max)
-        };
-
-        let solve = msgs::SolveDiagnostics {
-            status: result.status as u8,
-            iterations: result.iterations.min(u16::MAX as usize) as u16,
-            solve_time_ms: elapsed_ms.min(u16::MAX as u64) as u16,
-            num_pieces: result.num_pieces.min(u8::MAX as usize) as u8,
-            init_duration_s,
-            final_cost: result.final_cost,
-            peak_vel_m_s,
-            reject_reason: msgs::SOLVE_REJECT_NONE,
-        };
-
+        // Re-check abort + state INSIDE the publish lock to serialize
+        // against any concurrent state writer (outer_loop's abort path,
+        // failsafe). We `swap(false)` rather than `load` so this
+        // consumes the intent symmetrically with the outer_loop abort
+        // branch.
         let t_start = Instant::now();
         let mut published = false;
         MISSION_TRAJECTORY_SLOT.lock(|slot| {
@@ -611,7 +849,7 @@ pub async fn mission_planner_task() {
                 return;
             }
             *slot.borrow_mut() = Some(MissionTrajectory {
-                traj: result.trajectory,
+                traj: trajectory,
                 t_start,
                 total_duration_s: dur,
                 solve,
@@ -636,11 +874,9 @@ pub async fn mission_planner_task() {
             continue;
         }
         defmt::info!(
-            "mission_planner: → Executing (dur={}s, init_dur={}s, iters={}, peak_v={}m/s)",
+            "mission_planner: → Executing (dur={}s, peak_v={}m/s)",
             dur,
-            init_duration_s,
-            result.iterations,
-            peak_vel_m_s,
+            solve.peak_vel_m_s,
         );
         // Publish the Executing state immediately so the ground station sees
         // state=2 without waiting up to 100 ms for the outer_loop's decimated

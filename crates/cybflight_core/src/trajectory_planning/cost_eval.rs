@@ -12,7 +12,7 @@ use super::penalties::{
 };
 use super::quad_planning_config::QuadPlanningConfig;
 use super::types::{Vec3, ZERO3, PVA3D};
-use super::MAX_PIECES;
+use super::MAX_PLANNED_PIECES;
 use crate::params::PlannerParams;
 
 const JERK_COEFFS: usize = 6;
@@ -57,17 +57,17 @@ pub struct CostEvaluator {
     n_waypoints: usize,
     dim_k: usize,
 
-    nominal_waypoints: [Vec3; MAX_PIECES],
+    nominal_waypoints: [Vec3; MAX_PLANNED_PIECES],
     waypoint_radius: f32,
 
     minco: MincoJerk,
 
-    times: [f32; MAX_PIECES],
-    waypoints: [Vec3; MAX_PIECES],
-    partial_grad_c: [Vector3<f32>; JERK_COEFFS * MAX_PIECES],
-    partial_grad_t: [f32; MAX_PIECES],
-    grad_points: [Vector3<f32>; MAX_PIECES],
-    grad_times: [f32; MAX_PIECES],
+    times: [f32; MAX_PLANNED_PIECES],
+    waypoints: [Vec3; MAX_PLANNED_PIECES],
+    partial_grad_c: [Vector3<f32>; JERK_COEFFS * MAX_PLANNED_PIECES],
+    partial_grad_t: [f32; MAX_PLANNED_PIECES],
+    grad_points: [Vector3<f32>; MAX_PLANNED_PIECES],
+    grad_times: [f32; MAX_PLANNED_PIECES],
 }
 
 impl CostEvaluator {
@@ -76,7 +76,7 @@ impl CostEvaluator {
         n_pieces: usize,
         head: &PVA3D,
         tail: &PVA3D,
-        nominal_waypoints: &[Vec3; MAX_PIECES],
+        nominal_waypoints: &[Vec3; MAX_PLANNED_PIECES],
         waypoint_radius: f32,
     ) -> Self {
         let p = &config.planner;
@@ -110,12 +110,12 @@ impl CostEvaluator {
             nominal_waypoints: *nominal_waypoints,
             waypoint_radius,
             minco: MincoJerk::new(head, tail, n_pieces),
-            times: [0.0; MAX_PIECES],
-            waypoints: [ZERO3; MAX_PIECES],
-            partial_grad_c: [Vector3::zeros(); JERK_COEFFS * MAX_PIECES],
-            partial_grad_t: [0.0; MAX_PIECES],
-            grad_points: [Vector3::zeros(); MAX_PIECES],
-            grad_times: [0.0; MAX_PIECES],
+            times: [0.0; MAX_PLANNED_PIECES],
+            waypoints: [ZERO3; MAX_PLANNED_PIECES],
+            partial_grad_c: [Vector3::zeros(); JERK_COEFFS * MAX_PLANNED_PIECES],
+            partial_grad_t: [0.0; MAX_PLANNED_PIECES],
+            grad_points: [Vector3::zeros(); MAX_PLANNED_PIECES],
+            grad_times: [0.0; MAX_PLANNED_PIECES],
         }
     }
 

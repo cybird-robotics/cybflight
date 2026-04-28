@@ -17,7 +17,7 @@ use super::penalties::{backward_t, forward_t};
 use super::piecewise_polynomial::PiecewisePolynomial;
 use super::quad_planning_config::QuadPlanningConfig;
 use super::types::*;
-use super::MAX_PIECES;
+use super::MAX_PLANNED_PIECES;
 
 /// Solver convergence status.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,11 +53,11 @@ pub struct PlannerInput {
     /// End state [pos, vel, acc].
     pub tail: PVA3D,
     /// Intermediate waypoint positions (first `num_waypoints` entries valid).
-    pub waypoints: [Vec3; MAX_PIECES],
+    pub waypoints: [Vec3; MAX_PLANNED_PIECES],
     /// Number of intermediate waypoints (pieces = num_waypoints + 1).
     pub num_waypoints: usize,
     /// Initial time allocation per segment (first `num_waypoints + 1` entries valid).
-    pub init_times: [f32; MAX_PIECES],
+    pub init_times: [f32; MAX_PLANNED_PIECES],
     /// Ball-shape radius for anchoring each waypoint (stereographic
     /// projection, following the C++ reference `Ball::toP` parameterization).
     ///
@@ -93,7 +93,7 @@ impl PlannerInput {
         let head: PVA3D = [start_pos, start_vel, ZERO3];
         let tail: PVA3D = [target_pos, ZERO3, ZERO3];
         let dist = (start_pos - target_pos).norm();
-        let mut init_times = [0.0f32; MAX_PIECES];
+        let mut init_times = [0.0f32; MAX_PLANNED_PIECES];
         // Seed segment time generously so the init trajectory stays inside
         // the body-rate and thrust penalty knees. Starting inside an active
         // penalty region has been observed to trap BFGS: its first step
@@ -103,7 +103,7 @@ impl PlannerInput {
         Self {
             head,
             tail,
-            waypoints: [ZERO3; MAX_PIECES],
+            waypoints: [ZERO3; MAX_PLANNED_PIECES],
             num_waypoints: 0,
             init_times,
             waypoint_radius: DEFAULT_WAYPOINT_RADIUS,
@@ -137,14 +137,14 @@ impl PlannerInput {
         let head: PVA3D = [start_pos, start_vel, ZERO3];
         let tail: PVA3D = [tail_pos, ZERO3, ZERO3];
 
-        let num_intermediate = last_idx.min(MAX_PIECES - 1);
-        let mut wps = [ZERO3; MAX_PIECES];
+        let num_intermediate = last_idx.min(MAX_PLANNED_PIECES - 1);
+        let mut wps = [ZERO3; MAX_PLANNED_PIECES];
         for i in 0..num_intermediate {
             wps[i] = targets[i];
         }
 
-        let num_segments = (num_intermediate + 1).min(MAX_PIECES);
-        let mut init_times = [0.0f32; MAX_PIECES];
+        let num_segments = (num_intermediate + 1).min(MAX_PLANNED_PIECES);
+        let mut init_times = [0.0f32; MAX_PLANNED_PIECES];
         let mut prev = start_pos;
         for i in 0..num_segments {
             let next = if i < num_intermediate {
@@ -191,9 +191,9 @@ pub struct PlannerResult {
     /// Solver convergence status.
     pub status: SolverStatus,
     /// Optimized segment durations [s] (first `num_pieces` entries valid).
-    pub optimized_times: [f32; MAX_PIECES],
+    pub optimized_times: [f32; MAX_PLANNED_PIECES],
     /// Optimized waypoint positions (first `num_pieces - 1` entries valid).
-    pub optimized_waypoints: [Vec3; MAX_PIECES],
+    pub optimized_waypoints: [Vec3; MAX_PLANNED_PIECES],
     /// Number of polynomial pieces in the trajectory.
     pub num_pieces: usize,
 }
@@ -246,7 +246,7 @@ where
 {
     let n_wp = input.num_waypoints;
     let n_pieces = n_wp + 1;
-    debug_assert!(n_pieces >= 1 && n_pieces <= MAX_PIECES);
+    debug_assert!(n_pieces >= 1 && n_pieces <= MAX_PLANNED_PIECES);
 
     let dim_k = n_pieces;
     let dim_d = 3 * n_wp;
@@ -254,7 +254,7 @@ where
 
     // Initialize decision vector: x = [K_times, D_stereographic_coords].
     // D = 0 maps to the nominal waypoint via the stereographic projection.
-    let mut x = [0.0f32; 4 * MAX_PIECES];
+    let mut x = [0.0f32; 4 * MAX_PLANNED_PIECES];
     for i in 0..n_pieces {
         x[i] = backward_t(input.init_times[i]);
     }
@@ -283,8 +283,8 @@ where
 
     // Extract solution via stereographic forward map.
     let r = input.waypoint_radius;
-    let mut opt_times = [0.0f32; MAX_PIECES];
-    let mut opt_wp = [ZERO3; MAX_PIECES];
+    let mut opt_times = [0.0f32; MAX_PLANNED_PIECES];
+    let mut opt_wp = [ZERO3; MAX_PLANNED_PIECES];
     for i in 0..n_pieces {
         opt_times[i] = forward_t(x[i]);
     }
@@ -329,7 +329,7 @@ where
 /// all state the solver needs to pick up where it left off.
 pub struct PlanSession {
     /// Decision vector: `[K_times..., D_stereographic...]`, padded to max size.
-    pub x: [f32; 4 * MAX_PIECES],
+    pub x: [f32; 4 * MAX_PLANNED_PIECES],
     /// Active decision-vector length (`dim_k + dim_d`).
     pub dim_total: usize,
     /// Number of polynomial pieces.
@@ -339,7 +339,7 @@ pub struct PlanSession {
     /// Ball-shape stereographic radius, copied from the input.
     pub waypoint_radius: f32,
     /// Nominal waypoint centers, copied from the input for later forward-map.
-    pub nominal_waypoints: [Vec3; MAX_PIECES],
+    pub nominal_waypoints: [Vec3; MAX_PLANNED_PIECES],
     /// Head/tail boundary conditions (for the final MINCO trajectory build).
     pub head: PVA3D,
     pub tail: PVA3D,
@@ -361,7 +361,7 @@ pub fn plan_init(
 ) -> PlanSession {
     let n_wp = input.num_waypoints;
     let n_pieces = n_wp + 1;
-    debug_assert!(n_pieces >= 1 && n_pieces <= MAX_PIECES);
+    debug_assert!(n_pieces >= 1 && n_pieces <= MAX_PLANNED_PIECES);
 
     let dim_k = n_pieces;
     let dim_d = 3 * n_wp;
@@ -369,7 +369,7 @@ pub fn plan_init(
 
     // Decision vector: x = [K_times, D_stereographic_coords].
     // D = 0 maps to the nominal waypoint via the stereographic projection.
-    let mut x = [0.0f32; 4 * MAX_PIECES];
+    let mut x = [0.0f32; 4 * MAX_PLANNED_PIECES];
     for i in 0..n_pieces {
         x[i] = backward_t(input.init_times[i]);
     }
@@ -483,8 +483,8 @@ pub fn plan_finalize(
     let dim_k = session.n_pieces;
 
     // Forward stereographic map: D coords → actual waypoint positions.
-    let mut opt_times = [0.0f32; MAX_PIECES];
-    let mut opt_wp = [ZERO3; MAX_PIECES];
+    let mut opt_times = [0.0f32; MAX_PLANNED_PIECES];
+    let mut opt_wp = [ZERO3; MAX_PLANNED_PIECES];
     for i in 0..session.n_pieces {
         opt_times[i] = forward_t(session.x[i]);
     }

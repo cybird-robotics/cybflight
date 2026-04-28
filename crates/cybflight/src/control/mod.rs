@@ -29,6 +29,8 @@ pub mod indi_task;
 #[cfg(feature = "outer_mpc")]
 pub mod mission_planner;
 #[cfg(feature = "outer_mpc")]
+pub mod offline_mission;
+#[cfg(feature = "outer_mpc")]
 pub mod outer_loop;
 pub mod rc_interpreter;
 

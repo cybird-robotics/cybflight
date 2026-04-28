@@ -22,7 +22,7 @@ pub const QUADROTOR_BODY: RigidBodyParams = RigidBodyParams {
     // Roll/pitch symmetric (Ixx = Iyy = 0.02), yaw larger (Izz = 0.04).
     // Calibrate from a bifilar pendulum test or CAD model.
     inertia_kg_m2: [0.0021, 0.0, 0.0, 0.0, 0.0018, 0.0, 0.0, 0.0, 0.003],
-    max_rate_rad_s: [10.0, 10.0, 6.0],
+    max_rate_rad_s: [15.0, 15.0, 6.0],
 };
 
 const MAX_THRUST_N: f32 = 12.0;
@@ -77,6 +77,7 @@ pub fn default_params() -> cybflight_core::params::VehicleParams {
         learner: cybflight_core::params::LearnerParams::default(),
         mpc: cybflight_core::params::MpcParams::default(),
         planner: cybflight_core::params::PlannerParams::default(),
+        sampler: cybflight_core::params::SamplerParams::default(),
     }
 }
 

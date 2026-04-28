@@ -5,7 +5,7 @@
 //! This keeps the single-function-frame size tiny, preventing stack
 //! overflow on embedded targets (e.g. STM32H743 task stacks ≈ 4-8 KB).
 //!
-//! The workspace itself is ~35 KB for MAX_VARS = 64; place it on the
+//! The workspace itself is ~35 KB for MAX_VARS = 80; place it on the
 //! main stack, in a `static`, or in DTCM as the deployment requires.
 
 #[allow(unused_imports)]
@@ -13,8 +13,13 @@ use num_traits::Float;
 
 pub use crate::params::BfgsTrustParams;
 
-const MAX_VARS: usize = 4 * super::MAX_PIECES; // 64
-const MAX_VARS_SQ: usize = MAX_VARS * MAX_VARS; // 4096
+/// BFGS variable cap. Decoupled from [`super::MAX_PIECES`] (which sizes
+/// trajectory storage and may be much larger) and instead pinned to the
+/// BFGS planner's own bound `4 * MAX_PLANNED_PIECES`. Keeps the Hessian
+/// (`MAX_VARS²`) from blowing up when the offline trajectory storage cap
+/// is bumped.
+const MAX_VARS: usize = 4 * super::MAX_PLANNED_PIECES; // 80
+const MAX_VARS_SQ: usize = MAX_VARS * MAX_VARS; // 6400
 const MAX_PAST: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq)]

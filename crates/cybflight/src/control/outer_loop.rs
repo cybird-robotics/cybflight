@@ -1,4 +1,4 @@
-//! MPC outer-loop task: 100 Hz position/attitude controller using
+//! MPC outer-loop task: 50 Hz position/attitude controller using
 //! `SimpleSqpSolver` over `QuadModel`. Publishes body-rate + collective-thrust
 //! commands to `super::RATE_COMMAND` for the INDI inner loop to consume.
 //!
@@ -13,6 +13,11 @@
 use cybflight_core::mpc::quad_model::{N as MPC_N, NU as MPC_NU, NX as MPC_NX};
 use cybflight_core::mpc::{QuadModel, SimpleQuadProblem, SimpleSqpSolver};
 use cybflight_core::trajectory_planning::flatness::reference_quaternion;
+#[cfg(feature = "position_sampler")]
+use cybflight_core::trajectory_planning::sampler::PositionSampler;
+#[cfg(not(feature = "position_sampler"))]
+use cybflight_core::trajectory_planning::sampler::TimeSampler;
+use cybflight_core::trajectory_planning::sampler::{Sampler, SamplerInputs, SamplerNode};
 use embassy_time::{Duration, Instant, Ticker};
 use nalgebra::{SVector, UnitQuaternion, Vector3};
 use static_cell::StaticCell;
@@ -30,14 +35,21 @@ static MPC_SOLVER: StaticCell<SimpleSqpSolver> = StaticCell::new();
 /// Maximum age of an odometry sample (against its own timestamp) we will use
 /// as the MPC initial state. ESKF divergence often produces valid-looking
 /// (finite) but stale odometry; without this gate the MPC would happily plan
-/// from an ancient pose. Matches the cascade path's `ODOM_STALE_TIMEOUT` in
-/// `indi_task.rs`.
-const ODOM_STALE_TIMEOUT: Duration = Duration::from_millis(100);
+/// from an ancient pose.
+///
+/// Tightened from 100 ms to 50 ms to support the position-sampler path: at
+/// the planner's 4 m/s cap, 100 ms of stale `state_pos` translates to up to
+/// 0.4 m of position error fed into PositionSampler's closest-point search,
+/// which on a tight curve or near a self-intersection can lock the search
+/// onto the wrong τ. 50 ms = 2.5 outer-loop ticks worth of slack and caps
+/// the worst-case input error at ~0.2 m. TimeSampler doesn't read
+/// `state_pos` and is unaffected by this tighter gate.
+const ODOM_STALE_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Wall-clock budget for one SQP solve. The solver is synchronous (no
 /// `with_timeout` possible) so this is a *post-hoc* check: if a solve exceeds
 /// the budget we discard its output and refuse to publish, on the theory that
-/// (a) the command is now stale relative to the 100 Hz tick, and (b) a solve
+/// (a) the command is now stale relative to the 50 Hz tick, and (b) a solve
 /// that ran long is more likely to have diverged. Persistent overruns will
 /// trip the inner loop's `MPC_CMD_STALE_TIMEOUT` and the failsafe watchdog.
 // const MPC_SOLVE_BUDGET: Duration = Duration::from_millis(8);
@@ -45,7 +57,7 @@ const ODOM_STALE_TIMEOUT: Duration = Duration::from_millis(100);
 const POS_PUB_DECIMATION: u32 = 1;
 const ATT_PUB_DECIMATION: u32 = 1;
 const OCP_PUB_DECIMATION: u32 = 1;
-const MISSION_PUB_DECIMATION: u32 = 10;
+const MISSION_PUB_DECIMATION: u32 = 5;
 
 /// Reject odometry with any non-finite component.
 fn odom_is_valid(odom: &msgs::VehicleOdometry) -> bool {
@@ -104,7 +116,7 @@ pub async fn control_loop_task() {
     while !crate::estimation::ESTIMATOR_READY.load(core::sync::atomic::Ordering::Acquire) {
         embassy_time::Timer::after_millis(100).await;
     }
-    defmt::info!("MPC outer loop task started (100 Hz)");
+    defmt::info!("MPC outer loop task started (50 Hz)");
 
     // ── Param hot-reload bookkeeping (mirror of indi_task pattern) ────
     let mut local_param_ver =
@@ -122,8 +134,31 @@ pub async fn control_loop_task() {
     // Position reference is not clamped (the planner's head/tail are
     // algebraic boundary conditions, and the circle lives inside a
     // bounded region by construction).
-    let mut max_vel_m_s = params.planner.max_vel_m_s;
+    // let mut max_vel_m_s = params.planner.max_vel_m_s;
     // let mut max_tilt_rad = params.planner.max_tilt_rad;
+
+    // ── Reference sampler ─────────────────────────────────────────────
+    //
+    // Compile-time selected via the `position_sampler` feature. The
+    // sampler is pure — it never touches mission state, the active
+    // setpoint cell, or the trajectory slot. The outer loop owns the
+    // Idle ↔ Executing transition and calls `sampler.reset()` on entry
+    // so a stateful variant starts each mission fresh.
+    //
+    // PositionSampler params come from VehicleParams.sampler so flash
+    // updates land via the existing PARAM_VERSION hot-reload below.
+    #[cfg(not(feature = "position_sampler"))]
+    let mut sampler = Sampler::Time(TimeSampler::new());
+    #[cfg(feature = "position_sampler")]
+    let mut sampler = Sampler::Position(PositionSampler::new(
+        params.sampler.to_position_sampler_params(),
+    ));
+    let mut sample_buf: [SamplerNode; MPC_N + 1] = [SamplerNode::default(); MPC_N + 1];
+    // Local mirror of the mission state observed at the END of the last
+    // tick. Used purely to detect Idle→Executing edges for sampler reset;
+    // never read for control decisions (those use `mission_state` which
+    // is the authoritative atomic load each tick).
+    let mut prev_mission_state = super::MissionState::Idle;
 
     // ── 50 Hz tick loop ───────────────────────────────────────────────
     let mut ticker = Ticker::every(Duration::from_millis(20));
@@ -186,7 +221,22 @@ pub async fn control_loop_task() {
                 let hover_u = MpcInputVec::from_row_slice(&[hover_thrust, 0.0, 0.0, 0.0]);
                 u_refs = [hover_u; MPC_N];
                 u_warm = u_refs;
-                max_vel_m_s = np.planner.max_vel_m_s;
+                // max_vel_m_s = np.planner.max_vel_m_s;
+
+                // Rebuild the PositionSampler from the new flash params.
+                // The TimeSampler arm is stateless; nothing to reload.
+                // Disarmed-only reload guarantees we don't swap a sampler
+                // mid-mission. The new sampler starts with no
+                // `prev_query_tau` — equivalent to a `reset()` — which is
+                // the right semantics: any tunable change invalidates the
+                // last tick's converged search base.
+                #[cfg(feature = "position_sampler")]
+                {
+                    sampler = Sampler::Position(PositionSampler::new(
+                        np.sampler.to_position_sampler_params(),
+                    ));
+                }
+
                 defmt::info!("MPC outer loop: params reloaded (ver {})", cur);
             }
         }
@@ -352,6 +402,14 @@ pub async fn control_loop_task() {
         let mut tau_and_duration: Option<(f32, f32)> = None;
         let mut solve_diag: Option<msgs::SolveDiagnostics> = None;
         if mission_state == super::MissionState::Executing {
+            // Reset the sampler's per-mission state on the Idle→Executing
+            // transition. TimeSampler is stateless so this is a no-op
+            // today, but the hook keeps PositionSampler's `prev_query_tau`
+            // honest when it lands. Detection is purely local (no atomic
+            // reads): the sampler doesn't need to know about MissionState.
+            if prev_mission_state != super::MissionState::Executing {
+                sampler.reset();
+            }
             // Hold the mutex across all horizon samples to avoid cloning
             // the ~2 KB polynomial. The slot is written at most once per
             // mission by the planner task, so there is no contention.
@@ -361,48 +419,43 @@ pub async fn control_loop_task() {
                     return; // Race: slot was cleared. Fall through to hover.
                 };
 
+                // tau0 is computed via u64 `Instant::duration_since`
+                // BEFORE crossing into f32, then divided. Going to f32
+                // first and subtracting would lose microsecond precision
+                // on the difference and produce a controller with
+                // measurably different tracking error — see the sim
+                // regression snapshot.
                 let now = Instant::now();
-                let tau0 = if now >= traj.t_start {
+                let tau0_s = if now >= traj.t_start {
                     now.duration_since(traj.t_start).as_micros() as f32 * 1e-6
                 } else {
                     0.0
                 };
-
-                // Defensive: a negative or non-finite `max_vel_m_s` would
-                // make `f32::clamp(-v, v)` panic (lo > hi). Coerce to a
-                // sane non-negative number. Default is 5 m/s.
-                let v_lim = if max_vel_m_s.is_finite() && max_vel_m_s >= 0.0 {
-                    max_vel_m_s
-                } else {
-                    0.0
+                let inputs = SamplerInputs {
+                    traj: &traj.traj,
+                    total_duration_s: traj.total_duration_s,
+                    tau0_s,
+                    state_pos: odom.pose.position,
+                    horizon_dt: mpc_dt,
                 };
+                let result = sampler.sample(&inputs, &mut sample_buf);
+
+                // Per-node fan-out into x_refs. Quaternion construction
+                // stays here because it depends on `yaw_setpoint_rad`
+                // (RC-owned policy, not a trajectory property) and the
+                // past-end identity-tilt rule (the pre-loop yaw-only fill
+                // already wrote the right quaternion for those nodes, so
+                // we leave it untouched).
                 let grav = mpc_problem.model.grav;
-                for k in 0..=MPC_N {
-                    let t_k = (tau0 + k as f32 * mpc_dt).min(traj.total_duration_s);
-                    let past_end = t_k >= traj.total_duration_s;
-                    let (p, v) = if past_end {
-                        // Clamp to terminal pose, zero velocity.
-                        (traj.traj.get_pos(traj.total_duration_s), Vector3::zeros())
-                    } else {
-                        (traj.traj.get_pos(t_k), traj.traj.get_vel(t_k))
-                    };
-                    // Position.
-                    x_refs[k][0] = p[0];
-                    x_refs[k][1] = p[1];
-                    x_refs[k][2] = p[2];
-                    // Velocity slots [7..10]. Hard-clamp each component to
-                    // ±`max_vel_m_s` to defend against a solve that left
-                    // soft velocity penalties only partially resolved
-                    // (e.g. SolverStatus::MaxIterations).
-                    x_refs[k][7] = v[0].clamp(-v_lim, v_lim);
-                    x_refs[k][8] = v[1].clamp(-v_lim, v_lim);
-                    x_refs[k][9] = v[2].clamp(-v_lim, v_lim);
-                    // Quaternion via differential-flatness map. Past-end
-                    // nodes keep the pre-loop yaw-only fill (zero accel →
-                    // identity tilt → terminal hover at yaw_setpoint_rad).
-                    if !past_end {
-                        let acc = traj.traj.get_acc(t_k);
-                        let q_ref = reference_quaternion(acc, yaw_setpoint_rad, grav);
+                for (k, n) in sample_buf.iter().enumerate() {
+                    x_refs[k][0] = n.pos[0];
+                    x_refs[k][1] = n.pos[1];
+                    x_refs[k][2] = n.pos[2];
+                    x_refs[k][7] = n.vel[0];
+                    x_refs[k][8] = n.vel[1];
+                    x_refs[k][9] = n.vel[2];
+                    if !n.past_end {
+                        let q_ref = reference_quaternion(n.acc, yaw_setpoint_rad, grav);
                         x_refs[k][3] = q_ref.i; // qx
                         x_refs[k][4] = q_ref.j; // qy
                         x_refs[k][5] = q_ref.k; // qz
@@ -411,23 +464,20 @@ pub async fn control_loop_task() {
                 }
 
                 sampled_from_trajectory = true;
-                tau_and_duration = Some((tau0, traj.total_duration_s));
+                tau_and_duration = Some((result.tau0_s, traj.total_duration_s));
                 solve_diag = Some(traj.solve);
 
                 // Snapshot the τ₀ sample — this is the "currently tracked
                 // point" we must publish to ACTIVE_POSITION_SETPOINT each
                 // tick (invariant b: every Executing tick refreshes the
                 // shared cell, so its timestamp is a live liveness proof).
-                // If τ₀ has reached the end, clamp to the terminal pose
-                // so the hand-off to Idle lands exactly on the endpoint.
-                tau0_sample = Some(if tau0 >= traj.total_duration_s {
-                    traj.traj.get_pos(traj.total_duration_s)
-                } else {
-                    traj.traj.get_pos(tau0)
-                });
+                // The sampler already past-end-clamped node 0 to the
+                // terminal pose when `mission_done`, so we can read it
+                // straight out of the buffer.
+                tau0_sample = Some(sample_buf[0].pos);
 
-                if tau0 >= traj.total_duration_s {
-                    mission_done_final = Some(traj.traj.get_pos(traj.total_duration_s));
+                if result.mission_done {
+                    mission_done_final = Some(sample_buf[MPC_N].pos);
                 }
             });
 
@@ -583,5 +633,12 @@ pub async fn control_loop_task() {
                 solve: solve_diag.unwrap_or(msgs::SolveDiagnostics::NONE),
             });
         }
+
+        // Snapshot the authoritative mission state for the next tick's
+        // edge detector. `final_state` already reflects any in-tick
+        // transition (mission_done or abort), so an Executing→Idle flip
+        // this tick will look like Idle→Executing on the *next* mission's
+        // first Executing tick — exactly when sampler.reset() should fire.
+        prev_mission_state = final_state;
     }
 }

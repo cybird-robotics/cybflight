@@ -8,7 +8,7 @@ use cybflight_core::mixer::{MotorParams, RigidBodyParams, SpinDir};
 use cybflight_core::mpc::{FullQuadModel, NU, NX};
 use cybflight_core::params::{
     ControlGains, IndiControllerParams, IndiEffectivenessParams, LearnerParams, MpcParams,
-    PlannerParams, VehicleParams,
+    PlannerParams, SamplerParams, VehicleParams,
 };
 use nalgebra::{stack, Quaternion, SVector, UnitQuaternion, Vector3};
 
@@ -64,6 +64,7 @@ impl VehicleParamsBuilder {
             learner: LearnerParams::default(),
             mpc: MpcParams::default(),
             planner: PlannerParams::default(),
+            sampler: SamplerParams::default(),
         }
     }
 }

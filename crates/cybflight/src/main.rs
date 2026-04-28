@@ -146,7 +146,7 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::control::cascade_task::cascade_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn cascade task"));
-    // MPC SQP outer loop (100 Hz). ~4 ms per solve — thread executor
+    // MPC SQP outer loop (50 Hz). ~4 ms per solve — thread executor
     // so P10 INDI is never blocked.
     #[cfg(feature = "outer_mpc")]
     spawner

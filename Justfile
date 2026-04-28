@@ -20,12 +20,26 @@ OUTER_LOOP := env_var_or_default("OUTER_LOOP", "cascade")
 # "gps" (u-blox M10 NAV-PVT → LLH→ENU). Mutually exclusive via compile_error.
 POS_SOURCE := env_var_or_default("POS_SOURCE", "mocap")
 
+# Reference sampler selection (only meaningful with OUTER_LOOP=mpc):
+#   "time"     — TimeSampler (default; firmware-verified path).
+#   "position" — PositionSampler (closest-point search). Compiles in
+#                cybflight's `position_sampler` feature.
+# Misuse with OUTER_LOOP=cascade is silently ignored — the cascade path
+# does not consume the sampler abstraction.
+SAMPLER := env_var_or_default("SAMPLER", "time")
+
 # Compose the feature list for `cargo build`. The `outer_mpc` feature is
 # appended only when OUTER_LOOP=mpc; otherwise the cascade is used (the
 # `outer_mpc` feature is gated on est_eskf via a compile_error guard, so
-# misuse with est_mahony fails fast at build time).
+# misuse with est_mahony fails fast at build time). The `position_sampler`
+# feature is appended only when SAMPLER=position AND OUTER_LOOP=mpc — the
+# feature is a no-op outside the MPC outer loop.
 FEATURES := if OUTER_LOOP == "mpc" {
-    "board_" + BOARD + ",rx_" + RC_PROTOCOL + ",est_" + ESTIMATOR + ",est_pos_" + POS_SOURCE + ",outer_mpc"
+    if SAMPLER == "position" {
+        "board_" + BOARD + ",rx_" + RC_PROTOCOL + ",est_" + ESTIMATOR + ",est_pos_" + POS_SOURCE + ",outer_mpc,position_sampler"
+    } else {
+        "board_" + BOARD + ",rx_" + RC_PROTOCOL + ",est_" + ESTIMATOR + ",est_pos_" + POS_SOURCE + ",outer_mpc"
+    }
 } else {
     "board_" + BOARD + ",rx_" + RC_PROTOCOL + ",est_" + ESTIMATOR + ",est_pos_" + POS_SOURCE
 }
@@ -43,7 +57,7 @@ build-cascade:
 
 # Print the resolved feature list (useful for debugging the build matrix).
 print-features:
-    @echo "BOARD={{BOARD}} RC_PROTOCOL={{RC_PROTOCOL}} ESTIMATOR={{ESTIMATOR}} OUTER_LOOP={{OUTER_LOOP}} POS_SOURCE={{POS_SOURCE}}"
+    @echo "BOARD={{BOARD}} RC_PROTOCOL={{RC_PROTOCOL}} ESTIMATOR={{ESTIMATOR}} OUTER_LOOP={{OUTER_LOOP}} POS_SOURCE={{POS_SOURCE}} SAMPLER={{SAMPLER}}"
     @echo "FEATURES={{FEATURES}}"
 
 # Run all host-side tests (cybflight-core convergence + benchmark suite).

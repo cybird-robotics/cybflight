@@ -12,7 +12,9 @@
 //!       --test planner_convergence`
 
 use cybflight_core::params::{PlannerParams, VehicleParams};
-use cybflight_core::trajectory_planning::planner::{plan, PlannerInput, PlannerResult, SolverStatus};
+use cybflight_core::trajectory_planning::planner::{
+    PlannerInput, PlannerResult, SolverStatus, plan,
+};
 use cybflight_core::trajectory_planning::quad_planning_config::QuadPlanningConfig;
 use cybflight_core::trajectory_planning::types::{Vec3, ZERO3};
 use std::fs;
@@ -212,10 +214,7 @@ fn goto_converges_and_matches_boundary() {
         vec_norm((pf - target)) < BOUNDARY_POS_TOL,
         "end pos mismatch: {pf:?} vs {target:?}"
     );
-    assert!(
-        vec_norm(vf) < BOUNDARY_VEL_TOL,
-        "end vel not zero: {vf:?}"
-    );
+    assert!(vec_norm(vf) < BOUNDARY_VEL_TOL, "end vel not zero: {vf:?}");
 }
 
 #[test]
@@ -383,7 +382,8 @@ fn tilt_limit_sweep_shows_activation() {
         let input = PlannerInput::goto([0.0, 0.0, 1.0], ZERO3, [5.0, 0.0, 1.0]);
         let result = plan(&input, &config);
         let (tilt_max, _) = peak_tilt_rad(&result, &config);
-        let over_pct = 100.0 * (tilt_max - config.planner.max_tilt_rad) / config.planner.max_tilt_rad;
+        let over_pct =
+            100.0 * (tilt_max - config.planner.max_tilt_rad) / config.planner.max_tilt_rad;
         println!(
             "  {:.1}°     →  {:.2}°   {:.3}s   {:?}   over: {:+.2}%",
             max_tilt_deg,
@@ -606,15 +606,35 @@ fn write_trajectory_csv(
              {:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},\
              {:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},\
              {:.6e},{:.6e},{:.6e},{:.6e}\n",
-            p[0], p[1], p[2],
-            q[0], q[1], q[2], q[3],
-            v[0], v[1], v[2],
-            omega[0], omega[1], omega[2],
-            a[0], a[1], a[2],
-            a_rot[0], a_rot[1], a_rot[2],
-            u, u, u, u,
-            j[0], j[1], j[2],
-            s[0], s[1], s[2],
+            p[0],
+            p[1],
+            p[2],
+            q[0],
+            q[1],
+            q[2],
+            q[3],
+            v[0],
+            v[1],
+            v[2],
+            omega[0],
+            omega[1],
+            omega[2],
+            a[0],
+            a[1],
+            a[2],
+            a_rot[0],
+            a_rot[1],
+            a_rot[2],
+            u,
+            u,
+            u,
+            u,
+            j[0],
+            j[1],
+            j[2],
+            s[0],
+            s[1],
+            s[2],
             thrust,
         ));
     }
@@ -730,9 +750,7 @@ fn bench_runtime_across_tasks() {
         (p10, p50, p90, p99, last_iters, last_traj_dur)
     }
 
-    println!(
-        "\n=== Planner runtime evaluation (defaults: ball_radius=0.01m, we=0.01) ==="
-    );
+    println!("\n=== Planner runtime evaluation (defaults: ball_radius=0.01m, we=0.01) ===");
     println!("Weights: w_time=1, w_energy=0.01, w_vel=50, w_tilt=50, w_rate=50, w_thr=10");
     println!("Limits:  max_vel=4.0 m/s, max_tilt=60°");
     println!("Desktop x86 release build, 50 samples per task.\n");
@@ -755,12 +773,20 @@ fn bench_runtime_across_tasks() {
     macro_rules! run {
         ($label:expr, $n_pieces:expr, $input:expr) => {{
             let (p10, p50, p90, p99, iters, traj) = time_task($label, $n_pieces, $input);
-            let us_it = if iters > 0 { p50 * 1000.0 / iters as f64 } else { 0.0 };
+            let us_it = if iters > 0 {
+                p50 * 1000.0 / iters as f64
+            } else {
+                0.0
+            };
             println!(
                 "  {:<28} {:>3}  {:>5}  {:>7.3}  {:>7.3}  {:>7.3}  {:>7.3}  {:>7.1}  {:>8.3}",
                 $label, $n_pieces, iters, p10, p50, p90, p99, us_it, traj
             );
-            tasks.push(Task { label: $label, n_pieces: $n_pieces, p50_ms: p50 });
+            tasks.push(Task {
+                label: $label,
+                n_pieces: $n_pieces,
+                p50_ms: p50,
+            });
         }};
     }
 
@@ -777,22 +803,33 @@ fn bench_runtime_across_tasks() {
     // 2 pieces: single intermediate waypoint
     run!("waypoints (1 wp)", 2, || {
         PlannerInput::waypoints(
-            [0.0, 0.0, 1.0], ZERO3,
-            &[Vec3::new(2.0, 1.0, 1.0), Vec3::new(4.0, 0.0, 1.0)])
+            [0.0, 0.0, 1.0],
+            ZERO3,
+            &[Vec3::new(2.0, 1.0, 1.0), Vec3::new(4.0, 0.0, 1.0)],
+        )
     });
 
     // 3 pieces: zig-zag
     run!("waypoints (2 wp zig-zag)", 3, || {
         PlannerInput::waypoints(
-            [0.0, 0.0, 1.0], ZERO3,
-            &[Vec3::new(2.0, 1.0, 1.0), Vec3::new(4.0, -1.0, 1.0), Vec3::new(6.0, 0.0, 1.0)])
+            [0.0, 0.0, 1.0],
+            ZERO3,
+            &[
+                Vec3::new(2.0, 1.0, 1.0),
+                Vec3::new(4.0, -1.0, 1.0),
+                Vec3::new(6.0, 0.0, 1.0),
+            ],
+        )
     });
 
     // 5 pieces
     run!("waypoints (4 wp)", 5, || {
         let pts: [Vec3; 5] = [
-            Vec3::new(1.0, 1.0, 1.0), Vec3::new(2.0, 0.0, 1.0),
-            Vec3::new(3.0, -1.0, 1.0), Vec3::new(4.0, 0.0, 1.0), Vec3::new(5.0, 1.0, 1.0),
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::new(2.0, 0.0, 1.0),
+            Vec3::new(3.0, -1.0, 1.0),
+            Vec3::new(4.0, 0.0, 1.0),
+            Vec3::new(5.0, 1.0, 1.0),
         ];
         PlannerInput::waypoints([0.0, 0.0, 1.0], ZERO3, &pts)
     });
@@ -800,8 +837,13 @@ fn bench_runtime_across_tasks() {
     // 8 pieces: medium
     run!("waypoints (7 wp)", 8, || {
         let pts: [Vec3; 7] = [
-            Vec3::new(1.0, 1.0, 1.0), Vec3::new(2.0, -1.0, 1.2), Vec3::new(3.0, 1.0, 1.0),
-            Vec3::new(4.0, -1.0, 0.8), Vec3::new(5.0, 1.0, 1.0), Vec3::new(6.0, -1.0, 1.2), Vec3::new(7.0, 0.0, 1.0),
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::new(2.0, -1.0, 1.2),
+            Vec3::new(3.0, 1.0, 1.0),
+            Vec3::new(4.0, -1.0, 0.8),
+            Vec3::new(5.0, 1.0, 1.0),
+            Vec3::new(6.0, -1.0, 1.2),
+            Vec3::new(7.0, 0.0, 1.0),
         ];
         PlannerInput::waypoints([0.0, 0.0, 1.0], ZERO3, &pts)
     });
@@ -811,7 +853,10 @@ fn bench_runtime_across_tasks() {
 
     // STM32H7 scaled estimates.
     const STM32_FACTOR: f64 = 35.0;
-    println!("\nSTM32H7 @ 480 MHz estimates (×{:.0} typical slowdown):", STM32_FACTOR);
+    println!(
+        "\nSTM32H7 @ 480 MHz estimates (×{:.0} typical slowdown):",
+        STM32_FACTOR
+    );
     println!(
         "  {:<28} {:>3}  {:>10}  {:>10}  {:>12}",
         "task", "pc", "p50 (ms)", "p99 (ms)", "max rate (Hz)"
@@ -821,7 +866,11 @@ fn bench_runtime_across_tasks() {
         let max_rate_hz = 1000.0 / stm;
         println!(
             "  {:<28} {:>3}  {:>10.2}  {:>10.2}  {:>12.1}",
-            t.label, t.n_pieces, stm, stm * 1.3, max_rate_hz
+            t.label,
+            t.n_pieces,
+            stm,
+            stm * 1.3,
+            max_rate_hz
         );
     }
 }
@@ -864,11 +913,7 @@ fn bench_runtime_vs_weight_energy() {
         final_cost: f32,
     }
 
-    fn time_case<F: Fn() -> PlannerInput>(
-        label: &str,
-        make_input: F,
-        weight_energies: &[f32],
-    ) {
+    fn time_case<F: Fn() -> PlannerInput>(label: &str, make_input: F, weight_energies: &[f32]) {
         let n_samples = 30;
         let mut rows: Vec<Row> = Vec::new();
         for &we in weight_energies {
@@ -942,11 +987,7 @@ fn bench_runtime_vs_weight_energy() {
     );
 
     // 13 pieces: circular closed loop
-    time_case(
-        "CIRCULAR (13 pieces)",
-        || circular_input(),
-        we_values,
-    );
+    time_case("CIRCULAR (13 pieces)", || circular_input(), we_values);
 
     println!(
         "\nNote: with we > 0 the waypoint D-variables drift (the Rust port has no \
@@ -955,9 +996,7 @@ fn bench_runtime_vs_weight_energy() {
          benchmark measures runtime only — constraint satisfaction at we > 0 \
          should not be inferred from the trajectory duration."
     );
-    println!(
-        "STM32H7 @ 480 MHz estimate: multiply desktop p50 by ~35 for typical workload."
-    );
+    println!("STM32H7 @ 480 MHz estimate: multiply desktop p50 by ~35 for typical workload.");
 }
 
 #[test]
@@ -988,11 +1027,7 @@ fn bench_planner_scaling_by_piece_count() {
         QuadPlanningConfig::from_vehicle_params(&vp)
     }
 
-    fn time_case<F: Fn() -> PlannerInput>(
-        label: &str,
-        n_pieces: usize,
-        make_input: F,
-    ) {
+    fn time_case<F: Fn() -> PlannerInput>(label: &str, n_pieces: usize, make_input: F) {
         let config = make_bench_config();
         let _ = plan(&make_input(), &config); // warm-up
         let n_samples = 50;
@@ -1009,8 +1044,7 @@ fn bench_planner_scaling_by_piece_count() {
         let p50 = durations_ms[n_samples / 2];
         let p99 = durations_ms[(n_samples * 99) / 100];
         let mean: f64 = durations_ms.iter().sum::<f64>() / n_samples as f64;
-        let mean_iters: f64 =
-            iter_counts.iter().map(|&x| x as f64).sum::<f64>() / n_samples as f64;
+        let mean_iters: f64 = iter_counts.iter().map(|&x| x as f64).sum::<f64>() / n_samples as f64;
         let us_per_iter = (p50 / mean_iters.max(1.0)) * 1000.0;
         println!(
             "  {:<18} {:>2} pc   iters={:>5.0}   mean={:>6.2}ms  p50={:>6.2}ms  p99={:>6.2}ms  {:>5.1} us/iter",
@@ -1041,7 +1075,11 @@ fn bench_planner_scaling_by_piece_count() {
         PlannerInput::waypoints(
             [0.0, 0.0, 1.0],
             ZERO3,
-            &[Vec3::new(2.0, 1.0, 1.0), Vec3::new(4.0, -1.0, 1.0), Vec3::new(6.0, 0.0, 1.0)],
+            &[
+                Vec3::new(2.0, 1.0, 1.0),
+                Vec3::new(4.0, -1.0, 1.0),
+                Vec3::new(6.0, 0.0, 1.0),
+            ],
         )
     });
 
@@ -1133,11 +1171,14 @@ fn bench_circular_planner_runtime() {
     }
 
     // Derive per-iteration cost from the capped runs.
-    let per_iter_ms: f64 = per_iter_ms_samples.iter().sum::<f64>()
-        / per_iter_ms_samples.len() as f64;
+    let per_iter_ms: f64 =
+        per_iter_ms_samples.iter().sum::<f64>() / per_iter_ms_samples.len() as f64;
 
-    println!("\nderived per-BFGS-iteration cost: {:.3} ms ({:.1} μs)",
-        per_iter_ms, per_iter_ms * 1000.0);
+    println!(
+        "\nderived per-BFGS-iteration cost: {:.3} ms ({:.1} μs)",
+        per_iter_ms,
+        per_iter_ms * 1000.0
+    );
 
     // STM32H7 scaling estimate.
     //
@@ -1258,8 +1299,8 @@ fn production_regime_config() -> QuadPlanningConfig {
     vp.planner.weight_time = 1.0;
     vp.planner.weight_energy = 0.0;
     vp.planner.weight_pos = 0.0;
-    vp.planner.weight_vel = 0.0;
-    vp.planner.weight_tilt = 0.0;
+    vp.planner.weight_vel = 1.0;
+    vp.planner.weight_tilt = 1.0;
     vp.planner.weight_body_rate = 10.0;
     vp.planner.weight_thrust = 10.0;
     vp.planner.smoothing_eps = 0.01;
@@ -1298,10 +1339,7 @@ struct KinematicPeaks {
     omega_z_max: f32,
 }
 
-fn sample_kinematic_peaks(
-    result: &PlannerResult,
-    config: &QuadPlanningConfig,
-) -> KinematicPeaks {
+fn sample_kinematic_peaks(result: &PlannerResult, config: &QuadPlanningConfig) -> KinematicPeaks {
     let dur = result.trajectory.total_duration();
     let g = config.grav;
     let n = 1000;
@@ -1350,7 +1388,10 @@ fn print_piece_diagnostics(label: &str, result: &PlannerResult, config: &QuadPla
     let peaks = sample_kinematic_peaks(result, config);
     println!(
         "  [{label}] status={:?} iters={} pieces={} dur={:.3}s cost={:.3}",
-        result.status, result.iterations, n, result.trajectory.total_duration(),
+        result.status,
+        result.iterations,
+        n,
+        result.trajectory.total_duration(),
         result.final_cost,
     );
     println!(
@@ -1359,7 +1400,9 @@ fn print_piece_diagnostics(label: &str, result: &PlannerResult, config: &QuadPla
     );
     print!("    times=[");
     for (i, t) in times.iter().enumerate() {
-        if i > 0 { print!(", "); }
+        if i > 0 {
+            print!(", ");
+        }
         print!("{:.2}", t);
     }
     println!("]");
@@ -1377,9 +1420,13 @@ fn production_regime_full_circuit_converges() {
     print_piece_diagnostics("full 15wp", &result, &config);
     assert!(result.final_cost.is_finite(), "non-finite cost");
     assert!(
-        matches!(result.status, SolverStatus::Convergence | SolverStatus::Stop),
+        matches!(
+            result.status,
+            SolverStatus::Convergence | SolverStatus::Stop
+        ),
         "under-converged: {:?} at iter {}",
-        result.status, result.iterations,
+        result.status,
+        result.iterations,
     );
 }
 
@@ -1419,17 +1466,26 @@ fn production_regime_kinematics_feasible() {
     assert!(
         peaks.v_max <= max_vel,
         "peak velocity {:.2} > {:.2} (max_vel {} × {})",
-        peaks.v_max, max_vel, config.planner.max_vel_m_s, CONSTRAINT_SLACK,
+        peaks.v_max,
+        max_vel,
+        config.planner.max_vel_m_s,
+        CONSTRAINT_SLACK,
     );
     assert!(
         peaks.omega_xy_max <= max_omega_xy,
         "peak ω_xy {:.2} > {:.2} (limit {} × {})",
-        peaks.omega_xy_max, max_omega_xy, config.max_rate_rad_s[0], CONSTRAINT_SLACK,
+        peaks.omega_xy_max,
+        max_omega_xy,
+        config.max_rate_rad_s[0],
+        CONSTRAINT_SLACK,
     );
     assert!(
         peaks.omega_z_max <= max_omega_z,
         "peak ω_z {:.2} > {:.2} (limit {} × {})",
-        peaks.omega_z_max, max_omega_z, config.max_rate_rad_s[2], CONSTRAINT_SLACK,
+        peaks.omega_z_max,
+        max_omega_z,
+        config.max_rate_rad_s[2],
+        CONSTRAINT_SLACK,
     );
 }
 
@@ -1440,9 +1496,7 @@ fn production_regime_kinematics_feasible() {
 #[ignore] // diagnostic — run with `--release --ignored -- --nocapture`
 fn production_regime_piece_count_sweep() {
     let config = production_regime_config();
-    println!(
-        "\n=== Production-regime sweep: n targets → n pieces (wv=0, wtilt=0, we=0) ==="
-    );
+    println!("\n=== Production-regime sweep: n targets → n pieces (wv=0, wtilt=0, we=0) ===");
     for n_targets in 1..=PRODUCTION_WAYPOINTS.len() {
         let targets = &PRODUCTION_WAYPOINTS[..n_targets];
         let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, targets);
@@ -1481,7 +1535,10 @@ fn production_regime_repeatability() {
             .fold(f32::INFINITY, f32::min);
         println!(
             "  run {:02}: status={:?} iters={:3} min_T={:.3}s dur={:.3}s",
-            run, result.status, result.iterations, min_t,
+            run,
+            result.status,
+            result.iterations,
+            min_t,
             result.trajectory.total_duration(),
         );
     }
@@ -1518,13 +1575,13 @@ const MAX_PIECES_TEST: usize = 24;
 #[test]
 #[ignore] // diagnostic — run with `--release --ignored -- --nocapture`
 fn production_regime_piece_count_sweep_to_max() {
-    use cybflight_core::trajectory_planning::MAX_PIECES;
+    use cybflight_core::trajectory_planning::MAX_PLANNED_PIECES;
     let config = production_regime_config();
     println!(
-        "\n=== Production-regime sweep: n ∈ [8, {MAX_PIECES}] (repeating 7-point circuit) ==="
+        "\n=== Production-regime sweep: n ∈ [8, {MAX_PLANNED_PIECES}] (repeating 7-point circuit) ==="
     );
     let mut buf = [ZERO3; MAX_PIECES_TEST];
-    for n_targets in 8..=MAX_PIECES {
+    for n_targets in 8..=MAX_PLANNED_PIECES {
         let targets = circle_targets(n_targets, &mut buf);
         let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, targets);
         let init_dur: f32 = input.init_times[..n_targets].iter().sum();
@@ -1538,8 +1595,14 @@ fn production_regime_piece_count_sweep_to_max() {
         let peaks = sample_kinematic_peaks(&result, &config);
         println!(
             "  n={:2}  status={:?}  iters={:3}  init={:.2}s  final={:.2}s  ratio={:.2}  peak_v={:.2}m/s  cost={:.2}",
-            n_targets, result.status, result.iterations,
-            init_dur, final_dur, ratio, peaks.v_max, result.final_cost,
+            n_targets,
+            result.status,
+            result.iterations,
+            init_dur,
+            final_dur,
+            ratio,
+            peaks.v_max,
+            result.final_cost,
         );
     }
 }
@@ -1578,9 +1641,7 @@ fn production_regime_with_weight_vel_sweep() {
 #[test]
 #[ignore] // diagnostic — run with `--release --ignored -- --nocapture`
 fn production_regime_max_iterations_sweep() {
-    println!(
-        "\n=== Production-regime + max_iterations sweep (wv=0, wtilt=0, we=0) ==="
-    );
+    println!("\n=== Production-regime + max_iterations sweep (wv=0, wtilt=0, we=0) ===");
     for &max_iters in &[0_usize, 1, 2, 5, 10, 25, 50, 100, 150, 172, 500, 2000] {
         let mut vp = test_vehicle_params();
         vp.planner.max_vel_m_s = 5.0;

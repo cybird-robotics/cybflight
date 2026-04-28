@@ -17,18 +17,23 @@
 //!   MpcParams:          pos(12) + vel(12) + att(12) + rate(12) + thrust(4) + dt(4) + rho(4) = 60 bytes
 //!   PlannerParams:      max_vel_m_s(4) + max_tilt_rad(4) + weight_time(4) + weight_energy(4) + weight_pos(4) + weight_vel(4) + weight_tilt(4) + weight_body_rate(4) + weight_thrust(4) + smoothing_eps(4) + num_check_per_piece(4 as f32) = 44 bytes
 //!   BfgsTrustParams:    delta_init(4) + delta_max(4) + eta(4) + g_epsilon(4) + max_iterations(4 as f32) + past(4 as f32) + delta_conv(4) = 28 bytes
-//! [0x25C] padding: 4 bytes
+//!   SamplerParams:      search_tol(4) + axis_weights_sqrt(12) + search_dt(4) + max_search_steps(4 as f32) + radius_of_acceptance(4) = 28 bytes
 //! ```
+//!
+//! Old flash images (version < 16) are rejected and the firmware falls
+//! through to defaults.
 
 use crate::mixer::{MotorParams, RigidBodyParams, SpinDir};
+use crate::trajectory_planning::sampler::PositionSamplerParams;
+use crate::trajectory_planning::types::Vec3;
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 13;
+const VERSION: u32 = 16;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
-/// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 = 588 bytes
-const PAYLOAD_SIZE: usize = 588;
-/// Padded to 32-byte flash word boundary: ceil((16+588)/32)*32 = 608
-pub const PADDED_SIZE: usize = 608;
+/// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 + 28 = 616 bytes
+const PAYLOAD_SIZE: usize = 616;
+/// Padded to 32-byte flash word boundary: ceil((16+616)/32)*32 = 640
+pub const PADDED_SIZE: usize = 640;
 
 /// MPC tuning parameters: cost weights, discretization, and constraint penalty.
 ///
@@ -212,7 +217,7 @@ impl Default for IndiControllerParams {
     fn default() -> Self {
         Self {
             rate_gains: [30.0, 30.0, 30.0],
-            sync_filter_hz: 10.0,
+            sync_filter_hz: 15.0,
             wls_wv: [1.0, 1.0, 50.0, 50.0, 50.0, 5.0],
             wls_wu: [1.0, 1.0, 1.0, 1.0],
             motor_pole_count: 14,
@@ -253,6 +258,60 @@ impl Default for LearnerParams {
     }
 }
 
+/// Reference-sampler tuning parameters. Mirrors the fields of
+/// [`PositionSamplerParams`](crate::trajectory_planning::sampler::PositionSamplerParams)
+/// so a single struct holds the runtime-tunable surface for the position
+/// sampler. `TimeSampler` is stateless and ignores these values.
+///
+/// The struct lives in `VehicleParams` so a flash-persisted change reaches
+/// the outer loop through the existing `PARAM_VERSION` hot-reload path —
+/// no new shared globals required. Bumping any of these clears the
+/// sampler's `prev_query_tau` because the outer loop rebuilds the sampler
+/// from scratch on reload.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SamplerParams {
+    pub search_tol: f32,
+    pub axis_weights_sqrt: [f32; 3],
+    pub search_dt: f32,
+    pub max_search_steps: u16,
+    pub radius_of_acceptance: f32,
+}
+
+impl Default for SamplerParams {
+    fn default() -> Self {
+        // Mirror PositionSamplerParams::defaults() exactly. If the two ever
+        // drift, the round-trip test below — which compares
+        // SamplerParams::default() against the projection of
+        // PositionSamplerParams::defaults() — will fail loudly.
+        Self {
+            search_tol: 1e-3,
+            axis_weights_sqrt: [1.0, 1.0, 1.0],
+            search_dt: 0.01,
+            max_search_steps: 100,
+            radius_of_acceptance: 0.10,
+        }
+    }
+}
+
+impl SamplerParams {
+    /// Project a `SamplerParams` into the sampler-side `PositionSamplerParams`
+    /// shape. The outer loop calls this when constructing or rebuilding the
+    /// `Sampler::Position` instance.
+    pub fn to_position_sampler_params(&self) -> PositionSamplerParams {
+        PositionSamplerParams {
+            search_tol: self.search_tol,
+            axis_weights_sqrt: Vec3::new(
+                self.axis_weights_sqrt[0],
+                self.axis_weights_sqrt[1],
+                self.axis_weights_sqrt[2],
+            ),
+            search_dt: self.search_dt,
+            max_search_steps: self.max_search_steps,
+            radius_of_acceptance: self.radius_of_acceptance,
+        }
+    }
+}
+
 /// Full vehicle parameter set.
 #[derive(Clone, Debug)]
 pub struct VehicleParams {
@@ -264,6 +323,7 @@ pub struct VehicleParams {
     pub learner: LearnerParams,
     pub mpc: MpcParams,
     pub planner: PlannerParams,
+    pub sampler: SamplerParams,
 }
 
 impl VehicleParams {
@@ -386,6 +446,14 @@ impl VehicleParams {
         off = put_f32(&mut buf, off, self.planner.bfgs_trust.max_iterations as f32);
         off = put_f32(&mut buf, off, self.planner.bfgs_trust.past as f32);
         off = put_f32(&mut buf, off, self.planner.bfgs_trust.delta_conv);
+        // SamplerParams (added in v14; time_weight slot repurposed as search_tol in v16)
+        off = put_f32(&mut buf, off, self.sampler.search_tol);
+        for &v in &self.sampler.axis_weights_sqrt {
+            off = put_f32(&mut buf, off, v);
+        }
+        off = put_f32(&mut buf, off, self.sampler.search_dt);
+        off = put_f32(&mut buf, off, self.sampler.max_search_steps as f32);
+        off = put_f32(&mut buf, off, self.sampler.radius_of_acceptance);
         debug_assert_eq!(off - HEADER_SIZE, PAYLOAD_SIZE);
 
         // Header
@@ -682,6 +750,28 @@ impl VehicleParams {
             },
         };
 
+        // SamplerParams (added in v14; time_weight slot repurposed as search_tol in v16)
+        let sampler_search_tol = get_f32(buf, off);
+        off += 4;
+        let mut axis_weights_sqrt = [0.0f32; 3];
+        for slot in &mut axis_weights_sqrt {
+            *slot = get_f32(buf, off);
+            off += 4;
+        }
+        let search_dt = get_f32(buf, off);
+        off += 4;
+        let max_search_steps = get_f32(buf, off) as u16;
+        off += 4;
+        let radius_of_acceptance = get_f32(buf, off);
+        off += 4;
+        let sampler = SamplerParams {
+            search_tol: sampler_search_tol,
+            axis_weights_sqrt,
+            search_dt,
+            max_search_steps,
+            radius_of_acceptance,
+        };
+
         let _ = off; // suppress unused warning
 
         Some(VehicleParams {
@@ -693,6 +783,7 @@ impl VehicleParams {
             learner,
             mpc,
             planner,
+            sampler,
         })
     }
 
@@ -1616,6 +1707,7 @@ mod tests {
             learner: LearnerParams::default(),
             mpc: MpcParams::default(),
             planner: PlannerParams::default(),
+            sampler: SamplerParams::default(),
         }
     }
 
@@ -1667,6 +1759,55 @@ mod tests {
             restored.indi_effectiveness.nonlinearity,
             params.indi_effectiveness.nonlinearity
         );
+    }
+
+    #[test]
+    fn round_trip_with_sampler() {
+        // Non-default values across every field so a stuck/zeroed slot in
+        // to_bytes/from_bytes would fail the comparison.
+        let mut params = test_params();
+        params.sampler = SamplerParams {
+            search_tol: 2.5e-3,
+            axis_weights_sqrt: [1.5, 0.5, 0.25],
+            search_dt: 0.02,
+            max_search_steps: 250,
+            radius_of_acceptance: 0.07,
+        };
+        let bytes = params.to_bytes();
+        let restored = VehicleParams::from_bytes(&bytes).expect("from_bytes failed");
+        assert_eq!(restored.sampler, params.sampler);
+    }
+
+    #[test]
+    fn sampler_defaults_match_position_sampler_defaults() {
+        // Guard against drift between SamplerParams::default() and the
+        // sampler-side PositionSamplerParams::defaults().
+        let from_flash = SamplerParams::default().to_position_sampler_params();
+        let from_sampler = crate::trajectory_planning::sampler::PositionSamplerParams::defaults();
+        assert_eq!(from_flash.search_tol, from_sampler.search_tol);
+        assert_eq!(from_flash.axis_weights_sqrt, from_sampler.axis_weights_sqrt);
+        assert_eq!(from_flash.search_dt, from_sampler.search_dt);
+        assert_eq!(from_flash.max_search_steps, from_sampler.max_search_steps);
+        assert_eq!(
+            from_flash.radius_of_acceptance,
+            from_sampler.radius_of_acceptance
+        );
+    }
+
+    #[test]
+    fn old_version_returns_none() {
+        // A flash image written by an older firmware version (e.g. v13)
+        // must be rejected so the firmware falls through to defaults
+        // rather than mis-deserialising the new-layout bytes.
+        let params = test_params();
+        let mut bytes = params.to_bytes();
+        // Overwrite the version field with the previous version.
+        put_u32(&mut bytes, 4, 13);
+        // Recompute CRC over the (still-valid) payload so only the
+        // version mismatch trips the check, not the CRC.
+        let crc = crc32fast::hash(&bytes[HEADER_SIZE..HEADER_SIZE + PAYLOAD_SIZE]);
+        put_u32(&mut bytes, 12, crc);
+        assert!(VehicleParams::from_bytes(&bytes).is_none());
     }
 
     #[test]

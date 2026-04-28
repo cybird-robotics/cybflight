@@ -40,6 +40,17 @@ impl MincoJerk {
         }
     }
 
+    /// Update the boundary states (head/tail PVA) in place. Lets a
+    /// caller reuse a single BSS-resident `MincoJerk` across solves
+    /// with different start/end conditions without reconstructing
+    /// (the construction allocates a 6N-row banded storage block, so
+    /// holding one in `StaticCell` and just updating the boundary is
+    /// significantly cheaper than building a fresh solver per call).
+    pub fn set_boundary(&mut self, head_state: &PVA3D, tail_state: &PVA3D) {
+        self.head_pva = *head_state;
+        self.tail_pva = *tail_state;
+    }
+
     /// Set waypoints and time allocation, then solve for coefficients.
     pub fn solve(&mut self, waypoints: &[Vec3], times: &[f32]) {
         debug_assert_eq!(times.len(), self.n);

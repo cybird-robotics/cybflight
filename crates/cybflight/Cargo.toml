@@ -20,7 +20,7 @@ defmt_uart = []
 #
 # outer_rate:      INDI inner loop + manual rate control (RC sticks → rate_ref).
 # outer_geometric: INDI + cascade position→attitude→geometric controller.
-# outer_mpc:       INDI + SQP/MPC outer loop at 100 Hz.
+# outer_mpc:       INDI + SQP/MPC outer loop at 50 Hz.
 #
 # Mahony attitude filter always runs (gyro bias for INDI).
 # outer_geometric and outer_mpc auto-enable est_eskf (ESKF position/velocity
@@ -37,6 +37,11 @@ est_pos_gps = ["est_eskf"]
 outer_rate = []
 outer_geometric = ["est_eskf"]
 outer_mpc = ["est_eskf"]
+# Reference sampler selection (only meaningful with outer_mpc).
+# Default: TimeSampler (τ = (now − t_start) + k·dt). Setting this flag
+# selects the closest-point PositionSampler — see docs in
+# `cybflight_core::trajectory_planning::sampler`.
+position_sampler = []
 
 [dependencies]
 bsp-sakurah743 = { path = "../bsp/sakurah743", optional = true }

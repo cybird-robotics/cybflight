@@ -38,6 +38,17 @@ pub trait QuadDynamicsModel<const NX: usize, const NU: usize> {
     /// Number of consecutive nonzero rows in `df/du` starting at `BNZ_START`.
     const BNZ_LEN: usize;
 
+    /// First (potentially) nonzero column of `df/dx`. Columns
+    /// `[0, JAC_X_NZ_COL_START)` are guaranteed structurally zero.
+    /// For inertial-frame quadrotor models this is the position-state
+    /// dimension (positions never feed back into dynamics): `3` for both
+    /// `QuadModel` and `FullQuadModel`.
+    ///
+    /// The Riccati backward sweep uses this to skip `O(NX)` inner-product
+    /// work on the rows/columns of `A = I + dt·jac_x` that are guaranteed
+    /// to be identity-only, replacing the matmul with a direct copy.
+    const JAC_X_NZ_COL_START: usize;
+
     /// Project the quaternion components of `x` back onto the unit 3-sphere.
     fn normalize_quat(x: &mut SVector<f32, NX>);
 
@@ -95,6 +106,9 @@ impl QuadDynamicsModel<{ full_quad_model::NX }, { full_quad_model::NU }> for Ful
     // thrusts).
     const BNZ_START: usize = 7;
     const BNZ_LEN: usize = 6;
+
+    // Cols 0..3 of df/dx are zero (positions don't feed back into dynamics).
+    const JAC_X_NZ_COL_START: usize = 3;
 
     #[inline]
     fn normalize_quat(x: &mut SVector<f32, { full_quad_model::NX }>) {
@@ -195,6 +209,9 @@ impl QuadDynamicsModel<{ quad_model::NX }, { quad_model::NU }> for QuadModel {
     // 7-9 driven by collective thrust input).
     const BNZ_START: usize = 3;
     const BNZ_LEN: usize = 7;
+
+    // Cols 0..3 of df/dx are zero (positions don't feed back into dynamics).
+    const JAC_X_NZ_COL_START: usize = 3;
 
     #[inline]
     fn normalize_quat(x: &mut SVector<f32, { quad_model::NX }>) {

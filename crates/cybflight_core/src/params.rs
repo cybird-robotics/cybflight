@@ -23,7 +23,7 @@
 use crate::mixer::{MotorParams, RigidBodyParams, SpinDir};
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 9;
+const VERSION: u32 = 10;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
 /// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 = 588 bytes
 const PAYLOAD_SIZE: usize = 588;
@@ -127,7 +127,7 @@ pub struct PlannerParams {
 impl Default for PlannerParams {
     fn default() -> Self {
         Self {
-            max_vel_m_s: 20.0,
+            max_vel_m_s: 100.0,
             max_tilt_rad: core::f32::consts::FRAC_PI_3,
             weight_time: 1.0,
             // A small amount of jerk-integral regularization conditions the
@@ -212,7 +212,7 @@ impl Default for IndiControllerParams {
     fn default() -> Self {
         Self {
             rate_gains: [20.0, 20.0, 20.0],
-            sync_filter_hz: 12.0,
+            sync_filter_hz: 10.0,
             wls_wv: [1.0, 1.0, 50.0, 50.0, 50.0, 5.0],
             wls_wu: [1.0, 1.0, 1.0, 1.0],
             motor_pole_count: 14,

@@ -21,9 +21,9 @@ use crate::sensors::VEHICLE_ODOMETRY;
 use air_filters::iir::biquad::{
     BiquadFilter, BiquadFilterConfigBuilder, BiquadFilterType, DirectForm2,
 };
-use air_filters::{nonlinear::slew::SlewFilter, Filter};
+use air_filters::{Filter, nonlinear::slew::SlewFilter};
 #[cfg(not(feature = "outer_mpc"))]
-use cybflight_core::attitude_control::{self, geometric_controller, AttitudeControlOutput};
+use cybflight_core::attitude_control::{self, AttitudeControlOutput, geometric_controller};
 use cybflight_core::{
     indi::{
         controller::{IndiConfig, IndiController, MotorState, NU},
@@ -64,8 +64,8 @@ static LEARNED_SAVE_PENDING: core::sync::atomic::AtomicBool =
 /// Changing this is a global decision for the airframe; the meaning of `k`
 /// differs between models, so `indi_effectiveness.nonlinearity` typically
 /// needs re-identification after switching.
-// const THRUST_MODEL: ThrustModel = ThrustModel::Quadratic;
-const THRUST_MODEL: ThrustModel = ThrustModel::SqrtSquared;
+const THRUST_MODEL: ThrustModel = ThrustModel::Quadratic;
+// const THRUST_MODEL: ThrustModel = ThrustModel::SqrtSquared;
 
 /// Default motor nonlinearity `k`, matched to `THRUST_MODEL`.
 ///
@@ -82,7 +82,7 @@ const THRUST_NONLINEARITY: f32 = match THRUST_MODEL {
 
 /// Default INDI motor parameters.
 const MAX_RPM: f32 = 40000.0;
-const TIME_CONSTANT: f32 = 0.015;
+const TIME_CONSTANT: f32 = 0.02;
 
 const INDI_MOTOR_PARAMS: [IndiMotorParams; NU] = [
     IndiMotorParams {

@@ -16,7 +16,7 @@
 
 use embassy_futures::select::{select, Either};
 use embassy_sync::pubsub::WaitResult;
-use embassy_time::Instant;
+use embassy_time::{Duration, Instant};
 use nalgebra::Vector3;
 
 use cybflight_core::eskf::{Eskf, EskfConfig};
@@ -41,6 +41,13 @@ const MOCAP_ATT_STD: f32 = 0.03;
 /// Gyro-bias covariance trace threshold for convergence.
 /// Initial trace = 3 × 0.01 = 0.03; this requires roughly a 10× reduction.
 const GYRO_BIAS_COV_TRACE_THRESH: f32 = 0.003;
+
+/// Mocap staleness threshold. If no fresh ViconPose has been accepted
+/// within this window, the estimator stops publishing `VEHICLE_ODOMETRY`
+/// so downstream consumers (INDI → DShot → failsafe) detect silence and
+/// disarm. Mocap typically arrives at 100–360 Hz, so 100 ms tolerates
+/// several missed frames before declaring loss.
+const MOCAP_STALE: Duration = Duration::from_millis(100);
 
 /// Reject IMU samples with any non-finite component — they cascade straight
 /// into the filter's predict step and produce NaN state in one call.
@@ -128,6 +135,7 @@ pub async fn estimation_task() {
     let mut imu_skip: u32 = 0;
     let mut predict_count: u32 = 0;
     let mut last_predict_ts = Instant::now();
+    let mut last_mocap_ts = Instant::now();
     let mut converged = false;
 
     loop {
@@ -189,6 +197,19 @@ pub async fn estimation_task() {
 
                 predict_count = predict_count.wrapping_add(1);
                 if predict_count.is_multiple_of(ODOM_DECIMATION) {
+                    // Producer-side staleness gate: if mocap has stopped
+                    // arriving, go silent so the failure propagates per
+                    // docs/safety_protocol.md (VICON dropout example), and
+                    // drop ESTIMATOR_READY so re-arming is refused at gate 4.
+                    if Instant::now().duration_since(last_mocap_ts) > MOCAP_STALE {
+                        if converged {
+                            converged = false;
+                            ESTIMATOR_READY.store(false, Ordering::Release);
+                            defmt::warn!("ESKF: mocap stale — arming blocked");
+                        }
+                        continue;
+                    }
+
                     let (roll_deg, pitch_deg, yaw_deg, pos, vel, gyro_bias, accel_bias) =
                         state_fields(&eskf);
 
@@ -260,6 +281,8 @@ pub async fn estimation_task() {
                     defmt::warn!("estimation: non-finite mocap frame, rejecting");
                     continue;
                 }
+
+                last_mocap_ts = Instant::now();
 
                 // If the filter reset (NaN guard), re-seed from this pose.
                 if !eskf.is_initialized() {

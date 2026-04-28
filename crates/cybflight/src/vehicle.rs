@@ -25,7 +25,7 @@ pub const QUADROTOR_BODY: RigidBodyParams = RigidBodyParams {
     max_rate_rad_s: [10.0, 10.0, 6.0],
 };
 
-const MAX_THRUST_N: f32 = 13.0;
+const MAX_THRUST_N: f32 = 12.5;
 
 pub const QUADROTOR_MOTORS: [MotorParams; 4] = [
     // M0: REAR_RIGHT — CW, position (−d, −d) in FLU (right = −y).

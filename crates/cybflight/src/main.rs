@@ -179,6 +179,9 @@ async fn main(spawner: embassy_executor::Spawner) {
         .spawn(cybflight::usb_serial::gps_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn GPS stream task"));
     spawner
+        .spawn(cybflight::usb_serial::gpsrtk_stream_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn GPS RTK stream task"));
+    spawner
         .spawn(cybflight::usb_serial::magext_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn mag ext stream task"));
     spawner

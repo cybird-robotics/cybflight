@@ -10,7 +10,7 @@ use crate::hal;
 use crate::motors::ACTUATOR_MOTORS;
 use crate::msgs;
 use crate::platform;
-use crate::sensors::gps::GPS_HEALTH;
+use crate::sensors::gps::{carr_soln_str, GPS_HEALTH, LATEST_NAV_PVT};
 use crate::sensors::{
     BARO_1, BARO_2, DSHOT_TELEMETRY, GPS_FIX, IMU_1, IMU_2, MAG_EXT, MAG_INT, RC_INPUT,
     RC_LINK_STATUS, VEHICLE_ATTITUDE, VICON_POSE,
@@ -43,6 +43,7 @@ const HELP_TEXT: &[u8] = b"\
   dshot                one-shot DShot telemetry\r\n\
   gps                  one-shot GPS fix\r\n\
   gpshealth            one-shot GPS init/fix health\r\n\
+  gpsrtk               one-shot RTK / NAV-PVT detail (corrections, accuracy)\r\n\
   magext               one-shot external compass\r\n\
   magint               one-shot internal compass\r\n\
   baro1                one-shot barometer 1\r\n\
@@ -52,6 +53,8 @@ const HELP_TEXT: &[u8] = b"\
   eskf                 one-shot estimator status\r\n\
   stream <topic> on    stream data on <topic>\r\n\
   stream <topic> off   stop data stream on <topic>\r\n\
+                       (topics: imu1 imu2 att ocp rc rcstats dshot gps gpsrtk\r\n\
+                        magext magint baro1 baro2 attcontrol vicon timesync eskf)\r\n\
   motor <1-4> <0-100>  set motor throttle (test mode)\r\n\
   param list           list all vehicle parameters\r\n\
   param get <name>     get a parameter value\r\n\
@@ -75,6 +78,7 @@ pub static STREAM_RC: AtomicBool = AtomicBool::new(false);
 pub static STREAM_RC_LINK: AtomicBool = AtomicBool::new(false);
 pub static STREAM_DSHOT: AtomicBool = AtomicBool::new(false);
 pub static STREAM_GPS: AtomicBool = AtomicBool::new(false);
+pub static STREAM_GPSRTK: AtomicBool = AtomicBool::new(false);
 pub static STREAM_MAGEXT: AtomicBool = AtomicBool::new(false);
 pub static STREAM_MAGINT: AtomicBool = AtomicBool::new(false);
 pub static STREAM_BARO1: AtomicBool = AtomicBool::new(false);
@@ -159,6 +163,52 @@ pub async fn dshot_stream_task() {
 #[embassy_executor::task]
 pub async fn gps_stream_task() {
     msg_stream_task(&GPS_FIX, &STREAM_GPS).await
+}
+
+/// Periodically writes a NAV-PVT/RTK detail line to `SHELL_OUT` at 2 Hz while
+/// `STREAM_GPSRTK` is set. Uses the `LATEST_NAV_PVT` snapshot rather than the
+/// `GPS_NAV_PVT` Signal so the ESKF consumer is never starved.
+#[embassy_executor::task]
+pub async fn gpsrtk_stream_task() {
+    use embassy_time::Timer;
+    loop {
+        Timer::after(Duration::from_millis(500)).await;
+        if !STREAM_GPSRTK.load(Ordering::Relaxed) {
+            continue;
+        }
+        let snap = LATEST_NAV_PVT.lock(|c| c.get());
+        let mut line = ShellLine::new();
+        line.format(|w| match snap {
+            None => {
+                write!(w, "GPSRTK no NAV-PVT yet\r\n").ok();
+            }
+            Some(p) => {
+                let age_ms = Instant::now().duration_since(p.timestamp).as_millis();
+                write!(
+                    w,
+                    "GPSRTK fix={} sv={} rtk={}({}) dgps={} h={}mm v={}mm s={}mm/s \
+                     vNED={},{},{} pos={:.7},{:.7} alt={}mm age={}ms\r\n",
+                    p.fix_type,
+                    p.num_sv,
+                    carr_soln_str(p.carr_soln),
+                    p.carr_soln,
+                    if p.diff_soln { "yes" } else { "no" },
+                    p.h_acc_mm,
+                    p.v_acc_mm,
+                    p.s_acc_mm_s,
+                    p.vel_north_mm_s,
+                    p.vel_east_mm_s,
+                    p.vel_down_mm_s,
+                    p.lat_deg,
+                    p.lon_deg,
+                    p.alt_msl_mm,
+                    age_ms,
+                )
+                .ok();
+            }
+        });
+        SHELL_OUT.try_send(line).ok();
+    }
 }
 
 #[embassy_executor::task]
@@ -372,6 +422,7 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
     STREAM_RC_LINK.store(false, Ordering::Relaxed);
     STREAM_DSHOT.store(false, Ordering::Relaxed);
     STREAM_GPS.store(false, Ordering::Relaxed);
+    STREAM_GPSRTK.store(false, Ordering::Relaxed);
     STREAM_MAGEXT.store(false, Ordering::Relaxed);
     STREAM_MAGINT.store(false, Ordering::Relaxed);
     STREAM_BARO1.store(false, Ordering::Relaxed);
@@ -593,6 +644,51 @@ async fn dispatch<'d>(
             write!(w, "{}\r\n", health).ok();
             write_all(class, w.as_slice()).await?;
         }
+        "gpsrtk" => {
+            let snap = LATEST_NAV_PVT.lock(|c| c.get());
+            let mut buf = [0u8; 384];
+            let mut w = WriteBuf::new(&mut buf);
+            match snap {
+                None => {
+                    write!(w, "GPS: no NAV-PVT received yet\r\n").ok();
+                }
+                Some(p) => {
+                    let age_ms = Instant::now().duration_since(p.timestamp).as_millis();
+                    let fix_str = match p.fix_type {
+                        0 => "no-fix",
+                        1 => "dead-reckoning",
+                        2 => "2D",
+                        3 => "3D",
+                        4 => "GNSS+DR",
+                        5 => "time-only",
+                        _ => "?",
+                    };
+                    write!(
+                        w,
+                        "GPS NAV-PVT (age={}ms):\r\n  fix      = {} ({}), gnss_fix_ok={}, num_sv={}\r\n  rtk      = {} (carr_soln={}), dgps={}\r\n  acc      = h={}mm v={}mm s={}mm/s\r\n  vel NED  = {} {} {} mm/s\r\n  pos      = {:.7}, {:.7}  alt_msl={}mm\r\n",
+                        age_ms,
+                        p.fix_type,
+                        fix_str,
+                        if p.gnss_fix_ok { "yes" } else { "no" },
+                        p.num_sv,
+                        carr_soln_str(p.carr_soln),
+                        p.carr_soln,
+                        if p.diff_soln { "yes" } else { "no" },
+                        p.h_acc_mm,
+                        p.v_acc_mm,
+                        p.s_acc_mm_s,
+                        p.vel_north_mm_s,
+                        p.vel_east_mm_s,
+                        p.vel_down_mm_s,
+                        p.lat_deg,
+                        p.lon_deg,
+                        p.alt_msl_mm,
+                    )
+                    .ok();
+                }
+            }
+            write_all(class, w.as_slice()).await?;
+        }
         "vicon" => {
             let mut sub = match VICON_POSE.subscriber() {
                 Ok(s) => s,
@@ -614,6 +710,14 @@ async fn dispatch<'d>(
         "stream gps off" => {
             STREAM_GPS.store(false, Ordering::Relaxed);
             write_all(class, b"GPS stream off\r\n").await?;
+        }
+        "stream gpsrtk on" => {
+            STREAM_GPSRTK.store(true, Ordering::Relaxed);
+            write_all(class, b"GPS RTK stream on\r\n").await?;
+        }
+        "stream gpsrtk off" => {
+            STREAM_GPSRTK.store(false, Ordering::Relaxed);
+            write_all(class, b"GPS RTK stream off\r\n").await?;
         }
         "stream magext on" => {
             STREAM_MAGEXT.store(true, Ordering::Relaxed);

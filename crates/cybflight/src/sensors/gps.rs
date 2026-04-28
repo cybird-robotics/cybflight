@@ -53,14 +53,37 @@ pub enum GpsHealth {
         fix_type: u8,
         num_sv: u8,
         h_acc_mm: u32,
+        /// NAV-PVT flags bit 1: differential corrections applied.
+        diff_soln: bool,
+        /// NAV-PVT flags bits 6-7: 0=none, 1=RTK float, 2=RTK fixed.
+        /// Always 0 on receivers without RTK hardware (M8/M9 non-P).
+        carr_soln: u8,
         last_fix_at: Instant,
     },
     /// `read_fix` returned an error after init succeeded.
     ReadError(GpsErrKind),
 }
 
+/// Human-readable label for the carrier-phase solution status reported in
+/// NAV-PVT flags bits 6-7.
+pub fn carr_soln_str(c: u8) -> &'static str {
+    match c {
+        0 => "none",
+        1 => "float",
+        2 => "FIXED",
+        _ => "?",
+    }
+}
+
 pub static GPS_HEALTH: Mutex<CriticalSectionRawMutex, Cell<GpsHealth>> =
     Mutex::new(Cell::new(GpsHealth::Initializing));
+
+/// Latest NAV-PVT snapshot, writeable from the GPS task and readable from
+/// any shell context. Held as `Option` so the shell can distinguish "no
+/// fix yet" from "stale fix"; pair the snapshot's `timestamp` with
+/// `Instant::now()` for age.
+pub static LATEST_NAV_PVT: Mutex<CriticalSectionRawMutex, Cell<Option<GpsNavPvt>>> =
+    Mutex::new(Cell::new(None));
 
 /// Convert a u-blox driver error into the variant tag stored in `GpsHealth`.
 pub fn err_kind<E>(e: &UbxError<E>) -> GpsErrKind {
@@ -104,13 +127,20 @@ impl core::fmt::Display for GpsHealth {
                 fix_type,
                 num_sv,
                 h_acc_mm,
+                diff_soln,
+                carr_soln,
                 last_fix_at,
             } => {
                 let age_ms = Instant::now().duration_since(*last_fix_at).as_millis();
                 write!(
                     f,
-                    "GPS: locked (fix_type={}, num_sv={}, h_acc={}mm, age={}ms)",
-                    fix_type, num_sv, h_acc_mm, age_ms
+                    "GPS: locked (fix_type={}, num_sv={}, h_acc={}mm, dgps={}, rtk={}, age={}ms)",
+                    fix_type,
+                    num_sv,
+                    h_acc_mm,
+                    if *diff_soln { "yes" } else { "no" },
+                    carr_soln_str(*carr_soln),
+                    age_ms
                 )
             }
             GpsHealth::ReadError(k) => write!(f, "GPS: read error ({})", err_kind_str(*k)),
@@ -136,6 +166,13 @@ pub struct GpsNavPvt {
     pub h_acc_mm: u32,
     pub v_acc_mm: u32,
     pub s_acc_mm_s: u32,
+    /// NAV-PVT flags bit 0: receiver believes the fix is valid.
+    pub gnss_fix_ok: bool,
+    /// NAV-PVT flags bit 1: differential corrections (e.g. RTCM3) were applied.
+    pub diff_soln: bool,
+    /// NAV-PVT flags bits 6-7: RTK carrier-phase solution status.
+    /// 0=none, 1=float, 2=fixed.
+    pub carr_soln: u8,
 }
 
 pub struct GpsRunner {
@@ -161,6 +198,8 @@ impl GpsRunner {
                             fix_type: pvt.fix_type,
                             num_sv: pvt.num_sv,
                             h_acc_mm: pvt.h_acc_mm,
+                            diff_soln: pvt.diff_soln,
+                            carr_soln: pvt.carr_soln,
                             last_fix_at: now,
                         }
                     } else {
@@ -184,7 +223,7 @@ impl GpsRunner {
                         v_acc_mm: pvt.v_acc_mm,
                         pdop: pvt.pdop,
                     });
-                    super::GPS_NAV_PVT.signal(GpsNavPvt {
+                    let nav_pvt = GpsNavPvt {
                         timestamp: now,
                         fix_type: pvt.fix_type,
                         num_sv: pvt.num_sv,
@@ -197,7 +236,12 @@ impl GpsRunner {
                         h_acc_mm: pvt.h_acc_mm,
                         v_acc_mm: pvt.v_acc_mm,
                         s_acc_mm_s: pvt.s_acc_mm_s,
-                    });
+                        gnss_fix_ok: pvt.gnss_fix_ok,
+                        diff_soln: pvt.diff_soln,
+                        carr_soln: pvt.carr_soln,
+                    };
+                    super::GPS_NAV_PVT.signal(nav_pvt);
+                    LATEST_NAV_PVT.lock(|c| c.set(Some(nav_pvt)));
                 }
                 Err(e) => {
                     GPS_HEALTH.lock(|c| c.set(GpsHealth::ReadError(err_kind(&e))));

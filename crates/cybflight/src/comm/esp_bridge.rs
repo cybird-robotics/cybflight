@@ -11,7 +11,7 @@ use crate::{control, sensors};
 use cybflight_msgs::wire::{
     self, WireArmDisarm, WireAttitudeControlSetpoint, WireBaroSample, WireDshotTelemetry,
     WireGpsFix, WireImu, WireMagSample, WireMessage, WireMotorStateTelemetry,
-    WireOcpSolverOutput, WirePing, WirePingResp, WirePose,
+    WireOcpSolverOutput, WirePing, WirePingResp, WirePose, WirePowerStatus,
     WireRcInput, WireRcLinkStatus, WireTimeSync, WireTimeSyncStatus, WireVehicleAttitude,
     WireVehicleOdometry,
 };
@@ -120,6 +120,7 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
     let mut mag_int_sub = sensors::MAG_INT.subscriber().unwrap();
     let mut baro1_sub = sensors::BARO_1.subscriber().unwrap();
     let mut baro2_sub = sensors::BARO_2.subscriber().unwrap();
+    let mut power_sub = sensors::POWER_STATUS.subscriber().unwrap();
     let mut att_ctrl_sub = control::ATTITUDE_CONTROL_SETPOINT.subscriber().unwrap();
     #[cfg(feature = "est_eskf")]
     let mut pos_ctrl_sub = control::POSITION_CONTROL_SETPOINT.subscriber().unwrap();
@@ -219,6 +220,11 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
             let mut w = WireBaroSample::from_msg(&m);
             w.timestamp_us = utc_ts(m.timestamp);
             pos += encode_with_id(&w, wire::msg_id::BARO_2, &mut seq, &mut batch[pos..]);
+        }
+        if let Some(m) = drain_latest(&mut power_sub) {
+            let mut w = WirePowerStatus::from_msg(&m);
+            w.timestamp_us = utc_ts(m.timestamp);
+            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
         if let Some(m) = drain_latest(&mut att_ctrl_sub) {
             let mut w = WireAttitudeControlSetpoint::from_msg(&m);

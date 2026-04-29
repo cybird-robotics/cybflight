@@ -23,7 +23,7 @@
 use crate::mixer::{MotorParams, RigidBodyParams, SpinDir};
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 10;
+const VERSION: u32 = 13;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
 /// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 = 588 bytes
 const PAYLOAD_SIZE: usize = 588;
@@ -60,7 +60,7 @@ impl Default for MpcParams {
             vel_weight: [1.0, 1.0, 1.0],
             att_weight: [5.0, 5.0, 200.0],
             rate_weight: [1.0, 1.0, 1.0],
-            thrust_weight: 6.0,
+            thrust_weight: 1.0,
             dt: 0.05,
             rho: 1e4,
         }
@@ -211,7 +211,7 @@ pub struct IndiControllerParams {
 impl Default for IndiControllerParams {
     fn default() -> Self {
         Self {
-            rate_gains: [20.0, 20.0, 20.0],
+            rate_gains: [30.0, 30.0, 30.0],
             sync_filter_hz: 10.0,
             wls_wv: [1.0, 1.0, 50.0, 50.0, 50.0, 5.0],
             wls_wu: [1.0, 1.0, 1.0, 1.0],

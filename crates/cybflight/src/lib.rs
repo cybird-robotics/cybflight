@@ -19,6 +19,7 @@ pub mod platform;
 pub mod sensors;
 pub mod shell;
 pub mod status;
+pub mod thrust_tables;
 pub mod usb_serial;
 pub mod vehicle;
 pub mod watchdog;

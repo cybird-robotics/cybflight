@@ -12,8 +12,8 @@ use crate::msgs;
 use crate::platform;
 use crate::sensors::gps::{carr_soln_str, GPS_HEALTH, LATEST_NAV_PVT};
 use crate::sensors::{
-    BARO_1, BARO_2, DSHOT_TELEMETRY, GPS_FIX, IMU_1, IMU_2, MAG_EXT, MAG_INT, RC_INPUT,
-    RC_LINK_STATUS, VEHICLE_ATTITUDE, VICON_POSE,
+    BARO_1, BARO_2, DSHOT_TELEMETRY, GPS_FIX, IMU_1, IMU_2, MAG_EXT, MAG_INT, POWER_STATUS,
+    RC_INPUT, RC_LINK_STATUS, VEHICLE_ATTITUDE, VICON_POSE,
 };
 use crate::shell::format::ShellMsg;
 use crate::shell::write_all;
@@ -41,6 +41,7 @@ const HELP_TEXT: &[u8] = b"\
   rc                   one-shot RC channel values\r\n\
   rcstats              one-shot RC link status\r\n\
   dshot                one-shot DShot telemetry\r\n\
+  power                one-shot power status\r\n\
   gps                  one-shot GPS fix\r\n\
   gpshealth            one-shot GPS init/fix health\r\n\
   gpsrtk               one-shot RTK / NAV-PVT detail (corrections, accuracy)\r\n\
@@ -77,6 +78,7 @@ pub static STREAM_OCP: AtomicBool = AtomicBool::new(false);
 pub static STREAM_RC: AtomicBool = AtomicBool::new(false);
 pub static STREAM_RC_LINK: AtomicBool = AtomicBool::new(false);
 pub static STREAM_DSHOT: AtomicBool = AtomicBool::new(false);
+pub static STREAM_POWER: AtomicBool = AtomicBool::new(false);
 pub static STREAM_GPS: AtomicBool = AtomicBool::new(false);
 pub static STREAM_GPSRTK: AtomicBool = AtomicBool::new(false);
 pub static STREAM_MAGEXT: AtomicBool = AtomicBool::new(false);
@@ -158,6 +160,11 @@ pub async fn rc_link_stream_task() {
 #[embassy_executor::task]
 pub async fn dshot_stream_task() {
     msg_stream_task(&DSHOT_TELEMETRY, &STREAM_DSHOT).await
+}
+
+#[embassy_executor::task]
+pub async fn power_stream_task() {
+    msg_stream_task(&POWER_STATUS, &STREAM_POWER).await
 }
 
 #[embassy_executor::task]
@@ -428,6 +435,7 @@ async fn shell_loop<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d>>) {
     STREAM_RC.store(false, Ordering::Relaxed);
     STREAM_RC_LINK.store(false, Ordering::Relaxed);
     STREAM_DSHOT.store(false, Ordering::Relaxed);
+    STREAM_POWER.store(false, Ordering::Relaxed);
     STREAM_GPS.store(false, Ordering::Relaxed);
     STREAM_GPSRTK.store(false, Ordering::Relaxed);
     STREAM_MAGEXT.store(false, Ordering::Relaxed);
@@ -636,6 +644,21 @@ async fn dispatch<'d>(
         "stream dshot off" => {
             STREAM_DSHOT.store(false, Ordering::Relaxed);
             write_all(class, b"DShot telemetry stream off\r\n").await?;
+        }
+        "power" => {
+            let mut sub = match POWER_STATUS.subscriber() {
+                Ok(s) => s,
+                Err(_) => return write_all(class, b"error: no subscriber slot\r\n").await,
+            };
+            oneshot(class, &mut sub, 128).await?;
+        }
+        "stream power on" => {
+            STREAM_POWER.store(true, Ordering::Relaxed);
+            write_all(class, b"power stream on\r\n").await?;
+        }
+        "stream power off" => {
+            STREAM_POWER.store(false, Ordering::Relaxed);
+            write_all(class, b"power stream off\r\n").await?;
         }
         "gps" => {
             let mut sub = match GPS_FIX.subscriber() {

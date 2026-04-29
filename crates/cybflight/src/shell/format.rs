@@ -189,6 +189,23 @@ impl fmt::Display for ShellMsg<'_, msgs::BaroSample> {
     }
 }
 
+impl fmt::Display for ShellMsg<'_, msgs::PowerStatus> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.0;
+        write!(
+            f,
+            "Power(t={}, {}.{:02}V, {}.{:02}A, {}mAh, {}S)",
+            s.timestamp.as_millis(),
+            s.voltage_cv / 100,
+            s.voltage_cv % 100,
+            s.current_ca / 100,
+            (s.current_ca % 100).unsigned_abs(),
+            s.mah_drawn,
+            s.cell_count
+        )
+    }
+}
+
 impl fmt::Display for ShellMsg<'_, msgs::DshotTelemetry> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use cybflight_msgs::dshot::TelemetryValue;
@@ -249,6 +266,7 @@ pub struct ShellState {
     pub stream_baro1: bool,
     pub stream_baro2: bool,
     pub stream_attcontrol: bool,
+    pub stream_power: bool,
 }
 
 impl Printable for msgs::Imu {
@@ -364,6 +382,16 @@ impl Printable for msgs::BaroSample {
 impl Printable for msgs::AttitudeControlSetpoint {
     fn should_print(&self, ctx: &ShellState) -> bool {
         ctx.stream_attcontrol
+    }
+
+    fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        write!(w, "{}", ShellMsg(self))
+    }
+}
+
+impl Printable for msgs::PowerStatus {
+    fn should_print(&self, ctx: &ShellState) -> bool {
+        ctx.stream_power
     }
 
     fn write_to(&self, w: &mut dyn core::fmt::Write) -> core::fmt::Result {

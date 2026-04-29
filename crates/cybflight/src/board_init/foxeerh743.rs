@@ -20,6 +20,7 @@ use crate::sensors::baro::BaroReader;
 use crate::sensors::gps::GpsRunner;
 use crate::sensors::imu::{icm_reader_task, mpu_reader_task, ImuReader, SpiBusMtx};
 use crate::sensors::mag::{I2cBusMtx, MagReader};
+use crate::sensors::power::{PowerMonitor, power_task};
 use crate::status;
 use crate::usb_serial;
 use hal::gpio::{AfType, Flex, OutputType, Speed};
@@ -481,4 +482,16 @@ pub async fn init(
             board.motors.dma1_ch3,
         ))
         .unwrap_or_else(|_| defmt::error!("Failed to spawn DShot task"));
+
+    // --- Power monitoring (ADC3) ---
+    // Placed after DShot so motor control starts even if ADC init has issues.
+    let power_mon = PowerMonitor::new(
+        board.adc.adc3,
+        board.adc.vbat,
+        board.adc.curr,
+        bsp::POWER_CAL,
+    );
+    spawner
+        .spawn(power_task(power_mon))
+        .unwrap_or_else(|_| defmt::error!("Failed to spawn power task"));
 }

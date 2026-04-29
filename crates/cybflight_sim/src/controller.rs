@@ -103,6 +103,11 @@ pub struct MpcIndiController {
     mass: f32,
     grav: f32,
     per_motor_max_n: f32,
+    /// Nominal pack voltage handed to INDI's thrust linearization. Only
+    /// `ThrustModel::Table` reads this; the analytic models ignore it.
+    /// 23.0 V is mid-pack 6S, matching the bench thrust map at
+    /// `tmp/thrust_map/a2rl_0114.csv`. Sim plant has no battery sag model.
+    nominal_voltage_v: f32,
 }
 
 impl MpcIndiController {
@@ -173,6 +178,7 @@ impl MpcIndiController {
             mass,
             grav,
             per_motor_max_n,
+            nominal_voltage_v: 23.0,
         }
     }
 
@@ -253,6 +259,7 @@ impl Controller for MpcIndiController {
             true,
             &g2_valid,
             MotorState::Internal,
+            self.nominal_voltage_v,
         );
 
         // Convert normalized commands [0,1] → per-motor thrust [N]. Plant's

@@ -2,6 +2,7 @@ pub mod baro;
 pub mod gps;
 pub mod imu;
 pub mod mag;
+pub mod power;
 pub mod rc;
 use cybflight_msgs as msgs;
 
@@ -78,4 +79,9 @@ pub static BARO_1: PubSubChannel<CriticalSectionRawMutex, msgs::BaroSample, 2, 4
 
 // Baro 2: same sizing for dual-baro boards.
 pub static BARO_2: PubSubChannel<CriticalSectionRawMutex, msgs::BaroSample, 2, 4, 1> =
+    PubSubChannel::new();
+
+// Power status: CAP=2 (low-rate, latest matters),
+// SUBS=5 (esp_bridge + shell stream + oneshot + indi_task + spare), PUBS=1 (power_task).
+pub static POWER_STATUS: PubSubChannel<CriticalSectionRawMutex, msgs::PowerStatus, 2, 5, 1> =
     PubSubChannel::new();

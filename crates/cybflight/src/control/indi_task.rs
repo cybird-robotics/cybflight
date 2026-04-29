@@ -46,7 +46,7 @@ use crate::estimation::rpm_estimator::{
 use crate::{
     motors::ACTUATOR_MOTORS,
     msgs::{self, dshot::TelemetryValue},
-    sensors::{DSHOT_TELEMETRY, IMU_1},
+    sensors::{DSHOT_TELEMETRY, IMU_1, POWER_STATUS},
     vehicle::{QUADROTOR_BODY, QUADROTOR_MOTORS},
 };
 
@@ -60,12 +60,19 @@ static LEARNED_SAVE_PENDING: core::sync::atomic::AtomicBool =
 /// `Quadratic`: u = k·d² + (1−k)·d  (indiflight port; firmware default).
 /// `SqrtSquared`: u = (k·d + (1−k)·√d)²  (steady-state ω mix, T ∝ ω²;
 ///   often fits thrust-stand data better — see `tmp/thrust_map/`).
+/// `Table(...)`: 2D bench-data lookup `(thrust_N, voltage_V) → command`,
+///   where `thrust_N` is *per-rotor* force. Compensates for battery sag
+///   automatically. Not the default — needs bench data and validated
+///   voltage telemetry first. Bench rigs that report collective thrust are
+///   converted to per-rotor at build time (see `build.rs`); the runtime
+///   `ThrustTable` always carries per-rotor units.
 ///
 /// Changing this is a global decision for the airframe; the meaning of `k`
 /// differs between models, so `indi_effectiveness.nonlinearity` typically
 /// needs re-identification after switching.
-const THRUST_MODEL: ThrustModel = ThrustModel::Quadratic;
+// const THRUST_MODEL: ThrustModel = ThrustModel::Quadratic;
 // const THRUST_MODEL: ThrustModel = ThrustModel::SqrtSquared;
+const THRUST_MODEL: ThrustModel = ThrustModel::Table(&crate::thrust_tables::A2RL_0114);
 
 /// Default motor nonlinearity `k`, matched to `THRUST_MODEL`.
 ///
@@ -75,10 +82,41 @@ const THRUST_MODEL: ThrustModel = ThrustModel::Quadratic;
 ///   SqrtSquared:  k = 0.458  (RMS 0.230 N, R² 0.9961)
 ///
 /// Only used when no learned params exist in flash (fresh install).
+/// Unused for `Table` mode — the table itself encodes the curve.
 const THRUST_NONLINEARITY: f32 = match THRUST_MODEL {
     ThrustModel::Quadratic => 0.518,
     ThrustModel::SqrtSquared => 0.458,
+    ThrustModel::Table(_) => 0.0,
 };
+
+/// Bootstrap pack voltage, used as the initial value of `last_voltage_v`
+/// before `power_task` publishes its first frame. Matches the mid-range of
+/// the bench thrust map at `tmp/thrust_map/a2rl_0114.csv` (21.7–24.8 V →
+/// 23.0 V mid). Once any valid voltage frame arrives we always hold the
+/// last reading rather than fall back here — a freshly-stale value tracks
+/// truth far better than a fixed nominal, especially at end-of-flight
+/// when sag is largest.
+const NOMINAL_VOLTAGE_V: f32 = 23.0;
+/// Soft staleness threshold: past this many ms without a fresh
+/// `POWER_STATUS`, we still hold `last_voltage_v` (it tracks slowly under
+/// heavy load) but enter the "stale" state for logging + failsafe
+/// accounting. Power task publishes at 100 Hz, so 500 ms covers ~50
+/// missed frames — well past any plausible scheduling hiccup.
+const VOLTAGE_STALE_TIMEOUT: Duration = Duration::from_millis(500);
+/// Hard failsafe in `Table` mode: if voltage stays stale this long while
+/// armed, the inner loop goes silent and the watchdog disarms — same
+/// pattern as `CMD_STALE_TIMEOUT`. The 500 ms NOMINAL fallback is meant to
+/// ride out a transient `power_task` stall; if it persists beyond 2 s the
+/// linearization is unreliable enough that flying further is more
+/// dangerous than landing. Analytic models ignore voltage, so the failsafe
+/// is suppressed for them.
+const VOLTAGE_FAILSAFE_TIMEOUT: Duration = Duration::from_millis(2000);
+/// Plausibility gate — anything outside this is treated as a glitched
+/// frame and dropped. 12 V floor (4S empty) to 30 V ceiling (6S full)
+/// covers every battery this airframe will see; tighten per-airframe if
+/// needed.
+const VOLTAGE_MIN_PLAUSIBLE: f32 = 12.0;
+const VOLTAGE_MAX_PLAUSIBLE: f32 = 30.0;
 
 /// Default INDI motor parameters.
 const MAX_RPM: f32 = 40000.0;
@@ -307,6 +345,10 @@ pub async fn indi_task() {
     // --- Subscribe to channels ---
     let mut imu_sub = IMU_1.subscriber().unwrap();
     let mut dshot_sub = DSHOT_TELEMETRY.subscriber().unwrap();
+    // Battery voltage from `power_task` (100 Hz). Consumed by the thrust
+    // map in `Table` mode; ignored by the analytic models. Held between
+    // updates with a staleness fallback to nominal — see VOLTAGE_* consts.
+    let mut power_sub = POWER_STATUS.subscriber().unwrap();
     // Armed state read from IS_ARMED atomic (set by DShot task).
     let att_pub = super::ATTITUDE_CONTROL_SETPOINT.immediate_publisher();
     let motor_telem_pub = super::ACTUATOR_MOTORS_TELEM.immediate_publisher();
@@ -329,6 +371,17 @@ pub async fn indi_task() {
     /// silent and the watchdog disarms.
     const CMD_STALE_TIMEOUT: Duration = Duration::from_millis(100);
 
+    // --- Battery voltage tracking (for Table thrust model) ---
+    // Hold-last-value with staleness/plausibility fallback to nominal.
+    // power_task runs at 100 Hz; INDI runs at 8 kHz, so 99% of ticks
+    // reuse the held value — that's expected, not a problem.
+    let mut last_voltage_v: f32 = NOMINAL_VOLTAGE_V;
+    let mut last_voltage_time: Option<Instant> = None;
+    // Tracks the start of the current voltage-staleness episode for
+    // one-shot stale/recover logging and the Table-mode armed failsafe
+    // gate. `Some(t)` ⇒ stale since `t`; `None` ⇒ fresh.
+    let mut voltage_stale_since: Option<Instant> = None;
+
     // RPM estimator timestamp tracking (seconds, f32 relative to task start)
     let mut est_prev_ts: Option<Instant> = None;
     let mut est_current_ts: f32 = 0.0;
@@ -344,6 +397,40 @@ pub async fn indi_task() {
     // the first IMU tick; the outer loop's first RATE_COMMAND activates
     // motor output.
     defmt::info!("INDI task started ({}Hz)", loop_rate_hz as u32);
+
+    // ── Airframe ↔ thrust-table binding check ──────────────────────────
+    //
+    // `THRUST_MODEL = Table(...)` requires the table's per-rotor thrust
+    // axis to match the airframe's per-motor `max_thrust_n`; otherwise the
+    // u-axis scaling is silently wrong and the drone gets a fraction of
+    // the throttle authority WLS thinks it has. Hard-fail at startup
+    // rather than fly with the mismatch — `defmt::panic!` halts the
+    // firmware before motors arm. Voltage range is logged so an operator
+    // can sanity-check the active table against the pack in use.
+    if let ThrustModel::Table(t) = THRUST_MODEL {
+        let pm = QUADROTOR_MOTORS[0].max_thrust_n;
+        let tm = t.thrust_max_n();
+        defmt::info!(
+            "INDI Table: thrust [{}, {}] N/rotor, voltage [{}, {}] V, per_motor_max={} N",
+            t.thrust_min_n(),
+            tm,
+            t.voltage_min_v(),
+            t.voltage_max_v(),
+            pm,
+        );
+        // 10% relative tolerance: the bench rig's per-rotor max and the
+        // configured `max_thrust_n` should agree to well within this; any
+        // larger gap means the table was baked from a different airframe.
+        let rel_err = libm::fabsf(pm - tm) / tm;
+        if rel_err >= 0.10 {
+            defmt::panic!(
+                "INDI: Table thrust_max ({} N/rotor) and vehicle.rs max_thrust_n ({} N) disagree by {}% — re-bake the table or fix vehicle.rs",
+                tm,
+                pm,
+                rel_err * 100.0,
+            );
+        }
+    }
 
     /****************************/
     let motor_filter_hz = 15.0;
@@ -398,9 +485,9 @@ pub async fn indi_task() {
     // allocated (~10 KB BSS) but the per-loop work is dead-code eliminated
     // by the compiler since this is a `const bool`. Recompile + reflash to
     // toggle; matches the `THRUST_MODEL` const pattern used above.
-    const ENABLE_RPM_NOTCH: bool = true;
-    const RPM_NOTCH_Q: f32 = 5.0;
-    const RPM_NOTCH_MIN_HZ: f32 = 100.0;
+    const ENABLE_RPM_NOTCH: bool = false;
+    const RPM_NOTCH_Q: f32 = 5.0; // 2.0
+    const RPM_NOTCH_MIN_HZ: f32 = 100.0; // 200
     const RPM_NOTCH_FADE_HZ: f32 = 50.0;
     let mut gyro_rpm_notch = RpmNotchBank::<NU, 3>::new(
         loop_rate_hz,
@@ -704,7 +791,20 @@ pub async fn indi_task() {
             (gyro_corrected, accel_corrected)
         };
 
-        // 3. Drain latest rate command from outer loop.
+        // 3. Drain latest battery voltage. Plausibility-gate at the
+        //    boundary so a glitched ADC frame can't poison the thrust
+        //    map for the rest of the flight.
+        if let Some(power) = power_sub.try_next_message_pure() {
+            let v = power.voltage_cv as f32 * 0.01; // centivolts → volts
+            if v.is_finite() && (VOLTAGE_MIN_PLAUSIBLE..=VOLTAGE_MAX_PLAUSIBLE).contains(&v) {
+                last_voltage_v = v;
+                last_voltage_time = Some(power.timestamp);
+            }
+            // Implausible/NaN frames silently drop. Repeated drops trip
+            // the staleness fallback below.
+        }
+
+        // 4. Drain latest rate command from outer loop.
         let now = Instant::now();
         outer_counter += 1;
         if outer_counter >= OUTER_DECIMATION {
@@ -718,7 +818,7 @@ pub async fn indi_task() {
             last_cmd_time = Some(now);
         }
 
-        // 4. Stale command while armed — go silent, let watchdog handle it.
+        // 5. Stale command while armed — go silent, let watchdog handle it.
         let cmd_fresh = match last_cmd_time {
             Some(t) => now.duration_since(t) < CMD_STALE_TIMEOUT,
             None => false,
@@ -770,7 +870,49 @@ pub async fn indi_task() {
             }
         }
 
-        // 6. INDI step (8 kHz) — uses bias-corrected gyro.
+        // 7. INDI step (8 kHz) — uses bias-corrected gyro. Voltage feeds
+        //    the `Table` thrust model; analytic models ignore it. Single
+        //    source of truth: never sample VBAT here — power_task owns it.
+        //
+        //    Voltage-staleness machine:
+        //      - Always hold `last_voltage_v` (battery sag is slow vs. the
+        //        soft staleness window; at boot the field is initialized to
+        //        NOMINAL_VOLTAGE_V, which carries us until power_task's
+        //        first frame).
+        //      - Log warn on stale entry, info on recovery — once per
+        //        episode so the defmt log isn't spammed at 8 kHz.
+        //      - In Table mode, if stale persists past
+        //        VOLTAGE_FAILSAFE_TIMEOUT while armed, go silent and let
+        //        the controller watchdog disarm. The analytic models
+        //        ignore voltage so this gate is suppressed for them; the
+        //        failsafe also bounds how long a frozen reading can lie.
+        let voltage_fresh = match last_voltage_time {
+            Some(t) => now.duration_since(t) < VOLTAGE_STALE_TIMEOUT,
+            None => false,
+        };
+        let voltage_v = last_voltage_v;
+        if voltage_fresh {
+            if let Some(t0) = voltage_stale_since.take() {
+                defmt::info!(
+                    "INDI: voltage recovered after {}ms",
+                    now.duration_since(t0).as_millis() as u32,
+                );
+            }
+        } else if voltage_stale_since.is_none() {
+            voltage_stale_since = Some(now);
+            defmt::warn!(
+                "INDI: voltage stale, holding last reading {}V",
+                last_voltage_v,
+            );
+        }
+        if armed
+            && matches!(THRUST_MODEL, ThrustModel::Table(_))
+            && voltage_stale_since
+                .map(|t0| now.duration_since(t0) >= VOLTAGE_FAILSAFE_TIMEOUT)
+                .unwrap_or(false)
+        {
+            continue;
+        }
         //
         // Motor-state source:
         //   - Armed + LPF has a sample → feed dshot-derived ω, ω̇ from the
@@ -798,6 +940,7 @@ pub async fn indi_task() {
             armed,
             &g2_valid,
             motor_state,
+            voltage_v,
         );
 
         // 6b. Online learner.

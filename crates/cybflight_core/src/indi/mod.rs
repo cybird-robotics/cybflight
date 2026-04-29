@@ -5,3 +5,4 @@ pub mod linearization;
 pub mod rate_dot_estimator;
 pub mod rpm_notch;
 pub mod rpm_tracker;
+pub mod thrust_table;

@@ -173,6 +173,9 @@ async fn main(spawner: embassy_executor::Spawner) {
         .spawn(cybflight::usb_serial::dshot_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn DShot stream task"));
     spawner
+        .spawn(cybflight::usb_serial::power_stream_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn power stream task"));
+    spawner
         .spawn(cybflight::usb_serial::attitude_control_stream_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn attitude control stream task"));
     spawner

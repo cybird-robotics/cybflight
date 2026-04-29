@@ -6,7 +6,9 @@ use hal::exti;
 use hal::gpio::{Level, Output, Pull, Speed};
 use hal::{bind_interrupts, Config, Peripherals};
 
-pub use bsp_types::{DmaHint, MotorMeta, SensorAlign, SerialPortId, TimerChannel, TimerId};
+pub use bsp_types::{
+    DmaHint, MotorMeta, PowerCalibration, SensorAlign, SerialPortId, TimerChannel, TimerId,
+};
 pub use cybflight_drivers::beeper::Beeper;
 
 /// Board name from Betaflight target.
@@ -37,6 +39,18 @@ pub const LED_COUNT: usize = 1;
 // GPS         UART4   PA0 TX / PA1 RX   u-blox (M8/M9/F9P)
 // ESP bridge  USART6  PC6 TX / PC7 RX   WiFi/companion link, DMA
 // =====================================================================
+
+/// ADC calibration: BF defaults + config.h `DEFAULT_CURRENT_METER_SCALE=100`.
+pub const POWER_CAL: PowerCalibration = PowerCalibration {
+    voltage_scale: 110,
+    voltage_divider: 10,
+    voltage_multiplier: 1,
+    current_scale: 100,
+    current_offset: 0,
+};
+
+/// Serial port role assignments — the single place to reassign a role to a different UART.
+/// Changing one constant here is the only edit needed to move that role to a different port.
 pub const PORT_SERIAL_RX: SerialPortId = SerialPortId::Usart2;
 pub const PORT_GPS: SerialPortId = SerialPortId::Uart4;
 pub const PORT_ESP_BRIDGE: SerialPortId = SerialPortId::Usart6;
@@ -191,6 +205,7 @@ pub struct SerialPins {
 }
 
 pub struct AdcPins {
+    pub adc3: hal::Peri<'static, hal::peripherals::ADC3>,
     pub vbat: hal::Peri<'static, hal::peripherals::PC3>,
     pub curr: hal::Peri<'static, hal::peripherals::PC2>,
     pub rssi: hal::Peri<'static, hal::peripherals::PC5>,
@@ -309,6 +324,7 @@ fn board_config() -> Config {
         config.rcc.hsi48 = Some(Hsi48Config { sync_from_usb: true }); // 48 MHz for USB
         config.rcc.mux.usbsel = mux::Usbsel::HSI48;
         config.rcc.mux.spi123sel = mux::Saisel::PLL1_Q;
+        config.rcc.mux.adcsel = mux::Adcsel::PER; // PER_CK = HSI 64 MHz (ADC3)
     }
     config
 }
@@ -399,6 +415,7 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
     };
 
     let adc = AdcPins {
+        adc3: p.ADC3,
         vbat: p.PC3,
         curr: p.PC2,
         rssi: p.PC5,

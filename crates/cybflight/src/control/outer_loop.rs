@@ -125,8 +125,8 @@ pub async fn control_loop_task() {
     let mut max_vel_m_s = params.planner.max_vel_m_s;
     // let mut max_tilt_rad = params.planner.max_tilt_rad;
 
-    // ── 100 Hz tick loop ───────────────────────────────────────────────
-    let mut ticker = Ticker::every(Duration::from_millis(10));
+    // ── 50 Hz tick loop ───────────────────────────────────────────────
+    let mut ticker = Ticker::every(Duration::from_millis(20));
     let mut tick: u32 = 0;
     loop {
         ticker.next().await;

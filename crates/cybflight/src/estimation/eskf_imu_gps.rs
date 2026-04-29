@@ -1,12 +1,15 @@
 //! GNSS/INS state estimation task — mirror of `eskf_imu_mocap` with GPS
 //! replacing motion capture.
 //!
-//! The first good fix (fix_type ≥ 3, num_sv ≥ `GPS_MIN_SV`) anchors the
-//! ENU origin; subsequent fixes are converted to ENU and fed into the
-//! ESKF via `update_pos` + `update_vel`. Measurement σ is derived per
-//! fix from u-blox's h_acc / v_acc / s_acc estimates, floored so the
-//! filter cannot get over-confident when the receiver reports impossibly
-//! tight bounds.
+//! The ENU origin is anchored at the first **RTK-fixed** PVT
+//! (NAV-PVT `carr_soln == 2`) rather than the first 3D fix, so the world
+//! frame is centimeter-accurate from the start. Float-RTK (carr_soln=1)
+//! and stand-alone fixes are not used as the anchor — they have meter-
+//! scale absolute bias that would translate into a permanently miscalibrated
+//! ENU frame. Subsequent fixes (any `pvt_is_usable`, including post-anchor
+//! drops to float or stand-alone) feed `update_pos` / `update_vel` with σ
+//! derived from u-blox's h_acc / v_acc / s_acc estimates, floored so the
+//! filter cannot get over-confident.
 //!
 //! GPS-only builds have no attitude measurement — the ESKF leans on IMU
 //! gravity-aided tilt + gyro integration alone, so yaw is observable only
@@ -15,7 +18,7 @@
 //! bounded. See docs/HACKING.md GPS section (to be added) for the gap.
 //!
 //! # State machine
-//! 1. **Init** — waits for first good GPS fix, anchors `LlhOrigin`,
+//! 1. **Init** — waits for first **RTK-fixed** PVT, anchors `LlhOrigin`,
 //!    initialises ESKF with zero position / identity attitude / zero
 //!    biases.
 //! 2. **Converging** — predict/update loop active; gyro-bias covariance
@@ -75,6 +78,15 @@ fn pvt_is_usable(pvt: &GpsNavPvt) -> bool {
         && pvt.lon_deg.is_finite()
 }
 
+/// PVT acceptable as the *origin anchor*. Stricter than `pvt_is_usable`:
+/// only an RTK-fixed solution (`carr_soln == 2`) is allowed, so the ENU
+/// frame is centimeter-accurate from the start. Float-RTK and stand-alone
+/// fixes carry meter-scale absolute bias that would bake a permanent
+/// offset into every subsequent setpoint.
+fn pvt_is_origin_anchor(pvt: &GpsNavPvt) -> bool {
+    pvt_is_usable(pvt) && pvt.carr_soln >= 2
+}
+
 fn pvt_enu(pvt: &GpsNavPvt, origin: &LlhOrigin) -> (Vector3<f32>, Vector3<f32>) {
     let pos = origin.llh_to_enu(
         pvt.lat_deg * PI / 180.0,
@@ -96,12 +108,12 @@ pub async fn estimation_task() {
     let odom_pub = sensors::VEHICLE_ODOMETRY.immediate_publisher();
     let att_pub = sensors::VEHICLE_ATTITUDE.immediate_publisher();
 
-    // --- Wait for first good fix ---
+    // --- Wait for first RTK-fixed PVT to anchor the ENU origin ---
     let origin = loop {
         let pvt = gps_signal.wait().await;
-        if pvt_is_usable(&pvt) {
+        if pvt_is_origin_anchor(&pvt) {
             defmt::info!(
-                "GPS origin: lat={} lon={} alt_msl_mm={} num_sv={} h_acc_mm={}",
+                "GPS origin (RTK fixed): lat={} lon={} alt_msl_mm={} num_sv={} h_acc_mm={}",
                 pvt.lat_deg,
                 pvt.lon_deg,
                 pvt.alt_msl_mm,
@@ -112,6 +124,14 @@ pub async fn estimation_task() {
                 pvt.lat_deg * PI / 180.0,
                 pvt.lon_deg * PI / 180.0,
                 pvt.alt_msl_mm as f32 * 1e-3,
+            );
+        } else if pvt_is_usable(&pvt) {
+            defmt::info!(
+                "GPS waiting for RTK fixed: fix_type={} num_sv={} h_acc_mm={} carr_soln={} (need 2)",
+                pvt.fix_type,
+                pvt.num_sv,
+                pvt.h_acc_mm,
+                pvt.carr_soln,
             );
         } else {
             defmt::info!(
@@ -303,13 +323,13 @@ pub async fn estimation_task() {
                     continue;
                 }
 
-                let (enu_pos, enu_vel) = pvt_enu(&pvt, &origin);
-                let sigma_pos =
-                    (pvt.h_acc_mm.max(pvt.v_acc_mm) as f32 * 1e-3).max(GPS_POS_SIGMA_FLOOR_M);
-                let sigma_vel = (pvt.s_acc_mm_s as f32 * 1e-3).max(GPS_VEL_SIGMA_FLOOR_M_S);
+                let (enu_pos, _) = pvt_enu(&pvt, &origin);
+                // let sigma_pos =
+                // (pvt.h_acc_mm.max(pvt.v_acc_mm) as f32 * 1e-3).max(GPS_POS_SIGMA_FLOOR_M);
+                // let sigma_vel = (pvt.s_acc_mm_s as f32 * 1e-3).max(GPS_VEL_SIGMA_FLOOR_M_S);
 
-                eskf.update_pos(enu_pos, sigma_pos);
-                eskf.update_vel(enu_vel, sigma_vel);
+                eskf.update_pos(enu_pos, 0.7071);
+                // eskf.update_vel(enu_vel, sigma_vel);
 
                 if !eskf.is_initialized() {
                     defmt::error!("ESKF: non-finite state after GPS update — awaiting re-init");

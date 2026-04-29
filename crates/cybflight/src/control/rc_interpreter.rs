@@ -177,14 +177,6 @@ const THROTTLE_LAND_US: u16 = 1100;
 /// known, survivable velocity regardless of starting altitude.
 #[cfg(any(feature = "outer_geometric", feature = "outer_mpc"))]
 const LAND_RATE_M_PER_S: f32 = 0.4;
-/// Absolute position envelope: `|target.xy| ≤ XY_ENVELOPE_M` and
-/// `0 ≤ target.z ≤ Z_CEILING_M` in the world (ENU) frame.
-/// Prevents the setpoint from ever leaving a fixed safety box regardless
-/// of where the drone was armed. Sized for bench/indoor flight.
-#[cfg(any(feature = "outer_geometric", feature = "outer_mpc"))]
-const XY_ENVELOPE_M: f32 = 3.0;
-#[cfg(any(feature = "outer_geometric", feature = "outer_mpc"))]
-const Z_CEILING_M: f32 = 1.8;
 /// Upper bound on the per-frame integration step. Guards against RC frame
 /// gaps (e.g. transient link hiccups) producing huge single-step drifts.
 #[cfg(any(feature = "outer_geometric", feature = "outer_mpc"))]
@@ -246,12 +238,8 @@ pub async fn rc_interpreter_task() {
     }
     let origin = loop {
         let odom = odom_sub.next_message_pure().await;
-        let mut p = odom.pose.position;
+        let p = odom.pose.position;
         if p.x.is_finite() && p.y.is_finite() && p.z.is_finite() {
-            // Clamp to absolute envelope so the initial setpoint is in-bounds.
-            p.x = p.x.clamp(-XY_ENVELOPE_M, XY_ENVELOPE_M);
-            p.y = p.y.clamp(-XY_ENVELOPE_M, XY_ENVELOPE_M);
-            p.z = p.z.clamp(0.0, Z_CEILING_M);
             break p;
         }
         defmt::warn!("rc_interpreter: discarding non-finite odometry during origin capture");
@@ -346,8 +334,6 @@ pub async fn rc_interpreter_task() {
         // After a disarm→arm cycle the drone may have been physically
         // moved. Reset the position setpoint to the current pose so the
         // outer loop doesn't snap to the stale pre-disarm target.
-        // The origin is clamped to the z ceiling so the initial setpoint
-        // is always within the safe envelope.
         let armed = crate::motors::IS_ARMED.load(core::sync::atomic::Ordering::Acquire);
         if armed && !was_armed {
             // Drain to latest valid odometry for the new origin.
@@ -358,12 +344,7 @@ pub async fn rc_interpreter_task() {
                     new_origin = Some(p);
                 }
             }
-            if let Some(mut pos) = new_origin {
-                // Clamp to absolute envelope — the setpoint must be
-                // in-bounds from the very first frame.
-                pos.x = pos.x.clamp(-XY_ENVELOPE_M, XY_ENVELOPE_M);
-                pos.y = pos.y.clamp(-XY_ENVELOPE_M, XY_ENVELOPE_M);
-                pos.z = pos.z.clamp(0.0, Z_CEILING_M);
+            if let Some(pos) = new_origin {
                 origin = pos;
                 super::ACTIVE_POSITION_SETPOINT.lock(|cell| {
                     cell.set(Some(super::ActiveSetpoint {
@@ -563,12 +544,6 @@ pub async fn rc_interpreter_task() {
             } else {
                 pos.z += sz * Z_RATE_M_PER_S * dt;
             }
-
-            // Absolute envelope clamp — the setpoint must stay inside a
-            // fixed world-frame box regardless of where the drone armed.
-            pos.x = pos.x.clamp(-XY_ENVELOPE_M, XY_ENVELOPE_M);
-            pos.y = pos.y.clamp(-XY_ENVELOPE_M, XY_ENVELOPE_M);
-            pos.z = pos.z.clamp(0.0, Z_CEILING_M);
 
             cell.set(Some(super::ActiveSetpoint {
                 timestamp: now,

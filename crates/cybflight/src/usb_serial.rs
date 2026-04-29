@@ -282,8 +282,15 @@ pub async fn estimator_stream_task() {
 
 /// Format the estimator phase into `w`.
 fn write_eskf_phase(w: &mut WriteBuf<'_>, phase: &EstimatorPhase) -> core::fmt::Result {
+    #[cfg(feature = "est_pos_gps")]
+    const AWAITING_LABEL: &str = "ESKF awaiting first RTK-fixed PVT (carr_soln==2)";
+    #[cfg(feature = "est_pos_mocap")]
+    const AWAITING_LABEL: &str = "ESKF awaiting mocap";
+    #[cfg(not(any(feature = "est_pos_mocap", feature = "est_pos_gps")))]
+    const AWAITING_LABEL: &str = "ESKF awaiting exteroceptive";
+
     match phase {
-        EstimatorPhase::AwaitingExteroceptive => write!(w, "ESKF awaiting mocap"),
+        EstimatorPhase::AwaitingExteroceptive => write!(w, "{}", AWAITING_LABEL),
         EstimatorPhase::Converging {
             roll_deg,
             pitch_deg,

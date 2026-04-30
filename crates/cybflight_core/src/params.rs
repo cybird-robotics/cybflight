@@ -288,7 +288,7 @@ impl Default for SamplerParams {
             axis_weights_sqrt: [1.0, 1.0, 1.0],
             search_dt: 0.01,
             max_search_steps: 100,
-            radius_of_acceptance: 0.10,
+            radius_of_acceptance: 0.15,
         }
     }
 }

@@ -476,8 +476,43 @@ pub async fn control_loop_task() {
                 // straight out of the buffer.
                 tau0_sample = Some(sample_buf[0].pos);
 
+                // Wall-clock mission timeout. `PositionSampler`'s
+                // `mission_done` can stay false indefinitely when the
+                // drone settles offset from the trajectory: the
+                // forward-only closest-point search stalls at a τ short
+                // of `end`, and the radius-of-acceptance check fails by
+                // the same offset that caused the stall. Without an
+                // external escape the mission would stay in Executing
+                // forever — the drone hovers at whatever past-end
+                // setpoint the sampler is feeding, but rc_interpreter
+                // never gets stick control back. The grace factor is
+                // multiplicative on `total_duration_s` so long missions
+                // get proportionally more slack; 1.5× past the nominal
+                // end is conservative enough that a well-tracked
+                // mission never hits it.
+                const MISSION_GRACE_FACTOR: f32 = 0.5;
+                let timeout_s =
+                    traj.total_duration_s + traj.total_duration_s * MISSION_GRACE_FACTOR;
+                let wall_clock_timeout = tau0_s > timeout_s;
+
                 if result.mission_done {
                     mission_done_final = Some(sample_buf[MPC_N].pos);
+                } else if wall_clock_timeout {
+                    // Override tau0_sample so ACTIVE_POSITION_SETPOINT
+                    // lands at the trajectory's terminal pose — same
+                    // hover anchor as a normal mission_done. Without
+                    // this override, rc_interpreter's first Idle tick
+                    // would base stick integration on the search's
+                    // last-known tracking point, which on a stuck
+                    // mission is mid-trajectory.
+                    let end_pos = traj.traj.get_pos(traj.total_duration_s);
+                    tau0_sample = Some(end_pos);
+                    mission_done_final = Some(end_pos);
+                    defmt::warn!(
+                        "outer_loop: mission wall-clock timeout (tau0={=f32} > {=f32} s) → Idle at terminal pose",
+                        tau0_s,
+                        timeout_s
+                    );
                 }
             });
 

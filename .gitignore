@@ -3,5 +3,6 @@ target
 output
 tmp
 .claude
+.vscode
 tests/indi_golden/gen_golden
 .env

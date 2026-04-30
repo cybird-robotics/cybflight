@@ -858,14 +858,25 @@ pub async fn mission_planner_task() {
             published = true;
         });
         if !published {
+            // Critical: the publish was suppressed because either (a) abort
+            // raced inside the lock and we consumed the flag via swap, or
+            // (b) state was no longer Planning (e.g. failsafe). In case (a)
+            // outer_loop's abort path is gated on `MISSION_ABORT_REQUESTED.swap`
+            // returning true — since *we* already consumed the flag, that
+            // gate will never fire and the state would otherwise stay
+            // Planning forever (rc_interpreter's stick gate is `state != Idle`,
+            // so the pilot would lose stick control entirely).
+            //
+            // Force state to Idle here. Idempotent in case (b).
+            MISSION_STATE.store(MissionState::Idle as u8, Ordering::Release);
             defmt::warn!(
-                "mission_planner: publish suppressed (abort/state changed during lock acquisition)"
+                "mission_planner: publish suppressed (abort/state changed during lock acquisition) — forced Idle"
             );
             let mut race_solve = solve;
             race_solve.reject_reason = msgs::SOLVE_REJECT_PUBLISH_RACE;
             mission_status_pub.publish_immediate(msgs::MissionStatus {
                 timestamp: Instant::now(),
-                state: MissionState::from_u8(MISSION_STATE.load(Ordering::Acquire)) as u8,
+                state: MissionState::Idle as u8,
                 tau_s: 0.0,
                 total_duration_s: dur,
                 target_position: start_position,

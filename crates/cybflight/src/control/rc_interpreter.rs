@@ -487,26 +487,25 @@ pub async fn rc_interpreter_task() {
                 }
             }
 
-            // Falling edge while EXECUTING → request graceful abort.
+            // Falling edge while a mission is non-Idle → request graceful abort.
             //
-            // Abort is intentionally NOT signaled during Planning: the
-            // BFGS solve is already running, and the mission_planner clears
-            // MISSION_ABORT_REQUESTED at the start of each plan cycle. A
-            // falling edge that arrives after that clear (i.e. the switch
-            // goes LOW while the solve is still running) would cancel the
-            // result even if the pilot intended only a brief toggle. Keeping
-            // the abort scoped to Executing means the pilot's "switch LOW"
-            // intent is honored once the vehicle has actually started moving
-            // — the natural and safe abort window.
+            // Both Planning and Executing honor the abort:
+            //   - Executing: outer_loop consumes the flag, captures the
+            //     current trajectory ref as the hover point, clears slot,
+            //     flips state to Idle.
+            //   - Planning: mission_planner observes the flag at its
+            //     post-solve check (or inside its publish lock) and
+            //     discards the result, flipping state to Idle.
             //
-            // We DO NOT directly clear state or slot here: that is the outer
-            // loop's responsibility so it can capture the drone's current
-            // pose as the hover fallback point (safety: prevents snap-back
-            // to stale pre-mission `pos_setpoint`).
-            if falling && state == super::MissionState::Executing {
+            // We DO NOT directly clear state or slot here: that is the
+            // consumer's responsibility so it can capture the drone's
+            // current pose as the hover fallback point (safety: prevents
+            // snap-back to stale pre-mission `pos_setpoint`).
+            if falling && state != super::MissionState::Idle {
                 defmt::warn!(
-                    "RC: mission abort requested (ch{} falling, Executing)",
-                    MISSION_TRIGGER_CHANNEL
+                    "RC: mission abort requested (ch{} falling, state={})",
+                    MISSION_TRIGGER_CHANNEL,
+                    state as u8
                 );
                 super::MISSION_ABORT_REQUESTED.store(true, Ordering::Release);
                 // No last_target poisoning needed: because sticks are now

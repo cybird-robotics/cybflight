@@ -34,14 +34,21 @@ pub use time::TimeSampler;
 ///
 /// `past_end == true` means this node sits at or beyond the end of the
 /// trajectory. Callers should treat it as a terminal-hover node:
-/// `(pos = end, vel = 0, acc = 0)`, and typically substitute an
-/// identity-tilt attitude reference rather than calling the flatness map
-/// on a zero acceleration.
+/// `(pos = end, vel = 0, acc = 0, jerk = 0)`, and typically substitute
+/// an identity-tilt attitude reference rather than calling the flatness
+/// map on a zero acceleration.
+///
+/// `jerk` is exposed for the flatness body-rate feedforward used by the
+/// MPC outer loop. It is not part of the kinematic reference the SQP's
+/// position/velocity cost reads, so a sampler that does not need it
+/// (e.g. lower-fidelity tests) can leave it at zero without affecting
+/// the position/velocity tracking targets.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SamplerNode {
     pub pos: Vec3,
     pub vel: Vec3,
     pub acc: Vec3,
+    pub jerk: Vec3,
     pub past_end: bool,
 }
 
@@ -51,6 +58,7 @@ impl Default for SamplerNode {
             pos: Vec3::zeros(),
             vel: Vec3::zeros(),
             acc: Vec3::zeros(),
+            jerk: Vec3::zeros(),
             past_end: false,
         }
     }

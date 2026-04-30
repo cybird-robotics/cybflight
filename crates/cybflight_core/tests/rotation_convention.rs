@@ -475,6 +475,273 @@ fn zb_and_yaw_cross_branch_realizes_zb_and_yaw() {
 }
 
 #[test]
+fn zb_and_yaw_tilt_branch_safe_at_inverted_pole() {
+    // The tilt-then-yaw closed form has `tilt_den = sqrt(2·(1 + z_b.z))`,
+    // which is 0 at the inverted pole `z_b = (0, 0, -1)`. The library
+    // guards this and substitutes the canonical yaw-consistent 180°
+    // flip `q = (0, cos(yaw/2), sin(yaw/2), 0)`. Verify three contracts:
+    //
+    // 1. Output is finite for all yaw at the pole — no NaN/Inf.
+    // 2. Output realises the requested body-z direction.
+    // 3. Body-x heading at the inverted pole matches the upright
+    //    convention for the same yaw input — `(cos yaw, sin yaw, 0)` —
+    //    so the controller's yaw command keeps a consistent
+    //    world-frame meaning across the singularity.
+    use core::f32::consts::PI;
+    let v = Vector3::new(0.0, 0.0, -1.0);
+    for &yaw in &[-PI + 0.1, -1.0, -0.3, 0.0, 0.3, 1.0, PI - 0.1] {
+        let q = quaternion_from_zb_and_yaw(&v, yaw, true);
+        // (1) finite
+        let qv = q.as_vector();
+        assert!(
+            qv.x.is_finite() && qv.y.is_finite() && qv.z.is_finite() && qv.w.is_finite(),
+            "non-finite quaternion at yaw={yaw}: {:?}",
+            qv
+        );
+        // (2) body-z = v
+        let zb = q * Vector3::z();
+        assert!(
+            vec_close(&zb, &v, TOL_LOOSE),
+            "zb={:?} v={:?} at yaw={yaw}",
+            zb,
+            v
+        );
+        // (3) body-x heading matches upright convention
+        let xb = q * Vector3::x();
+        let expected = Vector3::new(libm::cosf(yaw), libm::sinf(yaw), 0.0);
+        assert!(
+            vec_close(&xb, &expected, TOL_LOOSE),
+            "body-x heading at inverted pole inconsistent with upright yaw={yaw}: \
+             xb={:?} expected={:?}",
+            xb,
+            expected
+        );
+    }
+}
+
+#[test]
+fn zb_and_yaw_tilt_branch_continuous_through_inverted_pole() {
+    // Continuous (acc, yaw) trajectory whose body-z reference traces a
+    // half-circle in the xz-plane and passes exactly through the
+    // inverted pole at t = 1 s:
+    //
+    //   z_b(t) = (sin(πt), 0, cos(πt))   for t ∈ [0, 2]
+    //     - t = 0  →   (0, 0,  1)   upright
+    //     - t = 1  →   (0, 0, -1)   ← pole; library substitutes the
+    //                                  yaw-consistent 180° flip
+    //     - t = 2  →   (0, 0,  1)   upright
+    //
+    //   yaw(t) = π/2 (constant)
+    //
+    // The trajectory enters the pole from the +x direction (φ ≈ 0). The
+    // library's pole substitution `q = (0, cos(yaw/2), sin(yaw/2), 0)`
+    // is the limit of the closed form along the approach direction
+    // `φ = yaw − π/2`, which equals 0 here — so the fallback at the pole
+    // matches the closed-form limit from both sides up to the canonical
+    // q ↔ −q sign ambiguity (the double cover of SO(3)). After
+    // hemisphere alignment, the quaternion curve is continuous.
+    use core::f32::consts::FRAC_PI_2;
+    const N: usize = 1001;
+    const YAW: f32 = FRAC_PI_2;
+    let pi = core::f32::consts::PI;
+    let mut prev_q: Option<UnitQuaternion<f32>> = None;
+    let mut max_jump = 0.0f32;
+    let mut max_jump_t = 0.0f32;
+    for k in 0..N {
+        let t = 2.0 * (k as f32) / ((N - 1) as f32);
+        let z_b = Vector3::new(libm::sinf(pi * t), 0.0, libm::cosf(pi * t));
+        let mut q = quaternion_from_zb_and_yaw(&z_b, YAW, true);
+
+        // (a) every quaternion is finite — covers t = 1 exactly.
+        let qv = q.as_vector();
+        assert!(
+            qv.x.is_finite() && qv.y.is_finite() && qv.z.is_finite() && qv.w.is_finite(),
+            "non-finite quaternion at t={t}: {:?}",
+            qv
+        );
+
+        // (b) sign-fix to the previous step's hemisphere. q and -q
+        //     represent the same rotation; tracking the SO(3) curve
+        //     requires staying on one branch of the double cover.
+        if let Some(prev) = prev_q {
+            let dot = q.coords.dot(&prev.coords);
+            if dot < 0.0 {
+                q = UnitQuaternion::new_unchecked(-q.into_inner());
+            }
+            // (c) consecutive quaternions stay close after sign-fix —
+            //     no large jump at or near the pole.
+            let diff = (q.coords - prev.coords).norm();
+            if diff > max_jump {
+                max_jump = diff;
+                max_jump_t = t;
+            }
+        }
+        prev_q = Some(q);
+    }
+
+    // Per-step body-z arc is π·dt = π / 500 ≈ 0.006 rad. The
+    // corresponding hemisphere-aligned quaternion vector step is at
+    // most ~0.5·π·dt ≈ 0.003 (half-angle scaling). A jump > ~0.05 would
+    // indicate the pole substitution introduced a discontinuity beyond
+    // what the smooth z_b motion accounts for.
+    assert!(
+        max_jump < 0.05,
+        "quaternion jumped by {max_jump} at t={max_jump_t} — pole substitution \
+         is not continuous along this trajectory"
+    );
+}
+
+#[test]
+fn hemisphere_alignment_keeps_horizon_continuous_across_pole() {
+    // Mirror of the in-horizon hemisphere-alignment logic that lives in
+    // `cybflight/src/control/outer_loop.rs` per-node fan-out: build a
+    // sequence of `q_ref` from a trajectory whose body-z reference
+    // sweeps a smooth path that the tilt-then-yaw closed form produces
+    // with a sign flip every couple of nodes (the failure mode the
+    // alignment is supposed to fix), apply the alignment, and assert
+    // (a) every adjacent dot product is ≥ 0 after alignment and
+    // (b) the maximum jump in quaternion-vector norm between adjacent
+    // aligned samples is bounded by the underlying smooth body-z motion
+    // — i.e. no step-discontinuity remains.
+    //
+    // Construction: sweep z_b along the upper hemisphere with a smooth
+    // 60° tilt and a slowly-varying azimuth, then *manually* negate
+    // every third sample to simulate the sign-flipping behaviour the
+    // closed form can produce on aggressive trajectories. The alignment
+    // logic is the system under test, not the library's pole
+    // substitution (which has its own continuity caveats — see
+    // `zb_and_yaw_tilt_branch_continuous_through_inverted_pole`).
+    use core::f32::consts::PI;
+    const N: usize = 40;
+    const YAW: f32 = 0.0;
+    let tilt_rad = 60.0_f32.to_radians();
+    let cos_tilt = libm::cosf(tilt_rad);
+    let sin_tilt = libm::sinf(tilt_rad);
+    let mut samples: Vec<UnitQuaternion<f32>> = Vec::with_capacity(N);
+    for k in 0..N {
+        let azimuth = 2.0 * PI * (k as f32) / (N as f32);
+        let z_b = Vector3::new(
+            sin_tilt * libm::cosf(azimuth),
+            sin_tilt * libm::sinf(azimuth),
+            cos_tilt,
+        );
+        let mut q = quaternion_from_zb_and_yaw(&z_b, YAW, true);
+        // Force a sign flip on every third sample to simulate the
+        // failure mode.
+        if k % 3 == 1 {
+            q = UnitQuaternion::new_unchecked(-q.into_inner());
+        }
+        samples.push(q);
+    }
+    // Verify the construction did produce hemisphere flips (otherwise
+    // the test isn't exercising the alignment).
+    let mut had_flip = false;
+    for k in 1..N {
+        if samples[k].coords.dot(&samples[k - 1].coords) < 0.0 {
+            had_flip = true;
+            break;
+        }
+    }
+    assert!(
+        had_flip,
+        "test setup failed: synthetic sequence has no hemisphere flips to align"
+    );
+
+    // Apply the in-horizon alignment (mirror of outer_loop.rs).
+    for k in 1..N {
+        let dot = samples[k].coords.dot(&samples[k - 1].coords);
+        if dot < 0.0 {
+            samples[k] = UnitQuaternion::new_unchecked(-samples[k].into_inner());
+        }
+    }
+
+    // (a) all adjacent dots non-negative after alignment.
+    for k in 1..N {
+        let dot = samples[k].coords.dot(&samples[k - 1].coords);
+        assert!(
+            dot >= -1e-6,
+            "adjacent dot product still negative at k={k}: {dot}"
+        );
+    }
+    // (b) the maximum quaternion-vector step is bounded by the smooth
+    // body-z motion. With azimuth stepping by 2π/40 ≈ 0.157 rad and a
+    // 60° fixed tilt, the half-angle quaternion step is well below 0.1.
+    // A step ≈ √2 would indicate a residual hemisphere flip.
+    let mut max_step = 0.0f32;
+    for k in 1..N {
+        let d = (samples[k].coords - samples[k - 1].coords).norm();
+        if d > max_step {
+            max_step = d;
+        }
+    }
+    assert!(
+        max_step < 0.20,
+        "alignment did not remove the hemisphere flip: max step = {max_step}"
+    );
+}
+
+#[test]
+fn hemisphere_alignment_across_ticks_stays_continuous() {
+    // Mirror of the cross-tick alignment in `outer_loop.rs`: each tick
+    // recomputes a horizon of q_refs from scratch, and a quaternion
+    // construction that flips sign between ticks (e.g. because z_b
+    // crossed the pole between two outer-loop ticks while moving
+    // smoothly) must be brought back to the previous tick's hemisphere.
+    use core::f32::consts::PI;
+    const TICKS: usize = 200;
+    const HORIZON: usize = 21;
+    const YAW: f32 = 0.0;
+    let mut prev_q0: Option<UnitQuaternion<f32>> = None;
+    let mut max_tick_step = 0.0f32;
+    let mut max_tick_step_at = 0usize;
+    for t in 0..TICKS {
+        let alpha0 = 2.0 * PI * (t as f32) / ((TICKS - 1) as f32);
+        // Build this tick's horizon: 21 nodes stepping forward in α by a
+        // small horizon-dt, all derived from a smoothly-rotating z_b.
+        let mut horizon: Vec<UnitQuaternion<f32>> = (0..HORIZON)
+            .map(|k| {
+                let alpha = alpha0 + 0.01 * (k as f32);
+                let z_b = Vector3::new(libm::sinf(alpha), 0.0, libm::cosf(alpha));
+                quaternion_from_zb_and_yaw(&z_b, YAW, true)
+            })
+            .collect();
+        // In-horizon alignment.
+        for k in 1..HORIZON {
+            let dot = horizon[k].coords.dot(&horizon[k - 1].coords);
+            if dot < 0.0 {
+                horizon[k] = UnitQuaternion::new_unchecked(-horizon[k].into_inner());
+            }
+        }
+        // Cross-tick alignment: negate the entire horizon if q_ref[0] is
+        // on the opposite hemisphere from the previous tick's q_ref[0].
+        if let Some(prev) = prev_q0 {
+            let dot = horizon[0].coords.dot(&prev.coords);
+            if dot < 0.0 {
+                for q in horizon.iter_mut() {
+                    *q = UnitQuaternion::new_unchecked(-q.into_inner());
+                }
+            }
+        }
+        // Continuity invariant: q_ref[0] this tick should be close to
+        // q_ref[0] last tick after alignment. Step bound is set by the
+        // tick rate of the synthetic α (one tick = ~0.0316 rad),
+        // half-angle quaternion step ≈ 0.0158; allow 4× for slack.
+        if let Some(prev) = prev_q0 {
+            let step = (horizon[0].coords - prev.coords).norm();
+            if step > max_tick_step {
+                max_tick_step = step;
+                max_tick_step_at = t;
+            }
+        }
+        prev_q0 = Some(horizon[0]);
+    }
+    assert!(
+        max_tick_step < 0.10,
+        "cross-tick alignment failed: max step = {max_tick_step} at tick {max_tick_step_at}"
+    );
+}
+
+#[test]
 fn zb_and_yaw_branches_agree_on_body_z() {
     // The two branches use *different* yaw conventions internally (the
     // tilt branch yaws about the body z after tilting; the cross-product

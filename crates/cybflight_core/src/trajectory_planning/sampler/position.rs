@@ -190,6 +190,7 @@ impl PositionSampler {
                     pos: pos_safe,
                     vel: Vec3::zeros(),
                     acc: Vec3::zeros(),
+                    jerk: Vec3::zeros(),
                     past_end: false,
                 };
             }
@@ -264,19 +265,26 @@ impl PositionSampler {
         for (k, node) in out.iter_mut().enumerate() {
             let t_k = (tau_curr + k as f32 * inp.horizon_dt).min(end);
             let past_end = t_k >= end;
-            let (pos, vel, acc) = if past_end {
-                (inp.traj.get_pos(end), Vec3::zeros(), Vec3::zeros())
+            let (pos, vel, acc, jerk) = if past_end {
+                (
+                    inp.traj.get_pos(end),
+                    Vec3::zeros(),
+                    Vec3::zeros(),
+                    Vec3::zeros(),
+                )
             } else {
                 (
                     inp.traj.get_pos(t_k),
                     inp.traj.get_vel(t_k),
                     inp.traj.get_acc(t_k),
+                    inp.traj.get_jerk(t_k),
                 )
             };
             *node = SamplerNode {
                 pos,
                 vel,
                 acc,
+                jerk,
                 past_end,
             };
         }

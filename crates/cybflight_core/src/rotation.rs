@@ -247,8 +247,14 @@ where
 /// Build a unit quaternion whose body z-axis is `v` and whose yaw is
 /// `yaw`. Two parameterizations:
 ///
-/// * `use_tilt = true`: tilt-then-yaw closed form (singular at
-///   `v.z == -1`, fast).
+/// * `use_tilt = true`: tilt-then-yaw closed form. The unique
+///   singularity is at `v.z == -1` (drone fully inverted), where the
+///   construction substitutes the canonical yaw-consistent 180° flip
+///   `q = (0, cos(yaw/2), sin(yaw/2), 0)` — body-x heading remains
+///   `(cos yaw, sin yaw, 0)`, matching the upright convention for the
+///   same `yaw` input. Discontinuous in `v` at the pole (unavoidable;
+///   SO(3) has no continuous global parameterisation), but finite and
+///   meaningful there.
 /// * `use_tilt = false`: cross-product construction (singular when the
 ///   yaw-aligned y-axis is parallel to `v`).
 pub fn quaternion_from_zb_and_yaw<T, S>(
@@ -271,7 +277,37 @@ where
         let c_half_yaw = (half * yaw).cos();
         let s_half_yaw = (half * yaw).sin();
 
-        let tilt_den = (two * (T::one() + z_b.z)).sqrt();
+        // Singularity guard at `z_b.z == -1` (drone fully inverted). The
+        // closed form below has `tilt_den = sqrt(2·(1 + z_b.z))` which
+        // collapses to 0/0 there, returning NaN. Substitute the canonical
+        // "yaw-consistent" 180° flip:
+        //
+        //   q = (0, cos(yaw/2), sin(yaw/2), 0)
+        //
+        // This is the 180° rotation about a horizontal axis at angle
+        // `yaw/2` from world-x, equivalently the composition
+        // `q_tilt(180° about world x) ⊗ q_yaw(-yaw)`. The yaw is *flipped*
+        // so the body-x heading at the inverted pose remains
+        // `(cos yaw, sin yaw, 0)` — the same world-frame direction the
+        // upright closed form gives for the same `yaw` input. Without
+        // the flip the controller's yaw command would invert direction
+        // when the body inverts; with it the yaw input keeps a
+        // consistent meaning across the pole.
+        //
+        // Discontinuous in `z_b` at the pole — unavoidable; SO(3) admits
+        // no continuous global parameterisation over the unit sphere.
+        let one_plus_zbz = T::one() + z_b.z;
+        let pole_eps: T = cast(1.0e-6);
+        if one_plus_zbz < pole_eps {
+            return UnitQuaternion::new_unchecked(Quaternion::new(
+                T::zero(),
+                c_half_yaw,
+                s_half_yaw,
+                T::zero(),
+            ));
+        }
+
+        let tilt_den = (two * one_plus_zbz).sqrt();
         let tilt0 = half * tilt_den;
         let tilt1 = -z_b.y / tilt_den;
         let tilt2 = z_b.x / tilt_den;

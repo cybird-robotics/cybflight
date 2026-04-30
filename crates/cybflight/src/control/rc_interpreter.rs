@@ -182,20 +182,27 @@ const LAND_RATE_M_PER_S: f32 = 0.4;
 #[cfg(any(feature = "outer_geometric", feature = "outer_mpc"))]
 const MAX_FRAME_DT_S: f32 = 0.1;
 
-/// Indoor (mocap) safety envelope: `|target.xy| ≤ XY_ENVELOPE_M` and
-/// `0 ≤ target.z ≤ Z_CEILING_M` in the world (ENU) frame. Sized for the
-/// lab arena. Only compiled in `est_pos_mocap` builds; outdoor (`est_pos_gps`)
-/// flight defines its envelope through waypoint planning, not a fixed box.
+/// Indoor (mocap) safety envelope: `|target.x| ≤ X_ENVELOPE_M`,
+/// `|target.y| ≤ Y_ENVELOPE_M`, and `0 ≤ target.z ≤ Z_CEILING_M` in the
+/// world (ENU) frame. Sized for the lab arena — asymmetric because the
+/// arena is longer along Y than X. Only compiled in `est_pos_mocap`
+/// builds; outdoor (`est_pos_gps`) flight defines its envelope through
+/// waypoint planning, not a fixed box.
 #[cfg(all(
     feature = "est_pos_mocap",
     any(feature = "outer_geometric", feature = "outer_mpc")
 ))]
-const XY_ENVELOPE_M: f32 = 3.0;
+const X_ENVELOPE_M: f32 = 2.5;
 #[cfg(all(
     feature = "est_pos_mocap",
     any(feature = "outer_geometric", feature = "outer_mpc")
 ))]
-const Z_CEILING_M: f32 = 1.8;
+const Y_ENVELOPE_M: f32 = 3.5;
+#[cfg(all(
+    feature = "est_pos_mocap",
+    any(feature = "outer_geometric", feature = "outer_mpc")
+))]
+const Z_CEILING_M: f32 = 2.0;
 
 /// Clamp `pos` to the indoor envelope. No-op for non-mocap builds.
 ///
@@ -210,8 +217,8 @@ const Z_CEILING_M: f32 = 1.8;
 ))]
 #[inline]
 fn clamp_indoor_envelope(pos: &mut nalgebra::Vector3<f32>) {
-    pos.x = pos.x.clamp(-XY_ENVELOPE_M, XY_ENVELOPE_M);
-    pos.y = pos.y.clamp(-XY_ENVELOPE_M, XY_ENVELOPE_M);
+    pos.x = pos.x.clamp(-X_ENVELOPE_M, X_ENVELOPE_M);
+    pos.y = pos.y.clamp(-Y_ENVELOPE_M, Y_ENVELOPE_M);
     pos.z = pos.z.clamp(0.0, Z_CEILING_M);
 }
 
@@ -404,10 +411,14 @@ pub async fn rc_interpreter_task() {
                 });
                 defmt::info!(
                     "rc_interpreter: arm transition — origin reset to [{},{},{}]",
-                    origin.x, origin.y, origin.z,
+                    origin.x,
+                    origin.y,
+                    origin.z,
                 );
             } else {
-                defmt::warn!("rc_interpreter: arm transition — no fresh odometry, keeping previous origin");
+                defmt::warn!(
+                    "rc_interpreter: arm transition — no fresh odometry, keeping previous origin"
+                );
             }
         }
         was_armed = armed;
@@ -582,7 +593,7 @@ pub async fn rc_interpreter_task() {
             });
             let mut pos = cur.position;
             pos.x += sx * XY_RATE_M_PER_S * dt;
-            pos.y += sy * XY_RATE_M_PER_S * dt;
+            pos.y -= sy * XY_RATE_M_PER_S * dt;
             if is_landing {
                 // Rate-limited descent toward the ground. The reference
                 // decreases by at most `LAND_RATE_M_PER_S · dt` per RC

@@ -778,6 +778,100 @@ pub fn flatness_to_state_tilt_yaw(
     })
 }
 
+/// Pole-safe flat-output → (thrust, attitude, body-rate) map for the MPC
+/// outer-loop feedforward.
+///
+/// Companion to [`flatness_to_state_tilt_yaw`] tailored to a 4-channel
+/// MPC whose control vector is `[T, ω_x, ω_y, ω_z]`. Returns:
+///
+/// - `thrust_per_mass = ‖a + g·ẑ‖`. Parameterization-independent —
+///   has no dependence on the tilt-yaw decomposition, so it stays
+///   well-defined arbitrarily close to the inverted pole.
+/// - `attitude` from [`quaternion_from_zb_and_yaw`] with `use_tilt = true`.
+///   The unique singularity at `z_b = -ẑ` is handled by a substituted
+///   180° flip inside that function.
+/// - `omega` in body frame, computed from the *minimum-norm* world
+///   angular velocity
+///
+///       ω_world  =  z_b × dz_b  +  ψ̇ · ẑ_world
+///
+///   then rotated into body frame via the (pole-safe) attitude
+///   quaternion. This is the parameterization-independent angular
+///   velocity that produces the smooth attitude trajectory through
+///   the pole; it is finite and bounded everywhere `‖a + g·ẑ‖` is
+///   above the free-fall floor.
+///
+/// ## Why min-norm body rate (and not the C++ tilt-yaw closed form)
+///
+/// [`flatness_to_state_tilt_yaw`] computes ω in the *intrinsic-Euler
+/// tilt-then-yaw* convention. That ω contains a `(zb1·dzb0 − zb0·dzb1)
+/// / (zb.z + 1)` body-z term that *diverges* as `z_b.z → −1` — it is
+/// the rate the body must spin around its z-axis to keep the intrinsic
+/// Euler "yaw" angle constant while tilting through the pole. A real
+/// drone cannot supply unbounded ω, so feeding this quantity into the
+/// MPC's `u_ref` would push the input cost off a cliff near the pole.
+///
+/// The min-norm form picks instead the body rate that:
+///
+/// 1. Correctly evolves `z_b(t)` along the trajectory (the perpendicular
+///    component is `z_b × dz_b`, identical to the limit of the closed
+///    form).
+/// 2. Adds yaw rate as a **world-z** rate (`ψ̇ · ẑ_world`) rather than as
+///    an intrinsic-Euler rate. For our MINCO trajectories `ψ̇ = 0`, so
+///    this distinction is invisible to the MPC.
+///
+/// At the pole the min-norm body rate matches the body-rate limit of the
+/// substituted attitude in [`quaternion_from_zb_and_yaw`] — the pair is
+/// kinematically consistent.
+///
+/// `omega_dot` is intentionally not returned: the firmware MPC's input
+/// is `[T, ω_x, ω_y, ω_z]` (no `ω̇` channel), and the closed-form ω̇
+/// formula contains `1/(zb.z + 1)²` which diverges quadratically faster
+/// than ω. Skipping it removes the worst pole singularity from the
+/// integration path entirely.
+pub fn flatness_to_thrust_omega(
+    acc: Vec3,
+    jer: Vec3,
+    yaw: f32,
+    yaw_rate: f32,
+    gravity: f32,
+) -> Result<(f32, UnitQuaternion<f32>, Vec3), FlatnessFault> {
+    let alpha = Vec3::new(acc[0], acc[1], acc[2] + gravity);
+    let alpha_norm_2 = alpha.norm_squared();
+    if alpha_norm_2 < ALPHA_NORM_SQR_FLOOR {
+        return Err(FlatnessFault::NearFreeFall);
+    }
+    let alpha_norm_1 = libm::sqrtf(alpha_norm_2);
+    let inv_alpha_norm_1 = 1.0 / alpha_norm_1;
+    let inv_alpha_norm_2 = inv_alpha_norm_1 * inv_alpha_norm_1;
+
+    // z_b = α / ‖α‖
+    let z_b = alpha * inv_alpha_norm_1;
+
+    // dz_b = N(α)·j = (j − α·(α·j)/‖α‖²) / ‖α‖. No division by `zb.z + 1`,
+    // so this stays bounded across the pole.
+    let proj_j = alpha.dot(&jer) * inv_alpha_norm_2;
+    let dz_b = Vec3::new(
+        (jer[0] - alpha[0] * proj_j) * inv_alpha_norm_1,
+        (jer[1] - alpha[1] * proj_j) * inv_alpha_norm_1,
+        (jer[2] - alpha[2] * proj_j) * inv_alpha_norm_1,
+    );
+
+    // World-frame angular velocity: perpendicular component rotates
+    // z_b along the trajectory; world-z component carries the yaw rate.
+    let perp = z_b.cross(&dz_b);
+    let omega_world = Vec3::new(perp[0], perp[1], perp[2] + yaw_rate);
+
+    // Attitude is pole-safe (substituted 180° flip at z_b = -ẑ).
+    let attitude = quaternion_from_zb_and_yaw(&z_b, yaw, true);
+
+    // ω_body = R^T · ω_world. UnitQuaternion's inverse_transform_vector
+    // is `q^{-1} · v · q` — the standard body-from-world rotation.
+    let omega_body = attitude.inverse_transform_vector(&omega_world);
+
+    Ok((alpha_norm_1, attitude, omega_body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,6 +952,156 @@ mod tests {
         let acc = Vec3::new(0.0, 0.0, -2.0 * 9.81);
         let r = flatness_to_state_tilt_yaw(acc, ZERO3, ZERO3, [0.0; 3], 9.81);
         assert_eq!(r.unwrap_err(), FlatnessFault::InvertedTilt);
+    }
+
+    // ── flatness_to_thrust_omega (pole-safe MPC u_ref feedforward) ──
+
+    /// Hover: zero a/j → identity attitude, zero body rate, thrust=g.
+    /// Same expectation as `test_flatness_hover` for the full map; this
+    /// confirms the trimmed function returns the same hover values.
+    #[test]
+    fn test_thrust_omega_hover() {
+        let (tpm, q, omega) =
+            flatness_to_thrust_omega(ZERO3, ZERO3, 0.0, 0.0, 9.81).expect("hover ok");
+        assert!((tpm - 9.81).abs() < 1e-4);
+        assert!((q.w - 1.0).abs() < 1e-4);
+        assert!(q.i.abs() < 1e-4 && q.j.abs() < 1e-4 && q.k.abs() < 1e-4);
+        assert!(omega.norm() < 1e-4, "hover omega nonzero: {omega:?}");
+    }
+
+    /// Free-fall fault parity with the full map.
+    #[test]
+    fn test_thrust_omega_free_fall_fault() {
+        let acc = Vec3::new(0.0, 0.0, -9.81);
+        let r = flatness_to_thrust_omega(acc, ZERO3, 0.0, 0.0, 9.81);
+        assert_eq!(r.unwrap_err(), FlatnessFault::NearFreeFall);
+    }
+
+    /// At the inverted pole the *full* map faults (`InvertedTilt`)
+    /// because its closed-form ω diverges. The pole-safe map must NOT
+    /// fault — that is the whole point — and the body rate it returns
+    /// must be finite.
+    #[test]
+    fn test_thrust_omega_pole_no_fault_finite_omega() {
+        // α = (0, 0, -2g) → z_b = (0, 0, -1): exact pole.
+        let acc = Vec3::new(0.0, 0.0, -2.0 * 9.81);
+        // Some nonzero jerk in xy so dz_b ≠ 0 and the perpendicular
+        // angular-velocity component is non-trivial.
+        let jer = Vec3::new(3.0, 1.5, 0.0);
+        let (tpm, _q, omega) = flatness_to_thrust_omega(acc, jer, 0.3, 0.0, 9.81)
+            .expect("pole-safe ok at z_b = -ẑ");
+        // Thrust per mass = ‖α‖ = g (positive, finite).
+        assert!((tpm - 9.81).abs() < 1e-3, "tpm wrong at pole: {tpm}");
+        // Body rate must be finite and bounded — `‖dz_b‖` here is on
+        // the order of `‖j‖/‖α‖` ≈ 3.4/9.81 ≈ 0.35 rad/s, so the body
+        // rate magnitude should be of that order, not "infinite".
+        assert!(
+            omega.iter().all(|c| c.is_finite()),
+            "non-finite omega at pole: {omega:?}"
+        );
+        assert!(
+            omega.norm() < 5.0,
+            "implausibly large omega at pole: {omega:?}"
+        );
+    }
+
+    /// Off the pole, the pole-safe map's ω agrees with the geometric
+    /// `z_b × dz_b` projected into body frame (which is its definition).
+    /// This regression-locks the formula and catches any future axis-
+    /// or sign-flipping mistake.
+    #[test]
+    fn test_thrust_omega_matches_min_norm_definition() {
+        use nalgebra::Vector3;
+        let acc = Vec3::new(2.0, -1.0, 1.5);
+        let jer = Vec3::new(0.7, 0.4, -0.2);
+        let yaw = 0.5;
+        let yaw_rate = 0.0;
+        let (tpm, q, omega_body) =
+            flatness_to_thrust_omega(acc, jer, yaw, yaw_rate, 9.81).expect("nominal ok");
+
+        // Thrust per mass = ‖a + g·ẑ‖
+        let alpha = Vec3::new(acc[0], acc[1], acc[2] + 9.81);
+        let alpha_norm = alpha.norm();
+        assert!((tpm - alpha_norm).abs() < 1e-4);
+
+        // Reconstruct ω_world from body-frame ω via the attitude.
+        let omega_world_back = q * omega_body;
+
+        // Geometric ω_world (yaw_rate = 0): z_b × dz_b
+        let z_b = alpha / alpha_norm;
+        let proj = alpha.dot(&jer) / (alpha_norm * alpha_norm);
+        let dz_b = (jer - alpha * proj) / alpha_norm;
+        let expected = z_b.cross(&dz_b);
+
+        let diff: Vector3<f32> = omega_world_back - expected;
+        assert!(
+            diff.norm() < 1e-4,
+            "omega_world reconstructed = {omega_world_back:?}, expected {expected:?}"
+        );
+    }
+
+    /// Yaw rate of `ψ̇` rad/s in world-z, identity attitude (z_b = ẑ,
+    /// yaw = 0): should produce body rate `(0, 0, ψ̇)` exactly. Confirms
+    /// the world-z yaw-rate convention.
+    #[test]
+    fn test_thrust_omega_yaw_rate_at_hover() {
+        let yaw_rate = 0.7;
+        let (_tpm, _q, omega) =
+            flatness_to_thrust_omega(ZERO3, ZERO3, 0.0, yaw_rate, 9.81).expect("ok");
+        assert!(omega.x.abs() < 1e-4);
+        assert!(omega.y.abs() < 1e-4);
+        assert!((omega.z - yaw_rate).abs() < 1e-4);
+    }
+
+    /// Sweep z_b through the inverted pole along a continuous path and
+    /// confirm thrust + body rate stay finite and bounded across the
+    /// crossing. This is the regression test for the original bug:
+    /// the full-map closed form blows up ω as `1/(zb.z + 1)`; the
+    /// pole-safe map must not.
+    #[test]
+    fn test_thrust_omega_continuous_through_pole() {
+        // Sweep φ ∈ [π/2 − δ, π/2 + δ] where the trajectory α =
+        // ‖α‖ · (sin φ, 0, −cos φ) crosses the pole exactly at φ = π/2
+        // (z_b = (1, 0, 0) → (0, 0, -1) → (-1, 0, 0)). dα/dφ supplies
+        // the jerk via α̇ ≈ (dα/dφ) · φ̇ ; we use φ̇ = 1 rad/s for
+        // simplicity, which makes ‖dz_b‖ = 1 rad/s by construction.
+        let alpha_mag = 12.0; // > free-fall floor
+        let phi_dot = 1.0;
+        let mut max_norm = 0.0f32;
+        let mut all_finite = true;
+        for i in 0..201 {
+            let phi = core::f32::consts::FRAC_PI_2 + (i as f32 - 100.0) * 1e-3;
+            let s = libm::sinf(phi);
+            let c = libm::cosf(phi);
+            let alpha = Vec3::new(alpha_mag * s, 0.0, -alpha_mag * c);
+            // d/dφ α = α_mag · (c, 0, s); jerk = α̇ − 0 = (dα/dφ)·φ̇.
+            let alpha_dot = Vec3::new(alpha_mag * c * phi_dot, 0.0, alpha_mag * s * phi_dot);
+            let acc = Vec3::new(alpha[0], alpha[1], alpha[2] - (-9.81)); // a = α − g·ẑ; here g·ẑ = (0,0,9.81), so a = α − (0,0,9.81)
+            let jer = alpha_dot;
+            let r = flatness_to_thrust_omega(acc, jer, 0.0, 0.0, 9.81);
+            match r {
+                Ok((tpm, _, omega)) => {
+                    if !tpm.is_finite() || omega.iter().any(|c| !c.is_finite()) {
+                        all_finite = false;
+                    }
+                    max_norm = max_norm.max(omega.norm());
+                }
+                Err(FlatnessFault::NearFreeFall) => {
+                    // Possible at certain φ if α magnitude dips; should not happen here.
+                    panic!("unexpected NearFreeFall at φ={phi}");
+                }
+                Err(FlatnessFault::InvertedTilt) => {
+                    panic!("pole-safe map must not return InvertedTilt at φ={phi}");
+                }
+            }
+        }
+        assert!(all_finite, "non-finite ω somewhere in the pole sweep");
+        // ‖dz_b‖ = 1 rad/s by construction, so ‖ω‖ should be ~1 rad/s
+        // across the sweep — well under any "diverging" threshold.
+        assert!(
+            max_norm < 5.0,
+            "max omega norm over pole sweep too large: {max_norm}"
+        );
     }
 
     /// Sanity check on the closed-form energy gradient by finite

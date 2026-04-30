@@ -29,7 +29,7 @@ use cybflight_core::trajectory_planning::types::{Vec3, ZERO3};
 // what the live firmware will see.
 
 const MASS_KG: f32 = 0.55;
-const GRAVITY_M_S2: f32 = 9.81;
+const GRAVITY_M_S2: f32 = 9.8066;
 
 // User-specified envelope for the offline race trajectory.
 const MAX_THRUST_N: f32 = 27.2;
@@ -498,9 +498,9 @@ fn trajectory_slow_yaml_passes_envelope() {
     check_envelope(&traj, &SLOW_FIXTURE);
 }
 
-// #[test]
-// fn trajectory_time_optimal_yaml_passes_envelope() {
-//     let (traj, _) = build_trajectory(&TO_FIXTURE);
-//     check_continuity(&traj, &TO_FIXTURE);
-//     check_envelope(&traj, &TO_FIXTURE);
-// }
+#[test]
+fn trajectory_time_optimal_yaml_passes_envelope() {
+    let (traj, _) = build_trajectory(&TO_FIXTURE);
+    check_continuity(&traj, &TO_FIXTURE);
+    check_envelope(&traj, &TO_FIXTURE);
+}

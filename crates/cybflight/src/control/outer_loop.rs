@@ -12,7 +12,11 @@
 
 use cybflight_core::mpc::quad_model::{N as MPC_N, NU as MPC_NU, NX as MPC_NX};
 use cybflight_core::mpc::{QuadModel, SimpleQuadProblem, SimpleSqpSolver};
+use cybflight_core::rotation::quaternion_from_zb_and_yaw;
 use cybflight_core::trajectory_planning::flatness::reference_quaternion;
+use cybflight_core::trajectory_planning::minco_snap::{
+    flatness_to_thrust_omega, FlatnessFault,
+};
 #[cfg(feature = "position_sampler")]
 use cybflight_core::trajectory_planning::sampler::PositionSampler;
 #[cfg(not(feature = "position_sampler"))]
@@ -58,6 +62,72 @@ const POS_PUB_DECIMATION: u32 = 1;
 const ATT_PUB_DECIMATION: u32 = 1;
 const OCP_PUB_DECIMATION: u32 = 1;
 const MISSION_PUB_DECIMATION: u32 = 5;
+
+/// Reference-quaternion construction for the per-node attitude target
+/// in `x_refs`. The two paths encode **different yaw conventions** —
+/// pick by what the source of `yaw_setpoint_rad` semantically means:
+///
+/// * `false` — `flatness::reference_quaternion(acc, yaw, g)`. Builds
+///   `x_b = (y_c × z_b).normalize()` where `y_c = (-sin yaw, cos yaw, 0)`
+///   is the yaw-aligned world ŷ. **Yaw input = world-frame azimuth of
+///   the body x-axis projection.** The drone's compass heading on the
+///   ground tracks the input yaw exactly, regardless of tilt — this is
+///   what an operator/RC stick or "point the camera north" command
+///   means by "yaw". Singular when `y_c` is parallel to `z_b` (≈ 90°
+///   tilt in a specific azimuthal direction).
+///
+/// * `true` — `rotation::quaternion_from_zb_and_yaw(z_b, yaw, true)`.
+///   Closed-form tilt-then-yaw. **Yaw input = the intrinsic Euler
+///   angle of the tilt-then-yaw decomposition.** The body x-axis
+///   projection on the world xy-plane rotates with tilt, so the
+///   compass heading is not directly the input yaw. The natural choice
+///   when yaw is a derived flat output (e.g. from a planner that
+///   already accounts for tilt). Singular only at `z_b.z = -1` (drone
+///   fully inverted), where the library substitutes the canonical
+///   yaw-consistent 180° flip.
+///
+/// Default `false` for the firmware: yaw comes from the RC stick
+/// integrator (`rc_interpreter`) and is the operator-facing compass
+/// heading. Flip to `true` for trajectories whose yaw schedule was
+/// designed under the tilt-then-yaw convention.
+const USE_TILT_REFERENCE_QUATERNION: bool = true;
+
+/// Enable / disable the trajectory-derived `u_refs` feedforward.
+///
+/// * `true` (default): each Executing-tick non-past-end node has its
+///   `u_refs[k] = [mass·‖α‖, ω_x, ω_y, ω_z]` populated from
+///   [`flatness_to_thrust_omega`] applied to the trajectory's
+///   (acc, jerk) sample. The MPC's input cost biases toward the
+///   open-loop differential-flatness solution, so the SQP only has to
+///   handle model error and disturbance — measurably tighter tracking
+///   on aggressive (high-α, high-‖j‖) trajectories.
+/// * `false`: every horizon step is biased to `hover_u` regardless of
+///   trajectory state. Equivalent to the pre-feedforward behaviour and
+///   useful as an A/B baseline if the feedforward ever needs to be
+///   debugged in flight without a firmware reflash + flash-param dance.
+///
+/// Note that the flag only controls the *bias term* in the SQP's input
+/// cost. The trajectory-derived **state** references (`x_refs[k]` —
+/// position, velocity, attitude) remain active in both modes; turning
+/// this off does not turn the trajectory into a hover.
+const USE_FLATNESS_U_REF_FEEDFORWARD: bool = true;
+
+/// One-shot flag for the "reference at inverted pole" diagnostic warn
+/// inside the per-node fan-out. Stays `true` after the first hit so the
+/// log isn't flooded — the planner-side problem (or genuine acrobatic
+/// intent) is the same on every subsequent node, and one warning per
+/// firmware boot is enough to catch it. Only meaningful when
+/// `USE_TILT_REFERENCE_QUATERNION = true`; the cross-product path has
+/// a different singularity profile.
+static INVERTED_REF_WARNED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// One-shot flag for the flatness-feedforward fault diagnostic. Same
+/// rationale as `INVERTED_REF_WARNED`: the underlying condition (free-
+/// fall α, infeasible trajectory sample) repeats on every subsequent
+/// node, so one boot-level warning is enough to point a debugger at it.
+static FLATNESS_U_REF_FAULT_WARNED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Reject odometry with any non-finite component.
 fn odom_is_valid(odom: &msgs::VehicleOdometry) -> bool {
@@ -159,6 +229,17 @@ pub async fn control_loop_task() {
     // never read for control decisions (those use `mission_state` which
     // is the authoritative atomic load each tick).
     let mut prev_mission_state = super::MissionState::Idle;
+    // Cross-tick hemisphere anchor for the MPC's reference quaternion.
+    // The SQP's per-pair sign canonicalisation (in
+    // `mpc::model_utils::attitude_error`) is computed independently each
+    // tick. If this tick's `q_ref[0]` lands on the opposite S³
+    // hemisphere from the previous tick's, every per-node `ea[k]`
+    // discontinuously flips, producing a step in the body-rate command
+    // even though SO(3) is smooth. Caching the previous tick's
+    // `q_ref[0]` and negating the entire horizon when the dot product
+    // is negative pins the reference's hemisphere choice across ticks.
+    // `None` until the first Executing tick fills it.
+    let mut prev_qref_q0: Option<[f32; 4]> = None;
 
     // ── 50 Hz tick loop ───────────────────────────────────────────────
     let mut ticker = Ticker::every(Duration::from_millis(20));
@@ -206,6 +287,19 @@ pub async fn control_loop_task() {
             x_refs[k][4] = 0.0;
             x_refs[k][5] = sin_h;
             x_refs[k][6] = cos_h;
+        }
+
+        // Default the input feedforward to hover at the top of every
+        // tick. This is the load-bearing invariant for `MissionState ==
+        // Idle`: if no Executing branch ever overrides `u_refs[k]`
+        // (Idle, Planning with empty slot, abort race, etc.), the SQP
+        // sees hover thrust and zero body rate as the reference target.
+        // The Executing trajectory-sample block below overrides
+        // per-node where appropriate; faults inside that block keep the
+        // hover default that's already in place, so a partial fan-out
+        // can never leave a stale Executing-tick u_refs in place.
+        for k in 0..MPC_N {
+            u_refs[k] = hover_u;
         }
 
         // 2. Hot-reload params when disarmed (mirrors indi_task's pattern).
@@ -409,6 +503,11 @@ pub async fn control_loop_task() {
             // reads): the sampler doesn't need to know about MissionState.
             if prev_mission_state != super::MissionState::Executing {
                 sampler.reset();
+                // Drop the cross-tick hemisphere anchor on a fresh
+                // mission — the previous mission's q_ref[0] is unrelated
+                // to this one, and a stale anchor could spuriously
+                // negate the new horizon on the first tick.
+                prev_qref_q0 = None;
             }
             // Hold the mutex across all horizon samples to avoid cloning
             // the ~2 KB polynomial. The slot is written at most once per
@@ -446,7 +545,19 @@ pub async fn control_loop_task() {
                 // past-end identity-tilt rule (the pre-loop yaw-only fill
                 // already wrote the right quaternion for those nodes, so
                 // we leave it untouched).
+                //
+                // u_refs feedforward is populated alongside x_refs in the
+                // same node loop. Each non-past-end node gets its own
+                // `[T, ω_x, ω_y, ω_z]` from the pole-safe flatness map
+                // applied to (acc, jerk) plus quasi-static yaw
+                // (`yaw_rate = 0`); past-end nodes bias to hover
+                // (zero body rate, mass·g thrust). On a `FlatnessFault`
+                // (free-fall α — should be unreachable on a valid MINCO
+                // schedule) we fall back to hover_u for that node and
+                // emit a single boot-level diagnostic.
                 let grav = mpc_problem.model.grav;
+                let mass = mpc_problem.model.mass;
+                let mpc_n_inputs = MPC_N; // u_refs is length MPC_N (no terminal input)
                 for (k, n) in sample_buf.iter().enumerate() {
                     x_refs[k][0] = n.pos[0];
                     x_refs[k][1] = n.pos[1];
@@ -454,12 +565,179 @@ pub async fn control_loop_task() {
                     x_refs[k][7] = n.vel[0];
                     x_refs[k][8] = n.vel[1];
                     x_refs[k][9] = n.vel[2];
+
+                    // Single-call flatness: when `USE_TILT_REFERENCE_QUATERNION`
+                    // is true, the attitude reference and the body-rate +
+                    // thrust feedforward share their entire computation
+                    // (z_b construction, projection-based dz_b, the pole-
+                    // safe `quaternion_from_zb_and_yaw` substitution). We
+                    // call `flatness_to_thrust_omega` once per node and
+                    // unpack both outputs, instead of building z_b twice
+                    // and invoking the quaternion construction redundantly.
+                    //
+                    // The cross-product attitude path is structurally
+                    // different (its yaw convention rotates body-x heading
+                    // around the world ẑ rather than around z_b) and shares
+                    // no intermediates with the tilt-yaw flatness map, so
+                    // it stays on its own branch that calls
+                    // `reference_quaternion` directly.
+                    // Per-node `u_refs` population. There are three
+                    // sub-cases here, and the `tilt_attitude` cache for
+                    // the `q_ref` path below depends on which one fires:
+                    //
+                    //  (a) Feedforward enabled, non-terminal, non-past-
+                    //      end node: call `flatness_to_thrust_omega` and
+                    //      use both outputs (u_refs + cached attitude).
+                    //  (b) Feedforward disabled OR past-end node:
+                    //      `u_refs[k]` stays at the top-of-tick `hover_u`
+                    //      default (we deliberately do *not* re-write
+                    //      it). When the feedforward is disabled we also
+                    //      need the attitude reference, so we still call
+                    //      `flatness_to_thrust_omega` for non-past-end
+                    //      nodes purely to populate `tilt_attitude` —
+                    //      saves an extra `quaternion_from_zb_and_yaw`
+                    //      call further down. Past-end nodes have no
+                    //      tilt reference (the pre-loop yaw-only fill
+                    //      is the right answer), so we skip the call.
+                    //  (c) Terminal node (k == MPC_N): no `u_refs[k]`
+                    //      slot exists. The `q_ref` path below falls
+                    //      back to a direct `quaternion_from_zb_and_yaw`
+                    //      call.
+                    let mut tilt_attitude: Option<UnitQuaternion<f32>> = None;
+                    let needs_flatness_call = !n.past_end
+                        && (USE_FLATNESS_U_REF_FEEDFORWARD || USE_TILT_REFERENCE_QUATERNION);
+                    if needs_flatness_call {
+                        match flatness_to_thrust_omega(
+                            n.acc,
+                            n.jerk,
+                            yaw_setpoint_rad,
+                            0.0,
+                            grav,
+                        ) {
+                            Ok((tpm, attitude, omega)) => {
+                                tilt_attitude = Some(attitude);
+                                if USE_FLATNESS_U_REF_FEEDFORWARD && k < mpc_n_inputs {
+                                    u_refs[k] = MpcInputVec::from_row_slice(&[
+                                        mass * tpm,
+                                        omega.x,
+                                        omega.y,
+                                        omega.z,
+                                    ]);
+                                }
+                            }
+                            Err(fault) => {
+                                if !FLATNESS_U_REF_FAULT_WARNED
+                                    .swap(true, core::sync::atomic::Ordering::Relaxed)
+                                {
+                                    let kind: &'static str = match fault {
+                                        FlatnessFault::NearFreeFall => "NearFreeFall",
+                                        FlatnessFault::InvertedTilt => "InvertedTilt",
+                                    };
+                                    defmt::warn!(
+                                        "outer_loop: flatness fault ({=str}, node={=usize}) — falling back to hover_u and tilt-yaw fallback; trajectory may be infeasible at this sample",
+                                        kind,
+                                        k,
+                                    );
+                                }
+                                // tilt_attitude stays None → q_ref path
+                                // falls back to direct construction.
+                                // u_refs[k] stays at top-of-tick hover_u.
+                            }
+                        }
+                    }
                     if !n.past_end {
-                        let q_ref = reference_quaternion(n.acc, yaw_setpoint_rad, grav);
+                        let q_ref = if USE_TILT_REFERENCE_QUATERNION {
+                            // Reuse the attitude already produced by
+                            // `flatness_to_thrust_omega`. For the terminal
+                            // horizon node (k == MPC_N) we never entered
+                            // the u_refs branch above, so `tilt_attitude`
+                            // is still `None` — fall back to a direct
+                            // call. The pre-loop inverted-pole diagnostic
+                            // is preserved on the *fallback* call only;
+                            // the in-loop tilt_attitude value already came
+                            // from the same closed form, so re-checking
+                            // its z_b would be redundant noise.
+                            if let Some(q) = tilt_attitude {
+                                q
+                            } else {
+                                let acc_cmd = Vector3::new(
+                                    n.acc[0],
+                                    n.acc[1],
+                                    n.acc[2] + grav,
+                                );
+                                let inv_norm = 1.0 / acc_cmd.norm().max(1e-8);
+                                let z_b = acc_cmd * inv_norm;
+                                if z_b.z < -1.0 + 1e-3
+                                    && !INVERTED_REF_WARNED
+                                        .swap(true, core::sync::atomic::Ordering::Relaxed)
+                                {
+                                    defmt::warn!(
+                                        "outer_loop: reference attitude at the inverted pole \
+                                         (z_b.z={=f32}, node={=usize}, τ₀={=f32}s) — using \
+                                         fallback 180° flip; trajectory may demand acrobatic flight",
+                                        z_b.z,
+                                        k,
+                                        result.tau0_s,
+                                    );
+                                }
+                                quaternion_from_zb_and_yaw(&z_b, yaw_setpoint_rad, true)
+                            }
+                        } else {
+                            // Cross-product construction. Yaw input is
+                            // the world-frame compass heading of the
+                            // body x-axis projection — the operator-
+                            // facing "yaw" the RC stick integrator
+                            // produces. Singular at 90° tilts aligned
+                            // with the yaw axis; on aggressive racing
+                            // trajectories prefer the tilt path above.
+                            reference_quaternion(n.acc, yaw_setpoint_rad, grav)
+                        };
                         x_refs[k][3] = q_ref.i; // qx
                         x_refs[k][4] = q_ref.j; // qy
                         x_refs[k][5] = q_ref.k; // qz
                         x_refs[k][6] = q_ref.w; // qw (scalar-last)
+
+                        // Hemisphere-align this node's q_ref with the
+                        // previous node's. Without this, a sign flip in
+                        // the q_ref construction (either parameterisation
+                        // can produce one near a pole or near a cross-
+                        // product singularity) lands adjacent horizon
+                        // nodes on opposite S³ hemispheres. The SQP's
+                        // per-pair sign canonicalisation in
+                        // `mpc::model_utils::attitude_error` then
+                        // computes inconsistent ea[k] for adjacent k,
+                        // and the resulting body-rate command is a
+                        // non-geodesic compromise between conflicting
+                        // per-node gradients. Aligning here preempts the
+                        // problem at the source — the canonicalisation
+                        // becomes identity (it never has to flip).
+                        if k > 0 {
+                            let dot = x_refs[k][3] * x_refs[k - 1][3]
+                                + x_refs[k][4] * x_refs[k - 1][4]
+                                + x_refs[k][5] * x_refs[k - 1][5]
+                                + x_refs[k][6] * x_refs[k - 1][6];
+                            if dot < 0.0 {
+                                x_refs[k][3] = -x_refs[k][3];
+                                x_refs[k][4] = -x_refs[k][4];
+                                x_refs[k][5] = -x_refs[k][5];
+                                x_refs[k][6] = -x_refs[k][6];
+                            }
+                        }
+                    } else if k > 0 {
+                        // past_end nodes inherit the pre-loop yaw-only
+                        // fill (qx=qy=0, qz=sin_h, qw=cos_h). Align them
+                        // too so the horizon stays on one hemisphere
+                        // across the trajectory→past_end boundary.
+                        let dot = x_refs[k][3] * x_refs[k - 1][3]
+                            + x_refs[k][4] * x_refs[k - 1][4]
+                            + x_refs[k][5] * x_refs[k - 1][5]
+                            + x_refs[k][6] * x_refs[k - 1][6];
+                        if dot < 0.0 {
+                            x_refs[k][3] = -x_refs[k][3];
+                            x_refs[k][4] = -x_refs[k][4];
+                            x_refs[k][5] = -x_refs[k][5];
+                            x_refs[k][6] = -x_refs[k][6];
+                        }
                     }
                 }
 
@@ -516,6 +794,34 @@ pub async fn control_loop_task() {
                 }
             });
 
+            // Cross-tick hemisphere alignment of the MPC reference
+            // quaternion. If this tick's q_ref[0] is on the opposite S³
+            // hemisphere from the previous tick's, negate the entire
+            // horizon so the SQP's quaternion-error gradients are
+            // continuous across ticks. This complements the in-horizon
+            // alignment above; together they keep the SQP's per-pair
+            // sign canonicalisation as a no-op.
+            if let Some(prev_q0) = prev_qref_q0 {
+                let dot = x_refs[0][3] * prev_q0[0]
+                    + x_refs[0][4] * prev_q0[1]
+                    + x_refs[0][5] * prev_q0[2]
+                    + x_refs[0][6] * prev_q0[3];
+                if dot < 0.0 {
+                    for k in 0..=MPC_N {
+                        x_refs[k][3] = -x_refs[k][3];
+                        x_refs[k][4] = -x_refs[k][4];
+                        x_refs[k][5] = -x_refs[k][5];
+                        x_refs[k][6] = -x_refs[k][6];
+                    }
+                }
+            }
+            prev_qref_q0 = Some([
+                x_refs[0][3],
+                x_refs[0][4],
+                x_refs[0][5],
+                x_refs[0][6],
+            ]);
+
             // Write the shared cell with this tick's tracked reference.
             // Invariant (a): this happens BEFORE any MISSION_STATE
             // transition, so rc_interpreter's first Idle tick reads a
@@ -551,6 +857,8 @@ pub async fn control_loop_task() {
 
         if !sampled_from_trajectory {
             // Hover reference: single pos_setpoint, zero velocity.
+            // (Hover `u_refs` was already filled at the top of the tick;
+            // nothing to do for inputs here.)
             for k in 0..=MPC_N {
                 x_refs[k][0] = pos_setpoint.x;
                 x_refs[k][1] = pos_setpoint.y;

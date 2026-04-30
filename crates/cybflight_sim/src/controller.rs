@@ -18,8 +18,8 @@
 //!   firmware's active path. Kept for diagnostic diffs.
 
 use crate::baselines::{
-    geometric_controller::GeometricAttitudeController, AttitudeControlSetpoint,
-    AttitudeControlState,
+    AttitudeControlSetpoint, AttitudeControlState,
+    geometric_controller::GeometricAttitudeController,
 };
 use cybflight_core::indi::{
     controller::{IndiConfig, IndiController, MotorState, NU as INDI_NU, NV},
@@ -28,16 +28,60 @@ use cybflight_core::indi::{
 };
 use cybflight_core::mixer::{LinearAllocator, MotorEffectiveness};
 use cybflight_core::mpc::{
+    FullQuadModel, FullQuadProblem, FullSqpSolver, N as FULL_N, NU, NX, QuadModel,
+    SimpleQuadProblem, SimpleSqpSolver,
     quad_model::{N as SIMPLE_N, NU as SIMPLE_NU, NX as SIMPLE_NX},
-    FullQuadModel, FullQuadProblem, FullSqpSolver, QuadModel, SimpleQuadProblem, SimpleSqpSolver,
-    N as FULL_N, NU, NX,
 };
 use cybflight_core::params::VehicleParams;
 use cybflight_core::position_control::{
-    self, pd_ff_control::PositionController, PositionControlSetpoint, PositionControlState,
+    self, PositionControlSetpoint, PositionControlState, pd_ff_control::PositionController,
 };
+use cybflight_core::rotation::quaternion_from_zb_and_yaw;
 use cybflight_core::trajectory_planning::flatness::reference_quaternion;
-use nalgebra::{stack, vector, Quaternion, SVector, UnitQuaternion, Vector3, Vector4};
+use nalgebra::{Quaternion, SVector, UnitQuaternion, Vector3, Vector4, stack, vector};
+
+/// Reference-quaternion construction switch for the MPC `q_ref` chain
+/// inside the sim controllers. Mirrors the firmware's
+/// `outer_loop::USE_TILT_REFERENCE_QUATERNION` so regression metrics
+/// reflect the path that actually flies.
+///
+/// * `false` — `flatness::reference_quaternion(acc, yaw, g)`
+///   (cross-product). Yaw input = world-frame compass heading of the
+///   body x-axis projection. Operator-facing yaw semantics. Singular
+///   at 90° tilts aligned with the yaw axis.
+/// * `true` — `rotation::quaternion_from_zb_and_yaw(z_b, yaw, true)`
+///   (tilt-then-yaw closed form). Yaw input = intrinsic Euler angle of
+///   the tilt-yaw decomposition. Natural for trajectories whose yaw
+///   schedule was designed under this convention. Singular only at
+///   fully inverted, with a yaw-consistent fallback.
+const USE_TILT_REFERENCE_QUATERNION: bool = false;
+
+/// One-shot warning for "reference attitude at the inverted pole",
+/// mirroring the firmware's `INVERTED_REF_WARNED`. Only fires on the
+/// tilt path.
+static INVERTED_REF_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn q_ref_from_setpoint(acc: Vector3<f32>, yaw: f32, grav: f32) -> UnitQuaternion<f32> {
+    if USE_TILT_REFERENCE_QUATERNION {
+        let acc_cmd = Vector3::new(acc[0], acc[1], acc[2] + grav);
+        let inv_norm = 1.0 / acc_cmd.norm().max(1e-8);
+        let z_b = acc_cmd * inv_norm;
+        if z_b.z < -1.0 + 1e-3
+            && !INVERTED_REF_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!(
+                "[sim controller] reference attitude at the inverted pole \
+                 (z_b.z={:.4}, yaw={:.3}) — using fallback 180° flip",
+                z_b.z, yaw,
+            );
+        }
+        quaternion_from_zb_and_yaw(&z_b, yaw, true)
+    } else {
+        reference_quaternion(acc, yaw, grav)
+    }
+}
 
 use crate::sensors::ImuMeasurement;
 use crate::trajectory::Setpoint;
@@ -186,7 +230,7 @@ impl MpcIndiController {
         debug_assert!(horizon.len() == SIMPLE_N + 1);
         for k in 0..=SIMPLE_N {
             let sp = &horizon[k];
-            let q_ref = reference_quaternion(sp.acceleration, sp.yaw, self.grav);
+            let q_ref = q_ref_from_setpoint(sp.acceleration, sp.yaw, self.grav);
             self.x_refs[k] = stack![sp.position; q_ref.coords; sp.velocity];
         }
     }
@@ -315,7 +359,7 @@ impl MpcDirectController {
     fn fill_reference(&mut self, horizon: &[Setpoint]) {
         for k in 0..=FULL_N {
             let sp = &horizon[k];
-            let q_ref = reference_quaternion(sp.acceleration, sp.yaw, self.grav);
+            let q_ref = q_ref_from_setpoint(sp.acceleration, sp.yaw, self.grav);
             self.x_refs[k] = stack![sp.position; q_ref.coords; sp.velocity; Vector3::zeros()];
         }
     }

@@ -306,11 +306,17 @@ fn write_eskf_phase(w: &mut WriteBuf<'_>, phase: &EstimatorPhase) -> core::fmt::
             vel,
             gyro_bias,
             accel_bias,
+            pos_reject_total,
+            att_reject_total,
+            pos_inflated_total,
+            att_inflated_total,
+            jump_total,
         } => write!(
             w,
             "ESKF[Converging] roll={:.1} pitch={:.1} yaw={:.1}  \
              pos=[{:.2},{:.2},{:.2}]m  vel=[{:.2},{:.2},{:.2}]m/s  \
-             gyro_bias=[{:.4},{:.4},{:.4}]rad/s  accel_bias=[{:.3},{:.3},{:.3}]m/s2",
+             gyro_bias=[{:.4},{:.4},{:.4}]rad/s  accel_bias=[{:.3},{:.3},{:.3}]m/s2  \
+             rej(pos/att)={}/{} infl(pos/att)={}/{} jumps={}",
             roll_deg,
             pitch_deg,
             yaw_deg,
@@ -326,6 +332,11 @@ fn write_eskf_phase(w: &mut WriteBuf<'_>, phase: &EstimatorPhase) -> core::fmt::
             accel_bias[0],
             accel_bias[1],
             accel_bias[2],
+            pos_reject_total,
+            att_reject_total,
+            pos_inflated_total,
+            att_inflated_total,
+            jump_total,
         ),
         EstimatorPhase::Running {
             roll_deg,
@@ -335,11 +346,17 @@ fn write_eskf_phase(w: &mut WriteBuf<'_>, phase: &EstimatorPhase) -> core::fmt::
             vel,
             gyro_bias,
             accel_bias,
+            pos_reject_total,
+            att_reject_total,
+            pos_inflated_total,
+            att_inflated_total,
+            jump_total,
         } => write!(
             w,
             "ESKF[Running] roll={:.1} pitch={:.1} yaw={:.1}  \
              pos=[{:.2},{:.2},{:.2}]m  vel=[{:.2},{:.2},{:.2}]m/s  \
-             gyro_bias=[{:.4},{:.4},{:.4}]rad/s  accel_bias=[{:.3},{:.3},{:.3}]m/s2",
+             gyro_bias=[{:.4},{:.4},{:.4}]rad/s  accel_bias=[{:.3},{:.3},{:.3}]m/s2  \
+             rej(pos/att)={}/{} infl(pos/att)={}/{} jumps={}",
             roll_deg,
             pitch_deg,
             yaw_deg,
@@ -355,6 +372,11 @@ fn write_eskf_phase(w: &mut WriteBuf<'_>, phase: &EstimatorPhase) -> core::fmt::
             accel_bias[0],
             accel_bias[1],
             accel_bias[2],
+            pos_reject_total,
+            att_reject_total,
+            pos_inflated_total,
+            att_inflated_total,
+            jump_total,
         ),
     }
 }

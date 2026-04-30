@@ -1,3 +1,3 @@
 mod eskf;
 
-pub use eskf::{Eskf, EskfConfig};
+pub use eskf::{Eskf, EskfConfig, UpdateOutcome};

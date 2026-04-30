@@ -9,12 +9,13 @@ use embassy_time::Timer;
 use crate::hal::usart::{UartRx, UartTx};
 use crate::{control, sensors};
 use cybflight_msgs::wire::{
-    self, WireArmDisarm, WireAttitudeControlSetpoint, WireBaroSample, WireDshotTelemetry,
-    WireGpsFix, WireImu, WireMagSample, WireMessage, WireMotorStateTelemetry,
-    WireOcpSolverOutput, WirePing, WirePingResp, WirePose, WirePowerStatus,
-    WireRcInput, WireRcLinkStatus, WireTimeSync, WireTimeSyncStatus, WireVehicleAttitude,
-    WireVehicleOdometry,
+    self, WireArmDisarm, WireAttitudeControlSetpoint, WireDshotTelemetry, WireGpsFix, WireMessage,
+    WireMotorStateTelemetry, WireOcpSolverOutput, WirePing, WirePingResp, WirePose,
+    WirePowerStatus, WireRcInput, WireRcLinkStatus, WireTimeSync, WireTimeSyncStatus,
+    WireVehicleAttitude, WireVehicleOdometry,
 };
+#[cfg(feature = "dev_telem")]
+use cybflight_msgs::wire::{WireBaroSample, WireImu, WireMagSample};
 #[cfg(feature = "est_eskf")]
 use cybflight_msgs::wire::WirePositionControlSetpoint;
 #[cfg(feature = "outer_mpc")]
@@ -100,6 +101,34 @@ const TX_PERIOD_MS: u64 = 10;
 /// Ping interval in TX ticks (500 × 10ms = 5s).
 const PING_INTERVAL_TICKS: u32 = 500;
 
+// ── Per-topic downlink decimation ────────────────────────────────────
+//
+// The TX task ticks at 100 Hz and `drain_latest` already caps each
+// topic's downlink rate at 100 Hz. To reduce the WiFi/Rerun load we
+// further decimate by gating each subscriber drain on `(tick %
+// DECIM_<topic>) == 0`. Numbers chosen for "rerun-grade visualization
+// is fine, no perceptible loss":
+//   100 Hz / 1  = 100 Hz   (unchanged)
+//   100 Hz / 2  =  50 Hz   (visualization-grade)
+//   100 Hz / 4  =  25 Hz   (tuning-grade)
+//   100 Hz / 100 = 1 Hz    (battery / status)
+// `drain_latest` discards backlog so downsampling is lossy by design —
+// each emission is the *latest* sample, never an averaged window.
+const DECIM_VEHICLE_ODOMETRY: u32 = 2;          //  50 Hz — rerun trajectory
+const DECIM_VEHICLE_ATTITUDE: u32 = 2;          //  50 Hz — rerun pose
+const DECIM_ATTITUDE_CONTROL_SETPOINT: u32 = 2; //  50 Hz — outer_loop ref
+const DECIM_RC_INPUT: u32 = 4;                  //  25 Hz — stick viz
+const DECIM_DSHOT_TELEM: u32 = 4;               //  25 Hz — eRPM tuning
+const DECIM_MOTOR_STATE_TELEM: u32 = 4;         //  25 Hz — KF state tuning
+const DECIM_ACTUATOR_MOTORS: u32 = 4;           //  25 Hz — motor cmd
+const DECIM_POWER_STATUS: u32 = 100;            //   1 Hz — battery
+#[cfg(feature = "dev_telem")]
+const DECIM_IMU: u32 = 4;                       //  25 Hz — raw IMU (debug)
+#[cfg(feature = "dev_telem")]
+const DECIM_MAG: u32 = 4;                       //  25 Hz — raw mag (debug)
+#[cfg(feature = "dev_telem")]
+const DECIM_BARO: u32 = 4;                      //  25 Hz — raw baro (debug)
+
 /// Convert a monotonic Instant to UTC microseconds for telemetry.
 fn utc_ts(instant: embassy_time::Instant) -> u64 {
     super::time_sync::to_utc_us(instant) as u64
@@ -107,8 +136,9 @@ fn utc_ts(instant: embassy_time::Instant) -> u64 {
 
 #[embassy_executor::task]
 pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>) {
-    let mut imu1_sub = sensors::IMU_1.subscriber().unwrap();
-    let mut imu2_sub = sensors::IMU_2.subscriber().unwrap();
+    // ── Subscribers, partitioned by purpose ──
+    //
+    // Always-on (visualization / control monitoring / health):
     let mut att_sub = sensors::VEHICLE_ATTITUDE.subscriber().unwrap();
     let mut rc_sub = sensors::RC_INPUT.subscriber().unwrap();
     let mut rc_link_sub = sensors::RC_LINK_STATUS.subscriber().unwrap();
@@ -116,10 +146,6 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
     let mut motor_state_sub = control::PROCESSED_MOTOR_STATE.subscriber().unwrap();
     let mut ocp_sub = control::OCP_SOLVER_OUTPUT.subscriber().unwrap();
     let mut gps_sub = sensors::GPS_FIX.subscriber().unwrap();
-    let mut mag_ext_sub = sensors::MAG_EXT.subscriber().unwrap();
-    let mut mag_int_sub = sensors::MAG_INT.subscriber().unwrap();
-    let mut baro1_sub = sensors::BARO_1.subscriber().unwrap();
-    let mut baro2_sub = sensors::BARO_2.subscriber().unwrap();
     let mut power_sub = sensors::POWER_STATUS.subscriber().unwrap();
     let mut att_ctrl_sub = control::ATTITUDE_CONTROL_SETPOINT.subscriber().unwrap();
     #[cfg(feature = "est_eskf")]
@@ -130,6 +156,23 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
     #[cfg(feature = "outer_mpc")]
     let mut mission_status_sub = control::MISSION_STATUS.subscriber().unwrap();
 
+    // Dev-only raw sensor channels — gated behind `dev_telem`. The ESKF
+    // consumes these internally; the rerun viewport doesn't visualize
+    // raw sensor signals during normal flight, so they're dropped on the
+    // floor by default to free WiFi/Rerun bandwidth.
+    #[cfg(feature = "dev_telem")]
+    let mut imu1_sub = sensors::IMU_1.subscriber().unwrap();
+    #[cfg(feature = "dev_telem")]
+    let mut imu2_sub = sensors::IMU_2.subscriber().unwrap();
+    #[cfg(feature = "dev_telem")]
+    let mut mag_ext_sub = sensors::MAG_EXT.subscriber().unwrap();
+    #[cfg(feature = "dev_telem")]
+    let mut mag_int_sub = sensors::MAG_INT.subscriber().unwrap();
+    #[cfg(feature = "dev_telem")]
+    let mut baro1_sub = sensors::BARO_1.subscriber().unwrap();
+    #[cfg(feature = "dev_telem")]
+    let mut baro2_sub = sensors::BARO_2.subscriber().unwrap();
+
     let mut seq: u8 = 0;
     // Batch buffer: holds all COBS-encoded frames for one tick.
     // Worst case ~16 frames × ~85 bytes each ≈ 1360 bytes; 1536 gives headroom.
@@ -138,59 +181,96 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
     // Ping state.
     let mut ping_counter: u32 = 0;
     let mut ping_id: u32 = 0;
+    // Free-running tick counter for per-topic decimation (mod by DECIM_*).
+    let mut tick: u32 = 0;
 
     defmt::info!("ESP bridge TX task started (DMA)");
 
     loop {
         Timer::after_millis(TX_PERIOD_MS).await;
+        tick = tick.wrapping_add(1);
 
-        // Drain each subscriber — only send the latest message per tick.
-        // try_next_message_pure() returns None when no unread messages,
-        // so low-rate channels send at their actual rate (no duplicates)
-        // and high-rate channels are capped at 100 Hz.
+        // Drain each subscriber — only send the latest message per
+        // *eligible* tick. Per-topic `DECIM_*` further throttles the
+        // 100 Hz tick to the rate appropriate for that topic's
+        // visualization / tuning need; topics not in their slot this
+        // tick are simply not drained, so backlog accumulates and the
+        // next eligible tick still sees the latest sample.
         //
-        // All frames are batch-encoded into one contiguous buffer,
-        // then sent as a single DMA transfer (one interrupt total).
+        // Edge-driven topics (ARM_DISARM) and natively-low-rate topics
+        // (GPS, RC_LINK_STATUS, MISSION_STATUS) are NOT decimated here —
+        // their producers already publish at the right rate.
         //
+        // All frames are batch-encoded into one contiguous buffer, then
+        // sent as a single DMA transfer (one interrupt total).
         // All telemetry timestamps are converted to UTC via time_sync.
 
         let mut pos = 0;
 
-        if let Some(m) = drain_latest(&mut imu1_sub) {
-            let mut w = WireImu::from_msg(&m);
+        // ── Visualization-grade @ 50 Hz ──
+        if tick % DECIM_VEHICLE_ATTITUDE == 0 {
+            if let Some(m) = drain_latest(&mut att_sub) {
+                let mut w = WireVehicleAttitude::from_msg(&m);
+                w.timestamp_us = utc_ts(m.timestamp);
+                pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+            }
+        }
+        if tick % DECIM_VEHICLE_ODOMETRY == 0 {
+            if let Some(m) = drain_latest(&mut odom_sub) {
+                let mut w = WireVehicleOdometry::from_msg(&m);
+                w.timestamp_us = utc_ts(m.timestamp);
+                pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+            }
+        }
+        if tick % DECIM_ATTITUDE_CONTROL_SETPOINT == 0 {
+            if let Some(m) = drain_latest(&mut att_ctrl_sub) {
+                let mut w = WireAttitudeControlSetpoint::from_msg(&m);
+                w.timestamp_us = utc_ts(m.timestamp);
+                pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+            }
+        }
+        // POSITION_CONTROL_SETPOINT producer is already 50 Hz — no decim.
+        #[cfg(feature = "est_eskf")]
+        if let Some(m) = drain_latest(&mut pos_ctrl_sub) {
+            let mut w = WirePositionControlSetpoint::from_msg(&m);
             w.timestamp_us = utc_ts(m.timestamp);
             pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
-        if let Some(m) = drain_latest(&mut imu2_sub) {
-            let mut w = WireImu::from_msg(&m);
-            w.timestamp_us = utc_ts(m.timestamp);
-            pos += encode_with_id(&w, wire::msg_id::IMU_2, &mut seq, &mut batch[pos..]);
+
+        // ── Tuning-grade @ 25 Hz ──
+        if tick % DECIM_RC_INPUT == 0 {
+            if let Some(m) = drain_latest(&mut rc_sub) {
+                let mut w = WireRcInput::from_msg(&m);
+                w.timestamp_us = utc_ts(m.timestamp);
+                pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+            }
         }
-        if let Some(m) = drain_latest(&mut att_sub) {
-            let mut w = WireVehicleAttitude::from_msg(&m);
-            w.timestamp_us = utc_ts(m.timestamp);
-            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+        if tick % DECIM_DSHOT_TELEM == 0 {
+            if let Some(m) = drain_latest(&mut dshot_sub) {
+                let mut w = WireDshotTelemetry::from_msg(&m);
+                w.timestamp_us = utc_ts(m.timestamp);
+                pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+            }
         }
-        if let Some(m) = drain_latest(&mut rc_sub) {
-            let mut w = WireRcInput::from_msg(&m);
-            w.timestamp_us = utc_ts(m.timestamp);
-            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+        if tick % DECIM_MOTOR_STATE_TELEM == 0 {
+            if let Some(m) = drain_latest(&mut motor_state_sub) {
+                let mut w = WireMotorStateTelemetry::from_msg(&m);
+                w.timestamp_us = utc_ts(m.timestamp);
+                pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+            }
         }
-        if let Some(m) = drain_latest(&mut rc_link_sub) {
-            let mut w = WireRcLinkStatus::from_msg(&m);
-            w.timestamp_us = utc_ts(m.timestamp);
-            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+        if tick % DECIM_ACTUATOR_MOTORS == 0 {
+            if let Some(m) = drain_latest(&mut motor_sub) {
+                let mut w = wire::WireActuatorMotors::from_msg(&m);
+                w.timestamp_us = utc_ts(m.timestamp);
+                pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+            }
         }
-        if let Some(m) = drain_latest(&mut dshot_sub) {
-            let mut w = WireDshotTelemetry::from_msg(&m);
-            w.timestamp_us = utc_ts(m.timestamp);
-            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
-        }
-        if let Some(m) = drain_latest(&mut motor_state_sub) {
-            let mut w = WireMotorStateTelemetry::from_msg(&m);
-            w.timestamp_us = utc_ts(m.timestamp);
-            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
-        }
+
+        // ── Solver / mission status — producer-paced, no decim ──
+        // OCP at 50 Hz, MISSION_STATUS at 10 Hz (already decimated by
+        // outer_loop), GPS at 5–10 Hz, RC_LINK_STATUS at ~10 Hz, and
+        // ARM_DISARM is event-driven; all forwarded as-is.
         if let Some(m) = drain_latest(&mut ocp_sub) {
             let mut w = WireOcpSolverOutput::from_msg(&m);
             w.timestamp_us = utc_ts(m.timestamp);
@@ -201,39 +281,8 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
             w.timestamp_us = utc_ts(m.timestamp);
             pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
-        if let Some(m) = drain_latest(&mut mag_ext_sub) {
-            let mut w = WireMagSample::from_msg(&m);
-            w.timestamp_us = utc_ts(m.timestamp);
-            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
-        }
-        if let Some(m) = drain_latest(&mut mag_int_sub) {
-            let mut w = WireMagSample::from_msg(&m);
-            w.timestamp_us = utc_ts(m.timestamp);
-            pos += encode_with_id(&w, wire::msg_id::MAG_INT, &mut seq, &mut batch[pos..]);
-        }
-        if let Some(m) = drain_latest(&mut baro1_sub) {
-            let mut w = WireBaroSample::from_msg(&m);
-            w.timestamp_us = utc_ts(m.timestamp);
-            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
-        }
-        if let Some(m) = drain_latest(&mut baro2_sub) {
-            let mut w = WireBaroSample::from_msg(&m);
-            w.timestamp_us = utc_ts(m.timestamp);
-            pos += encode_with_id(&w, wire::msg_id::BARO_2, &mut seq, &mut batch[pos..]);
-        }
-        if let Some(m) = drain_latest(&mut power_sub) {
-            let mut w = WirePowerStatus::from_msg(&m);
-            w.timestamp_us = utc_ts(m.timestamp);
-            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
-        }
-        if let Some(m) = drain_latest(&mut att_ctrl_sub) {
-            let mut w = WireAttitudeControlSetpoint::from_msg(&m);
-            w.timestamp_us = utc_ts(m.timestamp);
-            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
-        }
-        #[cfg(feature = "est_eskf")]
-        if let Some(m) = drain_latest(&mut pos_ctrl_sub) {
-            let mut w = WirePositionControlSetpoint::from_msg(&m);
+        if let Some(m) = drain_latest(&mut rc_link_sub) {
+            let mut w = WireRcLinkStatus::from_msg(&m);
             w.timestamp_us = utc_ts(m.timestamp);
             pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
@@ -242,21 +291,61 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
             w.timestamp_us = utc_ts(m.timestamp);
             pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
-        if let Some(m) = drain_latest(&mut odom_sub) {
-            let mut w = WireVehicleOdometry::from_msg(&m);
-            w.timestamp_us = utc_ts(m.timestamp);
-            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
-        }
-        if let Some(m) = drain_latest(&mut motor_sub) {
-            let mut w = wire::WireActuatorMotors::from_msg(&m);
-            w.timestamp_us = utc_ts(m.timestamp);
-            pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
-        }
         #[cfg(feature = "outer_mpc")]
         if let Some(m) = drain_latest(&mut mission_status_sub) {
             let mut w = WireMissionStatus::from_msg(&m);
             w.timestamp_us = utc_ts(m.timestamp);
             pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+        }
+
+        // ── Battery @ 1 Hz ──
+        if tick % DECIM_POWER_STATUS == 0 {
+            if let Some(m) = drain_latest(&mut power_sub) {
+                let mut w = WirePowerStatus::from_msg(&m);
+                w.timestamp_us = utc_ts(m.timestamp);
+                pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+            }
+        }
+
+        // ── Dev-only raw channels (gated by `dev_telem`) @ 25 Hz ──
+        #[cfg(feature = "dev_telem")]
+        if tick % DECIM_IMU == 0 {
+            if let Some(m) = drain_latest(&mut imu1_sub) {
+                let mut w = WireImu::from_msg(&m);
+                w.timestamp_us = utc_ts(m.timestamp);
+                pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+            }
+            if let Some(m) = drain_latest(&mut imu2_sub) {
+                let mut w = WireImu::from_msg(&m);
+                w.timestamp_us = utc_ts(m.timestamp);
+                pos += encode_with_id(&w, wire::msg_id::IMU_2, &mut seq, &mut batch[pos..]);
+            }
+        }
+        #[cfg(feature = "dev_telem")]
+        if tick % DECIM_MAG == 0 {
+            if let Some(m) = drain_latest(&mut mag_ext_sub) {
+                let mut w = WireMagSample::from_msg(&m);
+                w.timestamp_us = utc_ts(m.timestamp);
+                pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+            }
+            if let Some(m) = drain_latest(&mut mag_int_sub) {
+                let mut w = WireMagSample::from_msg(&m);
+                w.timestamp_us = utc_ts(m.timestamp);
+                pos += encode_with_id(&w, wire::msg_id::MAG_INT, &mut seq, &mut batch[pos..]);
+            }
+        }
+        #[cfg(feature = "dev_telem")]
+        if tick % DECIM_BARO == 0 {
+            if let Some(m) = drain_latest(&mut baro1_sub) {
+                let mut w = WireBaroSample::from_msg(&m);
+                w.timestamp_us = utc_ts(m.timestamp);
+                pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
+            }
+            if let Some(m) = drain_latest(&mut baro2_sub) {
+                let mut w = WireBaroSample::from_msg(&m);
+                w.timestamp_us = utc_ts(m.timestamp);
+                pos += encode_with_id(&w, wire::msg_id::BARO_2, &mut seq, &mut batch[pos..]);
+            }
         }
 
         // Periodic ping + time sync status telemetry (every 5s).

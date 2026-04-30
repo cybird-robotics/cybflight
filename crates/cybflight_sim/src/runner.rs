@@ -215,8 +215,8 @@ impl MissionRunner {
                 if t >= es.next_gps_t {
                     if let Some(gps_model) = scenario.gps_model.as_mut() {
                         let fix = gps_model.sample(plant);
-                        es.eskf.update_pos(fix.position, fix.sigma_pos);
-                        es.eskf.update_vel(fix.velocity, fix.sigma_vel);
+                        let _ = es.eskf.update_pos(fix.position, fix.sigma_pos);
+                        let _ = es.eskf.update_vel(fix.velocity, fix.sigma_vel);
                     }
                     es.next_gps_t += 1.0 / es.gps_rate_hz;
                 }

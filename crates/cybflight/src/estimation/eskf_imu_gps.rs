@@ -180,6 +180,11 @@ pub async fn estimation_task() {
             vel,
             gyro_bias,
             accel_bias,
+            pos_reject_total: 0,
+            att_reject_total: 0,
+            pos_inflated_total: 0,
+            att_inflated_total: 0,
+            jump_total: 0,
         })
     });
 
@@ -263,6 +268,11 @@ pub async fn estimation_task() {
                             vel,
                             gyro_bias,
                             accel_bias,
+                            pos_reject_total: 0,
+                            att_reject_total: 0,
+                            pos_inflated_total: 0,
+                            att_inflated_total: 0,
+                            jump_total: 0,
                         }
                     } else {
                         EstimatorPhase::Converging {
@@ -273,6 +283,11 @@ pub async fn estimation_task() {
                             vel,
                             gyro_bias,
                             accel_bias,
+                            pos_reject_total: 0,
+                            att_reject_total: 0,
+                            pos_inflated_total: 0,
+                            att_inflated_total: 0,
+                            jump_total: 0,
                         }
                     };
                     ESTIMATOR_STATUS.lock(|c| c.set(phase));

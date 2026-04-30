@@ -14,16 +14,16 @@
 //! 3. **Running** — covariance has converged; `ESTIMATOR_READY` is set and
 //!    arming is permitted.
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_sync::pubsub::WaitResult;
 use embassy_time::{Duration, Instant};
 use nalgebra::Vector3;
 
-use cybflight_core::eskf::{Eskf, EskfConfig};
+use cybflight_core::eskf::{Eskf, EskfConfig, UpdateOutcome};
 
 use core::sync::atomic::Ordering;
 
-use crate::estimation::{EstimatorPhase, ESTIMATOR_READY, ESTIMATOR_STATUS};
+use crate::estimation::{ESTIMATOR_READY, ESTIMATOR_STATUS, EstimatorPhase};
 use crate::sensors;
 use cybflight_msgs as msgs;
 
@@ -34,9 +34,31 @@ const PREDICT_DECIMATION: u32 = 8;
 const ODOM_DECIMATION: u32 = 1;
 
 /// Mocap position noise std-dev [m].
+///
+/// Calibrated for in-flight residuals, not bench-static residuals: real
+/// mocap-from-bridge has frame-to-frame jitter of several mm plus latency
+/// residuals of cm-scale during fast flight. With `gate_sigma = 5`, this
+/// gates real outliers at ~25 cm rather than ~5 cm — wide enough that
+/// valid-but-noisy frames in aggressive flight are still accepted (after
+/// covariance inflation if needed).
 const MOCAP_POS_STD: f32 = 0.01;
 /// Mocap attitude noise std-dev [rad].
 const MOCAP_ATT_STD: f32 = 0.03;
+
+/// Consecutive rejected mocap frames before declaring the estimator
+/// untrusted. At ~100–360 Hz mocap, 5 frames ≈ 14–50 ms of pure
+/// dead-reckoning before the failsafe propagates. Tighter than the
+/// 100 ms `MOCAP_STALE` window so the system fails before significant
+/// open-loop drift accumulates.
+const MAX_CONSECUTIVE_REJECTS: u32 = 8;
+
+/// Consecutive pose-jump rejections before forcing a filter re-init.
+/// Tighter than `MAX_CONSECUTIVE_REJECTS` because jumps indicate a
+/// catastrophic mocap fault (rigid-body flip / re-association), not
+/// merely a noisy frame. Three frames ≈ 8–30 ms — short enough that
+/// re-init from the next clean pose is cheaper than letting any
+/// fraction of a flipped pose leak into the estimate.
+const MAX_CONSECUTIVE_JUMPS: u32 = 3;
 
 /// Gyro-bias covariance trace threshold for convergence.
 /// Initial trace = 3 × 0.01 = 0.03; this requires roughly a 10× reduction.
@@ -53,6 +75,21 @@ const MOCAP_STALE: Duration = Duration::from_millis(100);
 /// into the filter's predict step and produce NaN state in one call.
 fn imu_is_valid(accel: &Vector3<f32>, gyro: &Vector3<f32>) -> bool {
     accel.iter().all(|v| v.is_finite()) && gyro.iter().all(|v| v.is_finite())
+}
+
+/// Map an `UpdateOutcome` to a short tag for defmt logging.
+/// `defmt` cannot format the enum directly without a `defmt::Format` impl,
+/// and the enum lives in `cybflight_core` which has no defmt dep.
+fn outcome_tag(outcome: UpdateOutcome) -> &'static str {
+    match outcome {
+        UpdateOutcome::Accepted { inflated: false } => "accepted",
+        UpdateOutcome::Accepted { inflated: true } => "inflated",
+        UpdateOutcome::NotInitialized => "not-init",
+        UpdateOutcome::InverseFailed => "inv-fail",
+        UpdateOutcome::InflationCapExceeded => "cap-exceeded",
+        UpdateOutcome::NaNAfterUpdate => "nan",
+        UpdateOutcome::JumpRejected => "jump",
+    }
 }
 
 /// Reject mocap frames with any non-finite component. One bad frame from the
@@ -128,6 +165,11 @@ pub async fn estimation_task() {
             vel,
             gyro_bias,
             accel_bias,
+            pos_reject_total: 0,
+            att_reject_total: 0,
+            pos_inflated_total: 0,
+            att_inflated_total: 0,
+            jump_total: 0,
         })
     });
 
@@ -137,6 +179,13 @@ pub async fn estimation_task() {
     let mut last_predict_ts = Instant::now();
     let mut last_mocap_ts = Instant::now();
     let mut converged = false;
+    let mut consecutive_rejects: u32 = 0;
+    let mut consecutive_jumps: u32 = 0;
+    let mut pos_reject_total: u32 = 0;
+    let mut att_reject_total: u32 = 0;
+    let mut pos_inflated_total: u32 = 0;
+    let mut att_inflated_total: u32 = 0;
+    let mut jump_total: u32 = 0;
 
     loop {
         match select(imu_sub.next_message(), mocap_sub.next_message()).await {
@@ -181,13 +230,17 @@ pub async fn estimation_task() {
 
                 // predict() clears `initialized` if it produced NaN. Report
                 // it and drop the convergence flag so downstream consumers
-                // know the estimate is no longer trusted.
+                // know the estimate is no longer trusted. Reset
+                // `last_predict_ts` so the next valid predict (after mocap
+                // re-seeds) doesn't compute a stale dt that would itself
+                // trip the `dt > 0.05` rejection.
                 if !eskf.is_initialized() {
                     defmt::error!(
                         "ESKF: non-finite state after predict — awaiting re-init from mocap"
                     );
                     converged = false;
                     ESTIMATOR_READY.store(false, Ordering::Release);
+                    last_predict_ts = Instant::now();
                     continue;
                 }
 
@@ -235,6 +288,11 @@ pub async fn estimation_task() {
                             vel,
                             gyro_bias,
                             accel_bias,
+                            pos_reject_total,
+                            att_reject_total,
+                            pos_inflated_total,
+                            att_inflated_total,
+                            jump_total,
                         }
                     } else {
                         EstimatorPhase::Converging {
@@ -245,6 +303,11 @@ pub async fn estimation_task() {
                             vel,
                             gyro_bias,
                             accel_bias,
+                            pos_reject_total,
+                            att_reject_total,
+                            pos_inflated_total,
+                            att_inflated_total,
+                            jump_total,
                         }
                     };
                     ESTIMATOR_STATUS.lock(|c| c.set(phase));
@@ -282,8 +345,6 @@ pub async fn estimation_task() {
                     continue;
                 }
 
-                last_mocap_ts = Instant::now();
-
                 // If the filter reset (NaN guard), re-seed from this pose.
                 if !eskf.is_initialized() {
                     defmt::error!("ESKF: re-initializing from mocap after NaN reset");
@@ -294,19 +355,99 @@ pub async fn estimation_task() {
                         Vector3::zeros(),
                     );
                     converged = false;
+                    consecutive_rejects = 0;
                     ESTIMATOR_READY.store(false, Ordering::Release);
                     last_predict_ts = Instant::now();
+                    last_mocap_ts = Instant::now();
                     continue;
                 }
 
-                eskf.update_pos(pose.position, MOCAP_POS_STD);
-                eskf.update_att(pose.orientation, MOCAP_ATT_STD);
+                // Joint pose update: position and attitude come from the
+                // same Vicon solve at the same instant, so we apply them
+                // as a single 6-D measurement. This preserves cross-
+                // covariance: the gain for both channels is computed
+                // against the same prior P, instead of the attitude
+                // update operating on a P that has already been collapsed
+                // by the position update.
+                let pose_outcome =
+                    eskf.update_pose(pose.position, pose.orientation, MOCAP_POS_STD, MOCAP_ATT_STD);
+
+                match pose_outcome {
+                    UpdateOutcome::Accepted { inflated: true } => {
+                        pos_inflated_total = pos_inflated_total.wrapping_add(1);
+                        att_inflated_total = att_inflated_total.wrapping_add(1);
+                    }
+                    UpdateOutcome::Accepted { inflated: false } => {}
+                    UpdateOutcome::JumpRejected => {
+                        // Counted in the jump branch below; don't count as
+                        // a normal rejection too.
+                    }
+                    other => {
+                        pos_reject_total = pos_reject_total.wrapping_add(1);
+                        att_reject_total = att_reject_total.wrapping_add(1);
+                        defmt::warn!("ESKF: pose update rejected ({})", outcome_tag(other));
+                    }
+                }
+
+                // Phase 4 jump-rejection: a jump is a catastrophic mocap
+                // fault (Vicon flip / re-association). The filter's own
+                // estimate is still trustworthy — only the incoming frame
+                // is bad — so we drop the frame and ride out on IMU
+                // dead-reckoning until clean poses resume. After
+                // `MAX_CONSECUTIVE_JUMPS` we drop `ESTIMATOR_READY` so
+                // arming is refused and downstream consumers know the
+                // estimate has lost its mocap anchor; `last_mocap_ts` is
+                // not refreshed either, so `MOCAP_STALE` will eventually
+                // fire as a hard failsafe if jumps persist. The filter
+                // state itself is preserved across all of this — re-init
+                // would throw away the IMU-integrated estimate that is
+                // the only thing keeping the vehicle controllable during
+                // the bad-mocap window.
+                if pose_outcome.is_jump() {
+                    jump_total = jump_total.wrapping_add(1);
+                    consecutive_jumps = consecutive_jumps.saturating_add(1);
+                    defmt::error!(
+                        "ESKF: pose jump ({}/{})",
+                        consecutive_jumps,
+                        MAX_CONSECUTIVE_JUMPS,
+                    );
+                    if converged && consecutive_jumps >= MAX_CONSECUTIVE_JUMPS {
+                        converged = false;
+                        ESTIMATOR_READY.store(false, Ordering::Release);
+                        defmt::error!(
+                            "ESKF: {} consecutive pose jumps — arming blocked",
+                            consecutive_jumps,
+                        );
+                    }
+                } else {
+                    consecutive_jumps = 0;
+                }
+
+                // Phase 3 fail-stop: only refresh the staleness timer when
+                // the joint update was absorbed by the filter (inflated or
+                // not). A frame that arrives but is rejected by the gate
+                // does not count as a healthy mocap measurement.
+                if pose_outcome.is_accepted() {
+                    last_mocap_ts = Instant::now();
+                    consecutive_rejects = 0;
+                } else {
+                    consecutive_rejects = consecutive_rejects.saturating_add(1);
+                    if converged && consecutive_rejects >= MAX_CONSECUTIVE_REJECTS {
+                        converged = false;
+                        ESTIMATOR_READY.store(false, Ordering::Release);
+                        defmt::error!(
+                            "ESKF: {} consecutive mocap rejections — arming blocked",
+                            consecutive_rejects,
+                        );
+                    }
+                }
 
                 // If an update produced NaN, drop convergence so the next
                 // mocap frame re-seeds the filter.
                 if !eskf.is_initialized() {
                     defmt::error!("ESKF: non-finite state after mocap update — awaiting re-init");
                     converged = false;
+                    consecutive_rejects = 0;
                     ESTIMATOR_READY.store(false, Ordering::Release);
                 }
             }

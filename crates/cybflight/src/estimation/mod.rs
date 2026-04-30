@@ -26,6 +26,16 @@ pub enum EstimatorPhase {
         vel: [f32; 3],
         gyro_bias: [f32; 3],
         accel_bias: [f32; 3],
+        /// Total exteroceptive position updates that exceeded the
+        /// inflation cap and were rejected since boot.
+        pos_reject_total: u32,
+        /// Total exteroceptive attitude updates rejected since boot.
+        att_reject_total: u32,
+        /// Total updates whose `R` was inflated to admit a large innovation.
+        pos_inflated_total: u32,
+        att_inflated_total: u32,
+        /// Total absolute-jump rejections (Vicon flips / re-associations).
+        jump_total: u32,
     },
     /// Filter converged — arming is permitted.
     Running {
@@ -36,6 +46,12 @@ pub enum EstimatorPhase {
         vel: [f32; 3],
         gyro_bias: [f32; 3],
         accel_bias: [f32; 3],
+        pos_reject_total: u32,
+        att_reject_total: u32,
+        pos_inflated_total: u32,
+        att_inflated_total: u32,
+        /// Total absolute-jump rejections (Vicon flips / re-associations).
+        jump_total: u32,
     },
 }
 

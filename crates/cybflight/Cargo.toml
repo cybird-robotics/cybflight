@@ -42,6 +42,13 @@ outer_mpc = ["est_eskf"]
 # selects the closest-point PositionSampler — see docs in
 # `cybflight_core::trajectory_planning::sampler`.
 position_sampler = []
+# Forward raw, ESKF-internal sensor channels (raw IMU, mag, baro, secondary
+# IMU/baro/mag) over the ESP32 telemetry link. Off by default — these
+# channels exist for offline calibration / sensor-health debugging only;
+# the ESKF consumes them internally and the rerun viewport does not need
+# them at flight time. See the audit comment at the top of
+# `comm/esp_bridge.rs` for bandwidth justification.
+dev_telem = []
 
 [dependencies]
 bsp-sakurah743 = { path = "../bsp/sakurah743", optional = true }

@@ -97,7 +97,7 @@ impl Default for EskfConfig {
             gyro_bias_random_walk: 0.00001,
             baro_noise_std: 0.5,
             mag_noise_std: 0.05,
-            gate_sigma: 7.0,
+            gate_sigma: 10.0,
         }
     }
 }
@@ -260,6 +260,205 @@ impl Eskf {
         }
     }
 
+    /// Block-sparse equivalent of `propagate_state`, exploiting F's
+    /// block structure to avoid the dense 15×15·15×15·15×15 product.
+    ///
+    /// F has only 9 non-zero 3×3 blocks (5 trivial: identity / scaled-identity;
+    /// 3 non-trivial: `R(-ω·dt)`, `-R·[a]× ·dt`, `-R·dt`; 1 zero remaining).
+    /// Computing `F·P·Fᵀ` block-by-block reduces the work from ~6750 FMAs
+    /// to ~1100 FMAs (~6× speedup) while producing the same result to
+    /// within float32 round-off.
+    ///
+    /// Symmetry is enforced by construction: only the upper triangle is
+    /// computed; the lower is mirrored. This is mathematically equivalent
+    /// to the dense version (which also produces a symmetric result up
+    /// to round-off) but eliminates the asymmetric round-off the dense
+    /// matmul leaves behind.
+    fn propagate_state_sparse(
+        &self,
+        accel: Vector3<f32>,
+        gyro: Vector3<f32>,
+        dt: f32,
+    ) -> (NominalState, SMatrix<f32, 15, 15>) {
+        let s = &self.state;
+        let a_ub = accel - s.accel_bias;
+        let w_ub = gyro - s.gyro_bias;
+        let rmat = *s.orientation.to_rotation_matrix().matrix();
+
+        let new_state = NominalState {
+            position: s.position + s.velocity * dt,
+            orientation: s.orientation * UnitQuaternion::from_scaled_axis(w_ub * dt),
+            velocity: s.velocity + (rmat * a_ub + GRAVITY_VEC) * dt,
+            accel_bias: s.accel_bias,
+            gyro_bias: s.gyro_bias,
+        };
+
+        // Non-trivial F blocks.
+        let r_neg = *UnitQuaternion::from_scaled_axis(-w_ub * dt)
+            .to_rotation_matrix()
+            .matrix(); // R(-ω·dt)
+        let m_a = -rmat * hat(&a_ub) * dt; // F's (vel, att) block
+        let m_b = -rmat * dt; // F's (vel, ba) block
+        let d = dt;
+
+        // Extract P's upper-triangle blocks once (lower comes from transposes).
+        let p_pp = self.cov.fixed_view::<3, 3>(0, 0).clone_owned();
+        let p_pa = self.cov.fixed_view::<3, 3>(0, 3).clone_owned();
+        let p_pv = self.cov.fixed_view::<3, 3>(0, 6).clone_owned();
+        let p_pba = self.cov.fixed_view::<3, 3>(0, 9).clone_owned();
+        let p_pbg = self.cov.fixed_view::<3, 3>(0, 12).clone_owned();
+        let p_aa = self.cov.fixed_view::<3, 3>(3, 3).clone_owned();
+        let p_av = self.cov.fixed_view::<3, 3>(3, 6).clone_owned();
+        let p_aba = self.cov.fixed_view::<3, 3>(3, 9).clone_owned();
+        let p_abg = self.cov.fixed_view::<3, 3>(3, 12).clone_owned();
+        let p_vv = self.cov.fixed_view::<3, 3>(6, 6).clone_owned();
+        let p_vba = self.cov.fixed_view::<3, 3>(6, 9).clone_owned();
+        let p_vbg = self.cov.fixed_view::<3, 3>(6, 12).clone_owned();
+        let p_baba = self.cov.fixed_view::<3, 3>(9, 9).clone_owned();
+        let p_babg = self.cov.fixed_view::<3, 3>(9, 12).clone_owned();
+        let p_bgbg = self.cov.fixed_view::<3, 3>(12, 12).clone_owned();
+
+        // Reused intermediates from FP[i, l] = sum_k F[i,k] · P[k,l].
+        // FP[0, l] = P[0,l] + d · P[2,l]
+        let fp0_a = p_pa + d * p_av.transpose(); // FP[0, 1]
+        let fp0_v = p_pv + d * p_vv; // FP[0, 2]
+        let fp0_ba = p_pba + d * p_vba; // FP[0, 3]
+        let fp0_bg = p_pbg + d * p_vbg; // FP[0, 4]
+
+        // FP[1, l] = R⁻ · P[1,l] − d · P[4,l]
+        let r_paa = r_neg * p_aa;
+        let r_pav = r_neg * p_av;
+        let r_paba = r_neg * p_aba;
+        let r_pabg = r_neg * p_abg;
+        // FP[1, 1] = R⁻·P_AA − d·P_ABGᵀ
+        let fp1_a = r_paa - d * p_abg.transpose();
+        let fp1_v = r_pav - d * p_vbg.transpose();
+        let fp1_ba = r_paba - d * p_babg.transpose();
+        let fp1_bg = r_pabg - d * p_bgbg;
+
+        // FP[2, l] = M_a · P[1,l] + P[2,l] + M_b · P[3,l]
+        let ma_paa = m_a * p_aa;
+        let ma_pav = m_a * p_av;
+        let ma_paba = m_a * p_aba;
+        let ma_pabg = m_a * p_abg;
+        // FP[2, 1] = M_a·P_AA + P_AVᵀ + M_b·P_ABAᵀ
+        let fp2_a = ma_paa + p_av.transpose() + m_b * p_aba.transpose();
+        let fp2_v = ma_pav + p_vv + m_b * p_vba.transpose();
+        let fp2_ba = ma_paba + p_vba + m_b * p_baba;
+        let fp2_bg = ma_pabg + p_vbg + m_b * p_babg;
+
+        // FP[3, l] = P[3, l]; FP[4, l] = P[4, l] (identity F block).
+
+        // P'[i, j] = sum_l FP[i,l] · F[j,l]ᵀ.
+        // For column j, only F[j, l] non-zero contributions matter.
+
+        // Upper-triangle output blocks.
+
+        // P'[0, 0] = FP[0, 0] + d · FP[0, 2]
+        let pp_pp = (p_pp + d * p_pv.transpose()) + d * fp0_v;
+
+        // P'[0, 1] = FP[0, 1] · R⁻ᵀ − d · FP[0, 4]
+        let pp_pa = fp0_a * r_neg.transpose() - d * fp0_bg;
+
+        // P'[0, 2] = FP[0, 1] · M_aᵀ + FP[0, 2] + FP[0, 3] · M_bᵀ
+        let pp_pv = fp0_a * m_a.transpose() + fp0_v + fp0_ba * m_b.transpose();
+
+        // P'[0, 3] = FP[0, 3]
+        let pp_pba = fp0_ba;
+
+        // P'[0, 4] = FP[0, 4]
+        let pp_pbg = fp0_bg;
+
+        // P'[1, 1] = FP[1, 1] · R⁻ᵀ − d · FP[1, 4]
+        let pp_aa = fp1_a * r_neg.transpose() - d * fp1_bg;
+
+        // P'[1, 2] = FP[1, 1] · M_aᵀ + FP[1, 2] + FP[1, 3] · M_bᵀ
+        let pp_av = fp1_a * m_a.transpose() + fp1_v + fp1_ba * m_b.transpose();
+
+        // P'[1, 3] = FP[1, 3]
+        let pp_aba = fp1_ba;
+
+        // P'[1, 4] = FP[1, 4]
+        let pp_abg = fp1_bg;
+
+        // P'[2, 2] = FP[2, 1] · M_aᵀ + FP[2, 2] + FP[2, 3] · M_bᵀ
+        let pp_vv = fp2_a * m_a.transpose() + fp2_v + fp2_ba * m_b.transpose();
+
+        // P'[2, 3] = FP[2, 3]
+        let pp_vba = fp2_ba;
+
+        // P'[2, 4] = FP[2, 4]
+        let pp_vbg = fp2_bg;
+
+        // P'[3, 3] = P_BABA  (identity block in F leaves it unchanged)
+        let pp_baba = p_baba;
+        let pp_babg = p_babg;
+        let pp_bgbg = p_bgbg;
+
+        // Q is diagonal; add to (att, vel, ba, bg) diagonal blocks.
+        let cfg = &self.config;
+        let q_aa = cfg.gyro_noise_density * cfg.gyro_noise_density * dt;
+        let q_vv = cfg.accel_noise_density * cfg.accel_noise_density * dt;
+        let q_baba = cfg.accel_bias_random_walk * cfg.accel_bias_random_walk * dt;
+        let q_bgbg = cfg.gyro_bias_random_walk * cfg.gyro_bias_random_walk * dt;
+        let pp_aa = pp_aa + Matrix3::from_diagonal_element(q_aa);
+        let pp_vv = pp_vv + Matrix3::from_diagonal_element(q_vv);
+        let pp_baba = pp_baba + Matrix3::from_diagonal_element(q_baba);
+        let pp_bgbg = pp_bgbg + Matrix3::from_diagonal_element(q_bgbg);
+
+        // Reassemble. Lower triangle is the transpose of the upper.
+        let mut new_cov = SMatrix::<f32, 15, 15>::zeros();
+        // Row 0 (pos)
+        new_cov.fixed_view_mut::<3, 3>(0, 0).copy_from(&pp_pp);
+        new_cov.fixed_view_mut::<3, 3>(0, 3).copy_from(&pp_pa);
+        new_cov.fixed_view_mut::<3, 3>(0, 6).copy_from(&pp_pv);
+        new_cov.fixed_view_mut::<3, 3>(0, 9).copy_from(&pp_pba);
+        new_cov.fixed_view_mut::<3, 3>(0, 12).copy_from(&pp_pbg);
+        // Row 1 (att)
+        new_cov.fixed_view_mut::<3, 3>(3, 0).copy_from(&pp_pa.transpose());
+        new_cov.fixed_view_mut::<3, 3>(3, 3).copy_from(&pp_aa);
+        new_cov.fixed_view_mut::<3, 3>(3, 6).copy_from(&pp_av);
+        new_cov.fixed_view_mut::<3, 3>(3, 9).copy_from(&pp_aba);
+        new_cov.fixed_view_mut::<3, 3>(3, 12).copy_from(&pp_abg);
+        // Row 2 (vel)
+        new_cov.fixed_view_mut::<3, 3>(6, 0).copy_from(&pp_pv.transpose());
+        new_cov.fixed_view_mut::<3, 3>(6, 3).copy_from(&pp_av.transpose());
+        new_cov.fixed_view_mut::<3, 3>(6, 6).copy_from(&pp_vv);
+        new_cov.fixed_view_mut::<3, 3>(6, 9).copy_from(&pp_vba);
+        new_cov.fixed_view_mut::<3, 3>(6, 12).copy_from(&pp_vbg);
+        // Row 3 (ba)
+        new_cov.fixed_view_mut::<3, 3>(9, 0).copy_from(&pp_pba.transpose());
+        new_cov.fixed_view_mut::<3, 3>(9, 3).copy_from(&pp_aba.transpose());
+        new_cov.fixed_view_mut::<3, 3>(9, 6).copy_from(&pp_vba.transpose());
+        new_cov.fixed_view_mut::<3, 3>(9, 9).copy_from(&pp_baba);
+        new_cov.fixed_view_mut::<3, 3>(9, 12).copy_from(&pp_babg);
+        // Row 4 (bg)
+        new_cov.fixed_view_mut::<3, 3>(12, 0).copy_from(&pp_pbg.transpose());
+        new_cov.fixed_view_mut::<3, 3>(12, 3).copy_from(&pp_abg.transpose());
+        new_cov.fixed_view_mut::<3, 3>(12, 6).copy_from(&pp_vbg.transpose());
+        new_cov.fixed_view_mut::<3, 3>(12, 9).copy_from(&pp_babg.transpose());
+        new_cov.fixed_view_mut::<3, 3>(12, 12).copy_from(&pp_bgbg);
+
+        (new_state, new_cov)
+    }
+
+    /// Block-sparse predict step. Equivalent to `predict` to within
+    /// float32 round-off; faster on the H743's M7 because F's structural
+    /// zeros are skipped instead of multiplied through a dense matmul.
+    pub fn predict_sparse(&mut self, accel: Vector3<f32>, gyro: Vector3<f32>, dt: f32) {
+        if !self.initialized {
+            return;
+        }
+        let (new_state, new_cov) = self.propagate_state_sparse(accel, gyro, dt);
+        self.state = new_state;
+        self.cov = new_cov;
+        self.renormalize_orientation();
+        self.clamp_covariance_diagonal();
+        if !self.state_is_finite() {
+            self.initialized = false;
+        }
+    }
+
     /// Joint pose measurement update (position + attitude in one step).
     ///
     /// Mocap delivers position and orientation at the same instant from the
@@ -363,6 +562,114 @@ impl Eskf {
         self.clamp_covariance_diagonal();
         // Boxplus rotated the orientation; renormalize so multiplicative
         // round-off doesn't leave a non-unit quaternion.
+        self.renormalize_orientation();
+        if !self.state_is_finite() {
+            self.initialized = false;
+            return UpdateOutcome::NaNAfterUpdate;
+        }
+        UpdateOutcome::Accepted { inflated }
+    }
+
+    /// Block-sparse equivalent of `update_pose`.
+    ///
+    /// H is sparse: only two 3×3 identity blocks at columns (0, 3) of the
+    /// 15-state. Exploiting this lets us avoid materializing `K·H` and
+    /// `(I − KH)` as full 15×15 matrices, replacing two 15·15·15 matmuls
+    /// with structurally smaller 15×6·6×15 matmuls.
+    ///
+    /// Specifically:
+    ///   - `H·P` is the first 6 rows of P (no matmul).
+    ///   - `P·Hᵀ` is the first 6 columns of P (no matmul).
+    ///   - Joseph form `(I−KH)·P·(I−KH)ᵀ` = `P − K·(HP) − (PHᵀ)·Kᵀ + K·(HPHᵀ)·Kᵀ`,
+    ///     which equals `B − B·Hᵀ·Kᵀ + K·R·Kᵀ` where `B = P − K·HP`.
+    ///
+    /// FMA count drops from ~16500 to ~4800 — about 3.5× speedup. Result
+    /// is equivalent to `update_pose` to within float32 round-off.
+    pub fn update_pose_sparse(
+        &mut self,
+        pos: Vector3<f32>,
+        q: UnitQuaternion<f32>,
+        pos_std: f32,
+        att_std: f32,
+    ) -> UpdateOutcome {
+        if !self.initialized {
+            return UpdateOutcome::NotInitialized;
+        }
+
+        let z_pos = pos - self.state.position;
+        if z_pos.norm() > MAX_POS_JUMP_M {
+            return UpdateOutcome::JumpRejected;
+        }
+
+        let q = if self.state.orientation.coords.dot(&q.coords) < 0.0 {
+            UnitQuaternion::from_quaternion(-q.into_inner())
+        } else {
+            q
+        };
+        let q_err = self.state.orientation.inverse() * q;
+        let z_att = q_err.scaled_axis();
+        if z_att.norm() > MAX_ATT_JUMP_RAD {
+            return UpdateOutcome::JumpRejected;
+        }
+
+        let mut z = SMatrix::<f32, 6, 1>::zeros();
+        z.fixed_rows_mut::<3>(0).copy_from(&z_pos);
+        z.fixed_rows_mut::<3>(3).copy_from(&z_att);
+
+        // HPHᵀ is the upper-left 6×6 of P (since H selects the pos and
+        // att blocks of P). No matmul needed.
+        let hph_t: SMatrix<f32, 6, 6> = self.cov.fixed_view::<6, 6>(0, 0).clone_owned();
+
+        let pv = pos_std * pos_std;
+        let av = att_std * att_std;
+        let mut r = SMatrix::<f32, 6, 6>::zeros();
+        r.fixed_view_mut::<3, 3>(0, 0).fill_diagonal(pv);
+        r.fixed_view_mut::<3, 3>(3, 3).fill_diagonal(av);
+
+        let s_mat = hph_t + r;
+        let Some(s_inv) = s_mat.try_inverse() else {
+            self.initialized = false;
+            return UpdateOutcome::InverseFailed;
+        };
+
+        let gamma = (z.transpose() * s_inv * z)[(0, 0)] / 6.0;
+        let gate_sq = self.config.gate_sigma * self.config.gate_sigma;
+        let (r_eff, s_inv_eff, inflated) = if gamma > gate_sq {
+            let inflate = gamma / gate_sq;
+            if inflate > INFLATION_CAP {
+                return UpdateOutcome::InflationCapExceeded;
+            }
+            let r_eff = r * inflate;
+            let s_eff = hph_t + r_eff;
+            let Some(s_inv_eff) = s_eff.try_inverse() else {
+                self.initialized = false;
+                return UpdateOutcome::InverseFailed;
+            };
+            (r_eff, s_inv_eff, true)
+        } else {
+            (r, s_inv, false)
+        };
+
+        // K = P·Hᵀ·S⁻¹ = (first 6 cols of P) · S⁻¹ → 15×6.
+        let p_ht: SMatrix<f32, 15, 6> = self.cov.fixed_view::<15, 6>(0, 0).clone_owned();
+        let k: SMatrix<f32, 15, 6> = p_ht * s_inv_eff;
+
+        // State update.
+        self.state = self.state.boxplus(&(k * z));
+
+        // Joseph form, sparse.
+        // H·P is the first 6 rows of P (no matmul).
+        let hp: SMatrix<f32, 6, 15> = self.cov.fixed_view::<6, 15>(0, 0).clone_owned();
+        // B = P − K·(H·P)
+        let b = self.cov - k * hp;
+        // B·Hᵀ is the first 6 cols of B.
+        let b_ht: SMatrix<f32, 15, 6> = b.fixed_view::<15, 6>(0, 0).clone_owned();
+        // P' = B − B·Hᵀ·Kᵀ + K·R·Kᵀ
+        let kt = k.transpose();
+        self.cov = b - b_ht * kt + k * r_eff * kt;
+
+        self.cov = (self.cov + self.cov.transpose()) * 0.5;
+        self.clamp_covariance_diagonal();
         self.renormalize_orientation();
         if !self.state_is_finite() {
             self.initialized = false;

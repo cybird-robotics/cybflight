@@ -1,4 +1,5 @@
 use cybflight_drivers::baro::dps310::Dps310;
+#[cfg(feature = "est_pos_gps")]
 use cybflight_drivers::gps::Ublox;
 use cybflight_drivers::imu::icm426xx::Icm426xx;
 use cybflight_drivers::imu::mpu6x00::Mpu6x00;
@@ -10,13 +11,16 @@ use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::{SendSpawner, Spawner};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::{with_timeout, Duration, Timer};
+use embassy_time::Timer;
+#[cfg(feature = "est_pos_gps")]
+use embassy_time::{with_timeout, Duration};
 use static_cell::StaticCell;
 
 use crate::bsp;
 use crate::hal;
 use crate::motors::{DshotQuadConfig, MotorTimerConfig};
 use crate::sensors::baro::BaroReader;
+#[cfg(feature = "est_pos_gps")]
 use crate::sensors::gps::GpsRunner;
 use crate::sensors::imu::{icm_reader_task, mpu_reader_task, ImuReader, SpiBusMtx};
 use crate::sensors::mag::{I2cBusMtx, MagReader};
@@ -263,6 +267,10 @@ pub async fn init(
     }
 
     // --- GPS: bsp::PORT_GPS selects the UART. ---
+    //
+    // Gated on `est_pos_gps` so non-GPS builds skip UART setup and the
+    // 3-second u-blox-init timeout entirely.
+    #[cfg(feature = "est_pos_gps")]
     match bsp::PORT_GPS {
         bsp::SerialPortId::Uart4 => {
             defmt::info!("GPS: starting UART4 init");

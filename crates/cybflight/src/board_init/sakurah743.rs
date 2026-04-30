@@ -1,5 +1,6 @@
 use cybflight_drivers::baro::dps310::Dps310;
 use cybflight_drivers::baro::icp20100::Icp20100;
+#[cfg(feature = "est_pos_gps")]
 use cybflight_drivers::gps::Ublox;
 use cybflight_drivers::imu::icm426xx::Icm426xx;
 use cybflight_drivers::led::Led;
@@ -9,13 +10,16 @@ use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::{SendSpawner, Spawner};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::{with_timeout, Duration, Timer};
+use embassy_time::Timer;
+#[cfg(feature = "est_pos_gps")]
+use embassy_time::{with_timeout, Duration};
 use static_cell::StaticCell;
 
 use crate::bsp;
 use crate::hal;
 use crate::motors::{DshotQuadConfig, MotorTimerConfig};
 use crate::sensors::baro::BaroReader;
+#[cfg(feature = "est_pos_gps")]
 use crate::sensors::gps::{err_kind, GpsHealth, GpsRunner, GPS_HEALTH};
 use crate::sensors::imu::{icm_reader_task, ImuReader, SpiBusMtx};
 use crate::sensors::mag::{I2cBusMtx, MagReader};
@@ -201,58 +205,70 @@ pub async fn init(
     }
 
     // --- GPS: bsp::PORT_GPS selects the UART. ---
-    const GPS_BAUD: u32 = 230_400;
-    GPS_HEALTH.lock(|c| c.set(GpsHealth::Initializing));
-    match bsp::PORT_GPS {
-        bsp::SerialPortId::Usart3 => {
-            defmt::info!("GPS: starting USART3 init");
-            static GPS_TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-            static GPS_RX_BUF: StaticCell<[u8; 1024]> = StaticCell::new();
-            let tx_buf = &mut GPS_TX_BUF.init([0u8; 256])[..];
-            let rx_buf = &mut GPS_RX_BUF.init([0u8; 1024])[..];
-            let mut uart_config = hal::usart::Config::default();
-            uart_config.baudrate = GPS_BAUD;
-            match hal::usart::BufferedUart::new(
-                board.serial.usart3,
-                board.serial.usart3_rx,
-                board.serial.usart3_tx,
-                tx_buf,
-                rx_buf,
-                SerialIrqs,
-                uart_config,
-            ) {
-                Ok(uart) => {
-                    defmt::info!("GPS: USART3 OK, sending CFG-MSG...");
-                    let mut delay = embassy_time::Delay;
-                    match with_timeout(Duration::from_secs(30), Ublox::new(uart, &mut delay)).await
-                    {
-                        Ok(Ok(gps)) => {
-                            defmt::info!("GPS u-blox init OK");
-                            spawner
-                                .spawn(crate::sensors::gps::ublox_gps_task(GpsRunner::new(gps)))
-                                .unwrap_or_else(|e| {
-                                    defmt::error!("Failed to spawn GPS task: {}", e)
-                                });
-                        }
-                        Ok(Err(e)) => {
-                            GPS_HEALTH.lock(|c| c.set(GpsHealth::InitFailed(err_kind(&e))));
-                            defmt::warn!("GPS init failed: {}", e);
-                        }
-                        Err(_) => {
-                            GPS_HEALTH.lock(|c| c.set(GpsHealth::InitTimedOut));
-                            defmt::warn!("GPS init timed out (no module?)");
+    //
+    // Gated on `est_pos_gps`: the receiver init talks to the module with a
+    // 30 s timeout that empirically resolves to ~3 s when no module answers,
+    // adding that latency to every mocap-only boot for no benefit. With the
+    // gate, a non-GPS build skips UART setup entirely and `gpshealth`
+    // reports `GpsHealth::NotConfigured`.
+    #[cfg(feature = "est_pos_gps")]
+    {
+        const GPS_BAUD: u32 = 230_400;
+        GPS_HEALTH.lock(|c| c.set(GpsHealth::Initializing));
+        match bsp::PORT_GPS {
+            bsp::SerialPortId::Usart3 => {
+                defmt::info!("GPS: starting USART3 init");
+                static GPS_TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+                static GPS_RX_BUF: StaticCell<[u8; 1024]> = StaticCell::new();
+                let tx_buf = &mut GPS_TX_BUF.init([0u8; 256])[..];
+                let rx_buf = &mut GPS_RX_BUF.init([0u8; 1024])[..];
+                let mut uart_config = hal::usart::Config::default();
+                uart_config.baudrate = GPS_BAUD;
+                match hal::usart::BufferedUart::new(
+                    board.serial.usart3,
+                    board.serial.usart3_rx,
+                    board.serial.usart3_tx,
+                    tx_buf,
+                    rx_buf,
+                    SerialIrqs,
+                    uart_config,
+                ) {
+                    Ok(uart) => {
+                        defmt::info!("GPS: USART3 OK, sending CFG-MSG...");
+                        let mut delay = embassy_time::Delay;
+                        match with_timeout(Duration::from_secs(30), Ublox::new(uart, &mut delay))
+                            .await
+                        {
+                            Ok(Ok(gps)) => {
+                                defmt::info!("GPS u-blox init OK");
+                                spawner
+                                    .spawn(crate::sensors::gps::ublox_gps_task(GpsRunner::new(
+                                        gps,
+                                    )))
+                                    .unwrap_or_else(|e| {
+                                        defmt::error!("Failed to spawn GPS task: {}", e)
+                                    });
+                            }
+                            Ok(Err(e)) => {
+                                GPS_HEALTH.lock(|c| c.set(GpsHealth::InitFailed(err_kind(&e))));
+                                defmt::warn!("GPS init failed: {}", e);
+                            }
+                            Err(_) => {
+                                GPS_HEALTH.lock(|c| c.set(GpsHealth::InitTimedOut));
+                                defmt::warn!("GPS init timed out (no module?)");
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    GPS_HEALTH.lock(|c| c.set(GpsHealth::UartInitFailed));
-                    defmt::error!("GPS USART3 init failed: {}", e);
+                    Err(e) => {
+                        GPS_HEALTH.lock(|c| c.set(GpsHealth::UartInitFailed));
+                        defmt::error!("GPS USART3 init failed: {}", e);
+                    }
                 }
             }
-        }
-        _ => {
-            GPS_HEALTH.lock(|c| c.set(GpsHealth::UartInitFailed));
-            defmt::warn!("GPS: PORT_GPS is not a supported GPS port on this board");
+            _ => {
+                GPS_HEALTH.lock(|c| c.set(GpsHealth::UartInitFailed));
+                defmt::warn!("GPS: PORT_GPS is not a supported GPS port on this board");
+            }
         }
     }
 

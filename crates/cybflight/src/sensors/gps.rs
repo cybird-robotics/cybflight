@@ -33,6 +33,10 @@ pub enum GpsErrKind {
 /// from any task without allocation.
 #[derive(Clone, Copy)]
 pub enum GpsHealth {
+    /// Build does not include `est_pos_gps`; the GPS task is not spawned
+    /// and no UART has been opened. Reported by `gpshealth` so a mocap-only
+    /// build doesn't look like the receiver is dead — it isn't there at all.
+    NotConfigured,
     /// Initial state — UART not yet opened, or init in progress.
     Initializing,
     /// `BufferedUart::new` failed (pin/peripheral conflict, bad config).
@@ -76,7 +80,7 @@ pub fn carr_soln_str(c: u8) -> &'static str {
 }
 
 pub static GPS_HEALTH: Mutex<CriticalSectionRawMutex, Cell<GpsHealth>> =
-    Mutex::new(Cell::new(GpsHealth::Initializing));
+    Mutex::new(Cell::new(GpsHealth::NotConfigured));
 
 /// Latest NAV-PVT snapshot, writeable from the GPS task and readable from
 /// any shell context. Held as `Option` so the shell can distinguish "no
@@ -107,6 +111,9 @@ fn err_kind_str(k: GpsErrKind) -> &'static str {
 impl core::fmt::Display for GpsHealth {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            GpsHealth::NotConfigured => {
+                write!(f, "GPS: not configured (build has no `est_pos_gps` feature)")
+            }
             GpsHealth::Initializing => write!(f, "GPS: initializing"),
             GpsHealth::UartInitFailed => write!(f, "GPS: UART init failed"),
             GpsHealth::InitTimedOut => write!(

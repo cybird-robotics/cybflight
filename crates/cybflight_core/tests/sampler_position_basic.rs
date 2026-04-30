@@ -37,12 +37,12 @@ fn default_params() -> PositionSamplerParams {
     PositionSamplerParams {
         axis_weights_sqrt: Vec3::new(1.0, 1.0, 1.0),
         search_dt: 0.01,
-        // Tight slack keeps the line-trajectory tests deterministic; the
-        // weighted distance changes by 0.01 per step so a 1e-5 tolerance
-        // does not let the search overshoot the predicted τ.
-        search_tol: 1e-5,
         max_search_steps: 500,
         radius_of_acceptance: 0.05,
+        // Time floor disabled by default in tests — drives the geometric
+        // search exclusively. `time_floor_unsticks_corner_overshoot`
+        // exercises the floor explicitly.
+        max_lag_s: f32::INFINITY,
     }
 }
 
@@ -371,4 +371,287 @@ fn forward_only_on_curve_revisit() {
         tau
     );
     assert!((tau - 1.5).abs() < 0.05, "τ {} not near 1.5", tau);
+}
+
+#[test]
+fn principled_search_finds_global_min_past_local_max() {
+    // 3-piece path where the closest-point distance to state=(0,0,0) is
+    // non-monotone in τ:
+    //   piece 0 (τ ∈ [0.0, 0.3]): x walks 1.0 → 0.5  (dist falls)
+    //   piece 1 (τ ∈ [0.3, 0.5]): x walks 0.5 → 0.6  (dist rises)
+    //   piece 2 (τ ∈ [0.5, 0.8]): x walks 0.6 → 0.0  (dist falls to 0)
+    //
+    // Local minima of dist² in τ:
+    //   τ = 0.3 (end of piece 0, dist = 0.5)
+    //   τ = 0.8 (end of piece 2, dist = 0)        ← global min
+    //
+    // The earlier break-on-rise heuristic stopped the moment piece 1's
+    // slight rise was detected, leaving τ ≈ 0.3 — which on a real flight
+    // would put the controller's setpoint 0.5 m behind the drone, i.e.
+    // commanding it to fly *back*. This test pins the principled
+    // forward-window minimizer: scan the whole window, take the smallest
+    // dist², so τ converges to the global min at 0.8 even after a
+    // transient rise.
+    let pieces = [
+        Polynomial::new(
+            1,
+            0.3,
+            &[Vec3::new(1.0, 0.0, 0.0), Vec3::new(-5.0 / 3.0, 0.0, 0.0)],
+        ),
+        Polynomial::new(
+            1,
+            0.2,
+            &[Vec3::new(0.5, 0.0, 0.0), Vec3::new(0.5, 0.0, 0.0)],
+        ),
+        Polynomial::new(
+            1,
+            0.3,
+            &[Vec3::new(0.6, 0.0, 0.0), Vec3::new(-2.0, 0.0, 0.0)],
+        ),
+    ];
+    let pp = PiecewisePolynomial::from_pieces(&pieces);
+    let total = pp.total_duration();
+
+    let mut s = PositionSampler::new(default_params());
+    let mut buf = vec![SamplerNode::default(); HORIZON_N1];
+    let inputs = SamplerInputs {
+        traj: &pp,
+        total_duration_s: total,
+        tau0_s: 0.0,
+        state_pos: Vec3::new(0.0, 0.0, 0.0),
+        horizon_dt: HORIZON_DT,
+    };
+    let r = s.sample(&inputs, &mut buf);
+    assert!(
+        (r.tau0_s - 0.8).abs() < 0.011,
+        "τ {} not at global min 0.8 — sampler stalled at the τ=0.3 local min",
+        r.tau0_s
+    );
+}
+
+#[test]
+fn time_floor_unsticks_corner_overshoot() {
+    // Trajectory with a sharp 90° corner: 1 m east, then 1 m north.
+    //   piece 0 (τ ∈ [0, 1]): p = (τ,   0,   0)
+    //   piece 1 (τ ∈ [1, 2]): p = (1,   τ−1, 0)
+    //
+    // Drone overshoots the corner: state at (1.1, 0, 0). The geometric
+    // closest point on the trajectory is exactly the corner (τ = 1.0):
+    // every τ > 1 has y > 0, which is *farther* from the drone (y = 0).
+    // Pure geometric minimization correctly identifies τ = 1.0 — and a
+    // controller tracking (1.0, 0, 0) would command the drone *backward*
+    // from (1.1, 0, 0) toward the corner.
+    //
+    // The principled escape is the time floor: `tau0_s` (wall-clock
+    // elapsed) advances independently of geometry; once the geometric
+    // search lags by more than `max_lag_s`, the floor pulls τ forward,
+    // and the controller's setpoint moves into piece 1 (north), so the
+    // drone turns instead of flying backward.
+    let pieces = [
+        Polynomial::new(
+            1,
+            1.0,
+            &[Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)],
+        ),
+        Polynomial::new(
+            1,
+            1.0,
+            &[Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)],
+        ),
+    ];
+    let pp = PiecewisePolynomial::from_pieces(&pieces);
+    let total = pp.total_duration();
+
+    let mut params = default_params();
+    params.max_lag_s = 0.3;
+    let mut s = PositionSampler::new(params);
+    let mut buf = vec![SamplerNode::default(); HORIZON_N1];
+
+    // Walk the sampler to the corner first using on-trajectory states
+    // (and tau0_s synchronised with the state's piece-0 progress) so τ
+    // converges to 1.0 before the overshoot tick.
+    for x in [0.0_f32, 0.5, 1.0] {
+        let inputs = SamplerInputs {
+            traj: &pp,
+            total_duration_s: total,
+            tau0_s: x,
+            state_pos: Vec3::new(x, 0.0, 0.0),
+            horizon_dt: HORIZON_DT,
+        };
+        s.sample(&inputs, &mut buf);
+    }
+    let tau_before = s.prev_query_tau().unwrap_or(0.0);
+    assert!(
+        (tau_before - 1.0).abs() < 0.02,
+        "setup: τ should be at the corner (1.0), got {}",
+        tau_before
+    );
+
+    // Overshoot tick: drone past the corner (x = 1.1) but still at y = 0.
+    // Real time has continued: tau0_s = 1.5 → floor = 1.5 − 0.3 = 1.2.
+    // Without the floor, geometric search would pin τ at 1.0 forever.
+    let r = s.sample(
+        &SamplerInputs {
+            traj: &pp,
+            total_duration_s: total,
+            tau0_s: 1.5,
+            state_pos: Vec3::new(1.1, 0.0, 0.0),
+            horizon_dt: HORIZON_DT,
+        },
+        &mut buf,
+    );
+    assert!(
+        r.tau0_s >= 1.2 - 0.02,
+        "time floor failed to unstick: τ = {} (expected ≥ 1.2)",
+        r.tau0_s
+    );
+    // Floor is one-sided — geometry doesn't pull τ past tau0_s.
+    assert!(
+        r.tau0_s <= 1.5 + 0.02,
+        "τ = {} ran past tau0_s = 1.5 — floor should not push past wall-clock time",
+        r.tau0_s
+    );
+}
+
+#[test]
+fn time_floor_disabled_when_max_lag_non_finite() {
+    // With `max_lag_s = INF` the floor expression `tau0_s − max_lag_s`
+    // is non-finite; the sampler must fall back to pure geometric
+    // minimization. Reproduces the corner-overshoot setup above and
+    // asserts τ stays pinned at the geometric minimum (the corner).
+    let pieces = [
+        Polynomial::new(
+            1,
+            1.0,
+            &[Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)],
+        ),
+        Polynomial::new(
+            1,
+            1.0,
+            &[Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)],
+        ),
+    ];
+    let pp = PiecewisePolynomial::from_pieces(&pieces);
+    let total = pp.total_duration();
+
+    // default_params() already disables the floor (max_lag_s = INF).
+    let mut s = PositionSampler::new(default_params());
+    let mut buf = vec![SamplerNode::default(); HORIZON_N1];
+    for x in [0.0_f32, 0.5, 1.0] {
+        s.sample(
+            &SamplerInputs {
+                traj: &pp,
+                total_duration_s: total,
+                tau0_s: x,
+                state_pos: Vec3::new(x, 0.0, 0.0),
+                horizon_dt: HORIZON_DT,
+            },
+            &mut buf,
+        );
+    }
+    let r = s.sample(
+        &SamplerInputs {
+            traj: &pp,
+            total_duration_s: total,
+            tau0_s: 1.5,
+            state_pos: Vec3::new(1.1, 0.0, 0.0),
+            horizon_dt: HORIZON_DT,
+        },
+        &mut buf,
+    );
+    assert!(
+        (r.tau0_s - 1.0).abs() < 0.02,
+        "with the floor disabled, τ should stay at the geometric corner (1.0); got {}",
+        r.tau0_s
+    );
+}
+
+#[test]
+fn radius_of_acceptance_does_not_fire_on_mid_flight_near_pass() {
+    // Out-and-back path A → B → A:
+    //   piece 0 (τ ∈ [0, 1]): p = (τ,         0, 0) — out
+    //   piece 1 (τ ∈ [1, 2]): p = (1 − (τ−1), 0, 0) — back
+    // Endpoint = (0, 0, 0); start = (0, 0, 0). The trajectory passes
+    // exactly through the endpoint at τ = 0 (start) and again at τ = 2
+    // (end). Mid-flight near-passes happen near both ends.
+    //
+    // Without a terminal-phase gate, the radius shortcut fires on the
+    // very first tick — drone at start, state inside the ball around
+    // the endpoint — and the mission never runs. With the gate
+    // (max_lag_s = 0.3), the shortcut is blocked outside the last
+    // 0.3 s of trajectory time.
+    let pieces = [
+        Polynomial::new(
+            1,
+            1.0,
+            &[Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)],
+        ),
+        Polynomial::new(
+            1,
+            1.0,
+            &[Vec3::new(1.0, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0)],
+        ),
+    ];
+    let pp = PiecewisePolynomial::from_pieces(&pieces);
+    let total = pp.total_duration();
+
+    let mut params = default_params();
+    params.radius_of_acceptance = 0.15;
+    params.max_lag_s = 0.3;
+    let mut s = PositionSampler::new(params);
+    let mut buf = vec![SamplerNode::default(); HORIZON_N1];
+
+    // Tick 0: drone at start (= endpoint). State exactly inside the
+    // ball. Without the gate, mission_done would fire immediately.
+    let r0 = s.sample(
+        &SamplerInputs {
+            traj: &pp,
+            total_duration_s: total,
+            tau0_s: 0.0,
+            state_pos: Vec3::new(0.0, 0.0, 0.0),
+            horizon_dt: HORIZON_DT,
+        },
+        &mut buf,
+    );
+    assert!(
+        !r0.mission_done,
+        "mission_done fired on tick 0 — the radius shortcut is not gated by terminal phase"
+    );
+
+    // Mid-mission: drone happens to be near (0,0,0) again — could be
+    // a real near-pass or just the start of the return leg. tau0_s is
+    // well below `end − max_lag_s = 1.7`, so the gate must keep the
+    // shortcut closed.
+    let r_mid = s.sample(
+        &SamplerInputs {
+            traj: &pp,
+            total_duration_s: total,
+            tau0_s: 0.5,
+            state_pos: Vec3::new(0.05, 0.0, 0.0),
+            horizon_dt: HORIZON_DT,
+        },
+        &mut buf,
+    );
+    assert!(
+        !r_mid.mission_done,
+        "mission_done fired mid-flight (τ < end − max_lag_s) on a state inside the terminal ball"
+    );
+
+    // Terminal phase: tau0_s = 1.95, time floor pulls τ_curr to
+    // ≥ end − max_lag_s = 1.7. State at (0.05, 0, 0) is well inside
+    // the ball. The gate opens and the shortcut fires.
+    let r_end = s.sample(
+        &SamplerInputs {
+            traj: &pp,
+            total_duration_s: total,
+            tau0_s: 1.95,
+            state_pos: Vec3::new(0.05, 0.0, 0.0),
+            horizon_dt: HORIZON_DT,
+        },
+        &mut buf,
+    );
+    assert!(
+        r_end.mission_done,
+        "mission_done failed to fire in terminal phase with state inside the ball — gate is too strict"
+    );
 }

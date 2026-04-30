@@ -17,10 +17,10 @@
 //!   MpcParams:          pos(12) + vel(12) + att(12) + rate(12) + thrust(4) + dt(4) + rho(4) = 60 bytes
 //!   PlannerParams:      max_vel_m_s(4) + max_tilt_rad(4) + weight_time(4) + weight_energy(4) + weight_pos(4) + weight_vel(4) + weight_tilt(4) + weight_body_rate(4) + weight_thrust(4) + smoothing_eps(4) + num_check_per_piece(4 as f32) = 44 bytes
 //!   BfgsTrustParams:    delta_init(4) + delta_max(4) + eta(4) + g_epsilon(4) + max_iterations(4 as f32) + past(4 as f32) + delta_conv(4) = 28 bytes
-//!   SamplerParams:      search_tol(4) + axis_weights_sqrt(12) + search_dt(4) + max_search_steps(4 as f32) + radius_of_acceptance(4) = 28 bytes
+//!   SamplerParams:      max_lag_s(4) + axis_weights_sqrt(12) + search_dt(4) + max_search_steps(4 as f32) + radius_of_acceptance(4) = 28 bytes
 //! ```
 //!
-//! Old flash images (version < 16) are rejected and the firmware falls
+//! Old flash images (version < 17) are rejected and the firmware falls
 //! through to defaults.
 
 use crate::mixer::{MotorParams, RigidBodyParams, SpinDir};
@@ -28,7 +28,7 @@ use crate::trajectory_planning::sampler::PositionSamplerParams;
 use crate::trajectory_planning::types::Vec3;
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 16;
+const VERSION: u32 = 17;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
 /// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 + 28 = 616 bytes
 const PAYLOAD_SIZE: usize = 616;
@@ -270,7 +270,7 @@ impl Default for LearnerParams {
 /// from scratch on reload.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SamplerParams {
-    pub search_tol: f32,
+    pub max_lag_s: f32,
     pub axis_weights_sqrt: [f32; 3],
     pub search_dt: f32,
     pub max_search_steps: u16,
@@ -284,7 +284,7 @@ impl Default for SamplerParams {
         // SamplerParams::default() against the projection of
         // PositionSamplerParams::defaults() — will fail loudly.
         Self {
-            search_tol: 1e-3,
+            max_lag_s: 0.3,
             axis_weights_sqrt: [1.0, 1.0, 1.0],
             search_dt: 0.01,
             max_search_steps: 100,
@@ -299,7 +299,6 @@ impl SamplerParams {
     /// `Sampler::Position` instance.
     pub fn to_position_sampler_params(&self) -> PositionSamplerParams {
         PositionSamplerParams {
-            search_tol: self.search_tol,
             axis_weights_sqrt: Vec3::new(
                 self.axis_weights_sqrt[0],
                 self.axis_weights_sqrt[1],
@@ -308,6 +307,7 @@ impl SamplerParams {
             search_dt: self.search_dt,
             max_search_steps: self.max_search_steps,
             radius_of_acceptance: self.radius_of_acceptance,
+            max_lag_s: self.max_lag_s,
         }
     }
 }
@@ -446,8 +446,11 @@ impl VehicleParams {
         off = put_f32(&mut buf, off, self.planner.bfgs_trust.max_iterations as f32);
         off = put_f32(&mut buf, off, self.planner.bfgs_trust.past as f32);
         off = put_f32(&mut buf, off, self.planner.bfgs_trust.delta_conv);
-        // SamplerParams (added in v14; time_weight slot repurposed as search_tol in v16)
-        off = put_f32(&mut buf, off, self.sampler.search_tol);
+        // SamplerParams (added in v14; time_weight slot repurposed as
+        // search_tol in v16, then as max_lag_s in v17 when the sampler
+        // moved from heuristic break-on-rise to forward-window minimization
+        // with a time floor — search_tol no longer exists).
+        off = put_f32(&mut buf, off, self.sampler.max_lag_s);
         for &v in &self.sampler.axis_weights_sqrt {
             off = put_f32(&mut buf, off, v);
         }
@@ -750,8 +753,9 @@ impl VehicleParams {
             },
         };
 
-        // SamplerParams (added in v14; time_weight slot repurposed as search_tol in v16)
-        let sampler_search_tol = get_f32(buf, off);
+        // SamplerParams (slot evolution: v14 time_weight → v16 search_tol →
+        // v17 max_lag_s, all f32 — same byte layout, only semantics change).
+        let sampler_max_lag_s = get_f32(buf, off);
         off += 4;
         let mut axis_weights_sqrt = [0.0f32; 3];
         for slot in &mut axis_weights_sqrt {
@@ -765,7 +769,7 @@ impl VehicleParams {
         let radius_of_acceptance = get_f32(buf, off);
         off += 4;
         let sampler = SamplerParams {
-            search_tol: sampler_search_tol,
+            max_lag_s: sampler_max_lag_s,
             axis_weights_sqrt,
             search_dt,
             max_search_steps,
@@ -1767,7 +1771,7 @@ mod tests {
         // to_bytes/from_bytes would fail the comparison.
         let mut params = test_params();
         params.sampler = SamplerParams {
-            search_tol: 2.5e-3,
+            max_lag_s: 0.42,
             axis_weights_sqrt: [1.5, 0.5, 0.25],
             search_dt: 0.02,
             max_search_steps: 250,
@@ -1784,7 +1788,6 @@ mod tests {
         // sampler-side PositionSamplerParams::defaults().
         let from_flash = SamplerParams::default().to_position_sampler_params();
         let from_sampler = crate::trajectory_planning::sampler::PositionSamplerParams::defaults();
-        assert_eq!(from_flash.search_tol, from_sampler.search_tol);
         assert_eq!(from_flash.axis_weights_sqrt, from_sampler.axis_weights_sqrt);
         assert_eq!(from_flash.search_dt, from_sampler.search_dt);
         assert_eq!(from_flash.max_search_steps, from_sampler.max_search_steps);
@@ -1792,6 +1795,7 @@ mod tests {
             from_flash.radius_of_acceptance,
             from_sampler.radius_of_acceptance
         );
+        assert_eq!(from_flash.max_lag_s, from_sampler.max_lag_s);
     }
 
     #[test]

@@ -42,59 +42,59 @@
     "peak_motor_saturation_pct": 20.898819
   },
   "mission_square/cascade": {
-    "rms_pos_err_m": 0.22971937,
-    "peak_pos_err_m": 0.41174048,
-    "terminal_pos_err_m": 0.08542232,
-    "peak_tilt_rad": 0.51325494,
-    "peak_motor_saturation_pct": 17.723682
+    "rms_pos_err_m": 0.22971357,
+    "peak_pos_err_m": 0.4117261,
+    "terminal_pos_err_m": 0.08542307,
+    "peak_tilt_rad": 0.5132367,
+    "peak_motor_saturation_pct": 17.723543
   },
   "mission_square/mpc_direct": {
-    "rms_pos_err_m": 0.005612627,
-    "peak_pos_err_m": 0.012365499,
-    "terminal_pos_err_m": 0.0015289175,
-    "peak_tilt_rad": 0.34491596,
-    "peak_motor_saturation_pct": 18.718676
+    "rms_pos_err_m": 0.0056127333,
+    "peak_pos_err_m": 0.012365252,
+    "terminal_pos_err_m": 0.0015291485,
+    "peak_tilt_rad": 0.34490713,
+    "peak_motor_saturation_pct": 18.718561
   },
   "mission_square/mpc_indi": {
-    "rms_pos_err_m": 0.028501753,
-    "peak_pos_err_m": 0.043710884,
-    "terminal_pos_err_m": 0.010566209,
-    "peak_tilt_rad": 0.3465557,
+    "rms_pos_err_m": 0.029225338,
+    "peak_pos_err_m": 0.04458165,
+    "terminal_pos_err_m": 0.011726617,
+    "peak_tilt_rad": 0.3464971,
     "peak_motor_saturation_pct": 18.401909
   },
   "mission_square_gps/mpc_indi": {
-    "rms_pos_err_m": 0.33682185,
-    "peak_pos_err_m": 0.63361865,
-    "terminal_pos_err_m": 0.20667973,
-    "peak_tilt_rad": 0.65720034,
-    "peak_motor_saturation_pct": 30.19352
+    "rms_pos_err_m": 0.33687672,
+    "peak_pos_err_m": 0.63367295,
+    "terminal_pos_err_m": 0.20658754,
+    "peak_tilt_rad": 0.6572183,
+    "peak_motor_saturation_pct": 30.186653
   },
   "mission_square_noisy/mpc_indi": {
-    "rms_pos_err_m": 0.028538158,
-    "peak_pos_err_m": 0.046684366,
-    "terminal_pos_err_m": 0.007451629,
-    "peak_tilt_rad": 0.34898204,
-    "peak_motor_saturation_pct": 18.473816
+    "rms_pos_err_m": 0.028470859,
+    "peak_pos_err_m": 0.046499074,
+    "terminal_pos_err_m": 0.007117262,
+    "peak_tilt_rad": 0.349936,
+    "peak_motor_saturation_pct": 18.473625
   },
   "p2p_x3/cascade": {
-    "rms_pos_err_m": 0.16777739,
-    "peak_pos_err_m": 0.36790502,
-    "terminal_pos_err_m": 0.0898129,
-    "peak_tilt_rad": 0.4366269,
-    "peak_motor_saturation_pct": 17.106522
+    "rms_pos_err_m": 0.16772956,
+    "peak_pos_err_m": 0.3677746,
+    "terminal_pos_err_m": 0.08979386,
+    "peak_tilt_rad": 0.4364879,
+    "peak_motor_saturation_pct": 17.105675
   },
   "p2p_x3/mpc_direct": {
-    "rms_pos_err_m": 0.005150165,
-    "peak_pos_err_m": 0.012247852,
-    "terminal_pos_err_m": 0.0016035326,
-    "peak_tilt_rad": 0.26733568,
-    "peak_motor_saturation_pct": 18.02782
+    "rms_pos_err_m": 0.0051470986,
+    "peak_pos_err_m": 0.012241359,
+    "terminal_pos_err_m": 0.001604012,
+    "peak_tilt_rad": 0.26726842,
+    "peak_motor_saturation_pct": 18.02716
   },
   "p2p_x3/mpc_indi": {
-    "rms_pos_err_m": 0.01938413,
-    "peak_pos_err_m": 0.036968406,
-    "terminal_pos_err_m": 0.010747127,
-    "peak_tilt_rad": 0.25888464,
-    "peak_motor_saturation_pct": 17.857933
+    "rms_pos_err_m": 0.019291509,
+    "peak_pos_err_m": 0.03710277,
+    "terminal_pos_err_m": 0.010464684,
+    "peak_tilt_rad": 0.25887555,
+    "peak_motor_saturation_pct": 17.85736
   }
 }

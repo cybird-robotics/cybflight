@@ -182,6 +182,46 @@ const LAND_RATE_M_PER_S: f32 = 0.4;
 #[cfg(any(feature = "outer_geometric", feature = "outer_mpc"))]
 const MAX_FRAME_DT_S: f32 = 0.1;
 
+/// Indoor (mocap) safety envelope: `|target.xy| ≤ XY_ENVELOPE_M` and
+/// `0 ≤ target.z ≤ Z_CEILING_M` in the world (ENU) frame. Sized for the
+/// lab arena. Only compiled in `est_pos_mocap` builds; outdoor (`est_pos_gps`)
+/// flight defines its envelope through waypoint planning, not a fixed box.
+#[cfg(all(
+    feature = "est_pos_mocap",
+    any(feature = "outer_geometric", feature = "outer_mpc")
+))]
+const XY_ENVELOPE_M: f32 = 3.0;
+#[cfg(all(
+    feature = "est_pos_mocap",
+    any(feature = "outer_geometric", feature = "outer_mpc")
+))]
+const Z_CEILING_M: f32 = 1.8;
+
+/// Clamp `pos` to the indoor envelope. No-op for non-mocap builds.
+///
+/// Defense-in-depth against stick drift, mocap glitches that survive the
+/// estimator's rejection gate, or a drone that was physically moved before
+/// re-arm. Without this, an Idle-state stick drift integrates without bound
+/// and can push the setpoint outside the mocap volume → loss of pose
+/// updates → estimator open-loop on IMU → crash.
+#[cfg(all(
+    feature = "est_pos_mocap",
+    any(feature = "outer_geometric", feature = "outer_mpc")
+))]
+#[inline]
+fn clamp_indoor_envelope(pos: &mut nalgebra::Vector3<f32>) {
+    pos.x = pos.x.clamp(-XY_ENVELOPE_M, XY_ENVELOPE_M);
+    pos.y = pos.y.clamp(-XY_ENVELOPE_M, XY_ENVELOPE_M);
+    pos.z = pos.z.clamp(0.0, Z_CEILING_M);
+}
+
+#[cfg(all(
+    not(feature = "est_pos_mocap"),
+    any(feature = "outer_geometric", feature = "outer_mpc")
+))]
+#[inline]
+fn clamp_indoor_envelope(_pos: &mut nalgebra::Vector3<f32>) {}
+
 /// Apply a symmetric dead-band to a centered ±1 stick reading and rescale
 /// so the output still saturates at ±1 at full stick deflection.
 ///
@@ -238,8 +278,12 @@ pub async fn rc_interpreter_task() {
     }
     let origin = loop {
         let odom = odom_sub.next_message_pure().await;
-        let p = odom.pose.position;
+        let mut p = odom.pose.position;
         if p.x.is_finite() && p.y.is_finite() && p.z.is_finite() {
+            // Indoor builds: clamp to the lab envelope so the initial
+            // setpoint is in-bounds even if the drone was placed near the
+            // arena edge. No-op outdoors.
+            clamp_indoor_envelope(&mut p);
             break p;
         }
         defmt::warn!("rc_interpreter: discarding non-finite odometry during origin capture");
@@ -262,11 +306,13 @@ pub async fn rc_interpreter_task() {
     //
     // Every Idle-state RC frame becomes a read-modify-write on
     // `ACTIVE_POSITION_SETPOINT`: read the current setpoint, add the
-    // stick Δ for this frame, clamp to the envelope, write back. The
-    // write happens **every** tick (not just on motion exceeding a
-    // threshold) so the cell's `timestamp` field is a real liveness
-    // proof for downstream consumers — centered sticks produce zero Δ
-    // after deadband, making the write idempotent apart from the stamp.
+    // stick Δ for this frame, indoor-clamp to the lab envelope, write
+    // back. The write happens **every** tick (not just on motion
+    // exceeding a threshold) so the cell's `timestamp` field is a real
+    // liveness proof for downstream consumers — centered sticks produce
+    // zero Δ after deadband, making the write idempotent apart from the
+    // stamp. The envelope clamp is a no-op on outdoor (`est_pos_gps`)
+    // builds.
     let mut last_frame_time = Instant::now();
     let mut was_armed = false;
     let mut origin = origin;
@@ -333,7 +379,9 @@ pub async fn rc_interpreter_task() {
         //
         // After a disarm→arm cycle the drone may have been physically
         // moved. Reset the position setpoint to the current pose so the
-        // outer loop doesn't snap to the stale pre-disarm target.
+        // outer loop doesn't snap to the stale pre-disarm target. On
+        // indoor builds the captured origin is also clamped to the lab
+        // envelope so the first setpoint is always in-bounds.
         let armed = crate::motors::IS_ARMED.load(core::sync::atomic::Ordering::Acquire);
         if armed && !was_armed {
             // Drain to latest valid odometry for the new origin.
@@ -344,7 +392,8 @@ pub async fn rc_interpreter_task() {
                     new_origin = Some(p);
                 }
             }
-            if let Some(pos) = new_origin {
+            if let Some(mut pos) = new_origin {
+                clamp_indoor_envelope(&mut pos);
                 origin = pos;
                 super::ACTIVE_POSITION_SETPOINT.lock(|cell| {
                     cell.set(Some(super::ActiveSetpoint {
@@ -498,10 +547,11 @@ pub async fn rc_interpreter_task() {
 
         // ── Stick integration (Idle, pilot in control) ────────────────
         //
-        // Read current setpoint → apply stick Δ → envelope-clamp → write
-        // back, all under one mutex acquisition. Deadbanded sticks → zero
-        // Δ → idempotent write apart from the timestamp refresh (which
-        // is the liveness proof consumers rely on).
+        // Read current setpoint → apply stick Δ → indoor envelope-clamp
+        // → write back, all under one mutex acquisition. Deadbanded
+        // sticks → zero Δ → idempotent write apart from the timestamp
+        // refresh (which is the liveness proof consumers rely on). The
+        // envelope clamp is a no-op on outdoor builds.
         //
         // `normalize` returns ±1 for centered channels and [0,1] for
         // throttle. Conventional stick convention:
@@ -544,6 +594,11 @@ pub async fn rc_interpreter_task() {
             } else {
                 pos.z += sz * Z_RATE_M_PER_S * dt;
             }
+
+            // Indoor builds: clamp the integrated setpoint into the lab
+            // envelope so a sustained stick deflection cannot drift the
+            // target outside the mocap volume. No-op outdoors.
+            clamp_indoor_envelope(&mut pos);
 
             cell.set(Some(super::ActiveSetpoint {
                 timestamp: now,

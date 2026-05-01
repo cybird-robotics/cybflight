@@ -155,6 +155,11 @@ pub async fn estimation_task() {
             pos_inflated_total: 0,
             att_inflated_total: 0,
             jump_total: 0,
+            // Mocap path has no GNSS — fields stay at zero; consumers
+            // should interpret carr_soln=0 here as "not applicable".
+            carr_soln: 0,
+            num_sv: 0,
+            h_acc_mm: 0,
         })
     });
 
@@ -278,6 +283,9 @@ pub async fn estimation_task() {
                             pos_inflated_total,
                             att_inflated_total,
                             jump_total,
+                            carr_soln: 0,
+                            num_sv: 0,
+                            h_acc_mm: 0,
                         }
                     } else {
                         EstimatorPhase::Converging {
@@ -293,6 +301,9 @@ pub async fn estimation_task() {
                             pos_inflated_total,
                             att_inflated_total,
                             jump_total,
+                            carr_soln: 0,
+                            num_sv: 0,
+                            h_acc_mm: 0,
                         }
                     };
                     ESTIMATOR_STATUS.lock(|c| c.set(phase));

@@ -55,13 +55,40 @@ const GPS_MIN_SV: u8 = 6;
 /// without letting obvious garbage through.
 const GPS_H_ACC_MAX_MM: u32 = 50_000;
 
-/// Measurement σ floors so the filter cannot run with unrealistic
-/// confidence when u-blox reports a < cm accuracy (which happens on a
-/// stationary receiver with good geometry but doesn't reflect real
-/// in-flight error).
-const GPS_POS_SIGMA_FLOOR_M: f32 = 0.05;
+/// Position σ floor at carr_soln=2 (RTK fixed) [m]. u-blox can report
+/// sub-cm accuracy on a stationary receiver with good geometry; the
+/// floor prevents the filter from running with unrealistic confidence
+/// in flight where multipath / ionospheric residuals dominate.
+const GPS_POS_SIGMA_FLOOR_FIX_M: f32 = 0.05;
+
+/// Position σ floor at carr_soln=1 (RTK float) [m]. Float-RTK biases
+/// are dm-scale, an order of magnitude looser than fixed; the floor
+/// must follow or the gate over-weights biased measurements.
+const GPS_POS_SIGMA_FLOOR_FLOAT_M: f32 = 0.30;
+
+/// Position σ floor at carr_soln=0 (stand-alone) [m]. Sub-meter is
+/// optimistic for a stand-alone u-blox in flight; this floor keeps
+/// the filter from snapping to a m-scale-biased fix as if it were
+/// truth, while still letting healthy degraded fixes pull the estimate
+/// gently toward the GPS-frame solution.
+const GPS_POS_SIGMA_FLOOR_NONE_M: f32 = 2.0;
+
 #[allow(dead_code)] // Reserved for when update_vel is wired up.
 const GPS_VEL_SIGMA_FLOOR_M_S: f32 = 0.10;
+
+/// Carrier-solution loss debounce. A single bad PVT (transient
+/// reflection / SV geometry blip) shouldn't drop ESTIMATOR_READY; we
+/// require carr_soln<2 to persist this long before declaring RTK lost.
+/// Sized to be comfortably longer than a single NAV-PVT period (100–200
+/// ms) but shorter than the GPS_STALE failsafe.
+const RTK_LOSS_DEBOUNCE: Duration = Duration::from_millis(1000);
+
+/// Carrier-solution acquisition debounce. After RTK loss, require
+/// sustained carr_soln=2 for this long before re-arming. Catches the
+/// fix-flicker pattern where a marginal geometry oscillates between
+/// float and fixed every few frames — we don't want to bounce
+/// ESTIMATOR_READY in lockstep.
+const RTK_FIX_DEBOUNCE: Duration = Duration::from_millis(2000);
 
 /// Consecutive rejected GPS frames before declaring the estimator
 /// untrusted. NAV-PVT arrives at 5–10 Hz, so 5 frames ≈ 0.5–1 s of
@@ -84,9 +111,28 @@ const MAX_CONSECUTIVE_JUMPS: u32 = 2;
 /// frames before declaring loss.
 const GPS_STALE: Duration = Duration::from_millis(2000);
 
-/// Gyro-bias covariance trace threshold for convergence.
-/// Initial trace = 3 × 0.01 = 0.03; this requires roughly a 10× reduction.
-const GYRO_BIAS_COV_TRACE_THRESH: f32 = 0.003;
+/// Gyro-bias x+y covariance threshold for convergence. Sums only the two
+/// observable axes — yaw bias is unobservable in a GPS-only build (no
+/// attitude or course-of-motion update wired in), so its variance never
+/// decreases and the 3-axis trace would never cross a sensible threshold.
+/// Initial 2-axis sum = 2 × 0.01 = 0.02; this requires ~10× reduction.
+const GYRO_BIAS_COV_TRACE_XY_THRESH: f32 = 0.002;
+
+/// Position-jump gate threshold [m] for the GPS path. Looser than the
+/// `EskfConfig` default (1 m, sized for mocap) because at 5–10 Hz NAV-PVT
+/// the legitimate inter-frame residual at 10 m/s flight speed is ~1 m by
+/// itself; a 1 m gate would hard-reject healthy fast-flight measurements.
+/// 3 m still catches RTK carrier-ambiguity loss / multipath wraparound,
+/// which jump tens of metres.
+const GPS_MAX_POS_JUMP_M: f32 = 3.0;
+
+/// Initial yaw covariance [rad²]. GPS-only init has no yaw measurement,
+/// so the orientation diagonal must reflect the genuine ignorance about
+/// heading. ~π² ≈ 10 covers the full ±π wrap; the filter relies on
+/// gravity-aided tilt for roll/pitch (those stay at 0.1) and waits for a
+/// future yaw observable (course-of-motion / mag) before claiming
+/// convergence on the heading channel.
+const INIT_YAW_COV: f32 = 10.0;
 
 fn imu_is_valid(accel: &Vector3<f32>, gyro: &Vector3<f32>) -> bool {
     accel.iter().all(|v| v.is_finite()) && gyro.iter().all(|v| v.is_finite())
@@ -107,6 +153,19 @@ fn pvt_is_usable(pvt: &GpsNavPvt) -> bool {
 /// offset into every subsequent setpoint.
 fn pvt_is_origin_anchor(pvt: &GpsNavPvt) -> bool {
     pvt_is_usable(pvt) && pvt.carr_soln >= 2
+}
+
+/// σ floor for a position update, scaled by carrier-solution quality.
+/// At fix the floor is cm-scale; at float and stand-alone it widens by
+/// an order of magnitude each, so the filter doesn't over-weight a
+/// known-biased measurement just because u-blox's internal h_acc number
+/// is small.
+fn pos_sigma_floor(pvt: &GpsNavPvt) -> f32 {
+    match pvt.carr_soln {
+        2 => GPS_POS_SIGMA_FLOOR_FIX_M,
+        1 => GPS_POS_SIGMA_FLOOR_FLOAT_M,
+        _ => GPS_POS_SIGMA_FLOOR_NONE_M,
+    }
 }
 
 fn pvt_enu(pvt: &GpsNavPvt, origin: &LlhOrigin) -> (Vector3<f32>, Vector3<f32>) {
@@ -166,12 +225,20 @@ pub async fn estimation_task() {
     };
 
     // --- Initialise ESKF at origin, identity orientation, zero biases ---
-    let mut eskf = Eskf::new(EskfConfig::default());
-    eskf.init(
+    // EskfConfig defaults are mocap-tuned; widen the position jump gate so
+    // healthy GPS frames at 10 m/s × 100 ms aren't hard-rejected, and seed
+    // the orientation covariance with high yaw uncertainty since GPS gives
+    // us no heading measurement.
+    let mut eskf = Eskf::new(EskfConfig {
+        max_pos_jump_m: GPS_MAX_POS_JUMP_M,
+        ..EskfConfig::default()
+    });
+    eskf.init_with_cov(
         Vector3::zeros(),
         UnitQuaternion::identity(),
         Vector3::zeros(),
         Vector3::zeros(),
+        Vector3::new(0.1, 0.1, INIT_YAW_COV),
     );
 
     let state_fields = |eskf: &Eskf| {
@@ -192,6 +259,12 @@ pub async fn estimation_task() {
         )
     };
 
+    // The origin-anchor PVT was carr_soln=2 by definition (`pvt_is_origin_anchor`).
+    // Track it as the last-known RTK quality state.
+    let mut last_carr_soln: u8 = 2;
+    let mut last_num_sv: u8 = 0;
+    let mut last_h_acc_mm: u32 = 0;
+
     ESTIMATOR_STATUS.lock(|c| {
         let (roll_deg, pitch_deg, yaw_deg, pos, vel, gyro_bias, accel_bias) = state_fields(&eskf);
         c.set(EstimatorPhase::Converging {
@@ -207,6 +280,9 @@ pub async fn estimation_task() {
             pos_inflated_total: 0,
             att_inflated_total: 0,
             jump_total: 0,
+            carr_soln: last_carr_soln,
+            num_sv: last_num_sv,
+            h_acc_mm: last_h_acc_mm,
         })
     });
 
@@ -223,6 +299,15 @@ pub async fn estimation_task() {
     let mut pos_reject_total: u32 = 0;
     let mut pos_inflated_total: u32 = 0;
     let mut jump_total: u32 = 0;
+
+    // RTK quality gate state. We just anchored on a carr_soln=2 frame,
+    // but require RTK_FIX_DEBOUNCE of sustained good fixes before flipping
+    // `rtk_quality_ok` to true — the anchor PVT on its own isn't proof of
+    // a stable carrier solution. Until then, ESTIMATOR_READY stays low
+    // even if `converged` flips early.
+    let mut rtk_quality_ok = false;
+    let mut rtk_fix_streak: Option<Instant> = Some(Instant::now());
+    let mut rtk_loss_streak: Option<Instant> = None;
 
     loop {
         match select(imu_sub.next_message(), gps_signal.wait()).await {
@@ -290,17 +375,24 @@ pub async fn estimation_task() {
                     let (roll_deg, pitch_deg, yaw_deg, pos, vel, gyro_bias, accel_bias) =
                         state_fields(&eskf);
 
-                    if !converged && eskf.gyro_bias_cov_trace() < GYRO_BIAS_COV_TRACE_THRESH {
+                    if !converged
+                        && eskf.gyro_bias_cov_trace_xy() < GYRO_BIAS_COV_TRACE_XY_THRESH
+                    {
                         converged = true;
-                        ESTIMATOR_READY.store(true, Ordering::Release);
                         defmt::info!(
-                            "ESKF converged: gyro_bias=[{},{},{}] trace={}",
+                            "ESKF converged: gyro_bias=[{},{},{}] trace_xy={}",
                             gyro_bias[0],
                             gyro_bias[1],
                             gyro_bias[2],
-                            eskf.gyro_bias_cov_trace(),
+                            eskf.gyro_bias_cov_trace_xy(),
                         );
                     }
+                    // ESTIMATOR_READY = converged AND rtk_quality_ok. The
+                    // RTK gate is updated in the GPS branch; here we just
+                    // re-publish the AND every odom tick so the flag tracks
+                    // whichever side flipped most recently.
+                    ESTIMATOR_READY
+                        .store(converged && rtk_quality_ok, Ordering::Release);
 
                     // GPS path has no attitude update, so att_*_total stay 0.
                     let phase = if converged {
@@ -317,6 +409,9 @@ pub async fn estimation_task() {
                             pos_inflated_total,
                             att_inflated_total: 0,
                             jump_total,
+                            carr_soln: last_carr_soln,
+                            num_sv: last_num_sv,
+                            h_acc_mm: last_h_acc_mm,
                         }
                     } else {
                         EstimatorPhase::Converging {
@@ -332,6 +427,9 @@ pub async fn estimation_task() {
                             pos_inflated_total,
                             att_inflated_total: 0,
                             jump_total,
+                            carr_soln: last_carr_soln,
+                            num_sv: last_num_sv,
+                            h_acc_mm: last_h_acc_mm,
                         }
                     };
                     ESTIMATOR_STATUS.lock(|c| c.set(phase));
@@ -368,13 +466,51 @@ pub async fn estimation_task() {
                     continue;
                 }
 
+                // Snapshot RTK-quality fields for telemetry (always reflects
+                // the most recent usable PVT — including degraded fixes, so
+                // operators can see the system *is* tracking even if it has
+                // dropped out of RTK).
+                last_carr_soln = pvt.carr_soln;
+                last_num_sv = pvt.num_sv;
+                last_h_acc_mm = pvt.h_acc_mm;
+
+                // RTK-quality streak tracking. Incoming PVT either extends
+                // the current streak or starts the opposite one. The
+                // debounced quality flag is checked further down so the
+                // ESTIMATOR_READY transition has a single re-evaluation
+                // point this iteration.
+                if pvt.carr_soln >= 2 {
+                    rtk_loss_streak = None;
+                    if rtk_fix_streak.is_none() {
+                        rtk_fix_streak = Some(Instant::now());
+                    }
+                } else {
+                    rtk_fix_streak = None;
+                    if rtk_loss_streak.is_none() {
+                        rtk_loss_streak = Some(Instant::now());
+                    }
+                }
+
+                let (enu_pos, _enu_vel) = pvt_enu(&pvt, &origin);
+
                 if !eskf.is_initialized() {
-                    defmt::error!("ESKF: re-initializing at origin after NaN reset");
-                    eskf.init(
-                        Vector3::zeros(),
+                    // Mid-flight NaN re-init: seed at the *current* GPS-derived
+                    // ENU position, not at origin. The LLH origin was anchored
+                    // at boot — re-anchoring at origin here would teleport the
+                    // estimate back to launch site and the controller would
+                    // fly the vehicle home through a wall.
+                    defmt::error!(
+                        "ESKF: re-initializing at current GPS pos [{},{},{}] after NaN reset",
+                        enu_pos.x,
+                        enu_pos.y,
+                        enu_pos.z,
+                    );
+                    eskf.init_with_cov(
+                        enu_pos,
                         UnitQuaternion::identity(),
                         Vector3::zeros(),
                         Vector3::zeros(),
+                        Vector3::new(0.1, 0.1, INIT_YAW_COV),
                     );
                     converged = false;
                     consecutive_rejects = 0;
@@ -385,15 +521,13 @@ pub async fn estimation_task() {
                     continue;
                 }
 
-                let (enu_pos, _enu_vel) = pvt_enu(&pvt, &origin);
-
-                // Derive σ from u-blox's reported accuracy with a floor:
-                // a stationary receiver under good geometry can report
-                // sub-cm accuracy that doesn't reflect real in-flight
-                // error, so the floor prevents the filter from running
-                // with unrealistic confidence.
-                let sigma_pos =
-                    (pvt.h_acc_mm.max(pvt.v_acc_mm) as f32 * 1e-3).max(GPS_POS_SIGMA_FLOOR_M);
+                // Derive σ from u-blox's reported accuracy with a
+                // carr_soln-scaled floor. The floor widens by ~10× per
+                // step down (fix → float → stand-alone) so a degraded
+                // fix doesn't get the cm-scale weighting that only
+                // RTK-fixed deserves.
+                let sigma_pos = (pvt.h_acc_mm.max(pvt.v_acc_mm) as f32 * 1e-3)
+                    .max(pos_sigma_floor(&pvt));
 
                 let pos_outcome = eskf.update_pos_sparse(enu_pos, sigma_pos);
 
@@ -469,7 +603,39 @@ pub async fn estimation_task() {
                     defmt::error!("ESKF: non-finite state after GPS update — awaiting re-init");
                     converged = false;
                     consecutive_rejects = 0;
+                    consecutive_jumps = 0;
                     ESTIMATOR_READY.store(false, Ordering::Release);
+                }
+
+                // Evaluate the debounced RTK quality gate now that the
+                // streak timestamps are up to date. Two-direction transition:
+                //   ok=false → ok=true on RTK_FIX_DEBOUNCE of carr_soln>=2.
+                //   ok=true  → ok=false on RTK_LOSS_DEBOUNCE of carr_soln<2.
+                // ESTIMATOR_READY is the AND of `converged` and `rtk_quality_ok`,
+                // so flipping either is enough to drop the flag; flipping both
+                // back is required to re-arm.
+                let now = Instant::now();
+                if rtk_quality_ok {
+                    if let Some(t) = rtk_loss_streak
+                        && now.duration_since(t) > RTK_LOSS_DEBOUNCE
+                    {
+                        rtk_quality_ok = false;
+                        ESTIMATOR_READY.store(false, Ordering::Release);
+                        defmt::warn!(
+                            "ESKF: RTK quality lost (carr_soln={}) — arming blocked",
+                            pvt.carr_soln,
+                        );
+                    }
+                } else if let Some(t) = rtk_fix_streak
+                    && now.duration_since(t) > RTK_FIX_DEBOUNCE
+                {
+                    rtk_quality_ok = true;
+                    ESTIMATOR_READY
+                        .store(converged && rtk_quality_ok, Ordering::Release);
+                    defmt::info!(
+                        "ESKF: RTK quality re-acquired (sustained carr_soln=2 for {}ms)",
+                        RTK_FIX_DEBOUNCE.as_millis(),
+                    );
                 }
             }
         }

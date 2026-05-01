@@ -38,6 +38,14 @@ pub enum EstimatorPhase {
         att_inflated_total: u32,
         /// Total absolute-jump rejections (Vicon flips / re-associations).
         jump_total: u32,
+        /// u-blox carrier solution from the most recent GPS PVT
+        /// (0 = none, 1 = float-RTK, 2 = fixed-RTK). 0 on the mocap
+        /// path — interpret "carr_soln=0" as "not applicable" there.
+        carr_soln: u8,
+        /// Satellites used in the most recent fix. 0 on mocap.
+        num_sv: u8,
+        /// Reported horizontal accuracy estimate [mm]. 0 on mocap.
+        h_acc_mm: u32,
     },
     /// Filter converged — arming is permitted.
     Running {
@@ -54,6 +62,14 @@ pub enum EstimatorPhase {
         att_inflated_total: u32,
         /// Total absolute-jump rejections (Vicon flips / re-associations).
         jump_total: u32,
+        /// u-blox carrier solution from the most recent GPS PVT
+        /// (0 = none, 1 = float-RTK, 2 = fixed-RTK). 0 on the mocap
+        /// path — interpret "carr_soln=0" as "not applicable" there.
+        carr_soln: u8,
+        /// Satellites used in the most recent fix. 0 on mocap.
+        num_sv: u8,
+        /// Reported horizontal accuracy estimate [mm]. 0 on mocap.
+        h_acc_mm: u32,
     },
 }
 

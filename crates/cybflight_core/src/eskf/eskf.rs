@@ -50,25 +50,6 @@ impl UpdateOutcome {
 /// cm-scale latency residuals through.
 const INFLATION_CAP: f32 = 100.0;
 
-/// Absolute position-innovation threshold [m]. Independent of filter
-/// covariance. Catches Vicon rigid-body re-association (frame swap to a
-/// different body in the volume) which can produce meter-scale jumps
-/// the Mahalanobis gate would soft-accept under inflation.
-///
-/// Sized for worst-case flight × worst-case latency: 10 m/s × 100 ms = 1.0 m.
-/// Real flight residuals at typical envelope are cm-scale, so this gate
-/// is comfortably above legitimate measurements and far below frame swaps.
-const MAX_POS_JUMP_M: f32 = 1.0;
-
-/// Absolute attitude-innovation threshold [rad]. Independent of filter
-/// covariance. Catches Vicon orientation flips (~180°) and rigid-body
-/// re-associations.
-///
-/// 30° is 3× the worst plausible inter-frame attitude change at 1000°/s
-/// gyro rate × 10 ms mocap period (=10°), and far below the smallest
-/// dangerous flip (90° axis swap, 180° quaternion flip).
-const MAX_ATT_JUMP_RAD: f32 = 0.7;
-
 /// ESKF noise / measurement configuration.
 pub struct EskfConfig {
     /// Accelerometer noise density [m/s²/√Hz].
@@ -86,6 +67,23 @@ pub struct EskfConfig {
     /// Outlier gate threshold in sigma units (per dimension).
     /// Measurement is rejected if zᵀ S⁻¹ z / dof > gate_sigma².
     pub gate_sigma: f32,
+    /// Absolute position-innovation threshold [m]. Independent of filter
+    /// covariance. Catches measurement-source faults (Vicon rigid-body
+    /// re-association, RTK carrier-ambiguity loss, multipath wraparound)
+    /// that the Mahalanobis gate would soft-accept under R-inflation.
+    ///
+    /// Default 1.0 m sized for mocap: worst-case flight × worst-case latency
+    /// = 10 m/s × 100 ms. GPS at 5–10 Hz needs a looser value (~3 m) so the
+    /// inter-frame residual at speed isn't hard-rejected.
+    pub max_pos_jump_m: f32,
+    /// Absolute attitude-innovation threshold [rad]. Independent of filter
+    /// covariance. Catches Vicon orientation flips (~180°) and rigid-body
+    /// re-associations.
+    ///
+    /// Default 0.7 rad (~40°) is 3× the worst plausible inter-frame attitude
+    /// change at 1000°/s × 10 ms mocap period, well below the smallest
+    /// dangerous flip (90° axis swap, 180° quaternion flip).
+    pub max_att_jump_rad: f32,
 }
 
 impl Default for EskfConfig {
@@ -98,6 +96,8 @@ impl Default for EskfConfig {
             baro_noise_std: 0.5,
             mag_noise_std: 0.05,
             gate_sigma: 10.0,
+            max_pos_jump_m: 1.0,
+            max_att_jump_rad: 0.7,
         }
     }
 }
@@ -160,12 +160,38 @@ impl Eskf {
     }
 
     /// Initialise filter with a known pose and sensor biases; resets covariance.
+    /// Orientation diagonal is set to 0.1 on all three axes — appropriate when
+    /// every axis is observable from the bootstrap measurement (e.g. mocap pose).
+    /// For exteroceptive sources that don't observe all axes (GPS-only has no
+    /// yaw measurement), use `init_with_cov` to set per-axis values.
     pub fn init(
         &mut self,
         position: Vector3<f32>,
         orientation: UnitQuaternion<f32>,
         gyro_bias: Vector3<f32>,
         accel_bias: Vector3<f32>,
+    ) {
+        self.init_with_cov(
+            position,
+            orientation,
+            gyro_bias,
+            accel_bias,
+            Vector3::new(0.1, 0.1, 0.1),
+        );
+    }
+
+    /// Initialise with an explicit per-axis orientation covariance diagonal.
+    /// Use this when one or more orientation axes is unobservable from the
+    /// bootstrap measurement: the corresponding diagonal entry should be set
+    /// large (e.g. ~10 = ~π² for a fully unknown yaw) so the filter doesn't
+    /// claim convergence on a state it has no evidence about.
+    pub fn init_with_cov(
+        &mut self,
+        position: Vector3<f32>,
+        orientation: UnitQuaternion<f32>,
+        gyro_bias: Vector3<f32>,
+        accel_bias: Vector3<f32>,
+        orientation_cov_diag: Vector3<f32>,
     ) {
         self.state = NominalState {
             position,
@@ -176,7 +202,9 @@ impl Eskf {
         };
         let mut cov = SMatrix::<f32, 15, 15>::zeros();
         cov.fixed_view_mut::<3, 3>(0, 0).fill_diagonal(1.0); // position
-        cov.fixed_view_mut::<3, 3>(3, 3).fill_diagonal(0.1); // orientation
+        cov[(3, 3)] = orientation_cov_diag.x;
+        cov[(4, 4)] = orientation_cov_diag.y;
+        cov[(5, 5)] = orientation_cov_diag.z;
         cov.fixed_view_mut::<3, 3>(6, 6).fill_diagonal(1.0); // velocity
         cov.fixed_view_mut::<3, 3>(9, 9).fill_diagonal(0.01); // accel bias
         cov.fixed_view_mut::<3, 3>(12, 12).fill_diagonal(0.01); // gyro bias
@@ -490,7 +518,7 @@ impl Eskf {
 
         // Position residual + jump gate.
         let z_pos = pos - self.state.position;
-        if z_pos.norm() > MAX_POS_JUMP_M {
+        if z_pos.norm() > self.config.max_pos_jump_m {
             return UpdateOutcome::JumpRejected;
         }
 
@@ -504,7 +532,7 @@ impl Eskf {
         };
         let q_err = self.state.orientation.inverse() * q;
         let z_att = q_err.scaled_axis();
-        if z_att.norm() > MAX_ATT_JUMP_RAD {
+        if z_att.norm() > self.config.max_att_jump_rad {
             return UpdateOutcome::JumpRejected;
         }
 
@@ -597,7 +625,7 @@ impl Eskf {
         }
 
         let z_pos = pos - self.state.position;
-        if z_pos.norm() > MAX_POS_JUMP_M {
+        if z_pos.norm() > self.config.max_pos_jump_m {
             return UpdateOutcome::JumpRejected;
         }
 
@@ -608,7 +636,7 @@ impl Eskf {
         };
         let q_err = self.state.orientation.inverse() * q;
         let z_att = q_err.scaled_axis();
-        if z_att.norm() > MAX_ATT_JUMP_RAD {
+        if z_att.norm() > self.config.max_att_jump_rad {
             return UpdateOutcome::JumpRejected;
         }
 
@@ -686,7 +714,7 @@ impl Eskf {
         let z = pos - self.state.position;
         // Absolute jump gate — runs before the Mahalanobis/inflation logic
         // so a frame-swap can't be soft-accepted via R inflation.
-        if z.norm() > MAX_POS_JUMP_M {
+        if z.norm() > self.config.max_pos_jump_m {
             return UpdateOutcome::JumpRejected;
         }
         let mut h = SMatrix::<f32, 3, 15>::zeros();
@@ -760,7 +788,7 @@ impl Eskf {
         // Absolute jump gate — runs before the Mahalanobis/inflation logic
         // so a frame-swap can't be soft-accepted via R inflation. Mirrors
         // the dense update_pos.
-        if z.norm() > MAX_POS_JUMP_M {
+        if z.norm() > self.config.max_pos_jump_m {
             return UpdateOutcome::JumpRejected;
         }
 
@@ -895,7 +923,7 @@ impl Eskf {
         // (~180°) which the Mahalanobis gate soft-accepts under inflation.
         // Must run before any inflation logic so the threshold is independent
         // of filter overconfidence.
-        if z.norm() > MAX_ATT_JUMP_RAD {
+        if z.norm() > self.config.max_att_jump_rad {
             return UpdateOutcome::JumpRejected;
         }
         let mut h = SMatrix::<f32, 3, 15>::zeros();
@@ -1062,6 +1090,16 @@ impl Eskf {
     /// Sum of the three diagonal gyro-bias covariance entries (indices 12–14).
     pub fn gyro_bias_cov_trace(&self) -> f32 {
         self.cov[(12, 12)] + self.cov[(13, 13)] + self.cov[(14, 14)]
+    }
+
+    /// Sum of the x and y gyro-bias covariance entries (indices 12, 13).
+    /// Use this for convergence checks when yaw is unobservable from the
+    /// available measurements (e.g. GPS-only with no magnetometer or
+    /// course-over-ground update): the z-axis bias variance never decreases
+    /// and would otherwise prevent `gyro_bias_cov_trace` from ever crossing
+    /// the threshold.
+    pub fn gyro_bias_cov_trace_xy(&self) -> f32 {
+        self.cov[(12, 12)] + self.cov[(13, 13)]
     }
 
     pub fn is_initialized(&self) -> bool {

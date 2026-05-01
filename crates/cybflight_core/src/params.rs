@@ -72,6 +72,12 @@ impl Default for MpcParams {
     }
 }
 
+impl MpcParams {
+    pub fn set_thrust_weight(&mut self, thrust_weight: f32) {
+        self.thrust_weight = thrust_weight;
+    }
+}
+
 /// BFGS trust-region parameters.
 #[derive(Clone, Debug)]
 pub struct BfgsTrustParams {
@@ -222,6 +228,16 @@ impl Default for IndiControllerParams {
             wls_wu: [1.0, 1.0, 1.0, 1.0],
             motor_pole_count: 14,
         }
+    }
+}
+
+impl IndiControllerParams {
+    pub fn set_rate_gains(&mut self, rate_gains: [f32; 3]) {
+        self.rate_gains = rate_gains;
+    }
+
+    pub fn set_sync_filter_hz(&mut self, sync_filter_hz: f32) {
+        self.sync_filter_hz = sync_filter_hz;
     }
 }
 

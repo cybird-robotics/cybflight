@@ -108,6 +108,14 @@ fn build_scenario(name: &str) -> Scenario {
             // trajectory snapshot-stable. 5 Hz, σ=0.5 m / σ=0.2 m/s
             // roughly matches open-sky u-blox M10 with SBAS aiding.
             .with_gps(Box::new(NoisyGps::isotropic(0xDEADBEEF, 5.0, 0.5, 0.2)));
+            // Mirror `crates/cybflight/src/vehicle.rs::default_params()`
+            // under `est_pos_gps` — see the comment block there for the
+            // rationale. Keep these three fields in sync with the
+            // firmware so the snapshot validates the same configuration
+            // the firmware actually flies.
+            s.vehicle_params.indi_controller.set_rate_gains([20.0, 20.0, 20.0]);
+            s.vehicle_params.indi_controller.set_sync_filter_hz(5.0);
+            s.vehicle_params.mpc.set_thrust_weight(6.0);
             // Same looser pass_criteria as the autotest — but the
             // snapshot test itself doesn't gate on verdict, so these
             // only matter for the occasional sim-run inspection.

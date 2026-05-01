@@ -78,6 +78,10 @@ pub fn default_params() -> cybflight_core::params::VehicleParams {
         mpc: cybflight_core::params::MpcParams::default(),
         planner: cybflight_core::params::PlannerParams::default(),
         sampler: cybflight_core::params::SamplerParams::default(),
+        #[cfg(feature = "outer_mpc")]
+        mission_profile: crate::control::offline_mission::DEFAULT_PROFILE_INDEX,
+        #[cfg(not(feature = "outer_mpc"))]
+        mission_profile: 0,
     }
 }
 

@@ -46,6 +46,23 @@ impl BandedSystem {
         self.data[..used].fill(0.0);
     }
 
+    /// Reconfigure the active matrix dimension in place. The inline
+    /// storage is already sized to `MAX_STORAGE`, so resizing only
+    /// updates `self.n` (which determines the index stride and the
+    /// `reset()` clear range). Subsequent reads of pre-existing entries
+    /// are invalidated — callers must re-populate via `set()` before
+    /// next use, which `MincoSnap::solve()` does unconditionally.
+    #[inline]
+    pub fn set_dimension(&mut self, n: usize) {
+        debug_assert!(
+            n * (self.lower_bw + self.upper_bw + 1) <= MAX_STORAGE,
+            "BandedSystem::set_dimension: required storage {} exceeds MAX_STORAGE {}",
+            n * (self.lower_bw + self.upper_bw + 1),
+            MAX_STORAGE
+        );
+        self.n = n;
+    }
+
     #[inline(always)]
     fn idx(&self, i: usize, j: usize) -> usize {
         ((i + self.upper_bw) - j) * self.n + j

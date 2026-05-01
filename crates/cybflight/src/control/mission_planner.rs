@@ -68,9 +68,7 @@ use cybflight_core::trajectory_planning::types::{Vec3, ZERO3};
 
 use crate::msgs;
 
-use super::offline_mission::{
-    OFFLINE_NUM_PIECES, OFFLINE_START_POS, OFFLINE_TIMESTAMPS, OFFLINE_WAYPOINTS,
-};
+use super::offline_mission::{self, OFFLINE_MAX_PIECES};
 use super::{
     read_active_setpoint, MissionState, MissionTrajectory, MISSION_ABORT_REQUESTED, MISSION_STATE,
     MISSION_STATUS, MISSION_TRAJECTORY_SLOT, PLAN_REQUEST,
@@ -107,6 +105,13 @@ const OFFLINE_USE_YAML_START: bool = false;
 // works against the published crate; once a release containing the
 // new constant lands, drop this and switch to `msgs::SOLVE_REJECT_INVALID_TIMES`.
 const SOLVE_REJECT_INVALID_TIMES: u8 = 8;
+
+// Local reject reason for the offline-path "active profile fails the
+// length / bound invariants" guard (waypoint count != timestamp count,
+// zero-length, or > OFFLINE_MAX_PIECES). Same temporary-shim story as
+// SOLVE_REJECT_INVALID_TIMES — fold into `msgs` once the next msgs
+// release lands.
+const SOLVE_REJECT_PROFILE_INVALID: u8 = 9;
 
 /// BFGS scratch memory (~35 KB). BSS-resident; init-once on first plan.
 /// Only consumed by the online planner (`plan_online`); allocation is
@@ -545,17 +550,49 @@ fn plan_offline(
     start_position: nalgebra::Vector3<f32>,
     minco: &mut MincoSnap,
 ) -> PlanOutcome {
+    // Pull the active profile and verify its shape before any indexing.
+    // A profile with mismatched waypoint/timestamp lengths, zero entries,
+    // or more than `OFFLINE_MAX_PIECES` would crash on slice access or
+    // overflow the stack-sized scratch arrays — reject up front so the
+    // mission never enters the planning stage. Per-profile compile-time
+    // const_assert!s catch the same conditions for in-tree data; this
+    // guard backstops any future runtime-loaded source.
+    let profile = offline_mission::active();
+    let n = profile.waypoints.len();
+    if n == 0 || n != profile.timestamps.len() || n > OFFLINE_MAX_PIECES {
+        defmt::warn!(
+            "mission_planner: profile '{}' invalid (wp={}, ts={}, max={}) — request dropped",
+            profile.name,
+            n,
+            profile.timestamps.len(),
+            OFFLINE_MAX_PIECES,
+        );
+        return PlanOutcome::Reject {
+            dur: 0.0,
+            solve: msgs::SolveDiagnostics {
+                status: 0,
+                iterations: 0,
+                solve_time_ms: 0,
+                num_pieces: n.min(u8::MAX as usize) as u8,
+                init_duration_s: 0.0,
+                final_cost: 0.0,
+                peak_vel_m_s: 0.0,
+                reject_reason: SOLVE_REJECT_PROFILE_INVALID,
+            },
+        };
+    }
+
     // Recover per-segment durations from the absolute timestamp
-    // schedule. `dur[0] = TIMESTAMPS[0]` (segment running from t=0);
+    // schedule. `dur[0] = timestamps[0]` (segment running from t=0);
     // subsequent durations are consecutive differences. Reject on
     // non-monotonic / non-positive / non-finite — the offline
     // generator should never emit such a schedule, but if the YAML
     // were ever hand-edited we don't want NaN to propagate through
     // MINCO.
-    let mut durations = [0.0f32; OFFLINE_NUM_PIECES];
+    let mut durations = [0.0f32; OFFLINE_MAX_PIECES];
     let mut prev_t = 0.0f32;
-    for i in 0..OFFLINE_NUM_PIECES {
-        let ts = OFFLINE_TIMESTAMPS[i];
+    for i in 0..n {
+        let ts = profile.timestamps[i];
         let d = ts - prev_t;
         if !d.is_finite() || d <= 0.0 {
             defmt::warn!(
@@ -569,8 +606,8 @@ fn plan_offline(
                     status: 0,
                     iterations: 0,
                     solve_time_ms: 0,
-                    num_pieces: OFFLINE_NUM_PIECES as u8,
-                    init_duration_s: OFFLINE_TIMESTAMPS[OFFLINE_NUM_PIECES - 1],
+                    num_pieces: n as u8,
+                    init_duration_s: profile.timestamps[n - 1],
                     final_cost: 0.0,
                     peak_vel_m_s: 0.0,
                     reject_reason: SOLVE_REJECT_INVALID_TIMES,
@@ -580,27 +617,26 @@ fn plan_offline(
         durations[i] = d;
         prev_t = ts;
     }
-    let init_duration_s = OFFLINE_TIMESTAMPS[OFFLINE_NUM_PIECES - 1];
+    let init_duration_s = profile.timestamps[n - 1];
 
     // Head pose: live setpoint by default, YAML start if the flag
     // says so. The trajectory's first segment duration is unchanged
     // either way.
     let head_pos: Vec3 = if OFFLINE_USE_YAML_START {
-        Vec3::from(OFFLINE_START_POS)
+        Vec3::from(profile.start_pos)
     } else {
         start_position
     };
 
-    // MINCO-snap contract: for `n = OFFLINE_NUM_PIECES` pieces, the
-    // solver needs `n−1` intermediate waypoints and a tail boundary.
-    // The YAML provides `n` waypoints; `wp[0..n−1]` are the
-    // intermediates and `wp[n−1]` is the tail.
-    const N_INTERMEDIATE: usize = OFFLINE_NUM_PIECES - 1;
-    let mut intermediate = [ZERO3; N_INTERMEDIATE];
-    for i in 0..N_INTERMEDIATE {
-        intermediate[i] = Vec3::from(OFFLINE_WAYPOINTS[i]);
+    // MINCO-snap contract: for `n` pieces, the solver needs `n−1`
+    // intermediate waypoints and a tail boundary. The schedule
+    // provides `n` waypoints; `wp[0..n−1]` are the intermediates and
+    // `wp[n−1]` is the tail.
+    let mut intermediate = [ZERO3; OFFLINE_MAX_PIECES - 1];
+    for i in 0..n - 1 {
+        intermediate[i] = Vec3::from(profile.waypoints[i]);
     }
-    let tail_pos = Vec3::from(OFFLINE_WAYPOINTS[OFFLINE_NUM_PIECES - 1]);
+    let tail_pos = Vec3::from(profile.waypoints[n - 1]);
 
     // PVAJ boundaries: zero v, a, j at both head and tail (the drone
     // is hovering when the mission triggers, and the offline schedule
@@ -609,17 +645,19 @@ fn plan_offline(
     let tail: [Vec3; 4] = [tail_pos, ZERO3, ZERO3, ZERO3];
 
     defmt::info!(
-        "mission_planner: offline solve (head=[{},{},{}], n={}, total={}s)",
+        "mission_planner: offline solve (profile={}, head=[{},{},{}], n={}, total={}s)",
+        profile.name,
         head_pos.x,
         head_pos.y,
         head_pos.z,
-        OFFLINE_NUM_PIECES,
+        n,
         init_duration_s
     );
 
     let t0 = Instant::now();
+    minco.set_piece_count(n);
     minco.set_boundary(&head, &tail);
-    minco.solve(&intermediate, &durations);
+    minco.solve(&intermediate[..n - 1], &durations[..n]);
     let trajectory = minco.get_trajectory();
     let final_cost = minco.get_energy();
     let elapsed_ms = Instant::now().duration_since(t0).as_millis();
@@ -638,7 +676,7 @@ fn plan_offline(
         status: SolverStatus::Convergence as u8,
         iterations: 0,
         solve_time_ms: elapsed_ms.min(u16::MAX as u64) as u16,
-        num_pieces: OFFLINE_NUM_PIECES as u8,
+        num_pieces: n as u8,
         init_duration_s,
         final_cost,
         peak_vel_m_s: peak,
@@ -674,13 +712,14 @@ fn plan_offline(
 #[embassy_executor::task]
 pub async fn mission_planner_task() {
     let workspace: &mut BfgsWorkspace = WORKSPACE.init(BfgsWorkspace::new());
-    // Pre-allocate the offline MINCO-snap solver with the YAML's piece
-    // count. Boundary states (PVAJ) are placeholders; `plan_offline`
-    // rewrites them via `set_boundary` on every request.
+    // Pre-allocate the offline MINCO-snap solver at the registry-wide
+    // upper bound. The active profile may need fewer pieces; `plan_offline`
+    // rebinds the active extent in place via `set_piece_count` on every
+    // request, and `set_boundary` rewrites the placeholder PVAJ.
     let offline_minco: &mut MincoSnap = OFFLINE_MINCO.init(MincoSnap::new(
         &[ZERO3, ZERO3, ZERO3, ZERO3],
         &[ZERO3, ZERO3, ZERO3, ZERO3],
-        OFFLINE_NUM_PIECES,
+        OFFLINE_MAX_PIECES,
     ));
     let mission_status_pub = MISSION_STATUS.immediate_publisher();
     // Build the planner config from the *live* vehicle params (mass,

@@ -1,13 +1,13 @@
 //! Persistent vehicle parameter container with manual serialization.
 //!
-//! On-flash layout (little-endian, 608 bytes, aligned to 32-byte flash words):
+//! On-flash layout (little-endian, 640 bytes, aligned to 32-byte flash words):
 //!
 //! ```text
 //! [0x00]  magic:   u32 = 0x43594250 ("CYBP")
-//! [0x04]  version: u32 = 8
-//! [0x08]  length:  u32 = PAYLOAD_SIZE (588)
+//! [0x04]  version: u32 = 18
+//! [0x08]  length:  u32 = PAYLOAD_SIZE (620)
 //! [0x0C]  crc32:   u32 (over payload only)
-//! [0x10]  payload: 588 bytes
+//! [0x10]  payload: 620 bytes
 //!   Body:               mass(4) + inertia(36) + max_rate(12) = 52 bytes
 //!   Motors (x4):        px(4) + py(4) + spin_dir(4) + max_thrust(4) + torque_coeff(4) = 80 bytes
 //!   ControlGains:       pos_kp(12) + pos_kd(12) + att_k_rate(12) = 36 bytes
@@ -18,9 +18,10 @@
 //!   PlannerParams:      max_vel_m_s(4) + max_tilt_rad(4) + weight_time(4) + weight_energy(4) + weight_pos(4) + weight_vel(4) + weight_tilt(4) + weight_body_rate(4) + weight_thrust(4) + smoothing_eps(4) + num_check_per_piece(4 as f32) = 44 bytes
 //!   BfgsTrustParams:    delta_init(4) + delta_max(4) + eta(4) + g_epsilon(4) + max_iterations(4 as f32) + past(4 as f32) + delta_conv(4) = 28 bytes
 //!   SamplerParams:      max_lag_s(4) + axis_weights_sqrt(12) + search_dt(4) + max_search_steps(4 as f32) + radius_of_acceptance(4) = 28 bytes
+//!   Mission:            profile_index(4 as f32) = 4 bytes
 //! ```
 //!
-//! Old flash images (version < 17) are rejected and the firmware falls
+//! Old flash images (version < 18) are rejected and the firmware falls
 //! through to defaults.
 
 use crate::mixer::{MotorParams, RigidBodyParams, SpinDir};
@@ -28,11 +29,11 @@ use crate::trajectory_planning::sampler::PositionSamplerParams;
 use crate::trajectory_planning::types::Vec3;
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 17;
+const VERSION: u32 = 18;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
-/// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 + 28 = 616 bytes
-const PAYLOAD_SIZE: usize = 616;
-/// Padded to 32-byte flash word boundary: ceil((16+616)/32)*32 = 640
+/// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 + 28 + 4 = 620 bytes
+const PAYLOAD_SIZE: usize = 620;
+/// Padded to 32-byte flash word boundary: ceil((16+620)/32)*32 = 640
 pub const PADDED_SIZE: usize = 640;
 
 /// MPC tuning parameters: cost weights, discretization, and constraint penalty.
@@ -340,6 +341,13 @@ pub struct VehicleParams {
     pub mpc: MpcParams,
     pub planner: PlannerParams,
     pub sampler: SamplerParams,
+    /// Index into `cybflight::control::offline_mission::PROFILES` selecting
+    /// which prebaked offline trajectory to fly. Persisted in flash so the
+    /// choice survives reboots; mirrored into `offline_mission::ACTIVE_PROFILE`
+    /// at boot. The shell verb `mission set <env> <variant> <speed>`
+    /// resolves a name triple to an index and writes both this field and
+    /// the live atomic.
+    pub mission_profile: u8,
 }
 
 impl VehicleParams {
@@ -473,6 +481,9 @@ impl VehicleParams {
         off = put_f32(&mut buf, off, self.sampler.search_dt);
         off = put_f32(&mut buf, off, self.sampler.max_search_steps as f32);
         off = put_f32(&mut buf, off, self.sampler.radius_of_acceptance);
+        // Mission profile index (added in v18). Stored as f32 to match the
+        // existing all-f32 payload encoding; truncated back to u8 on read.
+        off = put_f32(&mut buf, off, self.mission_profile as f32);
         debug_assert_eq!(off - HEADER_SIZE, PAYLOAD_SIZE);
 
         // Header
@@ -792,7 +803,16 @@ impl VehicleParams {
             radius_of_acceptance,
         };
 
-        let _ = off; // suppress unused warning
+        // Mission profile index (added in v18). Out-of-range values are
+        // resolved at use site (`offline_mission::init_active_from_index`),
+        // so `from_bytes` only does the byte-level read here.
+        let mission_profile = get_f32(buf, off) as u8;
+        off += 4;
+
+        // Symmetry with `to_bytes`: catch schema-edit bugs where a field
+        // is added to one side and not the other. Debug-only — release
+        // builds rely on the magic+version+CRC check above.
+        debug_assert_eq!(off - HEADER_SIZE, PAYLOAD_SIZE);
 
         Some(VehicleParams {
             body,
@@ -804,6 +824,7 @@ impl VehicleParams {
             mpc,
             planner,
             sampler,
+            mission_profile,
         })
     }
 
@@ -1728,6 +1749,7 @@ mod tests {
             mpc: MpcParams::default(),
             planner: PlannerParams::default(),
             sampler: SamplerParams::default(),
+            mission_profile: 3,
         }
     }
 
@@ -1743,6 +1765,23 @@ mod tests {
             assert_eq!(a.spin_dir, b.spin_dir);
             assert_eq!(a.max_thrust_n, b.max_thrust_n);
             assert_eq!(a.torque_coeff_m, b.torque_coeff_m);
+        }
+    }
+
+    #[test]
+    fn round_trip_mission_profile() {
+        // Sweep across the u8 range — including 0, the test fixture's
+        // value (3), and 255 — to confirm the f32-encoded byte survives
+        // the to_bytes/from_bytes loop without truncation or rounding.
+        for &expected in &[0u8, 1, 3, 8, 127, 254, 255] {
+            let mut params = test_params();
+            params.mission_profile = expected;
+            let bytes = params.to_bytes();
+            let restored = VehicleParams::from_bytes(&bytes).expect("from_bytes failed");
+            assert_eq!(
+                restored.mission_profile, expected,
+                "mission_profile round-trip mismatch for {expected}",
+            );
         }
     }
 

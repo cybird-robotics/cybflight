@@ -176,6 +176,8 @@ fn test_vehicle_params() -> VehicleParams {
         learner: LearnerParams::default(),
         mpc: MpcParams::default(),
         planner: PlannerParams::default(),
+        sampler: cybflight_core::params::SamplerParams::default(),
+        mission_profile: 0,
     }
 }
 

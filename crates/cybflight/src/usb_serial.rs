@@ -62,6 +62,9 @@ const HELP_TEXT: &[u8] = b"\
   param set <name> <v> set a parameter (in-memory)\r\n\
   param save           write params to flash\r\n\
   param defaults       reset to compile-time defaults\r\n\
+  mission list                            list available offline trajectories\r\n\
+  mission get                             show the active trajectory\r\n\
+  mission set <env> <variant> <speed>     select a trajectory (in-memory; 'param save' to persist)\r\n\
   reboot               software reset\r\n\
   reboot --dfu         reset into USB DFU bootloader\r\n\
   help                 show this message\r\n\
@@ -905,6 +908,10 @@ async fn dispatch<'d>(
         line if line.starts_with("param") => {
             dispatch_param(class, line).await?;
         }
+        #[cfg(feature = "outer_mpc")]
+        line if line.starts_with("mission") => {
+            dispatch_mission(class, line).await?;
+        }
         _ => {
             write_all(class, b"unknown command (try 'help')\r\n").await?;
         }
@@ -1022,11 +1029,121 @@ async fn dispatch_param<'d>(
             }
         },
         "defaults" => {
-            crate::params::set(crate::vehicle::default_params());
+            let defaults = crate::vehicle::default_params();
+            // Mirror the default mission_profile into the live atomic so
+            // a `mission get` after `param defaults` sees the reset, not
+            // the previous selection. (Without this, the atomic only
+            // resyncs on the next reboot via `init_from_flash`.)
+            #[cfg(feature = "outer_mpc")]
+            crate::control::offline_mission::init_active_from_index(defaults.mission_profile);
+            crate::params::set(defaults);
             write_all(class, b"params reset to defaults (not saved)\r\n").await?;
         }
         _ => {
             write_all(class, b"usage: param list|get|set|save|defaults\r\n").await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "outer_mpc")]
+async fn dispatch_mission<'d>(
+    class: &mut CdcAcmClass<'d, UsbDriver<'d>>,
+    line: &str,
+) -> Result<(), EndpointError> {
+    use crate::control::offline_mission;
+
+    let mut parts = line.split_ascii_whitespace();
+    parts.next(); // skip "mission"
+    let sub = parts.next().unwrap_or("");
+
+    match sub {
+        "list" => {
+            for (i, p) in offline_mission::PROFILES.iter().enumerate() {
+                let active = i as u8 == offline_mission::active_index();
+                let mut buf = [0u8; 96];
+                let mut w = WriteBuf::new(&mut buf);
+                write!(
+                    w,
+                    "  {} {}: {} ({} {} {})\r\n",
+                    if active { '*' } else { ' ' },
+                    i,
+                    p.name,
+                    p.env,
+                    p.variant,
+                    p.speed,
+                )
+                .ok();
+                write_all(class, w.as_slice()).await?;
+            }
+        }
+        "get" => {
+            let p = offline_mission::active();
+            let mut buf = [0u8; 96];
+            let mut w = WriteBuf::new(&mut buf);
+            write!(
+                w,
+                "{} (idx={}, n={})\r\n",
+                p.name,
+                offline_mission::active_index(),
+                p.num_pieces(),
+            )
+            .ok();
+            write_all(class, w.as_slice()).await?;
+        }
+        "set" => {
+            // Refuse while armed: changing the trajectory mid-flight (or even
+            // mid-arming) would cause the next mission trigger to load a
+            // different schedule than the operator vetted on the ground.
+            if crate::motors::IS_ARMED.load(Ordering::Acquire) {
+                write_all(class, b"refused: disarm before changing mission\r\n").await?;
+                return Ok(());
+            }
+            let env = parts.next();
+            let variant = parts.next();
+            let speed = parts.next();
+            let (env, variant, speed) = match (env, variant, speed) {
+                (Some(a), Some(b), Some(c)) => (a, b, c),
+                _ => {
+                    return write_all(
+                        class,
+                        b"usage: mission set <env> <variant> <speed>\r\n",
+                    )
+                    .await;
+                }
+            };
+            match offline_mission::find(env, variant, speed) {
+                Some(idx) => {
+                    offline_mission::set_active(idx);
+                    let mut params = crate::params::get();
+                    params.mission_profile = idx;
+                    crate::params::set(params);
+                    let p = offline_mission::active();
+                    let mut buf = [0u8; 128];
+                    let mut w = WriteBuf::new(&mut buf);
+                    write!(
+                        w,
+                        "mission = {} (idx={}) — run 'param save' to persist\r\n",
+                        p.name, idx,
+                    )
+                    .ok();
+                    write_all(class, w.as_slice()).await?;
+                }
+                None => {
+                    write_all(
+                        class,
+                        b"unknown mission (try 'mission list')\r\n",
+                    )
+                    .await?;
+                }
+            }
+        }
+        _ => {
+            write_all(
+                class,
+                b"usage: mission list|get|set <env> <variant> <speed>\r\n",
+            )
+            .await?;
         }
     }
     Ok(())

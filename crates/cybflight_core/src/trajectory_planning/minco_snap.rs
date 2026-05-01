@@ -93,6 +93,23 @@ impl MincoSnap {
         self.tail_pvaj = *tail_state;
     }
 
+    /// Reconfigure the active piece count in place. All inline buffers
+    /// are sized to [`MAX_PIECES`] regardless, so this only updates the
+    /// active extent and the underlying banded system's dimension.
+    /// `solve()` must be called before any subsequent read; this leaves
+    /// the buffers in an unspecified state.
+    pub fn set_piece_count(&mut self, piece_num: usize) {
+        debug_assert!(piece_num >= 1 && piece_num <= MAX_PIECES);
+        self.n = piece_num;
+        self.banded.set_dimension(8 * piece_num);
+    }
+
+    /// Currently configured piece count.
+    #[inline]
+    pub fn piece_count(&self) -> usize {
+        self.n
+    }
+
     /// Set waypoints + time allocation and solve for coefficients.
     ///
     /// `waypoints` contains the n−1 intermediate position targets in

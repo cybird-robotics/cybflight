@@ -65,6 +65,9 @@ impl VehicleParamsBuilder {
             mpc: MpcParams::default(),
             planner: PlannerParams::default(),
             sampler: SamplerParams::default(),
+            // Sim doesn't exercise the offline-mission registry; the field
+            // exists only to satisfy the firmware's flash schema.
+            mission_profile: 0,
         }
     }
 }

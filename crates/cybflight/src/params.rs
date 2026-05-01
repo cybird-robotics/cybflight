@@ -60,11 +60,22 @@ pub fn init_from_flash(flash_peri: hal::Peri<'static, hal::peripherals::FLASH>) 
     };
 
     let flash = hal::flash::Flash::new_blocking(flash_peri);
+    let mission_profile_idx = params.mission_profile;
     critical_section::with(|cs| {
         VEHICLE_PARAMS.borrow_ref_mut(cs).replace(params);
         FLASH_PERI.borrow_ref_mut(cs).replace(flash);
     });
     PARAM_VERSION.fetch_add(1, core::sync::atomic::Ordering::Release);
+
+    // Mirror the persisted offline-mission profile index into the
+    // `offline_mission::ACTIVE_PROFILE` atomic so the planner sees the
+    // user's last selection from the very first PLAN_REQUEST. Out-of-range
+    // values (e.g., flash from a firmware build that knew of more profiles)
+    // fall back to the default inside `init_active_from_index`.
+    #[cfg(feature = "outer_mpc")]
+    crate::control::offline_mission::init_active_from_index(mission_profile_idx);
+    #[cfg(not(feature = "outer_mpc"))]
+    let _ = mission_profile_idx;
 }
 
 /// Get a copy of the current vehicle parameters.

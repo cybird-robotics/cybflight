@@ -312,7 +312,7 @@ fn step_sparse(eskf: &mut Eskf, op: &Op) -> Option<UpdateOutcome> {
             pos_std,
             att_std,
         } => Some(eskf.update_pose_sparse(pos, q, pos_std, att_std)),
-        Op::UpdatePos { pos, std } => Some(eskf.update_pos(pos, std)),
+        Op::UpdatePos { pos, std } => Some(eskf.update_pos_sparse(pos, std)),
         Op::UpdateAtt { q, std } => Some(eskf.update_att(q, std)),
         Op::UpdateVel { vel, std } => Some(eskf.update_vel(vel, std)),
         Op::UpdateAltitude { alt } => Some(eskf.update_altitude(alt)),

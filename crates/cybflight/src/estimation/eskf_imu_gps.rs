@@ -395,7 +395,7 @@ pub async fn estimation_task() {
                 let sigma_pos =
                     (pvt.h_acc_mm.max(pvt.v_acc_mm) as f32 * 1e-3).max(GPS_POS_SIGMA_FLOOR_M);
 
-                let pos_outcome = eskf.update_pos(enu_pos, sigma_pos);
+                let pos_outcome = eskf.update_pos_sparse(enu_pos, sigma_pos);
 
                 match pos_outcome {
                     UpdateOutcome::Accepted { inflated: true } => {

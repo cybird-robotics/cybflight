@@ -734,6 +734,104 @@ impl Eskf {
         UpdateOutcome::Accepted { inflated }
     }
 
+    /// Block-sparse equivalent of `update_pos`.
+    ///
+    /// H is sparse: a single 3×3 identity block at columns (0..3) of the
+    /// 15-state. Exploiting this lets us avoid materializing `K·H` and
+    /// `(I − KH)` as full 15×15 matrices, replacing two 15·15·15 matmuls
+    /// with structurally smaller 15×3·3×15 matmuls.
+    ///
+    /// Specifically:
+    ///   - `H·P` is the first 3 rows of P (no matmul).
+    ///   - `P·Hᵀ` is the first 3 columns of P (no matmul).
+    ///   - `H·P·Hᵀ` is the upper-left 3×3 of P (no matmul).
+    ///   - Joseph form `(I−KH)·P·(I−KH)ᵀ` = `P − K·(HP) − (PHᵀ)·Kᵀ + K·(HPHᵀ)·Kᵀ`,
+    ///     which equals `B − B·Hᵀ·Kᵀ + K·R·Kᵀ` where `B = P − K·HP`.
+    ///
+    /// Mirrors `update_pose_sparse`'s shape with the attitude block
+    /// removed; the 6-DoF z and innovation gating shrink to 3-DoF.
+    /// Result is equivalent to `update_pos` to within float32 round-off.
+    pub fn update_pos_sparse(&mut self, pos: Vector3<f32>, pos_std: f32) -> UpdateOutcome {
+        if !self.initialized {
+            return UpdateOutcome::NotInitialized;
+        }
+
+        let z = pos - self.state.position;
+        // Absolute jump gate — runs before the Mahalanobis/inflation logic
+        // so a frame-swap can't be soft-accepted via R inflation. Mirrors
+        // the dense update_pos.
+        if z.norm() > MAX_POS_JUMP_M {
+            return UpdateOutcome::JumpRejected;
+        }
+
+        // HPHᵀ is the upper-left 3×3 of P (since H selects the pos block).
+        // No matmul needed.
+        let hph_t: Matrix3<f32> = self.cov.fixed_view::<3, 3>(0, 0).clone_owned();
+
+        let pv = pos_std * pos_std;
+        let r = Matrix3::identity() * pv;
+
+        let s_mat = hph_t + r;
+        let Some(s_inv) = s_mat.try_inverse() else {
+            self.initialized = false;
+            return UpdateOutcome::InverseFailed;
+        };
+
+        // Mahalanobis² normalised by 3 DoF, evaluated on the un-inflated
+        // S so the gate decision matches the dense update_pos exactly.
+        let gamma = z.dot(&(s_inv * z)) / 3.0;
+        let gate_sq = self.config.gate_sigma * self.config.gate_sigma;
+        let (r_eff, s_inv_eff, inflated) = if gamma > gate_sq {
+            let inflate = gamma / gate_sq;
+            if inflate > INFLATION_CAP {
+                return UpdateOutcome::InflationCapExceeded;
+            }
+            let r_eff = r * inflate;
+            let s_eff = hph_t + r_eff;
+            let Some(s_inv_eff) = s_eff.try_inverse() else {
+                self.initialized = false;
+                return UpdateOutcome::InverseFailed;
+            };
+            (r_eff, s_inv_eff, true)
+        } else {
+            (r, s_inv, false)
+        };
+
+        // K = P·Hᵀ·S⁻¹ = (first 3 cols of P) · S⁻¹ → 15×3.
+        let p_ht: SMatrix<f32, 15, 3> = self.cov.fixed_view::<15, 3>(0, 0).clone_owned();
+        let k: SMatrix<f32, 15, 3> = p_ht * s_inv_eff;
+
+        // State update. Boxplus interprets the orientation rows of `k·z`
+        // as a rotation vector and rotates the orientation accordingly,
+        // so attitude can move via cross-covariance even though the
+        // measurement is position-only — same behaviour as update_pos.
+        self.state = self.state.boxplus(&(k * z));
+
+        // Joseph form, sparse.
+        // H·P is the first 3 rows of P (no matmul).
+        let hp: SMatrix<f32, 3, 15> = self.cov.fixed_view::<3, 15>(0, 0).clone_owned();
+        // B = P − K·(H·P)
+        let b = self.cov - k * hp;
+        // B·Hᵀ is the first 3 cols of B.
+        let b_ht: SMatrix<f32, 15, 3> = b.fixed_view::<15, 3>(0, 0).clone_owned();
+        // P' = B − B·Hᵀ·Kᵀ + K·R·Kᵀ
+        let kt = k.transpose();
+        self.cov = b - b_ht * kt + k * r_eff * kt;
+
+        self.cov = (self.cov + self.cov.transpose()) * 0.5;
+        self.clamp_covariance_diagonal();
+        // Match dense `update_pos`: no `renormalize_orientation` call.
+        // (`update_pose` and `update_pose_sparse` do renormalize because
+        // the attitude measurement induces O(1) δθ; here δθ comes only
+        // through cross-covariance and is small enough that the dense
+        // form skips it. Keep the two paths bit-identical.)
+        if !self.state_is_finite() {
+            self.initialized = false;
+            return UpdateOutcome::NaNAfterUpdate;
+        }
+        UpdateOutcome::Accepted { inflated }
+    }
+
     /// Velocity measurement update (ENU). `vel_std` is std-dev in m/s.
     pub fn update_vel(&mut self, vel: Vector3<f32>, vel_std: f32) -> UpdateOutcome {
         if !self.initialized {

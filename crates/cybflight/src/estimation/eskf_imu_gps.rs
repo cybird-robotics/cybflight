@@ -27,10 +27,10 @@
 
 use embassy_futures::select::{select, Either};
 use embassy_sync::pubsub::WaitResult;
-use embassy_time::Instant;
+use embassy_time::{Duration, Instant};
 use nalgebra::{UnitQuaternion, Vector3};
 
-use cybflight_core::eskf::{Eskf, EskfConfig};
+use cybflight_core::eskf::{Eskf, EskfConfig, UpdateOutcome};
 use cybflight_core::geodetic::{ned_to_enu, LlhOrigin};
 
 use core::f64::consts::PI;
@@ -60,7 +60,29 @@ const GPS_H_ACC_MAX_MM: u32 = 50_000;
 /// stationary receiver with good geometry but doesn't reflect real
 /// in-flight error).
 const GPS_POS_SIGMA_FLOOR_M: f32 = 0.05;
+#[allow(dead_code)] // Reserved for when update_vel is wired up.
 const GPS_VEL_SIGMA_FLOOR_M_S: f32 = 0.10;
+
+/// Consecutive rejected GPS frames before declaring the estimator
+/// untrusted. NAV-PVT arrives at 5–10 Hz, so 5 frames ≈ 0.5–1 s of
+/// pure dead-reckoning before the failsafe propagates. Tighter than
+/// the 2 s `GPS_STALE` window so the system fails through this gate
+/// (which has more diagnostic context) before staleness fires.
+const MAX_CONSECUTIVE_REJECTS: u32 = 5;
+
+/// Consecutive pose-jump rejections before forcing a filter re-init.
+/// Tighter than `MAX_CONSECUTIVE_REJECTS` — and tighter than the mocap
+/// equivalent — because a GPS position jump indicates catastrophic
+/// carrier-phase ambiguity loss or a multipath wraparound, neither of
+/// which heals within a frame or two. Two NAV-PVTs ≈ 200–400 ms.
+const MAX_CONSECUTIVE_JUMPS: u32 = 2;
+
+/// GPS staleness threshold. If no usable PVT has been accepted within
+/// this window, the estimator stops publishing `VEHICLE_ODOMETRY` so
+/// downstream consumers (INDI → DShot → failsafe) detect silence and
+/// disarm. NAV-PVT arrives at 5–10 Hz; 2 s tolerates ~10–20 missed
+/// frames before declaring loss.
+const GPS_STALE: Duration = Duration::from_millis(2000);
 
 /// Gyro-bias covariance trace threshold for convergence.
 /// Initial trace = 3 × 0.01 = 0.03; this requires roughly a 10× reduction.
@@ -192,7 +214,15 @@ pub async fn estimation_task() {
     let mut imu_skip: u32 = 0;
     let mut predict_count: u32 = 0;
     let mut last_predict_ts = Instant::now();
+    // Seed `last_gps_ts` from the origin-anchor PVT timestamp so the
+    // staleness gate doesn't fire spuriously on the first IMU sample.
+    let mut last_gps_ts = Instant::now();
     let mut converged = false;
+    let mut consecutive_rejects: u32 = 0;
+    let mut consecutive_jumps: u32 = 0;
+    let mut pos_reject_total: u32 = 0;
+    let mut pos_inflated_total: u32 = 0;
+    let mut jump_total: u32 = 0;
 
     loop {
         match select(imu_sub.next_message(), gps_signal.wait()).await {
@@ -244,6 +274,19 @@ pub async fn estimation_task() {
 
                 predict_count = predict_count.wrapping_add(1);
                 if predict_count.is_multiple_of(ODOM_DECIMATION) {
+                    // Producer-side staleness gate: if GPS has stopped
+                    // arriving, go silent so the failure propagates per
+                    // docs/safety_protocol.md (sensor-loss example), and
+                    // drop ESTIMATOR_READY so re-arming is refused at gate 4.
+                    if Instant::now().duration_since(last_gps_ts) > GPS_STALE {
+                        if converged {
+                            converged = false;
+                            ESTIMATOR_READY.store(false, Ordering::Release);
+                            defmt::warn!("ESKF: GPS stale — arming blocked");
+                        }
+                        continue;
+                    }
+
                     let (roll_deg, pitch_deg, yaw_deg, pos, vel, gyro_bias, accel_bias) =
                         state_fields(&eskf);
 
@@ -259,6 +302,7 @@ pub async fn estimation_task() {
                         );
                     }
 
+                    // GPS path has no attitude update, so att_*_total stay 0.
                     let phase = if converged {
                         EstimatorPhase::Running {
                             roll_deg,
@@ -268,11 +312,11 @@ pub async fn estimation_task() {
                             vel,
                             gyro_bias,
                             accel_bias,
-                            pos_reject_total: 0,
+                            pos_reject_total,
                             att_reject_total: 0,
-                            pos_inflated_total: 0,
+                            pos_inflated_total,
                             att_inflated_total: 0,
-                            jump_total: 0,
+                            jump_total,
                         }
                     } else {
                         EstimatorPhase::Converging {
@@ -283,11 +327,11 @@ pub async fn estimation_task() {
                             vel,
                             gyro_bias,
                             accel_bias,
-                            pos_reject_total: 0,
+                            pos_reject_total,
                             att_reject_total: 0,
-                            pos_inflated_total: 0,
+                            pos_inflated_total,
                             att_inflated_total: 0,
-                            jump_total: 0,
+                            jump_total,
                         }
                     };
                     ESTIMATOR_STATUS.lock(|c| c.set(phase));
@@ -333,22 +377,98 @@ pub async fn estimation_task() {
                         Vector3::zeros(),
                     );
                     converged = false;
+                    consecutive_rejects = 0;
+                    consecutive_jumps = 0;
                     ESTIMATOR_READY.store(false, Ordering::Release);
                     last_predict_ts = Instant::now();
+                    last_gps_ts = Instant::now();
                     continue;
                 }
 
-                let (enu_pos, _) = pvt_enu(&pvt, &origin);
-                // let sigma_pos =
-                // (pvt.h_acc_mm.max(pvt.v_acc_mm) as f32 * 1e-3).max(GPS_POS_SIGMA_FLOOR_M);
-                // let sigma_vel = (pvt.s_acc_mm_s as f32 * 1e-3).max(GPS_VEL_SIGMA_FLOOR_M_S);
+                let (enu_pos, _enu_vel) = pvt_enu(&pvt, &origin);
 
-                eskf.update_pos(enu_pos, 0.7071);
-                // eskf.update_vel(enu_vel, sigma_vel);
+                // Derive σ from u-blox's reported accuracy with a floor:
+                // a stationary receiver under good geometry can report
+                // sub-cm accuracy that doesn't reflect real in-flight
+                // error, so the floor prevents the filter from running
+                // with unrealistic confidence.
+                let sigma_pos =
+                    (pvt.h_acc_mm.max(pvt.v_acc_mm) as f32 * 1e-3).max(GPS_POS_SIGMA_FLOOR_M);
+
+                let pos_outcome = eskf.update_pos(enu_pos, sigma_pos);
+
+                match pos_outcome {
+                    UpdateOutcome::Accepted { inflated: true } => {
+                        pos_inflated_total = pos_inflated_total.wrapping_add(1);
+                    }
+                    UpdateOutcome::Accepted { inflated: false } => {}
+                    UpdateOutcome::JumpRejected => {
+                        // Counted in the jump branch below; don't count
+                        // as a normal rejection too.
+                    }
+                    other => {
+                        pos_reject_total = pos_reject_total.wrapping_add(1);
+                        defmt::warn!(
+                            "ESKF: GPS pos update rejected ({})",
+                            super::outcome_tag(other)
+                        );
+                    }
+                }
+
+                // Jump rejection: a position jump is a catastrophic GPS
+                // fault (carrier-ambiguity loss / multipath wraparound).
+                // The filter's IMU-integrated estimate is still
+                // trustworthy — only the incoming PVT is bad — so we
+                // drop the frame and ride out on dead-reckoning until
+                // clean fixes resume. After `MAX_CONSECUTIVE_JUMPS` we
+                // drop `ESTIMATOR_READY` so arming is refused;
+                // `last_gps_ts` is not refreshed either, so `GPS_STALE`
+                // will eventually fire as the hard failsafe.
+                if pos_outcome.is_jump() {
+                    jump_total = jump_total.wrapping_add(1);
+                    consecutive_jumps = consecutive_jumps.saturating_add(1);
+                    defmt::error!(
+                        "ESKF: GPS pos jump ({}/{})",
+                        consecutive_jumps,
+                        MAX_CONSECUTIVE_JUMPS,
+                    );
+                    if converged && consecutive_jumps >= MAX_CONSECUTIVE_JUMPS {
+                        converged = false;
+                        ESTIMATOR_READY.store(false, Ordering::Release);
+                        defmt::error!(
+                            "ESKF: {} consecutive GPS jumps — arming blocked",
+                            consecutive_jumps,
+                        );
+                    }
+                } else {
+                    consecutive_jumps = 0;
+                }
+
+                // Fail-stop: only refresh staleness when the update was
+                // absorbed (inflated or not). A frame that arrives but
+                // is rejected by the gate doesn't count as a healthy
+                // measurement. After `MAX_CONSECUTIVE_REJECTS` we drop
+                // `ESTIMATOR_READY` — same gate as mocap, with a tighter
+                // count to fit GPS's lower frame rate.
+                if pos_outcome.is_accepted() {
+                    last_gps_ts = Instant::now();
+                    consecutive_rejects = 0;
+                } else {
+                    consecutive_rejects = consecutive_rejects.saturating_add(1);
+                    if converged && consecutive_rejects >= MAX_CONSECUTIVE_REJECTS {
+                        converged = false;
+                        ESTIMATOR_READY.store(false, Ordering::Release);
+                        defmt::error!(
+                            "ESKF: {} consecutive GPS rejections — arming blocked",
+                            consecutive_rejects,
+                        );
+                    }
+                }
 
                 if !eskf.is_initialized() {
                     defmt::error!("ESKF: non-finite state after GPS update — awaiting re-init");
                     converged = false;
+                    consecutive_rejects = 0;
                     ESTIMATOR_READY.store(false, Ordering::Release);
                 }
             }

@@ -14,7 +14,7 @@
 //! 3. **Running** — covariance has converged; `ESTIMATOR_READY` is set and
 //!    arming is permitted.
 
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{select, Either};
 use embassy_sync::pubsub::WaitResult;
 use embassy_time::{Duration, Instant};
 use nalgebra::Vector3;
@@ -23,7 +23,7 @@ use cybflight_core::eskf::{Eskf, EskfConfig, UpdateOutcome};
 
 use core::sync::atomic::Ordering;
 
-use crate::estimation::{ESTIMATOR_READY, ESTIMATOR_STATUS, EstimatorPhase};
+use crate::estimation::{EstimatorPhase, ESTIMATOR_READY, ESTIMATOR_STATUS};
 use crate::sensors;
 use cybflight_msgs as msgs;
 
@@ -75,21 +75,6 @@ const MOCAP_STALE: Duration = Duration::from_millis(100);
 /// into the filter's predict step and produce NaN state in one call.
 fn imu_is_valid(accel: &Vector3<f32>, gyro: &Vector3<f32>) -> bool {
     accel.iter().all(|v| v.is_finite()) && gyro.iter().all(|v| v.is_finite())
-}
-
-/// Map an `UpdateOutcome` to a short tag for defmt logging.
-/// `defmt` cannot format the enum directly without a `defmt::Format` impl,
-/// and the enum lives in `cybflight_core` which has no defmt dep.
-fn outcome_tag(outcome: UpdateOutcome) -> &'static str {
-    match outcome {
-        UpdateOutcome::Accepted { inflated: false } => "accepted",
-        UpdateOutcome::Accepted { inflated: true } => "inflated",
-        UpdateOutcome::NotInitialized => "not-init",
-        UpdateOutcome::InverseFailed => "inv-fail",
-        UpdateOutcome::InflationCapExceeded => "cap-exceeded",
-        UpdateOutcome::NaNAfterUpdate => "nan",
-        UpdateOutcome::JumpRejected => "jump",
-    }
 }
 
 /// Reject mocap frames with any non-finite component. One bad frame from the
@@ -369,8 +354,12 @@ pub async fn estimation_task() {
                 // against the same prior P, instead of the attitude
                 // update operating on a P that has already been collapsed
                 // by the position update.
-                let pose_outcome =
-                    eskf.update_pose(pose.position, pose.orientation, MOCAP_POS_STD, MOCAP_ATT_STD);
+                let pose_outcome = eskf.update_pose(
+                    pose.position,
+                    pose.orientation,
+                    MOCAP_POS_STD,
+                    MOCAP_ATT_STD,
+                );
 
                 match pose_outcome {
                     UpdateOutcome::Accepted { inflated: true } => {
@@ -385,7 +374,7 @@ pub async fn estimation_task() {
                     other => {
                         pos_reject_total = pos_reject_total.wrapping_add(1);
                         att_reject_total = att_reject_total.wrapping_add(1);
-                        defmt::warn!("ESKF: pose update rejected ({})", outcome_tag(other));
+                        defmt::warn!("ESKF: pose update rejected ({})", super::outcome_tag(other));
                     }
                 }
 

@@ -32,7 +32,7 @@ use crate::trajectory_planning::sampler::PositionSamplerParams;
 use crate::trajectory_planning::types::Vec3;
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 20;
+const VERSION: u32 = 21;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
 /// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 + 28 + 4 + 4 = 624 bytes
 const PAYLOAD_SIZE: usize = 624;
@@ -66,7 +66,7 @@ impl Default for MpcParams {
     fn default() -> Self {
         Self {
             pos_weight: [200.0, 200.0, 200.0],
-            vel_weight: [10.0, 10.0, 10.0],
+            vel_weight: [10.0, 10.0, 5.0],
             att_weight: [50.0, 50.0, 200.0],
             rate_weight: [50.0, 50.0, 50.0],
             thrust_weight: 1.0,
@@ -494,11 +494,7 @@ impl VehicleParams {
         // existing all-f32 payload encoding; truncated back to u8 on read.
         off = put_f32(&mut buf, off, self.mission_profile as f32);
         // Arm-LED enable flag (added in v20). 0.0 = off, anything else = on.
-        off = put_f32(
-            &mut buf,
-            off,
-            if self.arm_led_enabled { 1.0 } else { 0.0 },
-        );
+        off = put_f32(&mut buf, off, if self.arm_led_enabled { 1.0 } else { 0.0 });
         debug_assert_eq!(off - HEADER_SIZE, PAYLOAD_SIZE);
 
         // Header

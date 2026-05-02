@@ -88,9 +88,9 @@ impl Default for QuadModel {
             ],
             mass_inv: 1.0 / mass,
             w_pos: [200.0, 200.0, 200.0],
-            w_vel: [1.0, 1.0, 1.0],
-            w_att: [5.0, 5.0, 200.0],
-            w_input: Vector4::from_element(1.0),
+            w_vel: [10.0, 10.0, 10.0],
+            w_att: [50.0, 50.0, 200.0],
+            w_input: Vector4::new(1.0, 50.0, 50.0, 50.0),
             rho: 1e4,
         }
     }
@@ -133,7 +133,12 @@ impl QuadModel {
             // so we replicate `vp.mpc.thrust_weight` (a scalar) across all four
             // channels. Override the struct field directly if asymmetric tuning
             // is needed.
-            w_input: SVector::from_element(vp.mpc.thrust_weight),
+            w_input: Vector4::new(
+                vp.mpc.thrust_weight,
+                vp.mpc.rate_weight[0],
+                vp.mpc.rate_weight[1],
+                vp.mpc.rate_weight[2],
+            ),
             rho: vp.mpc.rho,
         }
     }

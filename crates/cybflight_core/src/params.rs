@@ -29,7 +29,7 @@ use crate::trajectory_planning::sampler::PositionSamplerParams;
 use crate::trajectory_planning::types::Vec3;
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 18;
+const VERSION: u32 = 19;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
 /// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 + 28 + 4 = 620 bytes
 const PAYLOAD_SIZE: usize = 620;
@@ -63,9 +63,9 @@ impl Default for MpcParams {
     fn default() -> Self {
         Self {
             pos_weight: [200.0, 200.0, 200.0],
-            vel_weight: [1.0, 1.0, 1.0],
-            att_weight: [5.0, 5.0, 200.0],
-            rate_weight: [1.0, 1.0, 1.0],
+            vel_weight: [10.0, 10.0, 10.0],
+            att_weight: [50.0, 50.0, 200.0],
+            rate_weight: [50.0, 50.0, 50.0],
             thrust_weight: 1.0,
             dt: 0.05,
             rho: 1e4,

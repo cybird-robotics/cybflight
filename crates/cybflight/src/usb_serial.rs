@@ -65,6 +65,8 @@ const HELP_TEXT: &[u8] = b"\
   mission list                            list available offline trajectories\r\n\
   mission get                             show the active trajectory\r\n\
   mission set <env> <variant> <speed>     select a trajectory (in-memory; 'param save' to persist)\r\n\
+  led on               enable arm LEDs (red top / blue bottom, brighter when armed)\r\n\
+  led off              disable arm LEDs\r\n\
   reboot               software reset\r\n\
   reboot --dfu         reset into USB DFU bootloader\r\n\
   help                 show this message\r\n\
@@ -912,6 +914,9 @@ async fn dispatch<'d>(
         line if line.starts_with("mission") => {
             dispatch_mission(class, line).await?;
         }
+        "led on" | "led off" => {
+            dispatch_led(class, line == "led on").await?;
+        }
         _ => {
             write_all(class, b"unknown command (try 'help')\r\n").await?;
         }
@@ -1147,6 +1152,43 @@ async fn dispatch_mission<'d>(
         }
     }
     Ok(())
+}
+
+/// `led on` / `led off`: toggle the external arm LED, mirror the change into
+/// the live atomic so the LED task picks it up within one poll tick, and
+/// auto-save the new value to flash. Refused while armed because flash erase
+/// stalls the CPU for ~1–2 s.
+async fn dispatch_led<'d>(
+    class: &mut CdcAcmClass<'d, UsbDriver<'d>>,
+    enable: bool,
+) -> Result<(), EndpointError> {
+    if crate::motors::IS_ARMED.load(Ordering::Acquire) {
+        return write_all(class, b"refused: disarm before changing LED config\r\n").await;
+    }
+
+    let mut params = crate::params::get();
+    params.arm_led_enabled = enable;
+    crate::params::set(params);
+
+    crate::arm_led::ARM_LED_ENABLED.store(enable, Ordering::Relaxed);
+    crate::arm_led::ARM_LED_REFRESH.signal(());
+
+    match crate::params::save_to_flash() {
+        Ok(()) => {
+            let msg: &[u8] = if enable {
+                b"arm LED on, saved\r\n"
+            } else {
+                b"arm LED off, saved\r\n"
+            };
+            write_all(class, msg).await
+        }
+        Err(e) => {
+            let mut buf = [0u8; 96];
+            let mut w = WriteBuf::new(&mut buf);
+            write!(w, "arm LED toggled but flash save failed: {}\r\n", e).ok();
+            write_all(class, w.as_slice()).await
+        }
+    }
 }
 
 /// Minimal f32 parser for no_std (core::str::parse::<f32> requires std).

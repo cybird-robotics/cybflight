@@ -88,6 +88,23 @@ pub async fn init(
     let led0 = Led::new(board.leds.led0, false);
     spawner.spawn(status::task(led0)).unwrap();
 
+    // --- External arm LED (Speedybee 2812 on PA8 / TIM1_CH1 / DMA1_CH7) ---
+    // Seed the live atomic from flash, then spawn the WS2812 driver task.
+    // The strip stays off until the operator runs `led on` AND the vehicle
+    // arms — see `arm_led::compose_frame`.
+    crate::arm_led::ARM_LED_ENABLED.store(
+        crate::params::get().arm_led_enabled,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    let arm_led_strip = crate::arm_led::ws2812::Ws2812::new(
+        board.motors.tim1,
+        board.motors.led_strip,
+        board.motors.dma1_ch7,
+    );
+    spawner
+        .spawn(crate::arm_led::task(arm_led_strip))
+        .unwrap_or_else(|e| defmt::error!("Failed to spawn arm LED task: {}", e));
+
     // --- USB CDC serial ---
     spawner
         .spawn(usb_serial::task(

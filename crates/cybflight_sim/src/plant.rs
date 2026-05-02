@@ -68,6 +68,7 @@ impl VehicleParamsBuilder {
             // Sim doesn't exercise the offline-mission registry; the field
             // exists only to satisfy the firmware's flash schema.
             mission_profile: 0,
+            arm_led_enabled: false,
         }
     }
 }

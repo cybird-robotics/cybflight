@@ -4,10 +4,10 @@
 //!
 //! ```text
 //! [0x00]  magic:   u32 = 0x43594250 ("CYBP")
-//! [0x04]  version: u32 = 18
-//! [0x08]  length:  u32 = PAYLOAD_SIZE (620)
+//! [0x04]  version: u32 = 20
+//! [0x08]  length:  u32 = PAYLOAD_SIZE (624)
 //! [0x0C]  crc32:   u32 (over payload only)
-//! [0x10]  payload: 620 bytes
+//! [0x10]  payload: 624 bytes
 //!   Body:               mass(4) + inertia(36) + max_rate(12) = 52 bytes
 //!   Motors (x4):        px(4) + py(4) + spin_dir(4) + max_thrust(4) + torque_coeff(4) = 80 bytes
 //!   ControlGains:       pos_kp(12) + pos_kd(12) + att_k_rate(12) = 36 bytes
@@ -19,21 +19,24 @@
 //!   BfgsTrustParams:    delta_init(4) + delta_max(4) + eta(4) + g_epsilon(4) + max_iterations(4 as f32) + past(4 as f32) + delta_conv(4) = 28 bytes
 //!   SamplerParams:      max_lag_s(4) + axis_weights_sqrt(12) + search_dt(4) + max_search_steps(4 as f32) + radius_of_acceptance(4) = 28 bytes
 //!   Mission:            profile_index(4 as f32) = 4 bytes
+//!   ArmLed:             enabled(4 as f32, 0.0/1.0) = 4 bytes
 //! ```
 //!
-//! Old flash images (version < 18) are rejected and the firmware falls
-//! through to defaults.
+//! Old flash images (version < 20) are rejected and the firmware falls
+//! through to defaults. v19 (same payload size as v18, MPC-tuning bump on
+//! `main`) collides on length but uses a different magic version, so it is
+//! correctly rejected here.
 
 use crate::mixer::{MotorParams, RigidBodyParams, SpinDir};
 use crate::trajectory_planning::sampler::PositionSamplerParams;
 use crate::trajectory_planning::types::Vec3;
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 19;
+const VERSION: u32 = 20;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
-/// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 + 28 + 4 = 620 bytes
-const PAYLOAD_SIZE: usize = 620;
-/// Padded to 32-byte flash word boundary: ceil((16+620)/32)*32 = 640
+/// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 + 28 + 4 + 4 = 624 bytes
+const PAYLOAD_SIZE: usize = 624;
+/// Padded to 32-byte flash word boundary: ceil((16+624)/32)*32 = 640
 pub const PADDED_SIZE: usize = 640;
 
 /// MPC tuning parameters: cost weights, discretization, and constraint penalty.
@@ -348,6 +351,12 @@ pub struct VehicleParams {
     /// resolves a name triple to an index and writes both this field and
     /// the live atomic.
     pub mission_profile: u8,
+    /// External arm-LED enable flag (added in v20). When true, the LED task
+    /// drives the WS2812 strip — red on the arm tops, blue on the arm
+    /// bottoms, dimmed while disarmed and full-bright while armed. When
+    /// false, the strip is held off. Toggled by the `led on` / `led off`
+    /// shell verbs which also auto-save to flash.
+    pub arm_led_enabled: bool,
 }
 
 impl VehicleParams {
@@ -484,6 +493,12 @@ impl VehicleParams {
         // Mission profile index (added in v18). Stored as f32 to match the
         // existing all-f32 payload encoding; truncated back to u8 on read.
         off = put_f32(&mut buf, off, self.mission_profile as f32);
+        // Arm-LED enable flag (added in v20). 0.0 = off, anything else = on.
+        off = put_f32(
+            &mut buf,
+            off,
+            if self.arm_led_enabled { 1.0 } else { 0.0 },
+        );
         debug_assert_eq!(off - HEADER_SIZE, PAYLOAD_SIZE);
 
         // Header
@@ -809,6 +824,10 @@ impl VehicleParams {
         let mission_profile = get_f32(buf, off) as u8;
         off += 4;
 
+        // Arm-LED enable flag (added in v20). Any non-zero is treated as on.
+        let arm_led_enabled = get_f32(buf, off) != 0.0;
+        off += 4;
+
         // Symmetry with `to_bytes`: catch schema-edit bugs where a field
         // is added to one side and not the other. Debug-only — release
         // builds rely on the magic+version+CRC check above.
@@ -825,6 +844,7 @@ impl VehicleParams {
             planner,
             sampler,
             mission_profile,
+            arm_led_enabled,
         })
     }
 
@@ -1750,6 +1770,7 @@ mod tests {
             planner: PlannerParams::default(),
             sampler: SamplerParams::default(),
             mission_profile: 3,
+            arm_led_enabled: false,
         }
     }
 
@@ -1854,6 +1875,21 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_arm_led_enabled() {
+        // Both true and false must survive the f32 round-trip.
+        for &expected in &[false, true] {
+            let mut params = test_params();
+            params.arm_led_enabled = expected;
+            let bytes = params.to_bytes();
+            let restored = VehicleParams::from_bytes(&bytes).expect("from_bytes failed");
+            assert_eq!(
+                restored.arm_led_enabled, expected,
+                "arm_led_enabled round-trip mismatch for {expected}",
+            );
+        }
+    }
+
+    #[test]
     fn old_version_returns_none() {
         // A flash image written by an older firmware version (e.g. v13)
         // must be rejected so the firmware falls through to defaults
@@ -1864,6 +1900,19 @@ mod tests {
         put_u32(&mut bytes, 4, 13);
         // Recompute CRC over the (still-valid) payload so only the
         // version mismatch trips the check, not the CRC.
+        let crc = crc32fast::hash(&bytes[HEADER_SIZE..HEADER_SIZE + PAYLOAD_SIZE]);
+        put_u32(&mut bytes, 12, crc);
+        assert!(VehicleParams::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn v19_returns_none() {
+        // v19 is reserved on `main` (MPC-tuning bump, same 620-byte payload
+        // shape). This branch's v20 added the arm-LED slot (+4 bytes) and
+        // must not silently accept a v19 image as if it were v20-compatible.
+        let params = test_params();
+        let mut bytes = params.to_bytes();
+        put_u32(&mut bytes, 4, 19);
         let crc = crc32fast::hash(&bytes[HEADER_SIZE..HEADER_SIZE + PAYLOAD_SIZE]);
         put_u32(&mut bytes, 12, crc);
         assert!(VehicleParams::from_bytes(&bytes).is_none());

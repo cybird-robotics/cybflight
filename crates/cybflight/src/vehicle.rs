@@ -82,6 +82,10 @@ pub fn default_params() -> cybflight_core::params::VehicleParams {
         mission_profile: crate::control::offline_mission::DEFAULT_PROFILE_INDEX,
         #[cfg(not(feature = "outer_mpc"))]
         mission_profile: 0,
+        // Default ON so a fresh-flashed board with blank flash lights up
+        // immediately at power-on — matches the test-bench workflow where
+        // the LED is used as a power-good / firmware-alive indicator.
+        arm_led_enabled: true,
     }
 }
 

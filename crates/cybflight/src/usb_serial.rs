@@ -67,6 +67,14 @@ const HELP_TEXT: &[u8] = b"\
   mission set <env> <variant> <speed>     select a trajectory (in-memory; 'param save' to persist)\r\n\
   led on               enable arm LEDs (red top / blue bottom, brighter when armed)\r\n\
   led off              disable arm LEDs\r\n\
+  blackbox record on   manually start a flight log (flight_NNNN.mcap)\r\n\
+  blackbox record off  stop the manual flight log\r\n\
+  blackbox status      show current recording state and what's triggering it\r\n\
+  blackbox set <tier>  set the record-set tier (none|small|mid|large)\r\n\
+                       small=events+rc, mid=+attitude, large=+imu (default), none=disabled\r\n\
+  blackbox ls          list files in the FAT root (rejected while recording)\r\n\
+                       (recorder also auto-starts on real ARM_STATE arm: RC switch / failsafe path)\r\n\
+                       (file numbering picks up after the highest existing flight_NNNN; survives reboots)\r\n\
   reboot               software reset\r\n\
   reboot --dfu         reset into USB DFU bootloader\r\n\
   help                 show this message\r\n\
@@ -917,11 +925,292 @@ async fn dispatch<'d>(
         "led on" | "led off" => {
             dispatch_led(class, line == "led on").await?;
         }
+        "blackbox record on" | "blackbox record off" => {
+            dispatch_blackbox_record(class, line == "blackbox record on").await?;
+        }
+        "blackbox status" => {
+            dispatch_blackbox_status(class).await?;
+        }
+        line if line.starts_with("blackbox set ") || line == "blackbox set" => {
+            dispatch_blackbox_set(class, line).await?;
+        }
+        "blackbox ls" => {
+            dispatch_blackbox_ls(class).await?;
+        }
         _ => {
             write_all(class, b"unknown command (try 'help')\r\n").await?;
         }
     }
     Ok(())
+}
+
+/// `blackbox record on/off` — manual recorder toggle for bench use.
+///
+/// Sets [`crate::blackbox::RECORDER_HOLD`] (`AtomicBool`). The
+/// recorder's "should-record" predicate is `IS_ARMED ||
+/// RECORDER_HOLD`, so toggling this flag is enough to start / stop
+/// a flight log without touching `ARM_STATE` (which would also
+/// cause the DShot task to drive idle PWM on the motor outputs).
+async fn dispatch_blackbox_record<'d>(
+    class: &mut CdcAcmClass<'d, UsbDriver<'d>>,
+    hold: bool,
+) -> Result<(), EndpointError> {
+    crate::blackbox::RECORDER_HOLD.store(hold, Ordering::Release);
+    let msg: &[u8] = if hold {
+        b"blackbox record: ON  (recorder will open flight_NNNN.mcap on next debounce-confirmed edge)\r\n"
+    } else {
+        b"blackbox record: OFF (recorder will close after the next disarm-poll cycle)\r\n"
+    };
+    write_all(class, msg).await
+}
+
+/// `blackbox status` shell renderer. Reads the two atomics that
+/// drive the recorder predicate (`motors::IS_ARMED` and
+/// `blackbox::RECORDER_HOLD`) and reports the resulting state plus
+/// what's currently holding it active.
+///
+/// Pure synchronous — no Signal round-trip through `blackbox_task` —
+/// so it works even when the recorder is mid-flush and the task is
+/// busy. Also runs on boards without storage; in that case the
+/// atomics still exist (they're firmware-wide) but the recorder
+/// itself isn't spawned, so we say so.
+async fn dispatch_blackbox_status<'d>(
+    class: &mut CdcAcmClass<'d, UsbDriver<'d>>,
+) -> Result<(), EndpointError> {
+    let armed = crate::motors::IS_ARMED.load(Ordering::Acquire);
+    let hold = crate::blackbox::RECORDER_HOLD.load(Ordering::Acquire);
+    let rs = crate::blackbox::record_set();
+
+    let mut buf = [0u8; 256];
+    let mut w = WriteBuf::new(&mut buf);
+    let storage_note = if !bsp::HAS_BLACKBOX_STORAGE {
+        " (board has no storage; recorder is not spawned)"
+    } else {
+        ""
+    };
+    let trigger = match (armed, hold) {
+        (true, true) => "armed + shell hold",
+        (true, false) => "armed",
+        (false, true) => "shell hold",
+        (false, false) => "none",
+    };
+    // The recorder ignores arm-edges when record_set is None, so
+    // surface that as the effective state instead of "recording".
+    let state = if (armed || hold) && rs.enabled() {
+        "recording"
+    } else if (armed || hold) && !rs.enabled() {
+        "idle (record_set=none, edge ignored)"
+    } else {
+        "idle"
+    };
+    let _ = write!(
+        w,
+        "blackbox status: {}  (trigger: {}){}\r\n\
+         \x20                 IS_ARMED={}, RECORDER_HOLD={}\r\n\
+         \x20                 record_set={}\r\n",
+        state,
+        trigger,
+        storage_note,
+        armed,
+        hold,
+        rs.name(),
+    );
+    write_all(class, w.as_slice()).await
+}
+
+/// `blackbox set <none|small|mid|large>` — change the active record
+/// set and persist it to flash.
+///
+/// Three-step update: the live atomic the recorder reads, the
+/// in-memory param copy, then `save_to_flash`. Refused while armed
+/// because `save_to_flash` triggers a same-bank flash erase that
+/// stalls the CPU bus for ~1–2 s with the IWDG extended — fine on
+/// the bench, dangerous mid-flight. Mirrors the armed-guard
+/// precedent set by `led on/off` and `mission set`.
+///
+/// The recorder snapshots the tier at session open, so even when
+/// disarmed a mid-session change does nothing until the current
+/// file closes — there's no way to be mid-session at the moment
+/// this handler runs (we already required disarm), but the
+/// `RECORDER_HOLD` shell-bench mode can still be active.
+async fn dispatch_blackbox_set<'d>(
+    class: &mut CdcAcmClass<'d, UsbDriver<'d>>,
+    line: &str,
+) -> Result<(), EndpointError> {
+    if crate::motors::IS_ARMED.load(Ordering::Acquire) {
+        return write_all(
+            class,
+            b"refused: disarm before changing blackbox record-set (flash save would stall CPU)\r\n",
+        )
+        .await;
+    }
+    let arg = line.split_ascii_whitespace().nth(2);
+    let parsed = arg.and_then(crate::blackbox::RecordSet::parse);
+    match parsed {
+        Some(rs) => {
+            // Update the live atomic the recorder reads.
+            crate::blackbox::set_record_set(rs);
+            // Persist in flash so the tier survives reboot. Mirrors
+            // the `led on/off` auto-save path: mutate the in-memory
+            // params copy, write back, then flush to sector 7.
+            let mut params = crate::params::get();
+            params.blackbox_record_set = rs as u8;
+            crate::params::set(params);
+            let save_status = match crate::params::save_to_flash() {
+                Ok(()) => "saved to flash",
+                Err(e) => {
+                    defmt::warn!("blackbox set: flash save failed: {}", e);
+                    "NOT saved (flash error - see defmt log)"
+                }
+            };
+            let mut buf = [0u8; 192];
+            let mut w = WriteBuf::new(&mut buf);
+            // RECORDER_HOLD-only sessions can still be live (since the
+            // armed guard only checks IS_ARMED). Note that case so the
+            // user knows the in-flight file isn't switching tiers.
+            let mid_note = if crate::blackbox::RECORDER_HOLD.load(Ordering::Acquire) {
+                "  (recorder hold active - current file keeps its tier snapshot)"
+            } else {
+                ""
+            };
+            let _ = write!(
+                w,
+                "blackbox set: record_set = {} ({}){}\r\n",
+                rs.name(),
+                save_status,
+                mid_note,
+            );
+            write_all(class, w.as_slice()).await
+        }
+        None => {
+            write_all(
+                class,
+                b"usage: blackbox set <none|small|mid|large>\r\n\
+                  \x20  none  - recorder muted (arm-edges produce no file)\r\n\
+                  \x20  small - events + rc\r\n\
+                  \x20  mid   - events + rc + attitude\r\n\
+                  \x20  large - events + rc + attitude + imu1 (default)\r\n",
+            )
+            .await
+        }
+    }
+}
+
+/// `blackbox ls` shell renderer. Asks the blackbox task to scan the
+/// FAT root and prints the result. Read-only, but still routed
+/// through the task because that task owns the SDMMC peripheral.
+async fn dispatch_blackbox_ls<'d>(
+    class: &mut CdcAcmClass<'d, UsbDriver<'d>>,
+) -> Result<(), EndpointError> {
+    use crate::blackbox::{LsReport, LS_REQUEST, LS_RESULT};
+
+    const LABEL: &str = "blackbox ls";
+
+    if !bsp::HAS_BLACKBOX_STORAGE {
+        return write_all(class, b"blackbox ls: no storage backend on this board\r\n").await;
+    }
+
+    let _ = LS_RESULT.try_take();
+    LS_REQUEST.signal(());
+
+    // 10 s slack covers a cold mount + scan on slow microSDs. The op
+    // is read-only — even a card with thousands of root entries
+    // returns well inside this.
+    let task_timeout = Duration::from_secs(10);
+
+    match with_timeout(task_timeout, LS_RESULT.wait()).await {
+        Ok(LsReport::Ok {
+            entries,
+            truncated,
+            total_files,
+        }) => {
+            // Header
+            {
+                let mut buf = [0u8; 96];
+                let mut w = WriteBuf::new(&mut buf);
+                let shown = entries.len();
+                if truncated {
+                    let _ = write!(
+                        w,
+                        "{}: {} files (showing first {}; bump LS_MAX_ENTRIES)\r\n",
+                        LABEL, total_files, shown,
+                    );
+                } else {
+                    let _ = write!(w, "{}: {} file(s)\r\n", LABEL, total_files);
+                }
+                write_all(class, w.as_slice()).await?;
+            }
+            // One line per entry. Print in chunks so a long list
+            // doesn't blow the stack.
+            for e in entries.iter() {
+                let mut buf = [0u8; 96];
+                let mut w = WriteBuf::new(&mut buf);
+                let _ = write!(w, "  /{}  {} bytes\r\n", e.name.as_str(), e.size);
+                write_all(class, w.as_slice()).await?;
+            }
+            Ok(())
+        }
+        Ok(LsReport::Failed(stage)) => {
+            let mut buf = [0u8; 256];
+            let mut w = WriteBuf::new(&mut buf);
+            let _ = write!(w, "{}: FAILED — {}\r\n", LABEL, blackbox_fat_reason(stage));
+            write_all(class, w.as_slice()).await
+        }
+        Ok(LsReport::Busy) => {
+            write_all(
+                class,
+                b"blackbox ls: REJECTED - recorder is mid-flight (disarm first)\r\n",
+            )
+            .await
+        }
+        Err(_) => {
+            let mut buf = [0u8; 96];
+            let mut w = WriteBuf::new(&mut buf);
+            let _ = write!(
+                w,
+                "{}: TIMEOUT — task didn't respond in {} ms\r\n",
+                LABEL,
+                task_timeout.as_millis(),
+            );
+            write_all(class, w.as_slice()).await
+        }
+    }
+}
+
+fn blackbox_fat_reason(stage: crate::blackbox::fat::OpError) -> &'static str {
+    use crate::blackbox::fat::OpError;
+    match stage {
+        OpError::NoSubscriberSlot => {
+            "topic has no free subscriber slot (bump SUBS on the channel)"
+        }
+        OpError::NoMessageInTimeout => {
+            "no fresh message on the topic within the op's timeout \
+             (sensor driver stalled or topic silent?)"
+        }
+        OpError::CardAcquire => {
+            "card acquire failed (CMD0/ACMD41 — card missing/unseated/locked?)"
+        }
+        OpError::NoPartitionTable => {
+            "sector 0 has neither MBR signature nor FAT BPB \
+             (card blank/GPT/corrupted; reformat as FAT32)"
+        }
+        OpError::NoFatPartition => {
+            "MBR present but no FAT partition entry \
+             (card formatted as exFAT/ext4/NTFS; reformat as FAT32)"
+        }
+        OpError::PartitionIo => "MBR/partition I/O fault (see defmt log)",
+        OpError::Mount => {
+            "FAT boot sector unreadable \
+             (partition exists but BPB corrupted; reformat as FAT32)"
+        }
+        OpError::Create => {
+            "directory entry create failed (root full, illegal name, or write-protected?)"
+        }
+        OpError::Write => "write/flush failed (disk full or I/O fault; see defmt log)",
+        OpError::Unmount => {
+            "unmount-flush failed (file may not have hit the card; see defmt log)"
+        }
+    }
 }
 
 async fn dispatch_motor<'d>(

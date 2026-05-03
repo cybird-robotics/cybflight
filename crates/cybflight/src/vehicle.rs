@@ -86,6 +86,10 @@ pub fn default_params() -> cybflight_core::params::VehicleParams {
         // immediately at power-on — matches the test-bench workflow where
         // the LED is used as a power-good / firmware-alive indicator.
         arm_led_enabled: true,
+        // RecordSet::Large = 3. Conservative default that preserves the
+        // pre-Stage-7 "log everything" behaviour. Persisted in flash;
+        // tweakable via `blackbox set <tier>`.
+        blackbox_record_set: 3,
     }
 }
 

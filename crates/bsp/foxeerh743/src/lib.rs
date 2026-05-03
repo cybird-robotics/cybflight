@@ -26,6 +26,11 @@ pub const HAS_OSD: bool = true;
 pub const HAS_FLASH: bool = true;
 pub const HAS_GPS: bool = true;
 pub const HAS_SDCARD: bool = false;
+/// True if the board exposes any storage backend usable for the
+/// blackbox / flight-data-recorder pipeline. FOXEERH743 has no SD slot
+/// and the SPI-NOR backend is not yet wired, so the pipeline compiles
+/// out entirely.
+pub const HAS_BLACKBOX_STORAGE: bool = false;
 pub const LED_COUNT: usize = 1;
 
 // =====================================================================

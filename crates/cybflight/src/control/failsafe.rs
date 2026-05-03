@@ -14,13 +14,32 @@
 //! disarm immediately. Catches sustained failures: ESKF divergence, NaN
 //! in the controller, stale odometry, or stale RC setpoints.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use embassy_time::{with_timeout, Duration, Instant};
 
 use crate::motors::ARM_STATE;
 use crate::sensors::RC_INPUT;
 use cybflight_msgs as msgs;
+
+/// Reason code for the most recent `enter_failsafe` call. Encoded
+/// as `u8` so it can be carried verbatim in the `data` field of a
+/// blackbox `KIND_FAILSAFE` event. Stable on disk — never
+/// renumber; assign new values for new conditions.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub enum FailsafeReason {
+    /// No failsafe in effect (or not yet recorded).
+    None = 0,
+    /// Inner-loop motor commands silent for `>CTRL_TIMEOUT` (500 ms).
+    /// Catches sustained controller failures: ESKF divergence
+    /// downstream effects, NaN in the controller, stale odometry
+    /// or RC setpoints feeding the controller.
+    ControllerTimeout = 1,
+    /// RC frames absent through `GUARD_PERIOD` (1500 ms) without
+    /// recovery during the guard window.
+    RcLoss = 2,
+}
 
 // ---------------------------------------------------------------------------
 // Timing constants
@@ -50,15 +69,46 @@ const CTRL_TIMEOUT: Duration = Duration::from_millis(500);
 /// `true` while failsafe is active. Checked by the arming state
 /// machine in `sensors/rc.rs` to block re-arming (mirrors BF
 /// `ARMING_DISABLED_FAILSAFE`).
+///
+/// **Write order convention:** `enter_failsafe` writes
+/// [`FAILSAFE_REASON`] *before* this atomic, both with
+/// `Ordering::Release`. Readers using `Acquire` to load
+/// `FAILSAFE_ACTIVE` are guaranteed to see the reason that
+/// triggered this transition because the Release/Acquire pair on
+/// this atomic carries every prior store in the same task.
 pub static FAILSAFE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Reason code carried alongside [`FAILSAFE_ACTIVE`]. Set by
+/// `enter_failsafe` *before* `FAILSAFE_ACTIVE` flips to true, and
+/// reset to `FailsafeReason::None as u8` when failsafe clears.
+/// Read with `Acquire` after observing a true→true edge on
+/// `FAILSAFE_ACTIVE`. The blackbox recorder mirrors this into the
+/// `data` field of a `KIND_FAILSAFE` event.
+pub static FAILSAFE_REASON: AtomicU8 = AtomicU8::new(FailsafeReason::None as u8);
+
+/// `true` whenever an RC frame has arrived within `RXLOSS_TRIGGER`
+/// (150 ms). Goes false on the first RC timeout in any Phase and
+/// true again on the next valid frame. Independent of
+/// `FAILSAFE_ACTIVE`: a brief drop that recovers within the guard
+/// period flips this atomic twice without ever flipping
+/// `FAILSAFE_ACTIVE`. The blackbox uses this to log `KIND_RC_LOSS`
+/// / `KIND_RC_RECOVERED` events — useful for diagnosing marginal
+/// RC links that don't quite trigger a hard failsafe.
+pub static RC_LINK_HEALTHY: AtomicBool = AtomicBool::new(true);
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /// Disarm and enter failsafe state.
-fn enter_failsafe(reason: &str) {
-    defmt::error!("FAILSAFE: {} — DISARMING", reason);
+///
+/// Stores `FAILSAFE_REASON` *before* `FAILSAFE_ACTIVE` so a
+/// reader observing the `false→true` edge on `FAILSAFE_ACTIVE`
+/// (Acquire) is guaranteed to see the matching reason
+/// (carried by the same Release).
+fn enter_failsafe(reason: FailsafeReason) {
+    defmt::error!("FAILSAFE: {:?} — DISARMING", reason);
+    FAILSAFE_REASON.store(reason as u8, Ordering::Release);
     FAILSAFE_ACTIVE.store(true, Ordering::Release);
     ARM_STATE.signal(msgs::ArmDisarm {
         timestamp: Instant::now(),
@@ -120,7 +170,7 @@ pub async fn failsafe_task() {
     loop {
         // --- Controller watchdog: check on every loop iteration ---
         if controller_timed_out() {
-            enter_failsafe("controller silent for >500ms");
+            enter_failsafe(FailsafeReason::ControllerTimeout);
             super::LAST_CONTROLLER_PUBLISH.lock(|c| c.set(None));
             phase = Phase::Landed {
                 recovery_start: None,
@@ -135,10 +185,18 @@ pub async fn failsafe_task() {
             Phase::Idle => {
                 match with_timeout(RXLOSS_TRIGGER, sub.next_message_pure()).await {
                     Ok(_rc) => {
-                        // Valid frame — stay idle.
+                        // Valid frame — stay idle. Idempotent — no-op
+                        // if already true; observable transitions only
+                        // happen on edges, which is what the recorder
+                        // edge-detects.
+                        RC_LINK_HEALTHY.store(true, Ordering::Release);
                     }
                     Err(_timeout) => {
                         let now = Instant::now();
+                        // Mark the link unhealthy *before* changing
+                        // Phase so any reader that observes the new
+                        // Phase already sees the down-edge.
+                        RC_LINK_HEALTHY.store(false, Ordering::Release);
                         defmt::warn!(
                             "Failsafe: RC frame timeout ({}ms) — guard period started",
                             RXLOSS_TRIGGER.as_millis(),
@@ -157,7 +215,7 @@ pub async fn failsafe_task() {
 
                 match remaining {
                     None | Some(Duration::MIN) => {
-                        enter_failsafe("RC loss for >1500ms");
+                        enter_failsafe(FailsafeReason::RcLoss);
                         phase = Phase::Landed {
                             recovery_start: None,
                         };
@@ -167,11 +225,20 @@ pub async fn failsafe_task() {
                         let wait = remaining.min(RXLOSS_TRIGGER);
                         match with_timeout(wait, sub.next_message_pure()).await {
                             Ok(_rc) => {
+                                // RC recovered before commit — flip
+                                // RC_LINK_HEALTHY back true so the
+                                // recorder logs a `KIND_RC_RECOVERED`
+                                // (paired with the prior
+                                // `KIND_RC_LOSS`). No `KIND_FAILSAFE`
+                                // is logged because failsafe never
+                                // committed.
+                                RC_LINK_HEALTHY.store(true, Ordering::Release);
                                 defmt::info!("Failsafe: RC recovered during guard period");
                                 phase = Phase::Idle;
                             }
                             Err(_timeout) => {
                                 // Still no data — loop will re-check guard expiry.
+                                // RC_LINK_HEALTHY stays false (already false).
                             }
                         }
                     }
@@ -184,10 +251,23 @@ pub async fn failsafe_task() {
             Phase::Landed { recovery_start } => {
                 match with_timeout(RXLOSS_TRIGGER, sub.next_message_pure()).await {
                     Ok(_rc) => {
+                        // Frame arrived. RC link is healthy regardless
+                        // of whether we've accumulated enough recovery
+                        // time to clear failsafe yet.
+                        RC_LINK_HEALTHY.store(true, Ordering::Release);
                         let start = recovery_start.unwrap_or(Instant::now());
                         if Instant::now().duration_since(start) >= RECOVERY_PERIOD {
                             // 500 ms of continuous valid RC — clear failsafe.
+                            // Reason cleared *after* ACTIVE so a reader
+                            // briefly seeing `ACTIVE=false, REASON=<old>`
+                            // is preferable to the inverse (where
+                            // ACTIVE=true with a stale REASON would be
+                            // ambiguous).
                             FAILSAFE_ACTIVE.store(false, Ordering::Release);
+                            FAILSAFE_REASON.store(
+                                FailsafeReason::None as u8,
+                                Ordering::Release,
+                            );
                             crate::status::STATUS
                                 .sender()
                                 .send(crate::status::SystemStatus::Disarmed);
@@ -204,6 +284,7 @@ pub async fn failsafe_task() {
                     }
                     Err(_timeout) => {
                         // Still no data — reset recovery timer.
+                        RC_LINK_HEALTHY.store(false, Ordering::Release);
                         phase = Phase::Landed {
                             recovery_start: None,
                         };

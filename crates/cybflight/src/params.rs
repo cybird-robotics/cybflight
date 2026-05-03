@@ -61,6 +61,7 @@ pub fn init_from_flash(flash_peri: hal::Peri<'static, hal::peripherals::FLASH>) 
 
     let flash = hal::flash::Flash::new_blocking(flash_peri);
     let mission_profile_idx = params.mission_profile;
+    let blackbox_record_set_byte = params.blackbox_record_set;
     critical_section::with(|cs| {
         VEHICLE_PARAMS.borrow_ref_mut(cs).replace(params);
         FLASH_PERI.borrow_ref_mut(cs).replace(flash);
@@ -76,6 +77,14 @@ pub fn init_from_flash(flash_peri: hal::Peri<'static, hal::peripherals::FLASH>) 
     crate::control::offline_mission::init_active_from_index(mission_profile_idx);
     #[cfg(not(feature = "outer_mpc"))]
     let _ = mission_profile_idx;
+
+    // Mirror the persisted blackbox record-set tier into the
+    // BLACKBOX_RECORD_SET atomic. Boards without storage compile out
+    // the recorder entirely, so this branch dead-code-eliminates.
+    if crate::bsp::HAS_BLACKBOX_STORAGE {
+        let rs = crate::blackbox::record_set::RecordSet::from_u8(blackbox_record_set_byte);
+        crate::blackbox::record_set::set(rs);
+    }
 }
 
 /// Get a copy of the current vehicle parameters.

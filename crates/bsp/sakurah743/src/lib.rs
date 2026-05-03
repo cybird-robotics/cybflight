@@ -26,6 +26,12 @@ pub const HAS_OSD: bool = false;
 pub const HAS_FLASH: bool = false;
 pub const HAS_GPS: bool = true;
 pub const HAS_SDCARD: bool = true;
+/// True if the board exposes any storage backend usable for the
+/// blackbox / flight-data-recorder pipeline. On SAKURAH743 this is
+/// driven by the onboard microSD slot. Flipping this to `false`
+/// compiles out the recorder pipeline entirely (no feature flag
+/// required).
+pub const HAS_BLACKBOX_STORAGE: bool = HAS_SDCARD;
 pub const LED_COUNT: usize = 3;
 
 // =====================================================================

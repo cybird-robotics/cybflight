@@ -43,3 +43,10 @@ codegen-units = 16
 
 [patch.utadr]
 #cybflight-msgs = { path = "../cybflight-msgs" }
+# Unify `block-device-driver` so embassy-stm32 (registry 0.2) and
+# embedded-fatfs/block-device-adapters (same version, but pulled from
+# git) talk about the *same* trait. Without this they appear as two
+# distinct crates and `BufStream<StorageDevice<...>, 512>` won't impl
+# `ReadWriteSeek`.
+[patch.crates-io]
+block-device-driver = { git = "https://github.com/MabezDev/embedded-fatfs", rev = "518528cc111fcf65c48abbdeb80735a38eada112" }

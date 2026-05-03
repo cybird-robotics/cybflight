@@ -58,6 +58,13 @@ hal::bind_interrupts!(struct Usart1Irqs {
     USART1 => hal::usart::InterruptHandler<hal::peripherals::USART1>;
 });
 
+// Bind SDMMC1 interrupt for the touch_sd / blackbox storage pipeline.
+// Gated on the BSP capability flag, not a Cargo feature — boards
+// without storage compile out the binding cleanly.
+hal::bind_interrupts!(struct SdmmcIrqs {
+    SDMMC1 => hal::sdmmc::InterruptHandler<hal::peripherals::SDMMC1>;
+});
+
 /// Board initialization.
 ///
 /// Spawner routing:
@@ -113,6 +120,36 @@ pub async fn init(
             board.usb.dm,
         ))
         .unwrap();
+
+    // --- Blackbox / flight-data-recorder pipeline ---
+    //
+    // SDMMC1 (4-bit) on SAKURAH743 → SdmmcBlockStore → blackbox_task.
+    // The task owns the SDMMC peripheral for its lifetime and waits
+    // on shell-driven request signals (touch_sd, skeleton, ...);
+    // nothing touches the card until the user invokes a blackbox op.
+    //
+    // Compile-time gate: `bsp::HAS_BLACKBOX_STORAGE` is a `const bool`
+    // so the entire branch is dead-code-eliminated on boards without
+    // storage. No Cargo feature required.
+    if bsp::HAS_BLACKBOX_STORAGE {
+        let mut sdmmc_cfg = hal::sdmmc::Config::default();
+        sdmmc_cfg.data_transfer_timeout = 5_000_000; // generous for low-end cards
+        let sdmmc = hal::sdmmc::Sdmmc::new_4bit(
+            board.sdio.sdio,
+            SdmmcIrqs,
+            board.sdio.ck,
+            board.sdio.cmd,
+            board.sdio.d0,
+            board.sdio.d1,
+            board.sdio.d2,
+            board.sdio.d3,
+            sdmmc_cfg,
+        );
+        let store = crate::blackbox::SdmmcBlockStore::new(sdmmc);
+        if let Err(e) = spawner.spawn(crate::blackbox::blackbox_task(store)) {
+            defmt::error!("blackbox: spawn failed: {:?}", defmt::Debug2Format(&e));
+        }
+    }
 
     // Wait for power to stabilize before touching SPI devices.
     Timer::after_millis(100).await;

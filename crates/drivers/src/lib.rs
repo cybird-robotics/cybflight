@@ -2,6 +2,7 @@
 
 pub mod baro;
 pub mod beeper;
+pub mod blackbox_storage;
 pub mod dshot;
 pub mod gps;
 pub mod imu;

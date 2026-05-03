@@ -32,12 +32,13 @@ use crate::trajectory_planning::sampler::PositionSamplerParams;
 use crate::trajectory_planning::types::Vec3;
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 21;
+const VERSION: u32 = 22;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
-/// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 + 28 + 4 + 4 = 624 bytes
-const PAYLOAD_SIZE: usize = 624;
-/// Padded to 32-byte flash word boundary: ceil((16+624)/32)*32 = 640
-pub const PADDED_SIZE: usize = 640;
+/// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 + 28 + 4 + 4 + 4 = 628 bytes
+/// (last 4 = blackbox_record_set, added in v22)
+const PAYLOAD_SIZE: usize = 628;
+/// Padded to 32-byte flash word boundary: ceil((16+628)/32)*32 = 672
+pub const PADDED_SIZE: usize = 672;
 
 /// MPC tuning parameters: cost weights, discretization, and constraint penalty.
 ///
@@ -357,6 +358,16 @@ pub struct VehicleParams {
     /// false, the strip is held off. Toggled by the `led on` / `led off`
     /// shell verbs which also auto-save to flash.
     pub arm_led_enabled: bool,
+    /// Blackbox record-set tier (added in v22). Encodes
+    /// `cybflight::blackbox::record_set::RecordSet` as `u8`:
+    /// 0=None, 1=Small, 2=Mid, 3=Large. Mirrored into the
+    /// `BLACKBOX_RECORD_SET` atomic at boot; updated and auto-saved by
+    /// the `blackbox set <tier>` shell verb.
+    ///
+    /// Out-of-range values fall back to `RecordSet::DEFAULT` at use
+    /// site, so a flash blob written by a future firmware that knew of
+    /// more tiers won't corrupt this firmware's recorder behaviour.
+    pub blackbox_record_set: u8,
 }
 
 impl VehicleParams {
@@ -495,6 +506,10 @@ impl VehicleParams {
         off = put_f32(&mut buf, off, self.mission_profile as f32);
         // Arm-LED enable flag (added in v20). 0.0 = off, anything else = on.
         off = put_f32(&mut buf, off, if self.arm_led_enabled { 1.0 } else { 0.0 });
+        // Blackbox record-set tier (added in v22). Encoded as f32 to
+        // match the rest of the all-f32 payload; truncated back to u8
+        // on read.
+        off = put_f32(&mut buf, off, self.blackbox_record_set as f32);
         debug_assert_eq!(off - HEADER_SIZE, PAYLOAD_SIZE);
 
         // Header
@@ -824,6 +839,12 @@ impl VehicleParams {
         let arm_led_enabled = get_f32(buf, off) != 0.0;
         off += 4;
 
+        // Blackbox record-set tier (added in v22). Out-of-range values
+        // are resolved at use site by `RecordSet::from_u8`, so
+        // `from_bytes` only does the byte-level read here.
+        let blackbox_record_set = get_f32(buf, off) as u8;
+        off += 4;
+
         // Symmetry with `to_bytes`: catch schema-edit bugs where a field
         // is added to one side and not the other. Debug-only — release
         // builds rely on the magic+version+CRC check above.
@@ -841,6 +862,7 @@ impl VehicleParams {
             sampler,
             mission_profile,
             arm_led_enabled,
+            blackbox_record_set,
         })
     }
 
@@ -1767,6 +1789,21 @@ mod tests {
             sampler: SamplerParams::default(),
             mission_profile: 3,
             arm_led_enabled: false,
+            blackbox_record_set: 2, // Mid — non-default so round-trip catches drops
+        }
+    }
+
+    #[test]
+    fn round_trip_blackbox_record_set() {
+        for expected in [0u8, 1, 2, 3] {
+            let mut params = test_params();
+            params.blackbox_record_set = expected;
+            let bytes = params.to_bytes();
+            let restored = VehicleParams::from_bytes(&bytes).expect("from_bytes failed");
+            assert_eq!(
+                restored.blackbox_record_set, expected,
+                "blackbox_record_set round-trip mismatch for {expected}",
+            );
         }
     }
 

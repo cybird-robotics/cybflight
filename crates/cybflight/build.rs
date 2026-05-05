@@ -97,12 +97,21 @@ fn bake_thrust_tables(out: &Path) {
         let voltage_max: f64 = hdr.next().expect("missing voltage_max").parse().unwrap();
 
         assert_eq!(
-            map_size, N,
+            map_size,
+            N,
             "thrust map {}: expected {N}×{N} grid, got {map_size}",
             path.display()
         );
-        assert!(thrust_max > thrust_min, "thrust map {}: thrust range degenerate", path.display());
-        assert!(voltage_max > voltage_min, "thrust map {}: voltage range degenerate", path.display());
+        assert!(
+            thrust_max > thrust_min,
+            "thrust map {}: thrust range degenerate",
+            path.display()
+        );
+        assert!(
+            voltage_max > voltage_min,
+            "thrust map {}: voltage range degenerate",
+            path.display()
+        );
 
         // Collective → per-rotor conversion. See module doc on `bake_thrust_tables`.
         let thrust_min = thrust_min / N_MOTORS as f64;
@@ -124,11 +133,17 @@ fn bake_thrust_tables(out: &Path) {
             );
             let mut prev = f32::NEG_INFINITY;
             for (col, s) in cols.iter().enumerate() {
-                let v: f32 = s
-                    .trim()
-                    .parse()
-                    .unwrap_or_else(|_| panic!("thrust map {}: row {row} col {col} not f32: {s:?}", path.display()));
-                assert!(v.is_finite(), "thrust map {}: row {row} col {col} not finite", path.display());
+                let v: f32 = s.trim().parse().unwrap_or_else(|_| {
+                    panic!(
+                        "thrust map {}: row {row} col {col} not f32: {s:?}",
+                        path.display()
+                    )
+                });
+                assert!(
+                    v.is_finite(),
+                    "thrust map {}: row {row} col {col} not finite",
+                    path.display()
+                );
                 assert!(
                     v >= prev - 1e-3,
                     "thrust map {}: row {row} not monotone in thrust at col {col}: {prev} → {v}",
@@ -140,7 +155,9 @@ fn bake_thrust_tables(out: &Path) {
         }
 
         // Emit the static.
-        emitted.push_str(&format!("/// Baked from `data/thrust_tables/{stem}.csv` at build time.\n"));
+        emitted.push_str(&format!(
+            "/// Baked from `data/thrust_tables/{stem}.csv` at build time.\n"
+        ));
         emitted.push_str(&format!(
             "pub static {const_name}: ::cybflight_core::indi::thrust_table::ThrustTable<{N}> = match \
              ::cybflight_core::indi::thrust_table::ThrustTable::<{N}>::new(\n    [\n"

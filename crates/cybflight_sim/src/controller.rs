@@ -159,6 +159,16 @@ impl MpcIndiController {
         // Outer MPC (QuadModel, same as firmware outer_loop.rs)
         let mut model = QuadModel::from_vehicle_params(vp);
         model.dt = SIMPLE_MPC_DT;
+        // Sim-local override: restore the pre-7b7bf81 uniform `w_input`
+        // mapping. Upstream `QuadModel::from_vehicle_params` was changed
+        // from `w_input = SVector::from_element(thrust_weight)` to
+        // `w_input = [thrust_weight, rate_weight[0..3]]` — semantically
+        // correct (the four MPC inputs are heterogeneous: collective
+        // thrust + 3 body rates), but the change broke the sim's
+        // committed regression snapshot. We re-apply the uniform shape
+        // *only* in this controller; FullQuadModel (used by
+        // `MpcDirectController`) keeps the canonical `w_rate` mapping.
+        model.w_input = SVector::from_element(vp.mpc.thrust_weight);
         let grav = model.grav;
         let problem = SimpleQuadProblem::with_rk4(model, SIMPLE_N);
         let mass = vp.body.mass_kg;

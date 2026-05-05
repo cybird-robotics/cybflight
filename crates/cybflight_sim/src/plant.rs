@@ -7,15 +7,26 @@
 use cybflight_core::mixer::{MotorParams, RigidBodyParams, SpinDir};
 use cybflight_core::mpc::{FullQuadModel, NU, NX};
 use cybflight_core::params::{
-    ControlGains, IndiControllerParams, IndiEffectivenessParams, LearnerParams, MpcParams,
-    PlannerParams, SamplerParams, VehicleParams,
+    BfgsTrustParams, ControlGains, IndiControllerParams, IndiEffectivenessParams, LearnerParams,
+    MpcParams, PlannerParams, SamplerParams, VehicleParams,
 };
-use nalgebra::{stack, Quaternion, SVector, UnitQuaternion, Vector3};
+use nalgebra::{Quaternion, SVector, UnitQuaternion, Vector3, stack};
 
-/// Canonical host-side vehicle parameters. Mirrors the firmware's
-/// `QUADROTOR_BODY` / `QUADROTOR_MOTORS` / `DEFAULT_CONTROL_GAINS` in
-/// `crates/cybflight/src/vehicle.rs`. Kept in sync manually — when the
-/// firmware numbers change, update this too. See the runner's parity test.
+/// Canonical host-side vehicle parameters.
+///
+/// **Schema-stability contract** (see `CLAUDE.md` "Snapshot drift"
+/// section): every tuning-sensitive sub-config is constructed here
+/// via explicit `Type::new(...)` — never via `Type::default()`.
+/// Firmware control authors retune `Default` impls in
+/// `cybflight_core::params` (MPC weights, planner caps, INDI rate
+/// gains) when flight test reveals a better operating point; the sim
+/// must NOT pick those up implicitly, or every retune silently
+/// shifts the regression snapshot.
+///
+/// New tuning fields added upstream will fail to compile this
+/// builder, forcing an explicit decision about what the sim should
+/// use. To intentionally adopt a new firmware tuning, edit the
+/// literals here and regenerate the snapshot in the same commit.
 pub const VEHICLE: VehicleParamsBuilder = VehicleParamsBuilder;
 
 pub struct VehicleParamsBuilder;
@@ -59,16 +70,60 @@ impl VehicleParamsBuilder {
                 pos_kd: [4.0, 4.0, 6.0],
                 att_k_rate: [3.0, 3.0, 1.0],
             },
-            indi_effectiveness: IndiEffectivenessParams::default(),
-            indi_controller: IndiControllerParams::default(),
-            learner: LearnerParams::default(),
-            mpc: MpcParams::default(),
-            planner: PlannerParams::default(),
-            sampler: SamplerParams::default(),
+            // Geometric fallback — no tuning surface; no Default drift.
+            indi_effectiveness: IndiEffectivenessParams::zero(),
+            indi_controller: IndiControllerParams::new(
+                [80.0, 80.0, 80.0],            // rate_gains
+                12.0,                           // sync_filter_hz
+                [1.0, 1.0, 50.0, 50.0, 50.0, 5.0], // wls_wv
+                [1.0, 1.0, 1.0, 1.0],          // wls_wu
+                14,                             // motor_pole_count
+            ),
+            learner: LearnerParams::new(
+                20.0,            // fx_filt_hz
+                40.0,            // motor_filt_hz
+                [0.0, 0.0, 0.0], // acc_offset_m
+                100.0,           // rls_gamma
+                0.25,            // rls_t_char_s
+                0.8,             // zeta_rate
+                0.8,             // zeta_attitude
+            ),
+            mpc: MpcParams::new(
+                [500.0, 500.0, 500.0], // pos_weight
+                [10.0, 10.0, 10.0],    // vel_weight
+                [5.0, 5.0, 200.0],     // att_weight
+                [20.0, 20.0, 20.0],    // rate_weight
+                1.0,                    // thrust_weight
+                0.05,                   // dt
+                1e4,                    // rho
+            ),
+            planner: PlannerParams::new(
+                100.0,                          // max_vel_m_s
+                core::f32::consts::FRAC_PI_3,   // max_tilt_rad
+                1.0,                            // weight_time
+                0.01,                           // weight_energy
+                0.0,                            // weight_pos
+                0.0,                            // weight_vel
+                0.0,                            // weight_tilt
+                10.0,                           // weight_body_rate
+                10.0,                           // weight_thrust
+                0.01,                           // smoothing_eps
+                8,                              // num_check_per_piece
+                BfgsTrustParams::default(),
+            ),
+            sampler: SamplerParams::new(
+                0.1,             // max_lag_s
+                [1.0, 1.0, 1.0], // axis_weights_sqrt
+                0.01,            // search_dt
+                100,             // max_search_steps
+                0.15,            // radius_of_acceptance
+                0.1,             // max_lead_s
+            ),
             // Sim doesn't exercise the offline-mission registry; the field
             // exists only to satisfy the firmware's flash schema.
             mission_profile: 0,
             arm_led_enabled: false,
+            blackbox_record_set: 0,
         }
     }
 }

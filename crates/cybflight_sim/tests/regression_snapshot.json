@@ -14,11 +14,11 @@
     "peak_motor_saturation_pct": 15.869119
   },
   "hover_level/mpc_indi": {
-    "rms_pos_err_m": 0.012736842,
-    "peak_pos_err_m": 0.023084283,
-    "terminal_pos_err_m": 0.012012999,
+    "rms_pos_err_m": 0.0027906364,
+    "peak_pos_err_m": 0.011423111,
+    "terminal_pos_err_m": 0.0010151907,
     "peak_tilt_rad": 0.0,
-    "peak_motor_saturation_pct": 16.42189
+    "peak_motor_saturation_pct": 16.889
   },
   "hover_tilt30/cascade": {
     "rms_pos_err_m": 0.19019082,
@@ -28,18 +28,18 @@
     "peak_motor_saturation_pct": 20.190208
   },
   "hover_tilt30/mpc_direct": {
-    "rms_pos_err_m": 0.037476342,
-    "peak_pos_err_m": 0.12953174,
-    "terminal_pos_err_m": 0.015482144,
+    "rms_pos_err_m": 0.06303454,
+    "peak_pos_err_m": 0.2050203,
+    "terminal_pos_err_m": 0.030614344,
     "peak_tilt_rad": 0.52359855,
-    "peak_motor_saturation_pct": 24.272509
+    "peak_motor_saturation_pct": 29.956123
   },
   "hover_tilt30/mpc_indi": {
-    "rms_pos_err_m": 0.058794778,
-    "peak_pos_err_m": 0.18090716,
-    "terminal_pos_err_m": 0.032108456,
+    "rms_pos_err_m": 0.017220914,
+    "peak_pos_err_m": 0.06314724,
+    "terminal_pos_err_m": 0.006542446,
     "peak_tilt_rad": 0.52359855,
-    "peak_motor_saturation_pct": 20.898819
+    "peak_motor_saturation_pct": 60.195732
   },
   "mission_square/cascade": {
     "rms_pos_err_m": 0.22971357,
@@ -49,32 +49,32 @@
     "peak_motor_saturation_pct": 17.723543
   },
   "mission_square/mpc_direct": {
-    "rms_pos_err_m": 0.0056127333,
-    "peak_pos_err_m": 0.012365252,
-    "terminal_pos_err_m": 0.0015291485,
-    "peak_tilt_rad": 0.34490713,
-    "peak_motor_saturation_pct": 18.718561
+    "rms_pos_err_m": 0.033754345,
+    "peak_pos_err_m": 0.056247912,
+    "terminal_pos_err_m": 0.009534433,
+    "peak_tilt_rad": 0.3466417,
+    "peak_motor_saturation_pct": 18.347588
   },
   "mission_square/mpc_indi": {
-    "rms_pos_err_m": 0.029225338,
-    "peak_pos_err_m": 0.04458165,
-    "terminal_pos_err_m": 0.011726617,
-    "peak_tilt_rad": 0.3464971,
-    "peak_motor_saturation_pct": 18.401909
+    "rms_pos_err_m": 0.002622723,
+    "peak_pos_err_m": 0.011305545,
+    "terminal_pos_err_m": 0.00073169084,
+    "peak_tilt_rad": 0.3451158,
+    "peak_motor_saturation_pct": 27.749443
   },
   "mission_square_gps/mpc_indi": {
-    "rms_pos_err_m": 0.33687672,
-    "peak_pos_err_m": 0.63367295,
-    "terminal_pos_err_m": 0.20658754,
-    "peak_tilt_rad": 0.6572183,
-    "peak_motor_saturation_pct": 30.186653
+    "rms_pos_err_m": 0.39954975,
+    "peak_pos_err_m": 0.713751,
+    "terminal_pos_err_m": 0.24520731,
+    "peak_tilt_rad": 0.5463486,
+    "peak_motor_saturation_pct": 28.928375
   },
   "mission_square_noisy/mpc_indi": {
-    "rms_pos_err_m": 0.028470859,
-    "peak_pos_err_m": 0.046499074,
-    "terminal_pos_err_m": 0.007117262,
-    "peak_tilt_rad": 0.349936,
-    "peak_motor_saturation_pct": 18.473625
+    "rms_pos_err_m": 0.0026780756,
+    "peak_pos_err_m": 0.011368417,
+    "terminal_pos_err_m": 0.00076862884,
+    "peak_tilt_rad": 0.34502327,
+    "peak_motor_saturation_pct": 28.035355
   },
   "p2p_x3/cascade": {
     "rms_pos_err_m": 0.16772956,
@@ -84,17 +84,17 @@
     "peak_motor_saturation_pct": 17.105675
   },
   "p2p_x3/mpc_direct": {
-    "rms_pos_err_m": 0.0051470986,
-    "peak_pos_err_m": 0.012241359,
-    "terminal_pos_err_m": 0.001604012,
-    "peak_tilt_rad": 0.26726842,
-    "peak_motor_saturation_pct": 18.02716
+    "rms_pos_err_m": 0.02773978,
+    "peak_pos_err_m": 0.053787388,
+    "terminal_pos_err_m": 0.009257608,
+    "peak_tilt_rad": 0.2544181,
+    "peak_motor_saturation_pct": 17.764317
   },
   "p2p_x3/mpc_indi": {
-    "rms_pos_err_m": 0.019291509,
-    "peak_pos_err_m": 0.03710277,
-    "terminal_pos_err_m": 0.010464684,
-    "peak_tilt_rad": 0.25887555,
-    "peak_motor_saturation_pct": 17.85736
+    "rms_pos_err_m": 0.0030673188,
+    "peak_pos_err_m": 0.011282339,
+    "terminal_pos_err_m": 0.0007301034,
+    "peak_tilt_rad": 0.25244376,
+    "peak_motor_saturation_pct": 24.950027
   }
 }

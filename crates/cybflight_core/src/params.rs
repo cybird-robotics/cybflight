@@ -78,6 +78,46 @@ impl Default for MpcParams {
 }
 
 impl MpcParams {
+    /// Explicit constructor. Pass every weight literally — useful for
+    /// the host simulation, which freezes its tuning baseline against
+    /// future `Default` retunes (see
+    /// `crates/cybflight_sim/src/plant.rs::VehicleParamsBuilder`).
+    pub fn new(
+        pos_weight: [f32; 3],
+        vel_weight: [f32; 3],
+        att_weight: [f32; 3],
+        rate_weight: [f32; 3],
+        thrust_weight: f32,
+        dt: f32,
+        rho: f32,
+    ) -> Self {
+        Self {
+            pos_weight,
+            vel_weight,
+            att_weight,
+            rate_weight,
+            thrust_weight,
+            dt,
+            rho,
+        }
+    }
+
+    pub fn set_pos_weight(&mut self, pos_weight: [f32; 3]) {
+        self.pos_weight = pos_weight;
+    }
+
+    pub fn set_vel_weight(&mut self, vel_weight: [f32; 3]) {
+        self.vel_weight = vel_weight;
+    }
+
+    pub fn set_att_weight(&mut self, att_weight: [f32; 3]) {
+        self.att_weight = att_weight;
+    }
+
+    pub fn set_rate_weight(&mut self, rate_weight: [f32; 3]) {
+        self.rate_weight = rate_weight;
+    }
+
     pub fn set_thrust_weight(&mut self, thrust_weight: f32) {
         self.thrust_weight = thrust_weight;
     }
@@ -110,6 +150,28 @@ impl Default for BfgsTrustParams {
             max_iterations: 500,
             past: 3,
             delta_conv: 1.0e-8,
+        }
+    }
+}
+
+impl BfgsTrustParams {
+    pub fn new(
+        delta_init: f32,
+        delta_max: f32,
+        eta: f32,
+        g_epsilon: f32,
+        max_iterations: usize,
+        past: usize,
+        delta_conv: f32,
+    ) -> Self {
+        Self {
+            delta_init,
+            delta_max,
+            eta,
+            g_epsilon,
+            max_iterations,
+            past,
+            delta_conv,
         }
     }
 }
@@ -163,6 +225,39 @@ impl Default for PlannerParams {
     }
 }
 
+impl PlannerParams {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        max_vel_m_s: f32,
+        max_tilt_rad: f32,
+        weight_time: f32,
+        weight_energy: f32,
+        weight_pos: f32,
+        weight_vel: f32,
+        weight_tilt: f32,
+        weight_body_rate: f32,
+        weight_thrust: f32,
+        smoothing_eps: f32,
+        num_check_per_piece: usize,
+        bfgs_trust: BfgsTrustParams,
+    ) -> Self {
+        Self {
+            max_vel_m_s,
+            max_tilt_rad,
+            weight_time,
+            weight_energy,
+            weight_pos,
+            weight_vel,
+            weight_tilt,
+            weight_body_rate,
+            weight_thrust,
+            smoothing_eps,
+            num_check_per_piece,
+            bfgs_trust,
+        }
+    }
+}
+
 /// Control gains for position and attitude loops.
 ///
 /// All vector gains are dimension-major: `[roll/x, pitch/y, yaw/z]`.
@@ -198,6 +293,13 @@ pub struct IndiEffectivenessParams {
 
 impl Default for IndiEffectivenessParams {
     fn default() -> Self {
+        Self::zero()
+    }
+}
+
+impl IndiEffectivenessParams {
+    /// Sentinel "not configured / use geometric fallback".
+    pub const fn zero() -> Self {
         Self {
             g1_force: [[0.0; 3]; 4],
             g1_torque: [[0.0; 3]; 4],
@@ -237,6 +339,22 @@ impl Default for IndiControllerParams {
 }
 
 impl IndiControllerParams {
+    pub fn new(
+        rate_gains: [f32; 3],
+        sync_filter_hz: f32,
+        wls_wv: [f32; 6],
+        wls_wu: [f32; 4],
+        motor_pole_count: u8,
+    ) -> Self {
+        Self {
+            rate_gains,
+            sync_filter_hz,
+            wls_wv,
+            wls_wu,
+            motor_pole_count,
+        }
+    }
+
     pub fn set_rate_gains(&mut self, rate_gains: [f32; 3]) {
         self.rate_gains = rate_gains;
     }
@@ -279,6 +397,28 @@ impl Default for LearnerParams {
     }
 }
 
+impl LearnerParams {
+    pub fn new(
+        fx_filt_hz: f32,
+        motor_filt_hz: f32,
+        acc_offset_m: [f32; 3],
+        rls_gamma: f32,
+        rls_t_char_s: f32,
+        zeta_rate: f32,
+        zeta_attitude: f32,
+    ) -> Self {
+        Self {
+            fx_filt_hz,
+            motor_filt_hz,
+            acc_offset_m,
+            rls_gamma,
+            rls_t_char_s,
+            zeta_rate,
+            zeta_attitude,
+        }
+    }
+}
+
 /// Reference-sampler tuning parameters. Mirrors the fields of
 /// [`PositionSamplerParams`](crate::trajectory_planning::sampler::PositionSamplerParams)
 /// so a single struct holds the runtime-tunable surface for the position
@@ -317,6 +457,24 @@ impl Default for SamplerParams {
 }
 
 impl SamplerParams {
+    pub fn new(
+        max_lag_s: f32,
+        axis_weights_sqrt: [f32; 3],
+        search_dt: f32,
+        max_search_steps: u16,
+        radius_of_acceptance: f32,
+        max_lead_s: f32,
+    ) -> Self {
+        Self {
+            max_lag_s,
+            axis_weights_sqrt,
+            search_dt,
+            max_search_steps,
+            radius_of_acceptance,
+            max_lead_s,
+        }
+    }
+
     /// Project a `SamplerParams` into the sampler-side `PositionSamplerParams`
     /// shape. The outer loop calls this when constructing or rebuilding the
     /// `Sampler::Position` instance.

@@ -8,6 +8,25 @@ utadr = { index = "sparse+https://crates.yifanl.com/api/v1/crates/" }
 rustflags = ["-C", "target-cpu=cortex-m7"]
 runner = "bash tools/build.sh"
 
+# Host-side rustflags. The sim regression snapshot
+# (`crates/cybflight_sim/tests/regression_snapshot.json`) is a
+# tight-tolerance numeric oracle: snapshot rows must match across
+# any developer's x86-64 Linux machine and CI runner. Compiler
+# choices that vary by host CPU — auto-vectorisation width, FMA
+# emission, SSE4 vs AVX2 reductions — break that oracle even when
+# the source code is byte-identical. Pin the codegen to the
+# baseline x86-64 ISA so all builds emit the same instructions:
+#
+#   - target-cpu=x86-64       — no SSE3/SSSE3/SSE4/AVX/AVX2.
+#   - target-feature=-fma     — belt-and-suspenders against fused
+#                               multiply-add re-ordering.
+#
+# Float math in cybflight-core goes through the `libm` crate
+# (portable software impl) rather than std `f32::*`, so libm
+# differences across distros don't bite either.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64", "-C", "target-feature=-fma"]
+
 [build]
 target = "thumbv7em-none-eabihf"
 

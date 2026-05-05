@@ -65,7 +65,34 @@ impl MissionProfile {
     pub const fn num_pieces(&self) -> usize {
         self.waypoints.len()
     }
+
+    /// Whether this profile's environment matches the firmware build.
+    ///
+    /// `est_pos_mocap` builds (indoor lab / HIL) only accept `env="indoor"`
+    /// profiles; `est_pos_gps` builds (outdoor) only accept `env="outdoor"`.
+    /// The `outer_mpc + est_pos_*` mutual-exclusion is enforced at compile
+    /// time in `control/mod.rs`.
+    pub fn is_compatible_with_build(&self) -> bool {
+        self.env.eq_ignore_ascii_case(BUILD_ENV)
+    }
 }
+
+// ─── Build-time environment ──────────────────────────────────────────
+//
+// Selected by the position-source feature:
+// - `est_pos_mocap` → "indoor" (VICON / lab)
+// - `est_pos_gps`   → "outdoor" (u-blox M10 NAV-PVT)
+//
+// The compile_error guards in `control/mod.rs` ensure exactly one is set
+// whenever this module is compiled (`outer_mpc` requires it).
+
+/// Indoor build (mocap / VICON position source).
+#[cfg(feature = "est_pos_mocap")]
+pub const BUILD_ENV: &str = "indoor";
+
+/// Outdoor build (GPS position source).
+#[cfg(feature = "est_pos_gps")]
+pub const BUILD_ENV: &str = "outdoor";
 
 // ─── Indoor, SplitS, Slow ────────────────────────────────────────────
 
@@ -241,75 +268,146 @@ pub static INDOOR_SPLITS_MID: MissionProfile = MissionProfile {
 
 // ─── Indoor, SplitS, Fast ────────────────────────────────────────────
 
+// static INDOOR_SPLITS_FAST_WP: [[f32; 3]; 60] = [
+//     [-2.385, -3.563, 1.077],
+//     [-1.3, -3.436, 1.389],
+//     [-0.335, -2.231, 1.6],
+//     [-0.3995, -1.016, 1.223],
+//     [-1.163, 0.3885, 0.9517],
+//     [-1.837, 1.643, 1.199],
+//     [-1.135, 3.086, 1.409],
+//     [0.6928, 3.185, 1.306],
+//     [2.285, 1.635, 1.203],
+//     [2.734, 0.2063, 1.309],
+//     [2.732, -1.178, 1.58],
+//     [2.553, -2.107, 1.795],
+//     [2.483, -2.476, 1.671],
+//     [2.518, -2.482, 1.341],
+//     [2.543, -2.106, 1.007],
+//     [2.285, -1.191, 0.7673],
+//     [1.519, -0.2076, 0.8247],
+//     [0.308, 0.3502, 0.9944],
+//     [-1.313, 0.1156, 1.002],
+//     [-2.352, -0.9535, 0.9395],
+//     [-2.389, -2.211, 1.003],
+//     [-1.661, -2.893, 1.198],
+//     [-0.77, -2.88, 1.524],
+//     [-0.3348, -2.232, 1.599],
+//     [-0.6452, -1.218, 1.178],
+//     [-1.448, 0.1667, 0.9672],
+//     [-1.837, 1.643, 1.2],
+//     [-1.047, 3.242, 1.356],
+//     [0.6791, 3.331, 1.271],
+//     [2.285, 1.635, 1.203],
+//     [2.71, 0.1738, 1.326],
+//     [2.707, -1.195, 1.601],
+//     [2.553, -2.107, 1.795],
+//     [2.499, -2.484, 1.656],
+//     [2.534, -2.487, 1.33],
+//     [2.543, -2.106, 1.007],
+//     [2.273, -1.185, 0.7762],
+//     [1.502, -0.2005, 0.8267],
+//     [0.3081, 0.3502, 0.9944],
+//     [-1.307, 0.1094, 0.9973],
+//     [-2.346, -0.9616, 0.9287],
+//     [-2.389, -2.211, 1.003],
+//     [-1.662, -2.901, 1.204],
+//     [-0.7722, -2.885, 1.525],
+//     [-0.3348, -2.232, 1.599],
+//     [-0.6241, -1.207, 1.174],
+//     [-1.422, 0.1791, 0.9569],
+//     [-1.837, 1.643, 1.2],
+//     [-1.061, 3.284, 1.357],
+//     [0.689, 3.342, 1.247],
+//     [2.284, 1.635, 1.202],
+//     [2.722, 0.1099, 1.344],
+//     [2.71, -1.246, 1.632],
+//     [2.554, -2.107, 1.797],
+//     [2.485, -2.478, 1.618],
+//     [2.52, -2.473, 1.284],
+//     [2.54, -2.108, 1.004],
+//     [1.699, -0.4978, 0.7795],
+//     [0.5322, 0.296, 1.037],
+//     [0.3099, 0.3554, 1.0],
+// ];
+
+// static INDOOR_SPLITS_FAST_TS: [f32; 60] = [
+//     0.1678, 0.3648, 0.5559, 0.6823, 0.8232, 0.9756, 1.186, 1.378, 1.567, 1.678, 1.791, 1.907,
+//     1.999, 2.09, 2.181, 2.301, 2.421, 2.541, 2.689, 2.839, 2.993, 3.128, 3.259, 3.396, 3.538,
+//     3.679, 3.813, 4.008, 4.203, 4.399, 4.508, 4.619, 4.732, 4.823, 4.914, 5.005, 5.124, 5.243,
+//     5.362, 5.511, 5.66, 5.814, 5.948, 6.078, 6.214, 6.354, 6.494, 6.627, 6.827, 7.027, 7.221,
+//     7.334, 7.445, 7.555, 7.647, 7.738, 7.828, 8.04, 8.246, 8.452,
+// ];
+
 static INDOOR_SPLITS_FAST_WP: [[f32; 3]; 60] = [
-    [-2.385, -3.563, 1.077],
-    [-1.3, -3.436, 1.389],
-    [-0.335, -2.231, 1.6],
-    [-0.3995, -1.016, 1.223],
-    [-1.163, 0.3885, 0.9517],
-    [-1.837, 1.643, 1.199],
-    [-1.135, 3.086, 1.409],
-    [0.6928, 3.185, 1.306],
-    [2.285, 1.635, 1.203],
-    [2.734, 0.2063, 1.309],
-    [2.732, -1.178, 1.58],
-    [2.553, -2.107, 1.795],
-    [2.483, -2.476, 1.671],
-    [2.518, -2.482, 1.341],
-    [2.543, -2.106, 1.007],
-    [2.285, -1.191, 0.7673],
-    [1.519, -0.2076, 0.8247],
-    [0.308, 0.3502, 0.9944],
-    [-1.313, 0.1156, 1.002],
-    [-2.352, -0.9535, 0.9395],
-    [-2.389, -2.211, 1.003],
-    [-1.661, -2.893, 1.198],
-    [-0.77, -2.88, 1.524],
-    [-0.3348, -2.232, 1.599],
-    [-0.6452, -1.218, 1.178],
-    [-1.448, 0.1667, 0.9672],
-    [-1.837, 1.643, 1.2],
-    [-1.047, 3.242, 1.356],
-    [0.6791, 3.331, 1.271],
-    [2.285, 1.635, 1.203],
-    [2.71, 0.1738, 1.326],
-    [2.707, -1.195, 1.601],
-    [2.553, -2.107, 1.795],
-    [2.499, -2.484, 1.656],
-    [2.534, -2.487, 1.33],
-    [2.543, -2.106, 1.007],
-    [2.273, -1.185, 0.7762],
-    [1.502, -0.2005, 0.8267],
-    [0.3081, 0.3502, 0.9944],
-    [-1.307, 0.1094, 0.9973],
-    [-2.346, -0.9616, 0.9287],
-    [-2.389, -2.211, 1.003],
-    [-1.662, -2.901, 1.204],
-    [-0.7722, -2.885, 1.525],
-    [-0.3348, -2.232, 1.599],
-    [-0.6241, -1.207, 1.174],
-    [-1.422, 0.1791, 0.9569],
-    [-1.837, 1.643, 1.2],
-    [-1.061, 3.284, 1.357],
-    [0.689, 3.342, 1.247],
-    [2.284, 1.635, 1.202],
-    [2.722, 0.1099, 1.344],
-    [2.71, -1.246, 1.632],
-    [2.554, -2.107, 1.797],
-    [2.485, -2.478, 1.618],
-    [2.52, -2.473, 1.284],
-    [2.54, -2.108, 1.004],
-    [1.699, -0.4978, 0.7795],
-    [0.5322, 0.296, 1.037],
+    [-2.423, -3.514, 1.048],
+    [-1.617, -3.444, 1.308],
+    [-0.331, -2.228, 1.595],
+    [-0.5492, -0.8822, 1.745],
+    [-1.214, 0.3425, 1.662],
+    [-1.838, 1.645, 1.199],
+    [-1.227, 2.155, 1.042],
+    [0.4519, 2.393, 1.034],
+    [2.289, 1.631, 1.205],
+    [2.811, 0.7344, 1.549],
+    [2.685, -0.3515, 1.883],
+    [2.546, -2.105, 1.793],
+    [2.529, -2.816, 1.477],
+    [2.56, -2.899, 1.18],
+    [2.548, -2.108, 1.008],
+    [2.09, -1.016, 0.9776],
+    [1.261, -0.1319, 0.9829],
+    [0.3084, 0.3526, 0.9917],
+    [-1.004, -0.03513, 1.074],
+    [-1.925, -0.8095, 1.057],
+    [-2.393, -2.211, 1.007],
+    [-1.475, -2.942, 1.167],
+    [-0.5922, -2.797, 1.363],
+    [-0.3307, -2.232, 1.593],
+    [-0.9028, -1.079, 1.784],
+    [-1.641, 0.2301, 1.607],
+    [-1.841, 1.642, 1.207],
+    [-0.8296, 2.481, 1.018],
+    [0.4009, 2.606, 1.009],
+    [2.289, 1.637, 1.208],
+    [2.758, 0.4622, 1.561],
+    [2.675, -0.9192, 1.886],
+    [2.548, -2.107, 1.791],
+    [2.49, -2.682, 1.551],
+    [2.485, -2.923, 1.253],
+    [2.546, -2.107, 1.008],
+    [2.085, -0.8593, 0.9624],
+    [1.31, -0.03543, 0.9623],
+    [0.309, 0.3534, 0.9917],
+    [-0.9416, -0.03766, 1.051],
+    [-2.02, -0.9767, 1.024],
+    [-2.393, -2.215, 1.008],
+    [-1.794, -2.925, 1.131],
+    [-0.8325, -2.99, 1.327],
+    [-0.3334, -2.226, 1.598],
+    [-0.7713, -0.877, 1.797],
+    [-1.528, 0.5085, 1.634],
+    [-1.839, 1.64, 1.194],
+    [-1.165, 2.088, 1.049],
+    [0.5164, 2.334, 1.044],
+    [2.288, 1.638, 1.208],
+    [2.854, 0.6612, 1.558],
+    [2.744, -0.4349, 1.887],
+    [2.549, -2.106, 1.793],
+    [2.552, -2.847, 1.495],
+    [2.595, -2.992, 1.174],
+    [2.544, -2.108, 1.007],
+    [1.6, -0.4852, 0.96],
+    [0.477, 0.2408, 0.9711],
     [0.3099, 0.3554, 1.0],
 ];
 
 static INDOOR_SPLITS_FAST_TS: [f32; 60] = [
-    0.1678, 0.3648, 0.5559, 0.6823, 0.8232, 0.9756, 1.186, 1.378, 1.567, 1.678, 1.791, 1.907,
-    1.999, 2.09, 2.181, 2.301, 2.421, 2.541, 2.689, 2.839, 2.993, 3.128, 3.259, 3.396, 3.538,
-    3.679, 3.813, 4.008, 4.203, 4.399, 4.508, 4.619, 4.732, 4.823, 4.914, 5.005, 5.124, 5.243,
-    5.362, 5.511, 5.66, 5.814, 5.948, 6.078, 6.214, 6.354, 6.494, 6.627, 6.827, 7.027, 7.221,
-    7.334, 7.445, 7.555, 7.647, 7.738, 7.828, 8.04, 8.246, 8.452,
+    0.1494, 0.3568, 0.6596, 0.8785, 1.078, 1.367, 1.51, 1.683, 1.878, 2.054, 2.261, 2.565, 2.729,
+    2.878, 3.03, 3.161, 3.291, 3.433, 3.64, 3.794, 4.012, 4.206, 4.373, 4.556, 4.797, 5.018, 5.239,
+    5.417, 5.538, 5.745, 5.916, 6.143, 6.369, 6.503, 6.643, 6.833, 6.983, 7.11, 7.26, 7.45, 7.626,
+    7.808, 7.963, 8.137, 8.359, 8.588, 8.818, 9.066, 9.201, 9.37, 9.556, 9.734, 9.943, 10.23,
+    10.39, 10.55, 10.72, 10.93, 11.16, 11.41,
 ];
 
 const _: () = assert!(INDOOR_SPLITS_FAST_WP.len() == INDOOR_SPLITS_FAST_TS.len());
@@ -579,8 +677,7 @@ static OUTDOOR_DRAG_LARGE_MID_WP: [[f32; 3]; 6] = [
 
 static OUTDOOR_DRAG_LARGE_MID_TS: [f32; 6] = [0.396, 0.792, 1.188, 1.584, 1.98, 2.376];
 
-const _: () =
-    assert!(OUTDOOR_DRAG_LARGE_MID_WP.len() == OUTDOOR_DRAG_LARGE_MID_TS.len());
+const _: () = assert!(OUTDOOR_DRAG_LARGE_MID_WP.len() == OUTDOOR_DRAG_LARGE_MID_TS.len());
 const _: () = assert!(OUTDOOR_DRAG_LARGE_MID_WP.len() <= OFFLINE_MAX_PIECES);
 
 pub static OUTDOOR_DRAG_LARGE_MID: MissionProfile = MissionProfile {
@@ -608,8 +705,7 @@ static OUTDOOR_DRAG_SUPER_MID_WP: [[f32; 3]; 6] = [
 
 static OUTDOOR_DRAG_SUPER_MID_TS: [f32; 6] = [0.4709, 0.9419, 1.413, 1.884, 2.355, 2.826];
 
-const _: () =
-    assert!(OUTDOOR_DRAG_SUPER_MID_WP.len() == OUTDOOR_DRAG_SUPER_MID_TS.len());
+const _: () = assert!(OUTDOOR_DRAG_SUPER_MID_WP.len() == OUTDOOR_DRAG_SUPER_MID_TS.len());
 const _: () = assert!(OUTDOOR_DRAG_SUPER_MID_WP.len() <= OFFLINE_MAX_PIECES);
 
 pub static OUTDOOR_DRAG_SUPER_MID: MissionProfile = MissionProfile {
@@ -885,9 +981,7 @@ static OUTDOOR_SPLITS_LARGE_FAST_TS: [f32; 63] = [
     14.44, 14.76, 15.09, 15.4, 15.65, 15.91, 16.2, 16.39, 16.68, 16.97, 17.35,
 ];
 
-const _: () = assert!(
-    OUTDOOR_SPLITS_LARGE_FAST_WP.len() == OUTDOOR_SPLITS_LARGE_FAST_TS.len()
-);
+const _: () = assert!(OUTDOOR_SPLITS_LARGE_FAST_WP.len() == OUTDOOR_SPLITS_LARGE_FAST_TS.len());
 const _: () = assert!(OUTDOOR_SPLITS_LARGE_FAST_WP.len() <= OFFLINE_MAX_PIECES);
 
 pub static OUTDOOR_SPLITS_LARGE_FAST: MissionProfile = MissionProfile {
@@ -947,8 +1041,13 @@ const _: () = {
 // Default index must point at a real entry in PROFILES.
 const _: () = assert!((DEFAULT_PROFILE_INDEX as usize) < PROFILES.len());
 
-/// Default profile applied at boot when flash holds no valid setting.
-/// Index into [`PROFILES`].
+/// Default profile applied at boot when flash holds no valid setting, or
+/// when a persisted index is incompatible with the current build env.
+/// Index into [`PROFILES`]. Must reference a profile whose `env` matches
+/// [`BUILD_ENV`] — the build-env split is gated below.
+#[cfg(feature = "est_pos_mocap")]
+pub const DEFAULT_PROFILE_INDEX: u8 = 0; // indoor_splits_slow
+#[cfg(feature = "est_pos_gps")]
 pub const DEFAULT_PROFILE_INDEX: u8 = 3; // outdoor_splits_slow
 
 /// Active profile index. Read by `mission_planner::plan_offline()`,
@@ -977,22 +1076,28 @@ pub fn active_index() -> u8 {
 }
 
 /// Sets the active profile by index. Returns `false` if `idx` is
-/// out of range (selection is left unchanged).
+/// out of range or the profile's `env` does not match [`BUILD_ENV`].
+/// Selection is left unchanged on rejection.
 pub fn set_active(idx: u8) -> bool {
     let i = idx as usize;
     if i >= PROFILES.len() {
+        return false;
+    }
+    if !PROFILES[i].is_compatible_with_build() {
         return false;
     }
     ACTIVE_PROFILE.store(i, Ordering::Release);
     true
 }
 
-/// Re-applies a persisted profile index at boot. Out-of-range values
-/// fall back to [`DEFAULT_PROFILE_INDEX`] (e.g., flash from an older
-/// firmware build that knew about more profiles than this one).
+/// Re-applies a persisted profile index at boot. Falls back to
+/// [`DEFAULT_PROFILE_INDEX`] (which is itself env-gated) when the
+/// persisted index is out of range OR points at a profile whose `env`
+/// does not match [`BUILD_ENV`] — e.g., flash from a prior firmware
+/// build that flew the same airframe in the other environment.
 pub fn init_active_from_index(idx: u8) {
     let i = idx as usize;
-    let resolved = if i < PROFILES.len() {
+    let resolved = if i < PROFILES.len() && PROFILES[i].is_compatible_with_build() {
         i
     } else {
         DEFAULT_PROFILE_INDEX as usize
@@ -1001,6 +1106,9 @@ pub fn init_active_from_index(idx: u8) {
 }
 
 /// Resolves `(env, variant, speed)` to a profile index. Case-insensitive.
+/// Pure registry lookup — does not enforce build-env compatibility; the
+/// shell layer (and `set_active`) gate that separately so the user gets a
+/// distinct "incompatible env" error vs. "unknown mission".
 pub fn find(env: &str, variant: &str, speed: &str) -> Option<u8> {
     PROFILES.iter().enumerate().find_map(|(i, p)| {
         (p.env.eq_ignore_ascii_case(env)

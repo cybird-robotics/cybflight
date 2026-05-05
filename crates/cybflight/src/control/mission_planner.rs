@@ -759,6 +759,27 @@ pub async fn mission_planner_task() {
             continue;
         }
 
+        // Refuse missions whose env doesn't match the build's POS_SOURCE:
+        // - `est_pos_mocap` builds (indoor lab) require indoor profiles.
+        // - `est_pos_gps`   builds (outdoor flight) require outdoor profiles.
+        //
+        // Stay in Idle: no state transition, no slot write, no failsafe,
+        // no disarm. The pilot keeps full stick authority via the existing
+        // manual outer-loop path; the mission-trigger RC switch becomes a
+        // no-op until a compatible profile is selected on the ground.
+        // Boot restore + shell `mission set` already reject incompatible
+        // selections, so this is the in-flight defense-in-depth gate.
+        let active_profile = offline_mission::active();
+        if !active_profile.is_compatible_with_build() {
+            defmt::warn!(
+                "mission_planner: PLAN_REQUEST refused — profile '{}' env='{}' is incompatible with build env '{}' (staying Idle)",
+                active_profile.name,
+                active_profile.env,
+                offline_mission::BUILD_ENV,
+            );
+            continue;
+        }
+
         // Snapshot the controller's current reference (what it is actively
         // tracking right now). A `None` here means `ACTIVE_POSITION_SETPOINT`
         // is uninitialized, non-finite, or its timestamp is stale — i.e.

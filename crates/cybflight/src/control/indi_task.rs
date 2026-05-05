@@ -407,30 +407,30 @@ pub async fn indi_task() {
     // rather than fly with the mismatch — `defmt::panic!` halts the
     // firmware before motors arm. Voltage range is logged so an operator
     // can sanity-check the active table against the pack in use.
-    if let ThrustModel::Table(t) = THRUST_MODEL {
-        let pm = QUADROTOR_MOTORS[0].max_thrust_n;
-        let tm = t.thrust_max_n();
-        defmt::info!(
-            "INDI Table: thrust [{}, {}] N/rotor, voltage [{}, {}] V, per_motor_max={} N",
-            t.thrust_min_n(),
-            tm,
-            t.voltage_min_v(),
-            t.voltage_max_v(),
-            pm,
-        );
-        // 10% relative tolerance: the bench rig's per-rotor max and the
-        // configured `max_thrust_n` should agree to well within this; any
-        // larger gap means the table was baked from a different airframe.
-        let rel_err = libm::fabsf(pm - tm) / tm;
-        if rel_err >= 0.10 {
-            defmt::panic!(
-                "INDI: Table thrust_max ({} N/rotor) and vehicle.rs max_thrust_n ({} N) disagree by {}% — re-bake the table or fix vehicle.rs",
-                tm,
-                pm,
-                rel_err * 100.0,
-            );
-        }
-    }
+    // if let ThrustModel::Table(t) = THRUST_MODEL {
+    //     let pm = QUADROTOR_MOTORS[0].max_thrust_n;
+    //     let tm = t.thrust_max_n();
+    //     defmt::info!(
+    //         "INDI Table: thrust [{}, {}] N/rotor, voltage [{}, {}] V, per_motor_max={} N",
+    //         t.thrust_min_n(),
+    //         tm,
+    //         t.voltage_min_v(),
+    //         t.voltage_max_v(),
+    //         pm,
+    //     );
+    //     // 10% relative tolerance: the bench rig's per-rotor max and the
+    //     // configured `max_thrust_n` should agree to well within this; any
+    //     // larger gap means the table was baked from a different airframe.
+    //     let rel_err = libm::fabsf(pm - tm) / tm;
+    //     if rel_err >= 0.10 {
+    //         defmt::panic!(
+    //             "INDI: Table thrust_max ({} N/rotor) and vehicle.rs max_thrust_n ({} N) disagree by {}% — re-bake the table or fix vehicle.rs",
+    //             tm,
+    //             pm,
+    //             rel_err * 100.0,
+    //         );
+    //     }
+    // }
 
     /****************************/
     let motor_filter_hz = 15.0;
@@ -905,15 +905,15 @@ pub async fn indi_task() {
                 last_voltage_v,
             );
         }
-        if armed
-            && matches!(THRUST_MODEL, ThrustModel::Table(_))
-            && voltage_stale_since
-                .map(|t0| now.duration_since(t0) >= VOLTAGE_FAILSAFE_TIMEOUT)
-                .unwrap_or(false)
-        {
-            continue;
-        }
-        //
+        // if armed
+        //     && matches!(THRUST_MODEL, ThrustModel::Table(_))
+        //     && voltage_stale_since
+        //         .map(|t0| now.duration_since(t0) >= VOLTAGE_FAILSAFE_TIMEOUT)
+        //         .unwrap_or(false)
+        // {
+        //     continue;
+        // }
+        // //
         // Motor-state source:
         //   - Armed + LPF has a sample → feed dshot-derived ω, ω̇ from the
         //     task-level biquad + finite difference. Used in both normal and

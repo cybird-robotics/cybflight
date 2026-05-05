@@ -38,15 +38,29 @@
 //!    really is the corner), no purely geometric criterion advances τ —
 //!    the controller would be commanded backward toward the corner.
 //!    `tau0_s` (wall-clock elapsed since trajectory start, supplied by
-//!    the outer loop) provides a forward floor:
+//!    the outer loop) provides a forward floor and a forward ceiling:
 //!
 //! ```text
-//!   τ_curr = max( τ_geom,  clamp(tau0_s − max_lag_s,  prev_τ,  end) )
+//!   τ_floor = clamp(tau0_s − max_lag_s,  prev_τ,  end)
+//!   τ_ceil  = clamp(tau0_s + max_lead_s, prev_τ,  end)
+//!   τ_curr  = clamp( τ_geom, τ_floor, τ_ceil )
 //! ```
 //!
-//! The floor is one-sided: it never pulls τ backward from a healthy
-//! geometric optimum, only forward when geometry has stalled. This is
-//! distinct from the rejected time-weight cost
+//! The clamps are one-sided / monotone: the floor only nudges τ forward
+//! when geometry stalls, and the ceiling only clips τ when it would race
+//! ahead of wall-clock progress. Together they form a "trust window"
+//! `[tau0_s − max_lag_s, tau0_s + max_lead_s]` around real time inside
+//! which the geometric optimum is trusted.
+//!
+//! The ceiling matters when the trajectory passes spatially close to
+//! itself (loops, splits, return-to-home). The geometric cost has
+//! multiple basins inside the lookahead window in that case, and Newton
+//! can lock onto a basin that is far ahead in `τ` but spatially closer
+//! to the drone — committing the controller to a "phantom" setpoint
+//! that skips over a whole segment of trajectory. Position alone cannot
+//! disambiguate; only progress (time) can.
+//!
+//! This is distinct from the rejected time-weight cost
 //! (`(1 + tw·|τ − τ_anchor|)`), which biased the minimum itself and so
 //! could refuse to advance past `τ_anchor` — a clamp is monotone.
 //!
@@ -96,6 +110,16 @@ pub struct PositionSamplerParams {
     /// behind the drone. A non-finite or non-positive value disables
     /// the floor and reverts to pure geometric minimization.
     pub max_lag_s: f32,
+    /// Maximum tolerated lead of `τ_curr` ahead of `tau0_s`, in seconds.
+    /// The time ceiling `τ ≤ tau0_s + max_lead_s` clips runaway matches
+    /// that could otherwise occur when the trajectory passes spatially
+    /// close to itself (loops, splits, return-to-home): the geometric
+    /// cost has multiple basins inside the lookahead window and Newton
+    /// can lock onto a far-ahead basin that is spatially closer to the
+    /// drone. The ceiling restricts the search to a "trust window"
+    /// around wall-clock progress so disambiguation falls back to
+    /// trajectory time. A non-finite value disables the ceiling.
+    pub max_lead_s: f32,
 }
 
 impl PositionSamplerParams {
@@ -105,7 +129,8 @@ impl PositionSamplerParams {
             search_dt: 0.01,
             max_search_steps: 100,
             radius_of_acceptance: 0.15,
-            max_lag_s: 0.3,
+            max_lag_s: 0.1,
+            max_lead_s: 0.1,
         }
     }
 }
@@ -206,7 +231,16 @@ impl PositionSampler {
         let max_steps = self.params.max_search_steps as usize;
 
         let prev_tau = self.prev_query_tau.unwrap_or(0.0).clamp(0.0, end);
-        let tau_hi = (prev_tau + dt * max_steps as f32).min(end);
+        // Forward ceiling derived from wall-clock progress. Disabled
+        // when `max_lead_s` is non-finite (NaN/±Inf) — the search then
+        // falls back to the pure `prev_tau + dt·max_steps` lookahead.
+        let tau_lead_raw = inp.tau0_s + self.params.max_lead_s;
+        let tau_lead = if tau_lead_raw.is_finite() {
+            tau_lead_raw.clamp(prev_tau, end)
+        } else {
+            end
+        };
+        let tau_hi = (prev_tau + dt * max_steps as f32).min(end).min(tau_lead);
 
         // Step 1: coarse grid running-min on g(τ) over [prev_tau, tau_hi].
         // No early break on rise — sharp curves can produce a transient
@@ -250,14 +284,19 @@ impl PositionSampler {
             tau_geom = tau_new;
         }
 
-        // Step 3: time floor (forward-only one-sided clamp).
+        // Step 3: time floor and ceiling (one-sided clamps in `tau0_s`
+        // space). Newton already clamped `tau_geom` to `[prev_tau, tau_hi]`
+        // and `tau_hi ≤ tau_lead`, so the explicit `.min(tau_lead)` here
+        // is defensive — it matters only if `tau_floor > tau_lead`, which
+        // a sane (max_lag_s, max_lead_s) configuration cannot produce
+        // but a misconfiguration could.
         let tau_floor_raw = inp.tau0_s - self.params.max_lag_s;
         let tau_floor = if tau_floor_raw.is_finite() {
             tau_floor_raw.clamp(prev_tau, end)
         } else {
             prev_tau
         };
-        let tau_curr = tau_geom.max(tau_floor);
+        let tau_curr = tau_geom.max(tau_floor).min(tau_lead);
 
         self.prev_query_tau = Some(tau_curr);
 

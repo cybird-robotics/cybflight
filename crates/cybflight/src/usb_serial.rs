@@ -1355,17 +1355,21 @@ async fn dispatch_mission<'d>(
         "list" => {
             for (i, p) in offline_mission::PROFILES.iter().enumerate() {
                 let active = i as u8 == offline_mission::active_index();
-                let mut buf = [0u8; 96];
+                // Last absolute timestamp = total trajectory duration.
+                // The registry's compile-time guard asserts `n >= 1`.
+                let dur_s = p.timestamps[p.timestamps.len() - 1];
+                let mut buf = [0u8; 128];
                 let mut w = WriteBuf::new(&mut buf);
                 write!(
                     w,
-                    "  {} {}: {} ({} {} {})\r\n",
+                    "  {} {}: {} ({} {} {}, {}s)\r\n",
                     if active { '*' } else { ' ' },
                     i,
                     p.name,
                     p.env,
                     p.variant,
                     p.speed,
+                    dur_s,
                 )
                 .ok();
                 write_all(class, w.as_slice()).await?;
@@ -1408,7 +1412,24 @@ async fn dispatch_mission<'d>(
             };
             match offline_mission::find(env, variant, speed) {
                 Some(idx) => {
-                    offline_mission::set_active(idx);
+                    if !offline_mission::set_active(idx) {
+                        // The only way set_active rejects a valid index is an
+                        // env mismatch with the build (BUILD_ENV is fixed at
+                        // compile time by the position-source feature).
+                        let p = offline_mission::PROFILES[idx as usize];
+                        let mut buf = [0u8; 160];
+                        let mut w = WriteBuf::new(&mut buf);
+                        write!(
+                            w,
+                            "refused: profile '{}' env='{}' incompatible with build env '{}'\r\n",
+                            p.name,
+                            p.env,
+                            offline_mission::BUILD_ENV,
+                        )
+                        .ok();
+                        write_all(class, w.as_slice()).await?;
+                        return Ok(());
+                    }
                     let mut params = crate::params::get();
                     params.mission_profile = idx;
                     crate::params::set(params);

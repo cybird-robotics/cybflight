@@ -14,7 +14,7 @@ ESTIMATOR := env_var_or_default("ESTIMATOR", "eskf")
 # "mpc" (the SQP/MPC running in `outer_loop::control_loop_task` at 100 Hz).
 # Only meaningful with ESTIMATOR=eskf; the cascade controller for est_mahony
 # lives in inner_loop.rs and is selected automatically.
-OUTER_LOOP := env_var_or_default("OUTER_LOOP", "cascade")
+OUTER_LOOP := env_var_or_default("OUTER_LOOP", "mpc")
 
 # ESKF position source: "mocap" (default, ESP bridge + VICON_POSE) or
 # "gps" (u-blox M10 NAV-PVT → LLH→ENU). Mutually exclusive via compile_error.

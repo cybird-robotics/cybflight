@@ -17,7 +17,7 @@
 //!   MpcParams:          pos(12) + vel(12) + att(12) + rate(12) + thrust(4) + dt(4) + rho(4) = 60 bytes
 //!   PlannerParams:      max_vel_m_s(4) + max_tilt_rad(4) + weight_time(4) + weight_energy(4) + weight_pos(4) + weight_vel(4) + weight_tilt(4) + weight_body_rate(4) + weight_thrust(4) + smoothing_eps(4) + num_check_per_piece(4 as f32) = 44 bytes
 //!   BfgsTrustParams:    delta_init(4) + delta_max(4) + eta(4) + g_epsilon(4) + max_iterations(4 as f32) + past(4 as f32) + delta_conv(4) = 28 bytes
-//!   SamplerParams:      max_lag_s(4) + axis_weights_sqrt(12) + search_dt(4) + max_search_steps(4 as f32) + radius_of_acceptance(4) = 28 bytes
+//!   SamplerParams:      max_lag_s(4) + axis_weights_sqrt(12) + search_dt(4) + max_search_steps(4 as f32) + radius_of_acceptance(4) + max_lead_s(4) = 32 bytes
 //!   Mission:            profile_index(4 as f32) = 4 bytes
 //!   ArmLed:             enabled(4 as f32, 0.0/1.0) = 4 bytes
 //! ```
@@ -32,12 +32,12 @@ use crate::trajectory_planning::sampler::PositionSamplerParams;
 use crate::trajectory_planning::types::Vec3;
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 22;
+const VERSION: u32 = 27;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
-/// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 + 28 + 4 + 4 + 4 = 628 bytes
-/// (last 4 = blackbox_record_set, added in v22)
-const PAYLOAD_SIZE: usize = 628;
-/// Padded to 32-byte flash word boundary: ceil((16+628)/32)*32 = 672
+/// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 + 32 + 4 + 4 + 4 = 632 bytes
+/// (sampler grew from 28→32 in v25 with the addition of `max_lead_s`).
+const PAYLOAD_SIZE: usize = 632;
+/// Padded to 32-byte flash word boundary: ceil((16+632)/32)*32 = 672
 pub const PADDED_SIZE: usize = 672;
 
 /// MPC tuning parameters: cost weights, discretization, and constraint penalty.
@@ -66,10 +66,10 @@ pub struct MpcParams {
 impl Default for MpcParams {
     fn default() -> Self {
         Self {
-            pos_weight: [200.0, 200.0, 200.0],
-            vel_weight: [10.0, 10.0, 5.0],
-            att_weight: [50.0, 50.0, 200.0],
-            rate_weight: [50.0, 50.0, 50.0],
+            pos_weight: [500.0, 500.0, 500.0],
+            vel_weight: [10.0, 10.0, 10.0],
+            att_weight: [5.0, 5.0, 200.0],
+            rate_weight: [20.0, 20.0, 20.0],
             thrust_weight: 1.0,
             dt: 0.05,
             rho: 1e4,
@@ -227,7 +227,7 @@ pub struct IndiControllerParams {
 impl Default for IndiControllerParams {
     fn default() -> Self {
         Self {
-            rate_gains: [30.0, 30.0, 30.0],
+            rate_gains: [80.0, 80.0, 80.0],
             sync_filter_hz: 12.0,
             wls_wv: [1.0, 1.0, 50.0, 50.0, 50.0, 5.0],
             wls_wu: [1.0, 1.0, 1.0, 1.0],
@@ -296,6 +296,7 @@ pub struct SamplerParams {
     pub search_dt: f32,
     pub max_search_steps: u16,
     pub radius_of_acceptance: f32,
+    pub max_lead_s: f32,
 }
 
 impl Default for SamplerParams {
@@ -305,11 +306,12 @@ impl Default for SamplerParams {
         // SamplerParams::default() against the projection of
         // PositionSamplerParams::defaults() — will fail loudly.
         Self {
-            max_lag_s: 0.3,
+            max_lag_s: 0.1,
             axis_weights_sqrt: [1.0, 1.0, 1.0],
             search_dt: 0.01,
             max_search_steps: 100,
             radius_of_acceptance: 0.15,
+            max_lead_s: 0.1,
         }
     }
 }
@@ -329,6 +331,7 @@ impl SamplerParams {
             max_search_steps: self.max_search_steps,
             radius_of_acceptance: self.radius_of_acceptance,
             max_lag_s: self.max_lag_s,
+            max_lead_s: self.max_lead_s,
         }
     }
 }
@@ -501,6 +504,8 @@ impl VehicleParams {
         off = put_f32(&mut buf, off, self.sampler.search_dt);
         off = put_f32(&mut buf, off, self.sampler.max_search_steps as f32);
         off = put_f32(&mut buf, off, self.sampler.radius_of_acceptance);
+        // max_lead_s — symmetric ceiling to max_lag_s; added in v25.
+        off = put_f32(&mut buf, off, self.sampler.max_lead_s);
         // Mission profile index (added in v18). Stored as f32 to match the
         // existing all-f32 payload encoding; truncated back to u8 on read.
         off = put_f32(&mut buf, off, self.mission_profile as f32);
@@ -821,12 +826,15 @@ impl VehicleParams {
         off += 4;
         let radius_of_acceptance = get_f32(buf, off);
         off += 4;
+        let max_lead_s = get_f32(buf, off);
+        off += 4;
         let sampler = SamplerParams {
             max_lag_s: sampler_max_lag_s,
             axis_weights_sqrt,
             search_dt,
             max_search_steps,
             radius_of_acceptance,
+            max_lead_s,
         };
 
         // Mission profile index (added in v18). Out-of-range values are
@@ -1003,6 +1011,31 @@ impl VehicleParams {
             ParamKey::PlanBfgsMaxIter => self.planner.bfgs_trust.max_iterations as f32,
             ParamKey::PlanBfgsPast => self.planner.bfgs_trust.past as f32,
             ParamKey::PlanBfgsDeltaConv => self.planner.bfgs_trust.delta_conv,
+            // MPC
+            ParamKey::MpcWPosX => self.mpc.pos_weight[0],
+            ParamKey::MpcWPosY => self.mpc.pos_weight[1],
+            ParamKey::MpcWPosZ => self.mpc.pos_weight[2],
+            ParamKey::MpcWVelX => self.mpc.vel_weight[0],
+            ParamKey::MpcWVelY => self.mpc.vel_weight[1],
+            ParamKey::MpcWVelZ => self.mpc.vel_weight[2],
+            ParamKey::MpcWAttR => self.mpc.att_weight[0],
+            ParamKey::MpcWAttP => self.mpc.att_weight[1],
+            ParamKey::MpcWAttY => self.mpc.att_weight[2],
+            ParamKey::MpcWRateR => self.mpc.rate_weight[0],
+            ParamKey::MpcWRateP => self.mpc.rate_weight[1],
+            ParamKey::MpcWRateY => self.mpc.rate_weight[2],
+            ParamKey::MpcWThrust => self.mpc.thrust_weight,
+            ParamKey::MpcDt => self.mpc.dt,
+            ParamKey::MpcRho => self.mpc.rho,
+            // Sampler
+            ParamKey::SamplerMaxLagS => self.sampler.max_lag_s,
+            ParamKey::SamplerMaxLeadS => self.sampler.max_lead_s,
+            ParamKey::SamplerAxisWeightsSqrtX => self.sampler.axis_weights_sqrt[0],
+            ParamKey::SamplerAxisWeightsSqrtY => self.sampler.axis_weights_sqrt[1],
+            ParamKey::SamplerAxisWeightsSqrtZ => self.sampler.axis_weights_sqrt[2],
+            ParamKey::SamplerSearchDt => self.sampler.search_dt,
+            ParamKey::SamplerMaxSearchSteps => self.sampler.max_search_steps as f32,
+            ParamKey::SamplerRadiusOfAcceptance => self.sampler.radius_of_acceptance,
         }
     }
 
@@ -1152,6 +1185,34 @@ impl VehicleParams {
             ParamKey::PlanBfgsMaxIter => self.planner.bfgs_trust.max_iterations = val as usize,
             ParamKey::PlanBfgsPast => self.planner.bfgs_trust.past = val as usize,
             ParamKey::PlanBfgsDeltaConv => self.planner.bfgs_trust.delta_conv = val,
+            // MPC
+            ParamKey::MpcWPosX => self.mpc.pos_weight[0] = val,
+            ParamKey::MpcWPosY => self.mpc.pos_weight[1] = val,
+            ParamKey::MpcWPosZ => self.mpc.pos_weight[2] = val,
+            ParamKey::MpcWVelX => self.mpc.vel_weight[0] = val,
+            ParamKey::MpcWVelY => self.mpc.vel_weight[1] = val,
+            ParamKey::MpcWVelZ => self.mpc.vel_weight[2] = val,
+            ParamKey::MpcWAttR => self.mpc.att_weight[0] = val,
+            ParamKey::MpcWAttP => self.mpc.att_weight[1] = val,
+            ParamKey::MpcWAttY => self.mpc.att_weight[2] = val,
+            ParamKey::MpcWRateR => self.mpc.rate_weight[0] = val,
+            ParamKey::MpcWRateP => self.mpc.rate_weight[1] = val,
+            ParamKey::MpcWRateY => self.mpc.rate_weight[2] = val,
+            ParamKey::MpcWThrust => self.mpc.thrust_weight = val,
+            ParamKey::MpcDt => self.mpc.dt = val,
+            ParamKey::MpcRho => self.mpc.rho = val,
+            // Sampler
+            ParamKey::SamplerMaxLagS => self.sampler.max_lag_s = val,
+            ParamKey::SamplerMaxLeadS => self.sampler.max_lead_s = val,
+            ParamKey::SamplerAxisWeightsSqrtX => self.sampler.axis_weights_sqrt[0] = val,
+            ParamKey::SamplerAxisWeightsSqrtY => self.sampler.axis_weights_sqrt[1] = val,
+            ParamKey::SamplerAxisWeightsSqrtZ => self.sampler.axis_weights_sqrt[2] = val,
+            ParamKey::SamplerSearchDt => self.sampler.search_dt = val,
+            // f32 → u16 truncation: shell-side responsibility to pass an
+            // in-range integer value. Values < 0 wrap via `as u16`; same
+            // convention as `MotorPoles`.
+            ParamKey::SamplerMaxSearchSteps => self.sampler.max_search_steps = val as u16,
+            ParamKey::SamplerRadiusOfAcceptance => self.sampler.radius_of_acceptance = val,
         }
     }
 }
@@ -1295,6 +1356,31 @@ pub enum ParamKey {
     PlanBfgsMaxIter,
     PlanBfgsPast,
     PlanBfgsDeltaConv,
+    // MPC
+    MpcWPosX,
+    MpcWPosY,
+    MpcWPosZ,
+    MpcWVelX,
+    MpcWVelY,
+    MpcWVelZ,
+    MpcWAttR,
+    MpcWAttP,
+    MpcWAttY,
+    MpcWRateR,
+    MpcWRateP,
+    MpcWRateY,
+    MpcWThrust,
+    MpcDt,
+    MpcRho,
+    // Sampler (position-sampler tuning surface)
+    SamplerMaxLagS,
+    SamplerMaxLeadS,
+    SamplerAxisWeightsSqrtX,
+    SamplerAxisWeightsSqrtY,
+    SamplerAxisWeightsSqrtZ,
+    SamplerSearchDt,
+    SamplerMaxSearchSteps,
+    SamplerRadiusOfAcceptance,
 }
 
 /// All parameter keys in order, for iteration.
@@ -1433,6 +1519,31 @@ pub const ALL_KEYS: &[ParamKey] = &[
     ParamKey::PlanBfgsMaxIter,
     ParamKey::PlanBfgsPast,
     ParamKey::PlanBfgsDeltaConv,
+    // MPC
+    ParamKey::MpcWPosX,
+    ParamKey::MpcWPosY,
+    ParamKey::MpcWPosZ,
+    ParamKey::MpcWVelX,
+    ParamKey::MpcWVelY,
+    ParamKey::MpcWVelZ,
+    ParamKey::MpcWAttR,
+    ParamKey::MpcWAttP,
+    ParamKey::MpcWAttY,
+    ParamKey::MpcWRateR,
+    ParamKey::MpcWRateP,
+    ParamKey::MpcWRateY,
+    ParamKey::MpcWThrust,
+    ParamKey::MpcDt,
+    ParamKey::MpcRho,
+    // Sampler
+    ParamKey::SamplerMaxLagS,
+    ParamKey::SamplerMaxLeadS,
+    ParamKey::SamplerAxisWeightsSqrtX,
+    ParamKey::SamplerAxisWeightsSqrtY,
+    ParamKey::SamplerAxisWeightsSqrtZ,
+    ParamKey::SamplerSearchDt,
+    ParamKey::SamplerMaxSearchSteps,
+    ParamKey::SamplerRadiusOfAcceptance,
 ];
 
 impl ParamKey {
@@ -1573,6 +1684,31 @@ impl ParamKey {
             "plan_bfgs_max_iter" => Some(Self::PlanBfgsMaxIter),
             "plan_bfgs_past" => Some(Self::PlanBfgsPast),
             "plan_bfgs_delta_conv" => Some(Self::PlanBfgsDeltaConv),
+            // MPC
+            "mpc_w_pos_x" => Some(Self::MpcWPosX),
+            "mpc_w_pos_y" => Some(Self::MpcWPosY),
+            "mpc_w_pos_z" => Some(Self::MpcWPosZ),
+            "mpc_w_vel_x" => Some(Self::MpcWVelX),
+            "mpc_w_vel_y" => Some(Self::MpcWVelY),
+            "mpc_w_vel_z" => Some(Self::MpcWVelZ),
+            "mpc_w_att_r" => Some(Self::MpcWAttR),
+            "mpc_w_att_p" => Some(Self::MpcWAttP),
+            "mpc_w_att_y" => Some(Self::MpcWAttY),
+            "mpc_w_rate_r" => Some(Self::MpcWRateR),
+            "mpc_w_rate_p" => Some(Self::MpcWRateP),
+            "mpc_w_rate_y" => Some(Self::MpcWRateY),
+            "mpc_w_thrust" => Some(Self::MpcWThrust),
+            "mpc_dt" => Some(Self::MpcDt),
+            "mpc_rho" => Some(Self::MpcRho),
+            // Sampler
+            "sampler_max_lag_s" => Some(Self::SamplerMaxLagS),
+            "sampler_max_lead_s" => Some(Self::SamplerMaxLeadS),
+            "sampler_axis_weights_sqrt_x" => Some(Self::SamplerAxisWeightsSqrtX),
+            "sampler_axis_weights_sqrt_y" => Some(Self::SamplerAxisWeightsSqrtY),
+            "sampler_axis_weights_sqrt_z" => Some(Self::SamplerAxisWeightsSqrtZ),
+            "sampler_search_dt" => Some(Self::SamplerSearchDt),
+            "sampler_max_search_steps" => Some(Self::SamplerMaxSearchSteps),
+            "sampler_radius_of_acceptance" => Some(Self::SamplerRadiusOfAcceptance),
             _ => None,
         }
     }
@@ -1714,6 +1850,31 @@ impl ParamKey {
             Self::PlanBfgsMaxIter => "plan_bfgs_max_iter",
             Self::PlanBfgsPast => "plan_bfgs_past",
             Self::PlanBfgsDeltaConv => "plan_bfgs_delta_conv",
+            // MPC
+            Self::MpcWPosX => "mpc_w_pos_x",
+            Self::MpcWPosY => "mpc_w_pos_y",
+            Self::MpcWPosZ => "mpc_w_pos_z",
+            Self::MpcWVelX => "mpc_w_vel_x",
+            Self::MpcWVelY => "mpc_w_vel_y",
+            Self::MpcWVelZ => "mpc_w_vel_z",
+            Self::MpcWAttR => "mpc_w_att_r",
+            Self::MpcWAttP => "mpc_w_att_p",
+            Self::MpcWAttY => "mpc_w_att_y",
+            Self::MpcWRateR => "mpc_w_rate_r",
+            Self::MpcWRateP => "mpc_w_rate_p",
+            Self::MpcWRateY => "mpc_w_rate_y",
+            Self::MpcWThrust => "mpc_w_thrust",
+            Self::MpcDt => "mpc_dt",
+            Self::MpcRho => "mpc_rho",
+            // Sampler
+            Self::SamplerMaxLagS => "sampler_max_lag_s",
+            Self::SamplerMaxLeadS => "sampler_max_lead_s",
+            Self::SamplerAxisWeightsSqrtX => "sampler_axis_weights_sqrt_x",
+            Self::SamplerAxisWeightsSqrtY => "sampler_axis_weights_sqrt_y",
+            Self::SamplerAxisWeightsSqrtZ => "sampler_axis_weights_sqrt_z",
+            Self::SamplerSearchDt => "sampler_search_dt",
+            Self::SamplerMaxSearchSteps => "sampler_max_search_steps",
+            Self::SamplerRadiusOfAcceptance => "sampler_radius_of_acceptance",
         }
     }
 }
@@ -1885,6 +2046,7 @@ mod tests {
             search_dt: 0.02,
             max_search_steps: 250,
             radius_of_acceptance: 0.07,
+            max_lead_s: 0.55,
         };
         let bytes = params.to_bytes();
         let restored = VehicleParams::from_bytes(&bytes).expect("from_bytes failed");
@@ -1905,6 +2067,7 @@ mod tests {
             from_sampler.radius_of_acceptance
         );
         assert_eq!(from_flash.max_lag_s, from_sampler.max_lag_s);
+        assert_eq!(from_flash.max_lead_s, from_sampler.max_lead_s);
     }
 
     #[test]

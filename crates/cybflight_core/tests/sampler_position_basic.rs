@@ -39,10 +39,12 @@ fn default_params() -> PositionSamplerParams {
         search_dt: 0.01,
         max_search_steps: 500,
         radius_of_acceptance: 0.05,
-        // Time floor disabled by default in tests — drives the geometric
-        // search exclusively. `time_floor_unsticks_corner_overshoot`
-        // exercises the floor explicitly.
+        // Time floor and ceiling both disabled by default in tests —
+        // existing tests exercise pure geometric matching. Tests that
+        // need the floor (`time_floor_unsticks_corner_overshoot`) or
+        // the ceiling override these fields explicitly.
         max_lag_s: f32::INFINITY,
+        max_lead_s: f32::INFINITY,
     }
 }
 

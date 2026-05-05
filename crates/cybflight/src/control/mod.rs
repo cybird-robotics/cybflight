@@ -21,6 +21,20 @@ compile_error!("one of outer_rate, outer_geometric, or outer_mpc must be selecte
 ))]
 compile_error!("at most one of outer_rate, outer_geometric, outer_mpc may be selected");
 
+// Position source for the ESKF — exactly one must be selected when an outer
+// loop that consumes ESKF output is active. The Justfile already composes
+// these mutually-exclusively, but enforce in code so a hand-rolled
+// `cargo build` cannot silently produce a build that compiles offline
+// missions without a defined flight environment.
+#[cfg(all(feature = "est_pos_mocap", feature = "est_pos_gps"))]
+compile_error!("est_pos_mocap and est_pos_gps are mutually exclusive");
+
+#[cfg(all(
+    feature = "outer_mpc",
+    not(any(feature = "est_pos_mocap", feature = "est_pos_gps"))
+))]
+compile_error!("outer_mpc requires one of est_pos_mocap (indoor) or est_pos_gps (outdoor)");
+
 #[cfg(feature = "outer_geometric")]
 pub mod cascade_task;
 pub mod failsafe;

@@ -19,7 +19,7 @@
 use core::cell::RefCell;
 
 use critical_section::Mutex;
-use cybflight_core::params::{VehicleParams, PADDED_SIZE};
+use cybflight_core::params::{PADDED_SIZE, VehicleParams};
 
 use crate::hal;
 
@@ -37,8 +37,7 @@ static FLASH_PERI: Mutex<RefCell<Option<hal::flash::Flash<'static, hal::flash::B
 /// a local copy and re-read params when the version changes.
 ///
 /// Check this only when idle (disarmed) — never in the 8kHz control loop.
-pub static PARAM_VERSION: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+pub static PARAM_VERSION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Initialize parameters from flash at boot. Falls back to compile-time defaults
 /// if flash is blank or corrupt.
@@ -48,16 +47,10 @@ pub fn init_from_flash(flash_peri: hal::Peri<'static, hal::peripherals::FLASH>) 
     // Read the parameter sector via raw pointer (flash is memory-mapped).
     let buf: &[u8; PADDED_SIZE] = unsafe { &*(PARAM_FLASH_ADDR as *const [u8; PADDED_SIZE]) };
 
-    let params = match VehicleParams::from_bytes(buf) {
-        Some(p) => {
-            defmt::info!("params: loaded from flash");
-            p
-        }
-        None => {
-            defmt::info!("params: flash blank/corrupt, using defaults");
-            crate::vehicle::default_params()
-        }
-    };
+    let params = VehicleParams::from_bytes(buf).unwrap_or_else(|| {
+        defmt::info!("params: flash blank/corrupt, using defaults");
+        crate::vehicle::default_params()
+    });
 
     let flash = hal::flash::Flash::new_blocking(flash_peri);
     let mission_profile_idx = params.mission_profile;

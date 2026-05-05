@@ -20,8 +20,8 @@ pub const SCHEMA: &[u8] = br#"{
   "properties": {
     "timestamp_ns": { "type": "integer" },
     "kind":         { "type": "integer",
-                      "description": "Kind enum: 1=ARM, 2=DISARM, 3=FAILSAFE, 4=FAILSAFE_CLEAR, 5=ESTIMATOR_DOWN, 6=ESTIMATOR_UP, 7=RC_LOSS, 8=RC_RECOVERED, 16=LOG_END" },
-    "data":         { "type": "integer", "description": "kind-specific: for KIND_FAILSAFE, encodes FailsafeReason (1=ControllerTimeout, 2=RcLoss); 0 otherwise" }
+                      "description": "Kind enum: 1=ARM, 2=DISARM, 3=FAILSAFE, 4=FAILSAFE_CLEAR, 5=ESTIMATOR_DOWN, 6=ESTIMATOR_UP, 7=RC_LOSS, 8=RC_RECOVERED, 9=MISSION_PLANNING, 10=MISSION_EXECUTING, 11=MISSION_IDLE, 16=LOG_END" },
+    "data":         { "type": "integer", "description": "kind-specific: for KIND_FAILSAFE, encodes FailsafeReason (1=ControllerTimeout, 2=RcLoss); for KIND_MISSION_IDLE, encodes the previous MissionState (1=Planning, 2=Executing); 0 otherwise" }
   }
 }"#;
 
@@ -71,6 +71,21 @@ pub const KIND_RC_LOSS: u8 = 0x07;
 /// "blip recovered before guard expired" and "post-failsafe
 /// RC arriving but recovery_period not yet satisfied".
 pub const KIND_RC_RECOVERED: u8 = 0x08;
+/// Mission state machine entered `Planning` — solver is running.
+/// Edge-detected from `control::MISSION_STATE`. Only published in
+/// `outer_mpc` builds (the only configuration that exposes
+/// `MISSION_STATE`).
+pub const KIND_MISSION_PLANNING: u8 = 0x09;
+/// Mission state machine entered `Executing` — trajectory slot
+/// populated, outer-loop is sampling waypoints. Edge from
+/// `MISSION_STATE`.
+pub const KIND_MISSION_EXECUTING: u8 = 0x0A;
+/// Mission state machine returned to `Idle`. The `data` field
+/// carries the prior state (1=Planning → reject, 2=Executing →
+/// completion or failsafe abort) so post-flight analysis can tell
+/// "rejected during plan" from "trajectory finished" without
+/// cross-referencing solver diagnostics.
+pub const KIND_MISSION_IDLE: u8 = 0x0B;
 pub const KIND_LOG_END: u8 = 0x10;
 
 pub fn encode(scratch: &mut [u8], timestamp: Instant, kind: u8, data: u32) -> cbor::Result<usize> {

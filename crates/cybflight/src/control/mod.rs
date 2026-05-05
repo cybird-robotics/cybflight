@@ -183,12 +183,14 @@ pub static LAST_CONTROLLER_PUBLISH: blocking_mutex::Mutex<
     Cell<Option<Instant>>,
 > = blocking_mutex::Mutex::new(Cell::new(None));
 
-/// Motor command telemetry: published by INDI task, subscribed by ESP bridge.
+/// Motor command telemetry: published by INDI task, subscribed by ESP
+/// bridge + blackbox recorder. SUBS=3 leaves headroom for one more
+/// downstream consumer.
 pub static ACTUATOR_MOTORS_TELEM: PubSubChannel<
     CriticalSectionRawMutex,
     msgs::ActuatorMotors,
     2,
-    2,
+    3,
     1,
 > = PubSubChannel::new();
 
@@ -202,10 +204,11 @@ pub static PROCESSED_DSHOT_TELEM: PubSubChannel<
 > = PubSubChannel::new();
 
 /// Processed motor state telemetry (filtered omega + omega_dot + raw).
+/// SUBS=3 covers ESP bridge + blackbox recorder + one spare.
 pub static PROCESSED_MOTOR_STATE: PubSubChannel<
     CriticalSectionRawMutex,
     msgs::MotorStateTelemetry,
     2,
-    2,
+    3,
     1,
 > = PubSubChannel::new();

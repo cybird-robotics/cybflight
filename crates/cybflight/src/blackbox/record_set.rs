@@ -21,8 +21,8 @@
 //! |-------|--------------------------------------------------|---|
 //! | none  | (nothing — recording disabled)                   | 0     |
 //! | small | events + rc                                      | ~250 KB |
-//! | mid   | + attitude + ESKF odometry + MPC output          | ~20 MB  |
-//! | large | + raw IMU1                                       | ~58 MB  |
+//! | mid   | + attitude + odometry + mpc + motors + motor_state | ~22 MB |
+//! | large | + raw IMU1                                       | ~60 MB  |
 //!
 //! "Small" is the *cheap* tier: low byte rate, just enough to
 //! reconstruct what the pilot commanded and which arm/disarm
@@ -88,6 +88,8 @@ const TOPICS_MID: &[TopicDef] = &[
     topics::attitude::DEF,
     topics::odometry::DEF,
     topics::mpc::DEF,
+    topics::motors::DEF,
+    topics::motor_state::DEF,
 ];
 
 const TOPICS_LARGE: &[TopicDef] = &[
@@ -96,6 +98,8 @@ const TOPICS_LARGE: &[TopicDef] = &[
     topics::attitude::DEF,
     topics::odometry::DEF,
     topics::mpc::DEF,
+    topics::motors::DEF,
+    topics::motor_state::DEF,
     topics::imu::DEF,
 ];
 
@@ -149,6 +153,16 @@ impl RecordSet {
 
     #[inline]
     pub const fn includes_mpc(self) -> bool {
+        matches!(self, Self::Mid | Self::Large)
+    }
+
+    #[inline]
+    pub const fn includes_motors(self) -> bool {
+        matches!(self, Self::Mid | Self::Large)
+    }
+
+    #[inline]
+    pub const fn includes_motor_state(self) -> bool {
         matches!(self, Self::Mid | Self::Large)
     }
 

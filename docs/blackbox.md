@@ -329,9 +329,11 @@ crates/cybflight/src/blackbox/
     ├── imu.rs        /imu1      channel id 1: schema + CBOR encoder
     ├── attitude.rs   /attitude  channel id 2: schema + CBOR encoder
     ├── rc.rs         /rc        channel id 3: schema + CBOR encoder
-    ├── events.rs     /events    channel id 4: ARM/DISARM/LOG_END encoder
+    ├── events.rs     /events    channel id 4: ARM/DISARM/FAILSAFE/MISSION_*/LOG_END encoder
     ├── odometry.rs   /odometry  channel id 5: ESKF fused pose+twist (~1 kHz)
-    └── mpc.rs        /mpc       channel id 6: OCP solver command + telemetry
+    ├── mpc.rs        /mpc       channel id 6: OCP solver command + telemetry
+    ├── motors.rs     /motors    channel id 7: INDI per-motor normalized output (100 Hz, commanded)
+    └── motor_state.rs /motor_state channel id 8: KF-fused per-motor ω + ω̇ + raw eRPM (100 Hz, achieved)
 
 crates/cybflight-drivers/src/blackbox_storage.rs    BlockStore trait + BlockStoreError
 
@@ -404,14 +406,16 @@ After popping the card:
 ```sh
 mcap doctor flight_0001.mcap     # must print no issues
 mcap info   flight_0001.mcap     # channel count depends on tier:
-                                 #   small=2 (events,rc), mid=5 (+attitude,odometry,mpc),
-                                 #   large=6 (+imu1)
+                                 #   small=2 (events,rc),
+                                 #   mid=7 (+attitude,odometry,mpc,motors,motor_state),
+                                 #   large=8 (+imu1)
 python3 read_mcap.py flight_0001.mcap | head            # see ARM event up top
 python3 read_mcap.py flight_0001.mcap | tail            # see DISARM + LOG_END
 python3 read_mcap.py flight_0001.mcap | grep events     # all events in order
 python3 read_mcap.py flight_0001.mcap | grep '/rc'      # stick / aux samples
 python3 read_mcap.py flight_0001.mcap | grep '/odom'    # ESKF pose+twist (mid+)
 python3 read_mcap.py flight_0001.mcap | grep '/mpc'     # OCP commands     (mid+)
+python3 read_mcap.py flight_0001.mcap | grep '/motors'  # INDI per-motor output (mid+)
 ```
 
 The included `read_mcap.py` decodes CBOR via the `cbor2` Python

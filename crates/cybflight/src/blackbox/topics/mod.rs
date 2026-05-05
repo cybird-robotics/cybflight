@@ -36,6 +36,8 @@
 pub mod attitude;
 pub mod events;
 pub mod imu;
+pub mod motor_state;
+pub mod motors;
 pub mod mpc;
 pub mod odometry;
 pub mod rc;

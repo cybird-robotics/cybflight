@@ -61,9 +61,11 @@ use super::mcap;
 use super::record_set::RecordSet;
 use super::sdmmc_block::SdmmcBlockStore;
 use super::should_record;
-use super::topics::{attitude, events, imu, mpc, odometry, rc};
+use super::topics::{attitude, events, imu, motor_state, motors, mpc, odometry, rc};
 use crate::control::failsafe::{FAILSAFE_ACTIVE, FAILSAFE_REASON, RC_LINK_HEALTHY};
-use crate::control::OCP_SOLVER_OUTPUT;
+use crate::control::{ACTUATOR_MOTORS_TELEM, OCP_SOLVER_OUTPUT, PROCESSED_MOTOR_STATE};
+#[cfg(feature = "outer_mpc")]
+use crate::control::{MissionState, MISSION_STATE};
 use crate::estimation::ESTIMATOR_READY;
 use crate::msgs;
 use crate::sensors::{IMU_1, RC_INPUT, VEHICLE_ATTITUDE, VEHICLE_ODOMETRY};
@@ -114,6 +116,15 @@ type AttSub = Subscriber<'static, CriticalSectionRawMutex, msgs::VehicleAttitude
 type RcSub = Subscriber<'static, CriticalSectionRawMutex, msgs::RcInput, 4, 6, 1>;
 type OdomSub = Subscriber<'static, CriticalSectionRawMutex, msgs::VehicleOdometry, 8, 6, 1>;
 type McpSub = Subscriber<'static, CriticalSectionRawMutex, msgs::OcpSolverOutput, 4, 4, 1>;
+/// Motors subscriber over `ACTUATOR_MOTORS_TELEM`. CAP=2 matches the
+/// channel; SUBS=3 leaves one slot for a future shell stream consumer
+/// alongside esp_bridge + this recorder.
+type MotorSub = Subscriber<'static, CriticalSectionRawMutex, msgs::ActuatorMotors, 2, 3, 1>;
+/// Motor-state subscriber over `PROCESSED_MOTOR_STATE`. The
+/// `commanded vs achieved` companion to `MotorSub` — same shape,
+/// CAP=2/SUBS=3.
+type MotorStateSub =
+    Subscriber<'static, CriticalSectionRawMutex, msgs::MotorStateTelemetry, 2, 3, 1>;
 
 pub struct FlightRecorder {
     record_set: RecordSet,
@@ -126,11 +137,15 @@ pub struct FlightRecorder {
     rc_sub: Option<RcSub>,
     odom_sub: Option<OdomSub>,
     mpc_sub: Option<McpSub>,
+    motor_sub: Option<MotorSub>,
+    motor_state_sub: Option<MotorStateSub>,
     imu_seq: u32,
     att_seq: u32,
     rc_seq: u32,
     odom_seq: u32,
     mpc_seq: u32,
+    motor_seq: u32,
+    motor_state_seq: u32,
     ev_seq: u32,
     /// Last-seen `FAILSAFE_ACTIVE` value. Edge-detected each
     /// iteration so we emit `KIND_FAILSAFE` / `KIND_FAILSAFE_CLEAR`
@@ -145,6 +160,14 @@ pub struct FlightRecorder {
     /// inside a single failsafe lifecycle (e.g. drop → recover-
     /// during-guard → drop-again → guard-expires → failsafe).
     prev_rc_link_healthy: bool,
+    /// Last-seen `MISSION_STATE` packed `repr(u8)` value. Edge-
+    /// detected for `KIND_MISSION_PLANNING` / `KIND_MISSION_EXECUTING`
+    /// / `KIND_MISSION_IDLE`. Stored as the raw `u8` (rather than the
+    /// `MissionState` enum) so the field exists on builds without
+    /// `outer_mpc` — the edge-detect block is feature-gated, but
+    /// keeping the field unconditionally avoids a second `cfg` site.
+    #[cfg(feature = "outer_mpc")]
+    prev_mission_state: u8,
     pub messages: u32,
     pub drops: u32,
 }
@@ -228,29 +251,48 @@ impl FileBody for FlightRecorder {
                 break;
             }
             let timer = Timer::after(DISARM_POLL_INTERVAL);
+            // Select-arm order is **deliberate**. `select6` polls
+            // left-to-right and ties go to the leftmost ready arm,
+            // so high-level / low-rate topics (rc, att, odom, mpc)
+            // come before raw IMU. With IMU at 8 kHz and the others
+            // at 50–200 Hz, the previous ordering (IMU first) meant
+            // every wake almost always handled an IMU sample, even
+            // when ESKF / RC / MPC frames were also waiting; the
+            // fairness drain then caught the rest. Putting IMU last
+            // makes the *first* emit-per-iteration a high-level
+            // sample whenever one is ready, which keeps the
+            // high-level stream tight under SD backpressure.
+            //
+            // `motors` (`/motors`, INDI inner-loop output) is
+            // intentionally NOT in the select arms — `select6` is
+            // the maximum named arity and the fairness drain below
+            // covers it. With IMU at 8 kHz waking the loop every
+            // 125 µs (and the 50 ms timer floor when nothing is
+            // publishing), the 100 Hz motors stream is drained well
+            // within its CAP=2 channel before lag accrues.
             match select6(
                 timer,
-                next_or_pend(&mut self.imu_sub),
-                next_or_pend(&mut self.att_sub),
                 next_or_pend(&mut self.rc_sub),
+                next_or_pend(&mut self.att_sub),
                 next_or_pend(&mut self.odom_sub),
                 next_or_pend(&mut self.mpc_sub),
+                next_or_pend(&mut self.imu_sub),
             )
             .await
             {
                 Either6::First(()) => {
                     // poll-wake — re-check IS_ARMED at top of loop
                 }
-                Either6::Second(wr) => total += self.emit_imu(w, &mut scratch, wr).await?,
+                Either6::Second(wr) => total += self.emit_rc(w, &mut scratch, wr).await?,
                 Either6::Third(wr) => total += self.emit_att(w, &mut scratch, wr).await?,
-                Either6::Fourth(wr) => total += self.emit_rc(w, &mut scratch, wr).await?,
-                Either6::Fifth(wr) => total += self.emit_odom(w, &mut scratch, wr).await?,
-                Either6::Sixth(wr) => total += self.emit_mpc(w, &mut scratch, wr).await?,
+                Either6::Fourth(wr) => total += self.emit_odom(w, &mut scratch, wr).await?,
+                Either6::Fifth(wr) => total += self.emit_mpc(w, &mut scratch, wr).await?,
+                Either6::Sixth(wr) => total += self.emit_imu(w, &mut scratch, wr).await?,
             }
 
             // Fairness drain — see comment above. Drains run in
             // **tier order**: small (rc) → mid (attitude, odometry,
-            // mpc) → large (imu). The large-tier drain uses
+            // mpc, motors) → large (imu). The large-tier drain uses
             // `DRAIN_BUDGET_DEPRIO` (smaller), so when the SD
             // pipeline can't keep up the drops naturally land on
             // IMU instead of the smaller / more-critical topics.
@@ -278,6 +320,19 @@ impl FileBody for FlightRecorder {
                 let next = self.mpc_sub.as_mut().and_then(|s| s.try_next_message());
                 let Some(wr) = next else { break };
                 total += self.emit_mpc(w, &mut scratch, wr).await?;
+            }
+            for _ in 0..DRAIN_BUDGET_NORMAL {
+                let next = self.motor_sub.as_mut().and_then(|s| s.try_next_message());
+                let Some(wr) = next else { break };
+                total += self.emit_motors(w, &mut scratch, wr).await?;
+            }
+            for _ in 0..DRAIN_BUDGET_NORMAL {
+                let next = self
+                    .motor_state_sub
+                    .as_mut()
+                    .and_then(|s| s.try_next_message());
+                let Some(wr) = next else { break };
+                total += self.emit_motor_state(w, &mut scratch, wr).await?;
             }
             // ── large tier (deprioritised) ──────────────────────
             for _ in 0..DRAIN_BUDGET_DEPRIO {
@@ -445,6 +500,52 @@ impl FlightRecorder {
         Ok(bytes)
     }
 
+    async fn emit_motors<W: Write>(
+        &mut self,
+        w: &mut W,
+        scratch: &mut [u8],
+        wr: WaitResult<msgs::ActuatorMotors>,
+    ) -> Result<u32, W::Error> {
+        let Some(m) = handle_wr(wr, &mut self.drops) else {
+            return Ok(0);
+        };
+        self.motor_seq = self.motor_seq.wrapping_add(1);
+        let n = motors::encode(scratch, &m).unwrap_or(0);
+        let bytes = emit_msg(
+            w,
+            motors::CHANNEL_ID,
+            self.motor_seq,
+            m.timestamp,
+            &scratch[..n],
+        )
+        .await?;
+        self.messages = self.messages.wrapping_add(1);
+        Ok(bytes)
+    }
+
+    async fn emit_motor_state<W: Write>(
+        &mut self,
+        w: &mut W,
+        scratch: &mut [u8],
+        wr: WaitResult<msgs::MotorStateTelemetry>,
+    ) -> Result<u32, W::Error> {
+        let Some(m) = handle_wr(wr, &mut self.drops) else {
+            return Ok(0);
+        };
+        self.motor_state_seq = self.motor_state_seq.wrapping_add(1);
+        let n = motor_state::encode(scratch, &m).unwrap_or(0);
+        let bytes = emit_msg(
+            w,
+            motor_state::CHANNEL_ID,
+            self.motor_state_seq,
+            m.timestamp,
+            &scratch[..n],
+        )
+        .await?;
+        self.messages = self.messages.wrapping_add(1);
+        Ok(bytes)
+    }
+
     /// Encode + emit one Event record on `/events`. Returns the byte
     /// count. Inlined here rather than going through TOPIC_SET because
     /// events have a tiny per-emit cost and the kind/data payload is
@@ -525,6 +626,31 @@ impl FlightRecorder {
             };
             total += self.emit_event(w, scratch, kind, 0).await?;
             self.prev_rc_link_healthy = now_rc;
+        }
+
+        // ── trajectory tracking status (outer_mpc only) ─────────
+        // Edge-detect `MISSION_STATE` transitions. The state machine
+        // is Idle → Planning → Executing → Idle, but the recorder
+        // doesn't assume a specific transition order — we just emit
+        // an event whenever the value changes. For Idle entries we
+        // pack the *previous* state into `data` so post-flight
+        // analysis can distinguish "rejected mid-plan"
+        // (data=Planning) from "trajectory finished or failsafe-
+        // aborted" (data=Executing) without joining against
+        // `MissionStatus.solve.reject_reason`.
+        #[cfg(feature = "outer_mpc")]
+        {
+            let now_mission_raw = MISSION_STATE.load(Ordering::Acquire);
+            if now_mission_raw != self.prev_mission_state {
+                let prev = self.prev_mission_state;
+                let kind = match MissionState::from_u8(now_mission_raw) {
+                    MissionState::Planning => events::KIND_MISSION_PLANNING,
+                    MissionState::Executing => events::KIND_MISSION_EXECUTING,
+                    MissionState::Idle => events::KIND_MISSION_IDLE,
+                };
+                total += self.emit_event(w, scratch, kind, prev as u32).await?;
+                self.prev_mission_state = now_mission_raw;
+            }
         }
 
         Ok(total)
@@ -625,14 +751,34 @@ pub async fn run_session(
     } else {
         None
     };
+    let motor_sub = if record_set.includes_motors() {
+        Some(ACTUATOR_MOTORS_TELEM.subscriber().map_err(|_| {
+            defmt::warn!("recorder: ACTUATOR_MOTORS_TELEM SUBS exhausted");
+            OpError::NoSubscriberSlot
+        })?)
+    } else {
+        None
+    };
+    let motor_state_sub = if record_set.includes_motor_state() {
+        Some(PROCESSED_MOTOR_STATE.subscriber().map_err(|_| {
+            defmt::warn!("recorder: PROCESSED_MOTOR_STATE SUBS exhausted");
+            OpError::NoSubscriberSlot
+        })?)
+    } else {
+        None
+    };
 
-    // Snapshot the failsafe / estimator state at session open. The
-    // capture loop's edge poll only emits `/events` records on
-    // transitions *from* these snapshots, so a session that opens
-    // with the estimator already converged (`ESTIMATOR_READY=true`,
-    // the normal arming-permitted state) does **not** emit a
-    // spurious `KIND_ESTIMATOR_UP` immediately. If either state
-    // flips later in the session, the corresponding event lands.
+    // Snapshot the failsafe / estimator / mission state at session
+    // open. The capture loop's edge poll only emits `/events`
+    // records on transitions *from* these snapshots, so a session
+    // that opens with the estimator already converged
+    // (`ESTIMATOR_READY=true`, the normal arming-permitted state)
+    // does **not** emit a spurious `KIND_ESTIMATOR_UP` immediately.
+    // For the mission state machine the same rule applies: a
+    // session armed during `Idle` (the typical case — pilot must
+    // arm before triggering a mission) snapshots Idle and only
+    // emits an event when the planner or controller advances the
+    // state.
     let mut body = FlightRecorder {
         record_set,
         imu_sub,
@@ -640,15 +786,21 @@ pub async fn run_session(
         rc_sub,
         odom_sub,
         mpc_sub,
+        motor_sub,
+        motor_state_sub,
         imu_seq: 0,
         att_seq: 0,
         rc_seq: 0,
         odom_seq: 0,
         mpc_seq: 0,
+        motor_seq: 0,
+        motor_state_seq: 0,
         ev_seq: 0,
         prev_failsafe: FAILSAFE_ACTIVE.load(Ordering::Acquire),
         prev_est_ready: ESTIMATOR_READY.load(Ordering::Acquire),
         prev_rc_link_healthy: RC_LINK_HEALTHY.load(Ordering::Acquire),
+        #[cfg(feature = "outer_mpc")]
+        prev_mission_state: MISSION_STATE.load(Ordering::Acquire),
         messages: 0,
         drops: 0,
     };

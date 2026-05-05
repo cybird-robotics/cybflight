@@ -139,4 +139,11 @@ impl<'a> CborWriter<'a> {
         // major 7, simple values: false=20, true=21
         self.put(if val { 0xf5 } else { 0xf4 })
     }
+
+    /// CBOR `null` (major 7, simple value 22). Used for optional
+    /// fields whose absence carries different meaning than a sentinel
+    /// (e.g. a missing motor-telemetry frame vs a true zero RPM).
+    pub fn null(&mut self) -> Result {
+        self.put(0xf6)
+    }
 }

@@ -61,9 +61,14 @@ use super::mcap;
 use super::record_set::RecordSet;
 use super::sdmmc_block::SdmmcBlockStore;
 use super::should_record;
-use super::topics::{attitude, events, imu, motor_state, motors, mpc, odometry, rc};
+use super::topics::{
+    attitude, events, imu, motor_state, motors, mpc, odometry, rc, tracking_error,
+};
 use crate::control::failsafe::{FAILSAFE_ACTIVE, FAILSAFE_REASON, RC_LINK_HEALTHY};
-use crate::control::{ACTUATOR_MOTORS_TELEM, OCP_SOLVER_OUTPUT, PROCESSED_MOTOR_STATE};
+use crate::control::{
+    ACTUATOR_MOTORS_TELEM, OCP_SOLVER_OUTPUT, PROCESSED_MOTOR_STATE, TRACKING_ERROR,
+};
+use crate::control::TrackingError as TrackErrMsg;
 #[cfg(feature = "outer_mpc")]
 use crate::control::{MissionState, MISSION_STATE};
 use crate::estimation::ESTIMATOR_READY;
@@ -125,6 +130,9 @@ type MotorSub = Subscriber<'static, CriticalSectionRawMutex, msgs::ActuatorMotor
 /// CAP=2/SUBS=3.
 type MotorStateSub =
     Subscriber<'static, CriticalSectionRawMutex, msgs::MotorStateTelemetry, 2, 3, 1>;
+/// Tracking-error subscriber over `TRACKING_ERROR`. CAP=4/SUBS=3/PUBS=3
+/// — see [`crate::control::TRACKING_ERROR`] for the rationale.
+type TrackErrSub = Subscriber<'static, CriticalSectionRawMutex, TrackErrMsg, 4, 3, 3>;
 
 pub struct FlightRecorder {
     record_set: RecordSet,
@@ -139,6 +147,7 @@ pub struct FlightRecorder {
     mpc_sub: Option<McpSub>,
     motor_sub: Option<MotorSub>,
     motor_state_sub: Option<MotorStateSub>,
+    track_err_sub: Option<TrackErrSub>,
     imu_seq: u32,
     att_seq: u32,
     rc_seq: u32,
@@ -146,6 +155,7 @@ pub struct FlightRecorder {
     mpc_seq: u32,
     motor_seq: u32,
     motor_state_seq: u32,
+    track_err_seq: u32,
     ev_seq: u32,
     /// Last-seen `FAILSAFE_ACTIVE` value. Edge-detected each
     /// iteration so we emit `KIND_FAILSAFE` / `KIND_FAILSAFE_CLEAR`
@@ -333,6 +343,14 @@ impl FileBody for FlightRecorder {
                     .and_then(|s| s.try_next_message());
                 let Some(wr) = next else { break };
                 total += self.emit_motor_state(w, &mut scratch, wr).await?;
+            }
+            for _ in 0..DRAIN_BUDGET_NORMAL {
+                let next = self
+                    .track_err_sub
+                    .as_mut()
+                    .and_then(|s| s.try_next_message());
+                let Some(wr) = next else { break };
+                total += self.emit_track_err(w, &mut scratch, wr).await?;
             }
             // ── large tier (deprioritised) ──────────────────────
             for _ in 0..DRAIN_BUDGET_DEPRIO {
@@ -538,6 +556,29 @@ impl FlightRecorder {
             w,
             motor_state::CHANNEL_ID,
             self.motor_state_seq,
+            m.timestamp,
+            &scratch[..n],
+        )
+        .await?;
+        self.messages = self.messages.wrapping_add(1);
+        Ok(bytes)
+    }
+
+    async fn emit_track_err<W: Write>(
+        &mut self,
+        w: &mut W,
+        scratch: &mut [u8],
+        wr: WaitResult<TrackErrMsg>,
+    ) -> Result<u32, W::Error> {
+        let Some(m) = handle_wr(wr, &mut self.drops) else {
+            return Ok(0);
+        };
+        self.track_err_seq = self.track_err_seq.wrapping_add(1);
+        let n = tracking_error::encode(scratch, &m).unwrap_or(0);
+        let bytes = emit_msg(
+            w,
+            tracking_error::CHANNEL_ID,
+            self.track_err_seq,
             m.timestamp,
             &scratch[..n],
         )
@@ -767,6 +808,14 @@ pub async fn run_session(
     } else {
         None
     };
+    let track_err_sub = if record_set.includes_tracking_error() {
+        Some(TRACKING_ERROR.subscriber().map_err(|_| {
+            defmt::warn!("recorder: TRACKING_ERROR SUBS exhausted");
+            OpError::NoSubscriberSlot
+        })?)
+    } else {
+        None
+    };
 
     // Snapshot the failsafe / estimator / mission state at session
     // open. The capture loop's edge poll only emits `/events`
@@ -788,6 +837,7 @@ pub async fn run_session(
         mpc_sub,
         motor_sub,
         motor_state_sub,
+        track_err_sub,
         imu_seq: 0,
         att_seq: 0,
         rc_seq: 0,
@@ -795,6 +845,7 @@ pub async fn run_session(
         mpc_seq: 0,
         motor_seq: 0,
         motor_state_seq: 0,
+        track_err_seq: 0,
         ev_seq: 0,
         prev_failsafe: FAILSAFE_ACTIVE.load(Ordering::Acquire),
         prev_est_ready: ESTIMATOR_READY.load(Ordering::Acquire),

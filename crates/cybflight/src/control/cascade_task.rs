@@ -57,6 +57,7 @@ pub async fn cascade_task() {
         .subscriber()
         .expect("cascade: VEHICLE_ODOMETRY subscriber");
     let pos_pub = super::POSITION_CONTROL_SETPOINT.immediate_publisher();
+    let tracking_err_pub = super::TRACKING_ERROR.immediate_publisher();
 
     // Wait for ESKF convergence + setpoint seed from rc_interpreter.
     super::ACTIVE_SETPOINT_READY.wait().await;
@@ -113,6 +114,20 @@ pub async fn cascade_task() {
         let collective_thrust_n = pc_out.collective_thrust_n;
         att_ref.attitude_quaternion = Some(pc_out.desired_attitude_quaternion);
         att_ref.body_rate_rad_s = pc_out.desired_body_rate_rad_s;
+
+        // Tracking error against the live position setpoint. Raw
+        // (unclamped) so the host can compare against the
+        // controller's `p_err_max`/`v_err_max` to detect saturation.
+        let pos_err = pos_setpoint.position - pos_state.position;
+        let vel_err = pos_setpoint.velocity - pos_state.velocity;
+        tracking_err_pub.publish_immediate(super::TrackingError {
+            timestamp: now,
+            pos_err,
+            vel_err,
+            attitude_err: Vector3::zeros(),
+            body_rate_err: Vector3::zeros(),
+            source: super::TRACKING_ERROR_SOURCE_CASCADE,
+        });
 
         // Attitude controller → rate reference.
         let AttitudeControlOutput {

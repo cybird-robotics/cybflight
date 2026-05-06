@@ -90,6 +90,7 @@ const TOPICS_MID: &[TopicDef] = &[
     topics::mpc::DEF,
     topics::motors::DEF,
     topics::motor_state::DEF,
+    topics::tracking_error::DEF,
 ];
 
 const TOPICS_LARGE: &[TopicDef] = &[
@@ -100,6 +101,7 @@ const TOPICS_LARGE: &[TopicDef] = &[
     topics::mpc::DEF,
     topics::motors::DEF,
     topics::motor_state::DEF,
+    topics::tracking_error::DEF,
     topics::imu::DEF,
 ];
 
@@ -163,6 +165,11 @@ impl RecordSet {
 
     #[inline]
     pub const fn includes_motor_state(self) -> bool {
+        matches!(self, Self::Mid | Self::Large)
+    }
+
+    #[inline]
+    pub const fn includes_tracking_error(self) -> bool {
         matches!(self, Self::Mid | Self::Large)
     }
 

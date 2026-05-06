@@ -333,7 +333,8 @@ crates/cybflight/src/blackbox/
     ├── odometry.rs   /odometry  channel id 5: ESKF fused pose+twist (~1 kHz)
     ├── mpc.rs        /mpc       channel id 6: OCP solver command + telemetry
     ├── motors.rs     /motors    channel id 7: INDI per-motor normalized output (100 Hz, commanded)
-    └── motor_state.rs /motor_state channel id 8: KF-fused per-motor ω + ω̇ + raw eRPM (100 Hz, achieved)
+    ├── motor_state.rs /motor_state channel id 8: KF-fused per-motor ω + ω̇ + raw eRPM (100 Hz, achieved)
+    └── tracking_error.rs /tracking_error channel id 9: controller-reported `reference - actual` (cascade/MPC: 50–100 Hz, INDI: 100 Hz)
 
 crates/cybflight-drivers/src/blackbox_storage.rs    BlockStore trait + BlockStoreError
 
@@ -407,8 +408,8 @@ After popping the card:
 mcap doctor flight_0001.mcap     # must print no issues
 mcap info   flight_0001.mcap     # channel count depends on tier:
                                  #   small=2 (events,rc),
-                                 #   mid=7 (+attitude,odometry,mpc,motors,motor_state),
-                                 #   large=8 (+imu1)
+                                 #   mid=8 (+attitude,odometry,mpc,motors,motor_state,tracking_error),
+                                 #   large=9 (+imu1)
 python3 read_mcap.py flight_0001.mcap | head            # see ARM event up top
 python3 read_mcap.py flight_0001.mcap | tail            # see DISARM + LOG_END
 python3 read_mcap.py flight_0001.mcap | grep events     # all events in order

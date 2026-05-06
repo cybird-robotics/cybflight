@@ -10,14 +10,13 @@
 
 #![cfg(feature = "outer_mpc")]
 
+use cybflight_core::mpc::model_utils;
 use cybflight_core::mpc::quad_model::{N as MPC_N, NU as MPC_NU, NX as MPC_NX, PosCostMode};
 use cybflight_core::mpc::{QuadModel, SimpleQuadProblem, SimpleSqpSolver};
 use cybflight_core::params::VehicleParams;
 use cybflight_core::rotation::quaternion_from_zb_and_yaw;
 use cybflight_core::trajectory_planning::flatness::reference_quaternion;
-use cybflight_core::trajectory_planning::minco_snap::{
-    flatness_to_thrust_omega, FlatnessFault,
-};
+use cybflight_core::trajectory_planning::minco_snap::{FlatnessFault, flatness_to_thrust_omega};
 #[cfg(feature = "position_sampler")]
 use cybflight_core::trajectory_planning::sampler::PositionSampler;
 #[cfg(not(feature = "position_sampler"))]
@@ -202,8 +201,7 @@ pub async fn control_loop_task() {
     // ── Construct MPC ──────────────────────────────────────────────────
     let params = crate::params::get();
     let mpc_solver: &mut SimpleSqpSolver = MPC_SOLVER.init(SimpleSqpSolver::new());
-    let mut mpc_problem =
-        SimpleQuadProblem::with_rk4(build_outer_quad_model(&params), MPC_N);
+    let mut mpc_problem = SimpleQuadProblem::with_rk4(build_outer_quad_model(&params), MPC_N);
 
     // ── Reference + warm-start trajectories ────────────────────────────
     let mut hover_thrust = QUADROTOR_BODY.mass_kg * 9.81;
@@ -221,6 +219,7 @@ pub async fn control_loop_task() {
     let pos_ctrl_pub = super::POSITION_CONTROL_SETPOINT.immediate_publisher();
     let att_ctrl_pub = super::ATTITUDE_CONTROL_SETPOINT.immediate_publisher();
     let ocp_pub = super::OCP_SOLVER_OUTPUT.immediate_publisher();
+    let tracking_err_pub = super::TRACKING_ERROR.immediate_publisher();
     let mission_status_pub = super::MISSION_STATUS.immediate_publisher();
     let mut odom_sub = VEHICLE_ODOMETRY
         .subscriber()
@@ -358,8 +357,7 @@ pub async fn control_loop_task() {
             if cur != local_param_ver {
                 local_param_ver = cur;
                 let np = crate::params::get();
-                mpc_problem =
-                    SimpleQuadProblem::with_rk4(build_outer_quad_model(&np), MPC_N);
+                mpc_problem = SimpleQuadProblem::with_rk4(build_outer_quad_model(&np), MPC_N);
                 hover_thrust = np.body.mass_kg * 9.81;
                 let hover_u = MpcInputVec::from_row_slice(&[hover_thrust, 0.0, 0.0, 0.0]);
                 u_refs = [hover_u; MPC_N];
@@ -864,12 +862,7 @@ pub async fn control_loop_task() {
                     }
                 }
             }
-            prev_qref_q0 = Some([
-                x_refs[0][3],
-                x_refs[0][4],
-                x_refs[0][5],
-                x_refs[0][6],
-            ]);
+            prev_qref_q0 = Some([x_refs[0][3], x_refs[0][4], x_refs[0][5], x_refs[0][6]]);
 
             // Write the shared cell with this tick's tracked reference.
             // Invariant (a): this happens BEFORE any MISSION_STATE
@@ -999,6 +992,28 @@ pub async fn control_loop_task() {
                 iterations: result.iters as i32,
                 converged: result.converged,
                 solve_time_us,
+            });
+
+            // Tracking error against the τ₀ reference, in the same
+            // parameterization the SQP cost uses. `attitude_error`
+            // returns the tilt-prioritizing 3-vec `ea` plus jacobians
+            // we ignore here. Sign convention: `error = reference -
+            // actual`, so we negate `(x - xref)`.
+            let pos_err = xr0.fixed_rows::<3>(0) - mpc_x0.fixed_rows::<3>(0);
+            let vel_err = xr0.fixed_rows::<3>(7) - mpc_x0.fixed_rows::<3>(7);
+            // `model_utils::attitude_error(x, xref)` builds
+            // `qa = conj(q) ⊗ qref` (the body-frame rotation from
+            // actual to reference) and returns its tilt-prio 3-vec
+            // parameterization. That already matches our
+            // `error = reference − actual` convention — no flip.
+            let (ea, _, _) = model_utils::attitude_error(&mpc_x0, xr0);
+            tracking_err_pub.publish_immediate(super::TrackingError {
+                timestamp: publish_time,
+                pos_err,
+                vel_err,
+                attitude_err: ea,
+                body_rate_err: Vector3::zeros(),
+                source: super::TRACKING_ERROR_SOURCE_MPC,
             });
         }
 

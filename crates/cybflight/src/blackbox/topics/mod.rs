@@ -41,6 +41,7 @@ pub mod motors;
 pub mod mpc;
 pub mod odometry;
 pub mod rc;
+pub mod tracking_error;
 
 /// Static description of one topic: everything the schema + channel
 /// records need. Encoders are NOT here — they're per-topic typed fns

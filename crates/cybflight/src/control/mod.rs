@@ -47,6 +47,12 @@ pub mod offline_mission;
 #[cfg(feature = "outer_mpc")]
 pub mod outer_loop;
 pub mod rc_interpreter;
+pub mod tracking_error_msg;
+
+pub use tracking_error_msg::{
+    TrackingError, TRACKING_ERROR_SOURCE_CASCADE, TRACKING_ERROR_SOURCE_INDI,
+    TRACKING_ERROR_SOURCE_MPC,
+};
 
 #[cfg(feature = "est_eskf")]
 pub mod flight_mode;
@@ -206,6 +212,24 @@ pub static ACTUATOR_MOTORS_TELEM: PubSubChannel<
     2,
     3,
     1,
+> = PubSubChannel::new();
+
+/// Per-tick controller tracking error. Multi-publisher: the active
+/// outer loop (cascade or MPC) publishes pos/vel/attitude error at
+/// 50–100 Hz; INDI publishes body-rate error at 100 Hz (decimated
+/// from the 8 kHz inner loop). PUBS=3 covers all three concrete
+/// publishers regardless of which feature combination is enabled —
+/// extra `pub` slots cost nothing on inactive paths.
+///
+/// CAP=4 mirrors `OCP_SOLVER_OUTPUT` since the consumer mix is
+/// similar (blackbox recorder + ground-station telemetry); SUBS=3
+/// leaves a free slot for a future shell-stream consumer.
+pub static TRACKING_ERROR: PubSubChannel<
+    CriticalSectionRawMutex,
+    TrackingError,
+    4,
+    3,
+    3,
 > = PubSubChannel::new();
 
 /// Processed motor RPM telemetry.

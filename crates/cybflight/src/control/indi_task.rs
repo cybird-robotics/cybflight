@@ -354,6 +354,7 @@ pub async fn indi_task() {
     let motor_telem_pub = super::ACTUATOR_MOTORS_TELEM.immediate_publisher();
     let processed_dshot_pub = super::PROCESSED_DSHOT_TELEM.immediate_publisher();
     let processed_motor_pub = super::PROCESSED_MOTOR_STATE.immediate_publisher();
+    let tracking_err_pub = super::TRACKING_ERROR.immediate_publisher();
 
     // --- State ---
     // Rate command from outer loop (cascade, MPC, or RC rate mode).
@@ -1048,6 +1049,26 @@ pub async fn indi_task() {
             processed_motor_pub.publish_immediate(msgs::MotorStateTelemetry {
                 timestamp: publish_time,
                 motors: processed_motor_dynamics,
+            });
+
+            // Body-rate tracking error: `rate_ref - gyro_corrected`.
+            // Published at the same 100 Hz decimation as the rest of
+            // the inner-loop telemetry. The 8 kHz inner-loop loop
+            // body computes this every tick implicitly inside the
+            // WLS step; we just snapshot it here so the blackbox
+            // doesn't have to subscribe to two separate streams to
+            // reconstruct the error.
+            //
+            // `gyro_corrected` here is the post-RPM-notch shadow
+            // (line 760) — the same signal the WLS allocator saw,
+            // so the error matches what INDI actually acted on.
+            tracking_err_pub.publish_immediate(super::TrackingError {
+                timestamp: publish_time,
+                pos_err: Vector3::zeros(),
+                vel_err: Vector3::zeros(),
+                attitude_err: Vector3::zeros(),
+                body_rate_err: rate_ref - gyro_corrected,
+                source: super::TRACKING_ERROR_SOURCE_INDI,
             });
         }
     }

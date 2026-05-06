@@ -173,6 +173,139 @@ pub fn write_pos_vel_hess<const NX: usize>(
     }
 }
 
+/// Add the velocity quadratic-cost contribution and write its gradient into
+/// `grad_x[7..10]`. Returns the cost contribution.
+///
+/// Companion to [`write_contour_lag_cost_grad`]: when the position cost is
+/// computed by the contour/lag helper, the caller still needs the standard
+/// velocity term, and this helper provides it without touching `grad_x[0..3]`.
+#[inline]
+pub fn write_vel_cost_grad<const NX: usize>(
+    x: &SVector<f32, NX>,
+    xref: &SVector<f32, NX>,
+    w_vel: &[f32; 3],
+    dt: f32,
+    grad_x: &mut SVector<f32, NX>,
+) -> f32 {
+    const { assert!(NX >= 10, "write_vel_cost_grad requires NX >= 10") };
+    let w_vel_v = Vector3::from(*w_vel);
+    let vel_err = x.fixed_rows::<3>(7) - xref.fixed_rows::<3>(7);
+    grad_x
+        .fixed_rows_mut::<3>(7)
+        .copy_from(&(vel_err.component_mul(&w_vel_v) * (2.0 * dt)));
+    dt * vel_err.component_mul(&vel_err).dot(&w_vel_v)
+}
+
+/// Write the velocity diagonal Hessian entries into `hess_xx[7..10][7..10]`.
+/// Companion to [`write_contour_lag_hess`].
+#[inline]
+pub fn write_vel_hess<const NX: usize>(
+    w_vel: &[f32; 3],
+    dt: f32,
+    hess_xx: &mut SMatrix<f32, NX, NX>,
+) {
+    const { assert!(NX >= 10, "write_vel_hess requires NX >= 10") };
+    for i in 0..3 {
+        hess_xx[(7 + i, 7 + i)] = 2.0 * dt * w_vel[i];
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// MPCTC contour/lag position cost
+// ───────────────────────────────────────────────────────────────────────────
+//
+// Model Predictive Contouring Tracking Control (MPCTC) replaces the plain
+// `w_pos · ‖p − p_ref‖²` position cost with a tangent-decomposed form:
+//
+//   t̂        = vel_ref / ‖vel_ref‖              (unit tangent of the path)
+//   e_lag    = t̂ · (p − p_ref)                  (signed scalar, along path)
+//   e_contour= (p − p_ref) − e_lag · t̂          (3-vector, orthogonal to path)
+//   J_pos    = w_c · ‖e_contour‖² + w_l · e_lag²
+//
+// Orthogonal-decomposition identity: when `w_c == w_l`, J_pos = w_c·‖e‖² —
+// MPCTC with equal weights is byte-identical to the standard quadratic cost.
+//
+// When `‖vel_ref‖ < vel_eps` (terminal hover, mission start), t̂ is undefined;
+// the cost degenerates to `w_c · ‖e‖²` (set t̂t̂ᵀ = 0, lag term vanishes).
+//
+// Gradient and Gauss-Newton Hessian:
+//
+//   M       = w_c·I + (w_l − w_c)·t̂t̂ᵀ          (3×3, dense, PSD)
+//   ∂J/∂p   = 2·M·(p − p_ref)
+//   ∂²J/∂p² = 2·M
+
+/// Add the MPCTC contour/lag position cost and write its gradient into
+/// `grad_x[0..3]`. The tangent direction is read from `xref[7..10]`
+/// (which is the trajectory velocity reference written by the sampler).
+/// Returns the cost contribution.
+#[inline]
+pub fn write_contour_lag_cost_grad<const NX: usize>(
+    x: &SVector<f32, NX>,
+    xref: &SVector<f32, NX>,
+    w_contour: f32,
+    w_lag: f32,
+    vel_eps: f32,
+    dt: f32,
+    grad_x: &mut SVector<f32, NX>,
+) -> f32 {
+    const { assert!(NX >= 10, "write_contour_lag_cost_grad requires NX >= 10") };
+    let pos_err = x.fixed_rows::<3>(0) - xref.fixed_rows::<3>(0);
+    let v_ref = xref.fixed_rows::<3>(7);
+    let vnorm_sq = v_ref.dot(&v_ref);
+
+    let (cost, grad3) = if vnorm_sq < vel_eps * vel_eps {
+        // Hover fallback: t̂t̂ᵀ = 0, M = w_c·I.
+        let cost = dt * w_contour * pos_err.dot(&pos_err);
+        let grad3 = pos_err * (2.0 * dt * w_contour);
+        (cost, grad3)
+    } else {
+        let inv = 1.0 / libm::sqrtf(vnorm_sq);
+        let t_hat = v_ref * inv;
+        let e_lag = t_hat.dot(&pos_err);
+        let e_contour_sq = pos_err.dot(&pos_err) - e_lag * e_lag;
+        let cost = dt * (w_contour * e_contour_sq + w_lag * e_lag * e_lag);
+        // grad = 2·dt · (w_c·e + (w_l − w_c)·e_lag·t̂)
+        let grad3 = pos_err * (2.0 * dt * w_contour)
+            + t_hat * (2.0 * dt * (w_lag - w_contour) * e_lag);
+        (cost, grad3)
+    };
+    grad_x.fixed_rows_mut::<3>(0).copy_from(&grad3);
+    cost
+}
+
+/// Write the MPCTC dense 3×3 position Hessian block into
+/// `hess_xx[0..3][0..3]`. Off-diagonal entries in that block are written
+/// (the block is dense), so the caller is expected to have zeroed the
+/// 3×3 block first (typically by zeroing the whole `hess_xx`).
+#[inline]
+pub fn write_contour_lag_hess<const NX: usize>(
+    xref: &SVector<f32, NX>,
+    w_contour: f32,
+    w_lag: f32,
+    vel_eps: f32,
+    dt: f32,
+    hess_xx: &mut SMatrix<f32, NX, NX>,
+) {
+    const { assert!(NX >= 10, "write_contour_lag_hess requires NX >= 10") };
+    let v_ref = xref.fixed_rows::<3>(7);
+    let vnorm_sq = v_ref.dot(&v_ref);
+    let two_dt = 2.0 * dt;
+    // Diagonal w_c·I always present.
+    for i in 0..3 {
+        hess_xx[(i, i)] = two_dt * w_contour;
+    }
+    if vnorm_sq >= vel_eps * vel_eps {
+        let inv = 1.0 / libm::sqrtf(vnorm_sq);
+        let t_hat = v_ref * inv;
+        let coef = two_dt * (w_lag - w_contour);
+        for i in 0..3 {
+            for j in 0..3 {
+                hess_xx[(i, j)] += coef * t_hat[i] * t_hat[j];
+            }
+        }
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Quaternion cost / gradient / Hessian
 // ───────────────────────────────────────────────────────────────────────────

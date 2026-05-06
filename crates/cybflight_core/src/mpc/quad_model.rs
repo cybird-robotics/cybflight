@@ -40,6 +40,66 @@ pub fn normalize_quat(x: &mut SVector<f32, NX>) {
     model_utils::normalize_quat(x);
 }
 
+/// Position-error cost mode.
+///
+/// `Quadratic` is the standard `w_pos · ‖p − p_ref‖²` cost — the default,
+/// byte-identical to the pre-MPCTC behavior.
+///
+/// `Contouring` activates **MPCTC** (Model Predictive Contouring Tracking
+/// Control): the position error is decomposed along the path tangent (read
+/// from `xref[7..10]` — the velocity reference written by the sampler).
+/// The two scalar weights are pulled from the existing `w_pos` array so the
+/// flash-tunable surface stays a single 3-element vector:
+///
+/// - `w_pos[0]` is the **contour weight** (penalizes orthogonal-to-path error)
+/// - `w_pos[2]` is the **lag weight** (penalizes along-path lag)
+/// - `w_pos[1]` is **unused** in this mode
+///
+/// When the two are equal, the cost is mathematically identical to the
+/// `Quadratic` mode by orthogonal decomposition. Lowering `w_pos[2]` lets
+/// the drone slide along the path under saturation while still pulling
+/// hard in the contour direction.
+///
+/// The tangent normalization is guarded by [`PosCostMode::VEL_EPS`]: when
+/// `‖vel_ref‖ < VEL_EPS` (hover, mission start, terminal), the cost
+/// degenerates to the `w_contour · ‖e‖²` form (lag term vanishes).
+///
+/// **Sampler-pairing safety invariant.** `Contouring` requires
+/// [`PositionSampler`] (firmware feature `position_sampler`). The position
+/// sampler's closest-point search produces an `xref[7..10]` tangent that
+/// is meaningful at every horizon step — so the contour/lag decomposition
+/// reflects the geometric path. Pairing `Contouring` with `TimeSampler`
+/// is unsafe in firmware operation: a time-anchored sample at hover, in a
+/// stall, or after a planner timeout produces zero or near-zero `vel_ref`
+/// for stretches of the horizon, dragging cost stages through the
+/// `VEL_EPS` fallback inconsistently and chattering between contour and
+/// isotropic regimes. The firmware enforces this invariant in
+/// `outer_loop::build_outer_quad_model`, which clamps `pos_cost_mode` to
+/// `Quadratic` whenever the `position_sampler` feature is off,
+/// regardless of `vp.mpc.pos_cost_mode`.
+///
+/// [`PositionSampler`]: crate::trajectory_planning::sampler::PositionSampler
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PosCostMode {
+    Quadratic,
+    Contouring,
+}
+
+impl PosCostMode {
+    /// Tangent-normalization guard for the contour/lag decomposition.
+    /// Below this `‖vel_ref‖` threshold the lag term vanishes and the
+    /// cost falls back to `w_contour · ‖e‖²` (correct hover behavior).
+    /// Fixed because retuning it bench-side is rare; if you need it
+    /// configurable, promote to a `MpcParams` field.
+    pub const VEL_EPS: f32 = 0.1;
+}
+
+impl Default for PosCostMode {
+    fn default() -> Self {
+        PosCostMode::Quadratic
+    }
+}
+
 #[derive(Clone)]
 pub struct QuadModel {
     pub mass: f32,
@@ -60,6 +120,10 @@ pub struct QuadModel {
     pub w_input: SVector<f32, NU>,
     /// Cubic constraint penalty weight (input bound enforcement).
     pub rho: f32,
+    /// Position-cost formulation. Default [`PosCostMode::Quadratic`] is
+    /// byte-identical to the pre-MPCTC behavior; switch to
+    /// [`PosCostMode::Contouring`] to activate MPCTC. See the enum doc.
+    pub pos_cost_mode: PosCostMode,
 }
 
 impl Default for QuadModel {
@@ -75,7 +139,7 @@ impl Default for QuadModel {
         let mass = 0.58;
         let grav = 9.81;
         // Sum of per-motor max thrusts from QUADROTOR_MOTORS (4 × 8.5 N).
-        let max_collective_thrust_n: f32 = 4.0 * 13.0;
+        let max_collective_thrust_n: f32 = 4.0 * 12.0;
         Self {
             mass,
             grav,
@@ -92,6 +156,7 @@ impl Default for QuadModel {
             w_att: [50.0, 50.0, 200.0],
             w_input: Vector4::new(1.0, 50.0, 50.0, 50.0),
             rho: 1e4,
+            pos_cost_mode: PosCostMode::Quadratic,
         }
     }
 }
@@ -115,13 +180,14 @@ impl QuadModel {
         for m in &vp.motors {
             max_collective_thrust_n += m.max_thrust_n;
         }
+        let thrust_percentage = 0.75;
         Self {
             mass,
             grav,
             dt: vp.mpc.dt,
             u_bounds: [
-                // [0.0_f32, max_collective_thrust_n],
-                [0.0_f32, 36.0_f32],
+                [0.0_f32, max_collective_thrust_n * thrust_percentage],
+                // [0.0_f32, 36.0_f32],
                 [-mr[0], mr[0]],
                 [-mr[1], mr[1]],
                 [-mr[2], mr[2]],
@@ -141,6 +207,7 @@ impl QuadModel {
                 vp.mpc.rate_weight[2],
             ),
             rho: vp.mpc.rho,
+            pos_cost_mode: vp.mpc.pos_cost_mode,
         }
     }
 
@@ -361,8 +428,24 @@ impl QuadModel {
         grad_x: &mut SVector<f32, NX>,
     ) -> f32 {
         let dt = self.dt;
-        let mut cost =
-            model_utils::write_pos_vel_cost_grad(x, xref, &self.w_pos, &self.w_vel, dt, grad_x);
+        let mut cost = match self.pos_cost_mode {
+            PosCostMode::Quadratic => {
+                model_utils::write_pos_vel_cost_grad(x, xref, &self.w_pos, &self.w_vel, dt, grad_x)
+            }
+            PosCostMode::Contouring => {
+                // w_pos[0] = contour weight, w_pos[2] = lag weight (see PosCostMode doc).
+                let pos = model_utils::write_contour_lag_cost_grad(
+                    x,
+                    xref,
+                    self.w_pos[0],
+                    self.w_pos[2],
+                    PosCostMode::VEL_EPS,
+                    dt,
+                    grad_x,
+                );
+                pos + model_utils::write_vel_cost_grad(x, xref, &self.w_vel, dt, grad_x)
+            }
+        };
         let (ea, de, dqa_dq) = model_utils::attitude_error(x, xref);
         cost += model_utils::write_quat_cost_grad(&ea, &de, &dqa_dq, &self.w_att, dt, grad_x);
         cost
@@ -378,9 +461,24 @@ impl QuadModel {
     ) -> f32 {
         let dt = self.dt;
 
-        // ── Pos + vel cost/gradient via shared helper ──
-        let mut cost =
-            model_utils::write_pos_vel_cost_grad(x, xref, &self.w_pos, &self.w_vel, dt, grad_x);
+        // ── Pos + vel cost/gradient (mode-dependent for pos) ──
+        let mut cost = match self.pos_cost_mode {
+            PosCostMode::Quadratic => {
+                model_utils::write_pos_vel_cost_grad(x, xref, &self.w_pos, &self.w_vel, dt, grad_x)
+            }
+            PosCostMode::Contouring => {
+                let pos = model_utils::write_contour_lag_cost_grad(
+                    x,
+                    xref,
+                    self.w_pos[0],
+                    self.w_pos[2],
+                    PosCostMode::VEL_EPS,
+                    dt,
+                    grad_x,
+                );
+                pos + model_utils::write_vel_cost_grad(x, xref, &self.w_vel, dt, grad_x)
+            }
+        };
 
         // ── Quaternion cost/gradient via shared helpers ──
         let (ea, de, dqa_dq) = model_utils::attitude_error(x, xref);
@@ -388,7 +486,22 @@ impl QuadModel {
 
         // ── Hessian ──
         hess_xx.fill(0.0);
-        model_utils::write_pos_vel_hess(&self.w_pos, &self.w_vel, dt, hess_xx);
+        match self.pos_cost_mode {
+            PosCostMode::Quadratic => {
+                model_utils::write_pos_vel_hess(&self.w_pos, &self.w_vel, dt, hess_xx)
+            }
+            PosCostMode::Contouring => {
+                model_utils::write_contour_lag_hess(
+                    xref,
+                    self.w_pos[0],
+                    self.w_pos[2],
+                    PosCostMode::VEL_EPS,
+                    dt,
+                    hess_xx,
+                );
+                model_utils::write_vel_hess(&self.w_vel, dt, hess_xx);
+            }
+        };
         model_utils::write_quat_hess(&de, &dqa_dq, &self.w_att, dt, hess_xx);
 
         cost

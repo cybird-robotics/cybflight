@@ -14,7 +14,7 @@
 //!   INDI effectiveness: g1_force(48) + g1_torque(48) + g2(48) + max_omega(16) + time_const(16) + nonlinearity(16) = 192 bytes
 //!   INDI controller:    rate_gains(12) + sync_filter_hz(4) + wls_wv(24) + wls_wu(16) + motor_pole_count(4 as f32) = 60 bytes
 //!   Learner:            fx_filt_hz(4) + motor_filt_hz(4) + acc_offset_m(12) + rls_gamma(4) + rls_t_char_s(4) + zeta_rate(4) + zeta_attitude(4) = 36 bytes
-//!   MpcParams:          pos(12) + vel(12) + att(12) + rate(12) + thrust(4) + dt(4) + rho(4) = 60 bytes
+//!   MpcParams:          pos(12) + vel(12) + att(12) + rate(12) + thrust(4) + dt(4) + rho(4) + pos_cost_mode(4 as f32, 0/1) = 64 bytes
 //!   PlannerParams:      max_vel_m_s(4) + max_tilt_rad(4) + weight_time(4) + weight_energy(4) + weight_pos(4) + weight_vel(4) + weight_tilt(4) + weight_body_rate(4) + weight_thrust(4) + smoothing_eps(4) + num_check_per_piece(4 as f32) = 44 bytes
 //!   BfgsTrustParams:    delta_init(4) + delta_max(4) + eta(4) + g_epsilon(4) + max_iterations(4 as f32) + past(4 as f32) + delta_conv(4) = 28 bytes
 //!   SamplerParams:      max_lag_s(4) + axis_weights_sqrt(12) + search_dt(4) + max_search_steps(4 as f32) + radius_of_acceptance(4) + max_lead_s(4) = 32 bytes
@@ -28,16 +28,18 @@
 //! correctly rejected here.
 
 use crate::mixer::{MotorParams, RigidBodyParams, SpinDir};
+use crate::mpc::quad_model::PosCostMode;
 use crate::trajectory_planning::sampler::PositionSamplerParams;
 use crate::trajectory_planning::types::Vec3;
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 27;
+const VERSION: u32 = 28;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
-/// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 60 + 44 + 28 + 32 + 4 + 4 + 4 = 632 bytes
-/// (sampler grew from 28→32 in v25 with the addition of `max_lead_s`).
-const PAYLOAD_SIZE: usize = 632;
-/// Padded to 32-byte flash word boundary: ceil((16+632)/32)*32 = 672
+/// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 64 + 44 + 28 + 32 + 4 + 4 + 4 = 636 bytes
+/// (MpcParams grew from 60→64 in v28 with the addition of `pos_cost_mode`,
+/// encoded as f32 with 0.0 = Quadratic, 1.0 = Contouring.)
+const PAYLOAD_SIZE: usize = 636;
+/// Padded to 32-byte flash word boundary: ceil((16+636)/32)*32 = 672
 pub const PADDED_SIZE: usize = 672;
 
 /// MPC tuning parameters: cost weights, discretization, and constraint penalty.
@@ -48,6 +50,11 @@ pub const PADDED_SIZE: usize = 672;
 #[derive(Clone, Debug)]
 pub struct MpcParams {
     /// Position tracking weights [x, y, z].
+    ///
+    /// In `PosCostMode::Quadratic` (default) this is the per-axis position
+    /// cost. In `PosCostMode::Contouring` (MPCTC) the same array is reused:
+    /// `pos_weight[0]` = contour (orthogonal-to-path) weight,
+    /// `pos_weight[2]` = lag (along-path) weight, `pos_weight[1]` is unused.
     pub pos_weight: [f32; 3],
     /// Velocity tracking weights [x, y, z].
     pub vel_weight: [f32; 3],
@@ -61,18 +68,25 @@ pub struct MpcParams {
     pub dt: f32,
     /// Cubic constraint penalty weight (input bound enforcement).
     pub rho: f32,
+    /// Position-cost formulation. `Quadratic` (default) is the standard
+    /// per-axis cost; `Contouring` activates MPCTC and reinterprets
+    /// `pos_weight[0]` / `pos_weight[2]` as contour / lag weights.
+    /// Flash-encoded as f32 (0.0 = Quadratic, 1.0 = Contouring) and
+    /// shell-tunable via `param set mpc_pos_cost_mode {0,1}`.
+    pub pos_cost_mode: PosCostMode,
 }
 
 impl Default for MpcParams {
     fn default() -> Self {
         Self {
-            pos_weight: [500.0, 500.0, 500.0],
+            pos_weight: [500.0, 500.0, 100.0],
             vel_weight: [10.0, 10.0, 10.0],
             att_weight: [5.0, 5.0, 200.0],
             rate_weight: [20.0, 20.0, 20.0],
             thrust_weight: 1.0,
             dt: 0.05,
             rho: 1e4,
+            pos_cost_mode: PosCostMode::Contouring,
         }
     }
 }
@@ -90,6 +104,7 @@ impl MpcParams {
         thrust_weight: f32,
         dt: f32,
         rho: f32,
+        pos_cost_mode: PosCostMode,
     ) -> Self {
         Self {
             pos_weight,
@@ -99,6 +114,7 @@ impl MpcParams {
             thrust_weight,
             dt,
             rho,
+            pos_cost_mode,
         }
     }
 
@@ -631,6 +647,15 @@ impl VehicleParams {
         off = put_f32(&mut buf, off, self.mpc.thrust_weight);
         off = put_f32(&mut buf, off, self.mpc.dt);
         off = put_f32(&mut buf, off, self.mpc.rho);
+        // pos_cost_mode (added v28): 0.0 = Quadratic, 1.0 = Contouring.
+        off = put_f32(
+            &mut buf,
+            off,
+            match self.mpc.pos_cost_mode {
+                PosCostMode::Quadratic => 0.0,
+                PosCostMode::Contouring => 1.0,
+            },
+        );
         // PlannerParams
         off = put_f32(&mut buf, off, self.planner.max_vel_m_s);
         off = put_f32(&mut buf, off, self.planner.max_tilt_rad);
@@ -898,6 +923,15 @@ impl VehicleParams {
         off += 4;
         let rho = get_f32(buf, off);
         off += 4;
+        // pos_cost_mode (added v28): decode 0.0 = Quadratic, anything else
+        // = Contouring. Threshold midway at 0.5 to be tolerant of f32 round
+        // trips through external tooling.
+        let pos_cost_mode = if get_f32(buf, off) < 0.5 {
+            PosCostMode::Quadratic
+        } else {
+            PosCostMode::Contouring
+        };
+        off += 4;
         let mpc = MpcParams {
             pos_weight,
             vel_weight,
@@ -906,6 +940,7 @@ impl VehicleParams {
             thrust_weight,
             dt,
             rho,
+            pos_cost_mode,
         };
 
         // PlannerParams
@@ -1185,6 +1220,10 @@ impl VehicleParams {
             ParamKey::MpcWThrust => self.mpc.thrust_weight,
             ParamKey::MpcDt => self.mpc.dt,
             ParamKey::MpcRho => self.mpc.rho,
+            ParamKey::MpcPosCostMode => match self.mpc.pos_cost_mode {
+                PosCostMode::Quadratic => 0.0,
+                PosCostMode::Contouring => 1.0,
+            },
             // Sampler
             ParamKey::SamplerMaxLagS => self.sampler.max_lag_s,
             ParamKey::SamplerMaxLeadS => self.sampler.max_lead_s,
@@ -1359,6 +1398,13 @@ impl VehicleParams {
             ParamKey::MpcWThrust => self.mpc.thrust_weight = val,
             ParamKey::MpcDt => self.mpc.dt = val,
             ParamKey::MpcRho => self.mpc.rho = val,
+            ParamKey::MpcPosCostMode => {
+                self.mpc.pos_cost_mode = if val < 0.5 {
+                    PosCostMode::Quadratic
+                } else {
+                    PosCostMode::Contouring
+                };
+            }
             // Sampler
             ParamKey::SamplerMaxLagS => self.sampler.max_lag_s = val,
             ParamKey::SamplerMaxLeadS => self.sampler.max_lead_s = val,
@@ -1530,6 +1576,7 @@ pub enum ParamKey {
     MpcWThrust,
     MpcDt,
     MpcRho,
+    MpcPosCostMode,
     // Sampler (position-sampler tuning surface)
     SamplerMaxLagS,
     SamplerMaxLeadS,
@@ -1693,6 +1740,7 @@ pub const ALL_KEYS: &[ParamKey] = &[
     ParamKey::MpcWThrust,
     ParamKey::MpcDt,
     ParamKey::MpcRho,
+    ParamKey::MpcPosCostMode,
     // Sampler
     ParamKey::SamplerMaxLagS,
     ParamKey::SamplerMaxLeadS,
@@ -1858,6 +1906,7 @@ impl ParamKey {
             "mpc_w_thrust" => Some(Self::MpcWThrust),
             "mpc_dt" => Some(Self::MpcDt),
             "mpc_rho" => Some(Self::MpcRho),
+            "mpc_pos_cost_mode" => Some(Self::MpcPosCostMode),
             // Sampler
             "sampler_max_lag_s" => Some(Self::SamplerMaxLagS),
             "sampler_max_lead_s" => Some(Self::SamplerMaxLeadS),
@@ -2024,6 +2073,7 @@ impl ParamKey {
             Self::MpcWThrust => "mpc_w_thrust",
             Self::MpcDt => "mpc_dt",
             Self::MpcRho => "mpc_rho",
+            Self::MpcPosCostMode => "mpc_pos_cost_mode",
             // Sampler
             Self::SamplerMaxLagS => "sampler_max_lag_s",
             Self::SamplerMaxLeadS => "sampler_max_lead_s",

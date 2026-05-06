@@ -6,6 +6,7 @@
 
 use cybflight_core::mixer::{MotorParams, RigidBodyParams, SpinDir};
 use cybflight_core::mpc::{FullQuadModel, NU, NX};
+use cybflight_core::mpc::quad_model::PosCostMode;
 use cybflight_core::params::{
     BfgsTrustParams, ControlGains, IndiControllerParams, IndiEffectivenessParams, LearnerParams,
     MpcParams, PlannerParams, SamplerParams, VehicleParams,
@@ -89,13 +90,14 @@ impl VehicleParamsBuilder {
                 0.8,             // zeta_attitude
             ),
             mpc: MpcParams::new(
-                [500.0, 500.0, 500.0], // pos_weight
-                [10.0, 10.0, 10.0],    // vel_weight
-                [5.0, 5.0, 200.0],     // att_weight
-                [20.0, 20.0, 20.0],    // rate_weight
-                1.0,                    // thrust_weight
-                0.05,                   // dt
-                1e4,                    // rho
+                [500.0, 500.0, 500.0],   // pos_weight
+                [10.0, 10.0, 10.0],      // vel_weight
+                [5.0, 5.0, 200.0],       // att_weight
+                [20.0, 20.0, 20.0],      // rate_weight
+                1.0,                     // thrust_weight
+                0.05,                    // dt
+                1e4,                     // rho
+                PosCostMode::Quadratic,  // pos_cost_mode
             ),
             planner: PlannerParams::new(
                 100.0,                          // max_vel_m_s

@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
+use cybflight_core::mpc::quad_model::PosCostMode;
 use cybflight_sim::{
     controller::{CascadeController, Controller, MpcDirectController, MpcIndiController},
     plant::QuadPlant,
@@ -60,6 +61,13 @@ const NOISY_SCENARIOS: &[&str] = &["mission_square_noisy"];
 /// a `NoisyGps` with a fixed seed. Also mpc_indi-only (matches the
 /// firmware `outer_mpc + est_pos_gps` topology).
 const GPS_SCENARIOS: &[&str] = &["mission_square_gps"];
+
+/// MPCTC (Contouring) scenarios — exercise the new `pos_cost_mode =
+/// Contouring` branch added in `Implement MPCTC`. Restricted to
+/// trajectory-tracking scenarios where the contour/lag reformulation
+/// of `pos_weight` actually differs from the Quadratic baseline; for
+/// static hover the two formulations collapse to the same cost.
+const MPCTC_SCENARIOS: &[&str] = &["p2p_x3", "mission_square"];
 
 fn build_scenario(name: &str) -> Scenario {
     match name {
@@ -133,6 +141,10 @@ fn build_controller(name: &str, scenario: &Scenario) -> Box<dyn Controller> {
         "cascade" => Box::new(CascadeController::from_params(vp)),
         "mpc_direct" => Box::new(MpcDirectController::from_params(vp)),
         "mpc_indi" => Box::new(MpcIndiController::from_params(vp)),
+        "mpc_indi_contouring" => Box::new(MpcIndiController::from_params_with_mode(
+            vp,
+            PosCostMode::Contouring,
+        )),
         other => panic!("unknown controller: {other}"),
     }
 }
@@ -153,6 +165,13 @@ fn compute_current() -> BTreeMap<String, Row> {
     // path is MpcIndi only).
     for &s in GPS_SCENARIOS {
         out.insert(format!("{s}/mpc_indi"), run_one(s, "mpc_indi"));
+    }
+    // MPCTC scenarios — same MpcIndi stack, Contouring pos_cost_mode.
+    for &s in MPCTC_SCENARIOS {
+        out.insert(
+            format!("{s}/mpc_indi_contouring"),
+            run_one(s, "mpc_indi_contouring"),
+        );
     }
     out
 }

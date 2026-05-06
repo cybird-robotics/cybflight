@@ -62,6 +62,13 @@
     "peak_tilt_rad": 0.3451158,
     "peak_motor_saturation_pct": 27.749443
   },
+  "mission_square/mpc_indi_contouring": {
+    "rms_pos_err_m": 0.0026239103,
+    "peak_pos_err_m": 0.011305546,
+    "terminal_pos_err_m": 0.0007527227,
+    "peak_tilt_rad": 0.3451091,
+    "peak_motor_saturation_pct": 27.749443
+  },
   "mission_square_gps/mpc_indi": {
     "rms_pos_err_m": 0.39954975,
     "peak_pos_err_m": 0.713751,
@@ -95,6 +102,13 @@
     "peak_pos_err_m": 0.011282339,
     "terminal_pos_err_m": 0.0007301034,
     "peak_tilt_rad": 0.25244376,
+    "peak_motor_saturation_pct": 24.950027
+  },
+  "p2p_x3/mpc_indi_contouring": {
+    "rms_pos_err_m": 0.003064585,
+    "peak_pos_err_m": 0.011282339,
+    "terminal_pos_err_m": 0.00071706,
+    "peak_tilt_rad": 0.2524447,
     "peak_motor_saturation_pct": 24.950027
   }
 }

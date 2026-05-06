@@ -10,8 +10,9 @@
 
 #![cfg(feature = "outer_mpc")]
 
-use cybflight_core::mpc::quad_model::{N as MPC_N, NU as MPC_NU, NX as MPC_NX};
+use cybflight_core::mpc::quad_model::{N as MPC_N, NU as MPC_NU, NX as MPC_NX, PosCostMode};
 use cybflight_core::mpc::{QuadModel, SimpleQuadProblem, SimpleSqpSolver};
+use cybflight_core::params::VehicleParams;
 use cybflight_core::rotation::quaternion_from_zb_and_yaw;
 use cybflight_core::trajectory_planning::flatness::reference_quaternion;
 use cybflight_core::trajectory_planning::minco_snap::{
@@ -148,13 +149,61 @@ fn clamp_mpc_output(u0: &mut MpcInputVec, u_bounds: &[[f32; 2]; MPC_NU]) {
     }
 }
 
+/// Build the outer-loop `QuadModel` from flash params, enforcing two
+/// MPCTC safety invariants:
+///
+/// 1. **Sampler-pairing.** `PosCostMode::Contouring` requires a sampler
+///    that publishes a non-zero `xref[7..10]` along the path tangent. The
+///    `PositionSampler` does so by construction; the `TimeSampler` build
+///    is paired with hover-style references where the tangent isn't
+///    well-defined for our missions. Compile-time guard: when the
+///    `position_sampler` feature is off, this helper unconditionally
+///    clamps `pos_cost_mode` to `Quadratic`.
+///
+/// 2. **Weight sanity.** In Contouring mode the cost reduces to
+///    `M = w_pos[0]·I + (w_pos[2] − w_pos[0])·t̂t̂ᵀ`. The 3×3 Hessian is
+///    PSD only when `w_pos[0] > 0` and `w_pos[2] ≥ 0`. A misconfigured
+///    `w_pos[0] = 0` collapses the contour-direction restoring force —
+///    the drone can drift orthogonally off the path indefinitely. Negative
+///    weights would invert the cost and are catastrophic. Runtime guard:
+///    if either condition is violated, clamp back to `Quadratic`.
+///
+/// In all clamp cases a `defmt::warn!` fires (once at boot, once per
+/// disarmed hot-reload) so a misconfigured flash is visibly surfaced.
+fn build_outer_quad_model(vp: &VehicleParams) -> QuadModel {
+    #[cfg_attr(feature = "position_sampler", allow(unused_mut))]
+    let mut model = QuadModel::from_vehicle_params(vp);
+    #[cfg(not(feature = "position_sampler"))]
+    {
+        if model.pos_cost_mode != PosCostMode::Quadratic {
+            defmt::warn!(
+                "MPC: position_sampler feature disabled — \
+                 forcing PosCostMode::Quadratic (Contouring requires the position sampler)"
+            );
+            model.pos_cost_mode = PosCostMode::Quadratic;
+        }
+    }
+    if model.pos_cost_mode == PosCostMode::Contouring
+        && (model.w_pos[0] <= 0.0 || model.w_pos[2] < 0.0)
+    {
+        defmt::warn!(
+            "MPC: Contouring mode with w_pos[0]={=f32} w_pos[2]={=f32} is unsafe \
+             (need w_pos[0]>0, w_pos[2]>=0) — forcing PosCostMode::Quadratic",
+            model.w_pos[0],
+            model.w_pos[2]
+        );
+        model.pos_cost_mode = PosCostMode::Quadratic;
+    }
+    model
+}
+
 #[embassy_executor::task]
 pub async fn control_loop_task() {
     // ── Construct MPC ──────────────────────────────────────────────────
     let params = crate::params::get();
     let mpc_solver: &mut SimpleSqpSolver = MPC_SOLVER.init(SimpleSqpSolver::new());
     let mut mpc_problem =
-        SimpleQuadProblem::with_rk4(QuadModel::from_vehicle_params(&params), MPC_N);
+        SimpleQuadProblem::with_rk4(build_outer_quad_model(&params), MPC_N);
 
     // ── Reference + warm-start trajectories ────────────────────────────
     let mut hover_thrust = QUADROTOR_BODY.mass_kg * 9.81;
@@ -310,7 +359,7 @@ pub async fn control_loop_task() {
                 local_param_ver = cur;
                 let np = crate::params::get();
                 mpc_problem =
-                    SimpleQuadProblem::with_rk4(QuadModel::from_vehicle_params(&np), MPC_N);
+                    SimpleQuadProblem::with_rk4(build_outer_quad_model(&np), MPC_N);
                 hover_thrust = np.body.mass_kg * 9.81;
                 let hover_u = MpcInputVec::from_row_slice(&[hover_thrust, 0.0, 0.0, 0.0]);
                 u_refs = [hover_u; MPC_N];

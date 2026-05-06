@@ -30,7 +30,7 @@ use cybflight_core::mixer::{LinearAllocator, MotorEffectiveness};
 use cybflight_core::mpc::{
     FullQuadModel, FullQuadProblem, FullSqpSolver, N as FULL_N, NU, NX, QuadModel,
     SimpleQuadProblem, SimpleSqpSolver,
-    quad_model::{N as SIMPLE_N, NU as SIMPLE_NU, NX as SIMPLE_NX},
+    quad_model::{N as SIMPLE_N, NU as SIMPLE_NU, NX as SIMPLE_NX, PosCostMode},
 };
 use cybflight_core::params::VehicleParams;
 use cybflight_core::position_control::{
@@ -156,6 +156,14 @@ pub struct MpcIndiController {
 
 impl MpcIndiController {
     pub fn from_params(vp: &VehicleParams) -> Self {
+        Self::from_params_with_mode(vp, vp.mpc.pos_cost_mode)
+    }
+
+    /// Build the controller with an explicit [`PosCostMode`] override that
+    /// supersedes `vp.mpc.pos_cost_mode`. Useful for sim sweeps that
+    /// compare Quadratic vs. Contouring on the same `VehicleParams`
+    /// without having to mutate the param struct between runs.
+    pub fn from_params_with_mode(vp: &VehicleParams, pos_cost_mode: PosCostMode) -> Self {
         // Outer MPC (QuadModel, same as firmware outer_loop.rs)
         let mut model = QuadModel::from_vehicle_params(vp);
         model.dt = SIMPLE_MPC_DT;
@@ -169,6 +177,7 @@ impl MpcIndiController {
         // *only* in this controller; FullQuadModel (used by
         // `MpcDirectController`) keeps the canonical `w_rate` mapping.
         model.w_input = SVector::from_element(vp.mpc.thrust_weight);
+        model.pos_cost_mode = pos_cost_mode;
         let grav = model.grav;
         let problem = SimpleQuadProblem::with_rk4(model, SIMPLE_N);
         let mass = vp.body.mass_kg;

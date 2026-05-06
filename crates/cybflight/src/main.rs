@@ -3,7 +3,18 @@
 
 use cybflight::hal::interrupt;
 use embassy_executor::InterruptExecutor;
+// `panic_probe` is the default panic handler for `probe-rs run` —
+// emits a defmt log then `udf` so the debugger breaks on panic. The
+// post-mortem subsystem provides its own `#[panic_handler]` that
+// commits state to BKPSRAM before sys_reset; only one
+// `#[panic_handler]` symbol may be linked per binary, so the two are
+// mutually exclusive.
+#[cfg(not(feature = "postmortem"))]
 use panic_probe as _;
+// When `postmortem` is on, the `#[panic_handler]` lives inside
+// `cybflight::postmortem::fault`. The lib's `pub mod postmortem;`
+// (gated on the same feature) pulls it in via `lib.rs`, so we don't
+// need a separate import here — just gate out `panic_probe`.
 
 // ─────────────────────────────────────────────────────────────────────
 // Three-tier cooperative-preemptive executor architecture.
@@ -88,6 +99,27 @@ async fn main(spawner: embassy_executor::Spawner) {
     //   * Everything else (LED, USB, RC, mag, baro, GPS, ESP bridge)
     //     on `spawner` (thread).
     cybflight::board_init::init(&spawner, &ctrl_spawner, &high_spawner, board).await;
+
+    // --- Post-mortem: BKPSRAM enable + boot recovery ---
+    //
+    // Order matters: `bkpsram::enable` must run before any reader (so
+    // the AHB4 clock is up before we touch 0x3880_0000), and
+    // `boot_recovery` reads the prior boot's record + initializes
+    // this boot's record. After this, the post-mortem task and the
+    // fault handlers (panic / HardFault / PVD) all share a coherent
+    // BKPSRAM state.
+    //
+    // `enable_pvd_brownout` arms the PVD interrupt — must be after
+    // bsp::init configures clocks (PWR clock comes from APB1).
+    #[cfg(feature = "postmortem")]
+    {
+        cybflight::postmortem::bkpsram::enable();
+        cybflight::postmortem::recovery::boot_recovery();
+        cybflight::postmortem::fault::enable_pvd_brownout();
+        spawner
+            .spawn(cybflight::postmortem::task::postmortem_task())
+            .unwrap_or_else(|_| defmt::panic!("failed to spawn postmortem task"));
+    }
 
     // --- IWDG: system-level safety net ---
     cybflight::watchdog::init();

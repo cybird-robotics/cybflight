@@ -31,6 +31,9 @@ pub const HAS_SDCARD: bool = false;
 /// and the SPI-NOR backend is not yet wired, so the pipeline compiles
 /// out entirely.
 pub const HAS_BLACKBOX_STORAGE: bool = false;
+/// STM32H743's D3-domain backup SRAM. See SAKURAH743 BSP for the full
+/// rationale; same MCU, same answer.
+pub const HAS_BACKUP_SRAM: bool = true;
 pub const LED_COUNT: usize = 1;
 
 // =====================================================================

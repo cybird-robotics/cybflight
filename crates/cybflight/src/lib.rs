@@ -19,6 +19,8 @@ pub mod motors;
 pub use cybflight_msgs as msgs;
 pub mod params;
 pub mod platform;
+#[cfg(feature = "postmortem")]
+pub mod postmortem;
 pub mod sensors;
 pub mod shell;
 pub mod status;

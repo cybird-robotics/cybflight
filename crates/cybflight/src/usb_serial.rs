@@ -76,6 +76,8 @@ const HELP_TEXT: &[u8] = b"\
   blackbox ls          list files in the FAT root (rejected while recording)\r\n\
                        (recorder also auto-starts on real ARM_STATE arm: RC switch / failsafe path)\r\n\
                        (file numbering picks up after the highest existing flight_NNNN; survives reboots)\r\n\
+  postmortem show      print the prior-boot crash record (reset cause, fatal kind, last events)\r\n\
+  postmortem clear     wipe the BKPSRAM post-mortem slot\r\n\
   reboot               software reset\r\n\
   reboot --dfu         reset into USB DFU bootloader\r\n\
   help                 show this message\r\n\
@@ -985,6 +987,14 @@ async fn dispatch<'d>(
         "blackbox ls" => {
             dispatch_blackbox_ls(class).await?;
         }
+        #[cfg(feature = "postmortem")]
+        "postmortem show" => {
+            dispatch_postmortem_show(class).await?;
+        }
+        #[cfg(feature = "postmortem")]
+        "postmortem clear" => {
+            dispatch_postmortem_clear(class).await?;
+        }
         _ => {
             write_all(class, b"unknown command (try 'help')\r\n").await?;
         }
@@ -1223,6 +1233,119 @@ async fn dispatch_blackbox_ls<'d>(
             write_all(class, w.as_slice()).await
         }
     }
+}
+
+/// `postmortem show` — print the prior-boot crash record.
+///
+/// Reads BKPSRAM directly via [`crate::postmortem::recovery::current_boot_record`]
+/// (idempotent — the Signal-based `take_pending` is reserved for the
+/// blackbox recorder's single-shot mirror). Prints reset cause, fatal
+/// kind + register summary, last-N events, and the most recent
+/// snapshot.
+#[cfg(feature = "postmortem")]
+async fn dispatch_postmortem_show<'d>(
+    class: &mut CdcAcmClass<'d, UsbDriver<'d>>,
+) -> Result<(), EndpointError> {
+    use crate::postmortem::record::{self as pmrec, FatalKind};
+    use crate::postmortem::recovery;
+    use crate::postmortem::reset_cause;
+
+    let rec = recovery::current_boot_record();
+    let valid = pmrec::is_valid(&rec);
+
+    let mut buf = [0u8; 256];
+    let mut w = WriteBuf::new(&mut buf);
+    if !valid {
+        let cause = reset_cause::read();
+        let _ = write!(
+            w,
+            "postmortem: no valid record (current boot's slot, reset_cause=0x{:08x} kind={:?})\r\n",
+            cause,
+            reset_cause::classify(cause)
+        );
+        return write_all(class, w.as_slice()).await;
+    }
+    let cause_kind = reset_cause::classify(rec.header.reset_cause);
+    let fatal_kind = FatalKind::from_u8(rec.fatal.kind);
+    let _ = write!(
+        w,
+        "postmortem: boot {} (reset_cause=0x{:08x} {:?}, fw=0x{:08x}, uptime={}ms)\r\n",
+        rec.header.boot_count,
+        rec.header.reset_cause,
+        cause_kind,
+        rec.header.fw_git_hash,
+        rec.header.uptime_ms,
+    );
+    write_all(class, w.as_slice()).await?;
+
+    if !matches!(fatal_kind, FatalKind::None) {
+        let mut buf = [0u8; 256];
+        let mut w = WriteBuf::new(&mut buf);
+        let _ = write!(
+            w,
+            "  fatal: {:?}  pc=0x{:08x} lr=0x{:08x} psr=0x{:08x}\r\n\
+             \x20        cfsr=0x{:08x} hfsr=0x{:08x} mmfar=0x{:08x} bfar=0x{:08x}\r\n",
+            fatal_kind,
+            rec.fatal.pc,
+            rec.fatal.lr,
+            rec.fatal.psr,
+            rec.fatal.cfsr,
+            rec.fatal.hfsr,
+            rec.fatal.mmfar,
+            rec.fatal.bfar,
+        );
+        write_all(class, w.as_slice()).await?;
+    }
+
+    // Events: walk in chronological order, print one line each. Stop
+    // after a sensible cap so a wedged ring doesn't flood the shell.
+    let mut count = 0u32;
+    for ev in rec.events_in_order() {
+        let mut buf = [0u8; 96];
+        let mut w = WriteBuf::new(&mut buf);
+        let _ = write!(
+            w,
+            "  ev[{}] @{}ms kind=0x{:02x} data=0x{:08x}\r\n",
+            ev.seq, ev.timestamp_ms, ev.kind, ev.data,
+        );
+        write_all(class, w.as_slice()).await?;
+        count += 1;
+        if count >= pmrec::EVENT_RING_LEN as u32 {
+            break;
+        }
+    }
+    if count == 0 {
+        write_all(class, b"  (no events captured this boot)\r\n").await?;
+    }
+
+    // Snapshot summary — single line.
+    let mut buf = [0u8; 192];
+    let mut w = WriteBuf::new(&mut buf);
+    let q = rec.snapshots.attitude_quat_wijk;
+    let p = rec.snapshots.position_xyz;
+    let v = rec.snapshots.velocity_xyz;
+    let _ = write!(
+        w,
+        "  last: q=[{:.3},{:.3},{:.3},{:.3}] p=[{:.2},{:.2},{:.2}] v=[{:.2},{:.2},{:.2}]\r\n",
+        q[0], q[1], q[2], q[3], p[0], p[1], p[2], v[0], v[1], v[2],
+    );
+    write_all(class, w.as_slice()).await
+}
+
+/// `postmortem clear` — wipe the BKPSRAM slot.
+///
+/// Used after a developer has inspected `postmortem show` and wants
+/// to ensure the next boot starts clean. The next boot will still
+/// see this boot's reset_cause via `RCC.RSR`, but the slot itself
+/// will be invalid (magic = 0).
+#[cfg(feature = "postmortem")]
+async fn dispatch_postmortem_clear<'d>(
+    class: &mut CdcAcmClass<'d, UsbDriver<'d>>,
+) -> Result<(), EndpointError> {
+    crate::postmortem::bkpsram::with_record_mut(|r| {
+        crate::postmortem::record::clear(r);
+    });
+    write_all(class, b"postmortem: BKPSRAM slot cleared\r\n").await
 }
 
 fn blackbox_fat_reason(stage: crate::blackbox::fat::OpError) -> &'static str {

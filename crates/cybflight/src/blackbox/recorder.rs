@@ -268,6 +268,76 @@ impl FileBody for FlightRecorder {
             total += self
                 .emit_event(w, &mut scratch, events::KIND_ARM, 0)
                 .await?;
+
+            // ── Prior-boot post-mortem mirror ───────────────────
+            //
+            // If the previous boot left a valid post-mortem record,
+            // emit it inline as `/events` records bracketed by
+            // KIND_BOOT_POSTMORTEM start/end sentinels. The opening
+            // bracket's `data` field packs `(reset_cause << 8 |
+            // fatal_kind)` so a post-flight reader can summarize the
+            // prior crash from a single record without parsing the
+            // full BKPSRAM struct.
+            //
+            // `take_pending` is single-shot: only the *first* SD
+            // session opened after a crashed boot mirrors the
+            // record. Subsequent sessions on the same boot don't
+            // re-emit it.
+            #[cfg(feature = "postmortem")]
+            if let Some(prior) = crate::postmortem::recovery::take_pending() {
+                let summary_data = ((prior.header.reset_cause & 0x00FF_FFFF) << 8)
+                    | (prior.fatal.kind as u32 & 0xFF);
+                total += self
+                    .emit_event(
+                        w,
+                        &mut scratch,
+                        events::KIND_BOOT_POSTMORTEM,
+                        summary_data,
+                    )
+                    .await?;
+                // If the fatal slot is populated, emit a synthetic
+                // event with the fatal kind so post-flight tools
+                // see a single explicit "this is what killed it"
+                // marker without having to inspect the bracket
+                // payload.
+                let fatal_kind = prior.fatal.kind;
+                let synth_kind = match crate::postmortem::record::FatalKind::from_u8(fatal_kind) {
+                    crate::postmortem::record::FatalKind::Panic => Some(events::KIND_PANIC),
+                    crate::postmortem::record::FatalKind::HardFault => {
+                        Some(events::KIND_HARDFAULT)
+                    }
+                    crate::postmortem::record::FatalKind::Brownout => {
+                        Some(events::KIND_BROWNOUT)
+                    }
+                    crate::postmortem::record::FatalKind::IwdgReset => {
+                        Some(events::KIND_IWDG_RESET)
+                    }
+                    crate::postmortem::record::FatalKind::None => None,
+                };
+                if let Some(k) = synth_kind {
+                    // Encode CFSR low 16 bits (or panic_msg_idx for
+                    // panic) in `data` — same convention as the
+                    // event-kind docs.
+                    let data = match k {
+                        events::KIND_HARDFAULT => prior.fatal.cfsr & 0xFFFF,
+                        events::KIND_PANIC => prior.fatal.panic_msg_idx as u32,
+                        _ => 0,
+                    };
+                    total += self.emit_event(w, &mut scratch, k, data).await?;
+                }
+                // Replay the prior-boot event ring. Each entry's
+                // `kind` is in the same KIND_* code space — readers
+                // see the prior session's RC/FAILSAFE/MISSION events
+                // inline, all between the BOOT_POSTMORTEM brackets.
+                for ev in prior.events_in_order() {
+                    total += self
+                        .emit_event(w, &mut scratch, ev.kind, ev.data)
+                        .await?;
+                }
+                total += self
+                    .emit_event(w, &mut scratch, events::KIND_BOOT_POSTMORTEM, 0)
+                    .await?;
+            }
         }
 
         // ── capture loop ────────────────────────────────────────

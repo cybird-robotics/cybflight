@@ -6,7 +6,7 @@ publish = false
 
 [features]
 # Pick one board by default; enable CRSF RC and UART logging by default
-default = ["board_foxeerh743", "rx_crsf", "defmt_uart", "outer_mpc", "est_pos_mocap"]
+default = ["board_foxeerh743", "rx_crsf", "defmt_uart", "outer_mpc", "est_pos_mocap", "postmortem"]
 
 board_sakurah743 = ["dep:bsp-sakurah743"]
 board_foxeerh743 = ["dep:bsp-foxeerh743"]
@@ -37,6 +37,13 @@ est_pos_gps = ["est_eskf"]
 outer_rate = []
 outer_geometric = ["est_eskf"]
 outer_mpc = ["est_eskf"]
+# Post-mortem logging subsystem (BKPSRAM + flash mirror + custom panic
+# handler). Default-on for release / firmware builds — captures crash
+# state across reboots and brownouts. Disable for `probe-rs run`
+# debug sessions if you want panic_probe's breakpoint-on-panic flow
+# (cargo run --no-default-features --features=...without postmortem).
+# When this feature is on, `panic_probe` is NOT linked.
+postmortem = []
 # Reference sampler selection (only meaningful with outer_mpc).
 # Default: TimeSampler (τ = (now − t_start) + k·dt). Setting this flag
 # selects the closest-point PositionSampler — see docs in
@@ -78,6 +85,11 @@ defmt = "1.0.1"
 critical-section = "1"
 embedded-io = "0.7"
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+# CRC over the post-mortem record body. `default-features = false`
+# disables std-only "use_simd" path; the no_std fallback is the
+# table-based implementation which is still callable from a
+# panic/HardFault context (no allocator, no statics-with-Drop).
+crc32fast = { version = "1.5", default-features = false }
 
 # COBS framing for ESP bridge communication
 cobs = { version = "0.5", default-features = false }

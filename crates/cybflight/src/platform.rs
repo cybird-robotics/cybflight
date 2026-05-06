@@ -19,6 +19,21 @@ pub fn sys_reboot() -> ! {
 
 #[cortex_m_rt::pre_init]
 unsafe fn pre_init() {
+    // ── Post-mortem reset-cause capture ────────────────────────────────
+    //
+    // Read RCC.RSR + PWR.CSR1 into a `.uninit` static **before** any
+    // other code runs. The flags are sticky, so doing this in `main`
+    // is fine — but `bsp::init()` may touch RCC for clock setup, and
+    // a future change that writes RMVF anywhere upstream of the
+    // post-mortem subsystem would silently lose the prior boot's
+    // cause. Capturing here guarantees we own the cause regardless.
+    //
+    // The capture itself is ~10 cycles and uses no peripherals beyond
+    // raw RCC/PWR reads (always-on domain). Compiles out to a no-op
+    // when the `postmortem` feature is disabled.
+    #[cfg(feature = "postmortem")]
+    crate::postmortem::reset_cause::capture();
+
     const DFU_MAGIC: u32 = 0xDEAD_D00D;
     // RTC backup register 0 on STM32H743
     let bkpr0 = 0x58004050 as *mut u32;

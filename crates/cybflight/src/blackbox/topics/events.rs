@@ -20,8 +20,8 @@ pub const SCHEMA: &[u8] = br#"{
   "properties": {
     "timestamp_ns": { "type": "integer" },
     "kind":         { "type": "integer",
-                      "description": "Kind enum: 1=ARM, 2=DISARM, 3=FAILSAFE, 4=FAILSAFE_CLEAR, 5=ESTIMATOR_DOWN, 6=ESTIMATOR_UP, 7=RC_LOSS, 8=RC_RECOVERED, 9=MISSION_PLANNING, 10=MISSION_EXECUTING, 11=MISSION_IDLE, 16=LOG_END" },
-    "data":         { "type": "integer", "description": "kind-specific: for KIND_FAILSAFE, encodes FailsafeReason (1=ControllerTimeout, 2=RcLoss); for KIND_MISSION_IDLE, encodes the previous MissionState (1=Planning, 2=Executing); 0 otherwise" }
+                      "description": "Kind enum: 1=ARM, 2=DISARM, 3=FAILSAFE, 4=FAILSAFE_CLEAR, 5=ESTIMATOR_DOWN, 6=ESTIMATOR_UP, 7=RC_LOSS, 8=RC_RECOVERED, 9=MISSION_PLANNING, 10=MISSION_EXECUTING, 11=MISSION_IDLE, 16=LOG_END, 32=PANIC, 33=HARDFAULT, 34=BROWNOUT, 35=IWDG_RESET, 36=BOOT_POSTMORTEM" },
+    "data":         { "type": "integer", "description": "kind-specific: KIND_FAILSAFE -> FailsafeReason (1=ControllerTimeout, 2=RcLoss); KIND_MISSION_IDLE -> previous MissionState (1=Planning, 2=Executing); KIND_BOOT_POSTMORTEM -> packed (reset_cause<<8 | fatal_kind) when entering, 0 when leaving the prior-boot bracket; 0 otherwise" }
   }
 }"#;
 
@@ -87,6 +87,40 @@ pub const KIND_MISSION_EXECUTING: u8 = 0x0A;
 /// cross-referencing solver diagnostics.
 pub const KIND_MISSION_IDLE: u8 = 0x0B;
 pub const KIND_LOG_END: u8 = 0x10;
+
+// ── Post-mortem fault events (0x20+) ────────────────────────────────────
+//
+// Emitted by the post-mortem subsystem (see `crate::postmortem`). The
+// fault itself is captured in BKPSRAM during the crash; on the next
+// boot, the recorder mirrors the prior-boot's event ring into the new
+// MCAP session as `/events` records, so post-flight tools see the
+// fault inline with normal flight events. Stable codes — never
+// renumber.
+//
+/// Custom panic handler fired. `data` carries the panic-message index
+/// into a static message table (Stage A) — `0xFF` means "message not
+/// captured / index out of range".
+pub const KIND_PANIC: u8 = 0x20;
+/// HardFault exception fired. `data` is the low 16 bits of CFSR, useful
+/// for distinguishing UsageFault / BusFault / MemManage subtypes
+/// without dragging the full register set into the event payload (the
+/// full registers live in the BKPSRAM fatal slot).
+pub const KIND_HARDFAULT: u8 = 0x21;
+/// PVD brown-out trip — VDD fell below the programmed PVD threshold.
+/// `data` carries the PWR.CSR1.PVDO bit (1 = below threshold) for
+/// future-compatibility with multi-level PVD.
+pub const KIND_BROWNOUT: u8 = 0x22;
+/// Independent watchdog reset — the firmware stalled past the IWDG
+/// timeout (~500 ms). Captured via `RCC.RSR.IWDGRSTF` on the next
+/// boot, not from a runtime hook (the IWDG resets the MCU before any
+/// software can react). `data` is 0.
+pub const KIND_IWDG_RESET: u8 = 0x23;
+/// Bracket marker emitted by the recorder at session-open when a
+/// prior-boot post-mortem record is being mirrored into the new MCAP
+/// session. `data` on the *opening* bracket is `(reset_cause << 8 |
+/// fatal_kind)` so the bracket itself summarises the prior boot. The
+/// closing bracket has `data = 0`.
+pub const KIND_BOOT_POSTMORTEM: u8 = 0x24;
 
 pub fn encode(scratch: &mut [u8], timestamp: Instant, kind: u8, data: u32) -> cbor::Result<usize> {
     let mut w = CborWriter::new(scratch);

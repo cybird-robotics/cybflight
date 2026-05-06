@@ -32,6 +32,14 @@ pub const HAS_SDCARD: bool = true;
 /// compiles out the recorder pipeline entirely (no feature flag
 /// required).
 pub const HAS_BLACKBOX_STORAGE: bool = HAS_SDCARD;
+/// STM32H743's D3-domain backup SRAM is always present at the MCU
+/// level, so this is universally `true` for both supported boards.
+/// Whether it survives **full power loss** (vs. just soft-reset) is a
+/// per-board hardware question — depends on whether VBAT is wired to a
+/// battery / supercap. The post-mortem subsystem treats it as the
+/// primary "survives reboot" store and pairs it with a flash mirror
+/// for full-power-loss survival.
+pub const HAS_BACKUP_SRAM: bool = true;
 pub const LED_COUNT: usize = 3;
 
 // =====================================================================

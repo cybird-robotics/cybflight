@@ -540,6 +540,56 @@ pub async fn indi_task() {
     // that would tilt the first ~τ ms of notch tracking.
     let mut motor_freq_lpf_has_prev = false;
 
+    // Tracks the previous tick's [`super::LAUNCHED`] value so we can
+    // detect the !was_launched → launched edge and reset INDI internal
+    // state on it (mirrors the existing arm-edge reset). Only meaningful
+    // in position-mode builds where the LAUNCHED static exists.
+    #[cfg(any(feature = "outer_mpc", feature = "outer_geometric"))]
+    let mut was_launched = false;
+
+    // ── INDI state-reset macro ────────────────────────────────────────
+    //
+    // Resets every piece of inner-loop state that should start fresh on
+    // a clean handover (KF, slew gates, motor-omega LPF, RPM-notch
+    // bank). Used at the arm edge AND at the !LAUNCHED → LAUNCHED
+    // edge below — both edges represent the same underlying invariant:
+    // "motors transition from rest/idle to closed-loop control, prior
+    // filter state is irrelevant or misleading."
+    //
+    // Macro rather than closure to avoid the `&mut`-capture lifetime
+    // dance that would otherwise tie up half the locals for the rest of
+    // the loop body.
+    macro_rules! reset_indi_state {
+        () => {{
+            for est in rpm_estimators.iter_mut() {
+                est.reset_state();
+            }
+            slew_filters.reset([0.0; NU]).unwrap();
+            motor_omega_filter = core::array::from_fn(|_| make_biquad());
+            last_y_meas_hold = SVector::zeros();
+            omega_fs = SVector::zeros();
+            omega_dot_fs = SVector::zeros();
+            omega_fs_has_prev = false;
+
+            if ENABLE_RPM_NOTCH {
+                gyro_rpm_notch.reset();
+                accel_rpm_notch.reset();
+                motor_freq_lpf_state = [0.0; NU];
+                motor_freq_lpf_has_prev = false;
+            }
+
+            if learner_prearm_latched {
+                indi.reset_to_geometric(
+                    &QUADROTOR_MOTORS,
+                    &QUADROTOR_BODY,
+                    &INDI_MOTOR_PARAMS,
+                );
+                learner.reset();
+                raw_omega_hold = SVector::zeros();
+            }
+        }};
+    }
+
     loop {
         // 1. Await IMU sample — this drives the loop at ~8 kHz.
         let imu = imu_sub.next_message_pure().await;
@@ -577,46 +627,17 @@ pub async fn indi_task() {
             learner_prearm_latched =
                 super::LEARNER_PREARM.load(core::sync::atomic::Ordering::Acquire);
 
-            // Always reset KF state — fresh start every flight
-            for est in rpm_estimators.iter_mut() {
-                est.reset_state();
-            }
-
-            // Always re-seed the slew filters to 0 so re-arm doesn't inherit stale omega from
-            // the previous flight. Motors are at rest at arm time, so 0 is the correct prior.
-            slew_filters.reset([0.0; NU]).unwrap();
-
-            // Reset motor-omega LPF, ZOH hold, and derivative state so re-arm
-            // starts fresh at 0. (The biquad has no in-place reset API; replace
-            // the array with freshly-constructed filters.)
-            motor_omega_filter = core::array::from_fn(|_| make_biquad());
-            last_y_meas_hold = SVector::zeros();
-            omega_fs = SVector::zeros();
-            omega_dot_fs = SVector::zeros();
-            omega_fs_has_prev = false;
-
-            if ENABLE_RPM_NOTCH {
-                // Clear RPM-notch delay lines and weights so the previous
-                // flight's coefficient state doesn't bleed into this one.
-                gyro_rpm_notch.reset();
-                accel_rpm_notch.reset();
-
-                // Re-seed the notch frequency tracker on the next valid
-                // dshot frame so a re-arm starts from the current motor
-                // state, not from a stale frequency belonging to the
-                // previous flight.
-                motor_freq_lpf_state = [0.0; NU];
-                motor_freq_lpf_has_prev = false;
-            }
-
+            // Reset every inner-loop filter / KF / slew gate. Comment
+            // history: the KF reset gives a fresh-per-flight start; the
+            // slew + motor-omega resets prevent stale omega from the
+            // previous flight bleeding into this one (motors are at rest
+            // at arm time, so 0 is the right prior); the optional
+            // RPM-notch resets clear delay lines and re-seed the
+            // frequency tracker; and the learner-prearm branch wipes any
+            // previously-learned G1/G2 so a learning flight starts from
+            // the analytic geometric model.
+            reset_indi_state!();
             if learner_prearm_latched {
-                // Learner prearm: throw away any previously-learned G1/G2 so
-                // this learning flight starts from the analytic geometric
-                // model. The unstable-prearm bug was not in this reset — it
-                // was in the motor-state source (see `motor_state` below).
-                indi.reset_to_geometric(&QUADROTOR_MOTORS, &QUADROTOR_BODY, &INDI_MOTOR_PARAMS);
-                learner.reset();
-                raw_omega_hold = SVector::zeros();
                 defmt::info!("INDI: learner prearm LATCHED — effectiveness reset to geometric");
             }
         }
@@ -641,6 +662,61 @@ pub async fn indi_task() {
             learner_prearm_latched = false;
         }
         was_armed = armed;
+
+        // ── Launch edge: mirror the arm-edge state reset ──────────────
+        //
+        // While `armed && !LAUNCHED`, the bypass branch below `continue`s
+        // before the dshot/IMU/INDI processing path runs, so the
+        // controller's filters / KF / slew gates accumulate no state
+        // during pre-launch. On the !was_launched → launched edge we
+        // reset them again so the first closed-loop tick sees the same
+        // fresh prior the arm edge already established — uniform-idle
+        // motors are the new "rest" prior for the slew/omega filters.
+        #[cfg(any(feature = "outer_mpc", feature = "outer_geometric"))]
+        let launched = super::LAUNCHED.load(core::sync::atomic::Ordering::Acquire);
+        #[cfg(any(feature = "outer_mpc", feature = "outer_geometric"))]
+        {
+            if armed && launched && !was_launched {
+                reset_indi_state!();
+                defmt::info!("INDI: LAUNCHED edge — state reset");
+            }
+            was_launched = launched;
+        }
+
+        // ── Pre-launch idle bypass ────────────────────────────────────
+        //
+        // While armed but not yet launched, write a uniform
+        // [`super::IDLE_NORMALIZED`] to all four motors and skip the
+        // entire INDI / learner / KF stack. Guarantees motors spin at
+        // the same speed regardless of (a) drone tilt on the ground,
+        // (b) WLS allocator asymmetry from learned G1, or (c) any
+        // upstream MPC / cascade output (which is silently dropped
+        // here).
+        //
+        // We update `LAST_CONTROLLER_PUBLISH` (DShot's 10-ms
+        // motor-cmd-stale watchdog needs this to not drop motors to
+        // forced idle) but DELIBERATELY DO NOT update `last_cmd_time`.
+        // Letting the cmd-staleness gate trip naturally on the launch
+        // tick is the safety mechanism: if `outer_loop` was silent
+        // during pre-launch (e.g. ESKF stale), the first launched
+        // tick will see `try_take() = None`, `cmd_fresh = false`, and
+        // INDI will silently skip → the controller watchdog (500 ms)
+        // disarms. If we bumped `last_cmd_time` here, INDI would
+        // instead run WLS with stale local-cache values
+        // (`rate_ref`/`collective_thrust_n`) for up to 100 ms — a
+        // dangerous moment of unknown thrust at the most critical
+        // tick. See safety review note H1.
+        #[cfg(any(feature = "outer_mpc", feature = "outer_geometric"))]
+        if armed && !launched {
+            let idle = msgs::NormalizedThrottle::new_saturating(super::IDLE_NORMALIZED);
+            let now = Instant::now();
+            ACTUATOR_MOTORS.signal(msgs::ActuatorMotors {
+                timestamp: now,
+                motor_commands: [idle; NU],
+            });
+            super::LAST_CONTROLLER_PUBLISH.lock(|c| c.set(Some(now)));
+            continue;
+        }
 
         // ── DShot telemetry + slew outlier filter ──────────────────────
         //

@@ -153,8 +153,8 @@ impl Default for QuadModel {
             mass_inv: 1.0 / mass,
             w_pos: [200.0, 200.0, 200.0],
             w_vel: [10.0, 10.0, 10.0],
-            w_att: [50.0, 50.0, 200.0],
-            w_input: Vector4::new(1.0, 50.0, 50.0, 50.0),
+            w_att: [5.0, 5.0, 200.0],
+            w_input: Vector4::new(1.0, 20.0, 20.0, 20.0),
             rho: 1e4,
             pos_cost_mode: PosCostMode::Quadratic,
         }
@@ -186,8 +186,8 @@ impl QuadModel {
             grav,
             dt: vp.mpc.dt,
             u_bounds: [
-                // [0.0_f32, max_collective_thrust_n * thrust_percentage],
-                [0.0_f32, 36.0_f32],
+                [0.0_f32, max_collective_thrust_n * thrust_percentage],
+                // [0.0_f32, 36.0_f32],
                 [-mr[0], mr[0]],
                 [-mr[1], mr[1]],
                 [-mr[2], mr[2]],

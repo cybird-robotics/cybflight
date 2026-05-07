@@ -196,6 +196,37 @@ pub static LEARNING_ENABLED: core::sync::atomic::AtomicBool =
 pub static LEARNER_PREARM: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Throttle µs threshold the stick must hold ABOVE for
+/// `LAUNCH_CONFIRM_FRAMES` consecutive RC frames before [`LAUNCHED`]
+/// latches. Above the mid-stick THROTTLE_DEADBAND (1440–1560 µs) so
+/// launch is an unambiguous push, not a centering gesture.
+#[cfg(any(feature = "outer_mpc", feature = "outer_geometric"))]
+pub const LAUNCH_US: u16 = 1600;
+
+/// Frame-count debounce on the launch threshold. ~50–150 Hz CRSF →
+/// 5 frames ≈ 30–100 ms. Rejects single-frame RC glitches without
+/// feeling laggy. Counter resets on any frame below threshold.
+#[cfg(any(feature = "outer_mpc", feature = "outer_geometric"))]
+pub const LAUNCH_CONFIRM_FRAMES: u8 = 5;
+
+/// Per-motor normalized throttle written to all four motors during
+/// the pre-launch idle bypass. ~Betaflight `motor_idle` default of
+/// 5.5%. Promote to a vehicle param later if airframe-specific
+/// tuning warrants it.
+#[cfg(any(feature = "outer_mpc", feature = "outer_geometric"))]
+pub const IDLE_NORMALIZED: f32 = 0.055;
+
+/// Sticky "drone has crossed the launch threshold this arm session"
+/// latch. Set by `rc_interpreter` after `LAUNCH_CONFIRM_FRAMES`
+/// confirm frames; cleared only on the disarm edge. Read by
+/// `indi_task` to gate motor output between pre-launch idle and
+/// normal closed-loop flight. One-way per arm session — pulling
+/// throttle low in flight does NOT clear it (the existing land
+/// path handles descent).
+#[cfg(any(feature = "outer_mpc", feature = "outer_geometric"))]
+pub static LAUNCHED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Last time the control loop published a motor command.
 /// Written by indi_task, read by failsafe controller watchdog.
 pub static LAST_CONTROLLER_PUBLISH: blocking_mutex::Mutex<

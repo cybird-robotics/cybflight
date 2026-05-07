@@ -323,6 +323,11 @@ pub async fn rc_interpreter_task() {
     let mut last_frame_time = Instant::now();
     let mut was_armed = false;
     let mut origin = origin;
+    // Frame-count debounce for [`super::LAUNCHED`]. Counts consecutive
+    // frames with throttle > [`super::LAUNCH_US`]; latches LAUNCHED after
+    // [`super::LAUNCH_CONFIRM_FRAMES`]. Resets on any below-threshold
+    // frame and on the disarm edge.
+    let mut launch_above_count: u8 = 0;
 
     /// RC channel index for the learning toggle switch (0-indexed).
     /// Channel 6 (7th channel). >1500 µs = learning data collection active.
@@ -421,7 +426,42 @@ pub async fn rc_interpreter_task() {
                 );
             }
         }
+        // Disarm edge: clear LAUNCHED + counter so the next arm cycle
+        // re-enters pre-launch idle. The latch is one-way per arm
+        // session — only the disarm edge resets it.
+        if !armed && was_armed {
+            super::LAUNCHED.store(false, core::sync::atomic::Ordering::Release);
+            launch_above_count = 0;
+            defmt::info!("rc_interpreter: disarm transition — LAUNCHED cleared");
+        }
         was_armed = armed;
+
+        // ── LAUNCHED debounce ──────────────────────────────────────────
+        //
+        // While armed and not yet launched, count consecutive RC frames
+        // with throttle stick above [`super::LAUNCH_US`]. After
+        // [`super::LAUNCH_CONFIRM_FRAMES`] consecutive frames, latch
+        // LAUNCHED so [`indi_task`]'s pre-launch idle bypass releases
+        // and closed-loop control engages. Any below-threshold frame
+        // restarts the count — partial credit is the wrong UX here.
+        if armed && !super::LAUNCHED.load(core::sync::atomic::Ordering::Acquire) {
+            if rc.channels[throttle_cal.index] > super::LAUNCH_US {
+                launch_above_count = launch_above_count.saturating_add(1);
+                if launch_above_count >= super::LAUNCH_CONFIRM_FRAMES {
+                    super::LAUNCHED
+                        .store(true, core::sync::atomic::Ordering::Release);
+                    defmt::info!("rc_interpreter: LAUNCHED latched");
+                    // No special re-seed of ACTIVE_POSITION_SETPOINT
+                    // here: the pre-launch pin block below already
+                    // wrote the live odometry pose this frame, and the
+                    // post-launch tick runs the existing
+                    // stick-integration block starting from that fresh
+                    // value.
+                }
+            } else {
+                launch_above_count = 0;
+            }
+        }
 
         // Learning toggle: channel 6 > 1500 → enable RLS data collection
         let learn_on = rc.channel_count > LEARN_TOGGLE_CHANNEL as u8
@@ -552,6 +592,42 @@ pub async fn rc_interpreter_task() {
         // therefore reads that value and integrates from it — no local
         // `target` mirror needed.
         if mission_active {
+            continue;
+        }
+
+        // ── Pre-launch setpoint pin (armed && !LAUNCHED) ──────────────
+        //
+        // While the pilot is armed but hasn't crossed the launch
+        // threshold, INDI is bypassed (motors at fixed idle) and any
+        // stick fidget would drift the position setpoint without
+        // visible effect — but it would corrupt the launch handover.
+        // Pin ACTIVE_POSITION_SETPOINT to the live odometry pose every
+        // frame so the moment LAUNCHED latches, the closed-loop
+        // controller starts tracking the drone's *actual* current
+        // position, not a stale or drifted target.
+        //
+        // Drain the odom subscriber to its newest valid sample. If
+        // none has arrived this frame we hold the previous value
+        // rather than emit a stale-timestamp write that confuses
+        // downstream liveness consumers.
+        if armed && !super::LAUNCHED.load(core::sync::atomic::Ordering::Acquire) {
+            let mut latest = None;
+            while let Some(o) = odom_sub.try_next_message_pure() {
+                let p = o.pose.position;
+                if p.x.is_finite() && p.y.is_finite() && p.z.is_finite() {
+                    latest = Some(p);
+                }
+            }
+            if let Some(mut p) = latest {
+                clamp_indoor_envelope(&mut p);
+                super::ACTIVE_POSITION_SETPOINT.lock(|cell| {
+                    cell.set(Some(super::ActiveSetpoint {
+                        timestamp: now,
+                        position: p,
+                        yaw_rad: 0.0,
+                    }));
+                });
+            }
             continue;
         }
 

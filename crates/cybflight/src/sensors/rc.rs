@@ -3,14 +3,38 @@
 //! Each task reads frames from the UART, publishes RC channel data and link
 //! statistics to the pub/sub channels, and sends telemetry in the inter-frame gaps.
 
+use core::cell::{Cell, RefCell};
 use core::sync::atomic::Ordering;
 
+use embassy_sync::blocking_mutex::{raw::CriticalSectionRawMutex, Mutex as BlockingMutex};
 use embassy_time::Instant;
 
 use crate::hal;
 use crate::motors::ARM_STATE;
 use crate::status;
 use cybflight_msgs as msgs;
+
+/// Latest gate-rejection reason from the most recent arm attempt, plus the
+/// instant it was latched. Cleared on disarm and on successful arm. Read by
+/// the `health` shell command so users can ask "why didn't it arm?" after
+/// the fact, even after the per-attempt summary line has scrolled away.
+pub static LATEST_BLOCK_REASON:
+    BlockingMutex<CriticalSectionRawMutex, Cell<Option<(BlockReason, Instant)>>> =
+    BlockingMutex::new(Cell::new(None));
+
+/// Most recent RC channel frame, mirrored into a shared cell as it is
+/// published to `RC_INPUT`. The `health` shell command reads this synchronously
+/// — a fresh `RC_INPUT.subscriber()` cannot recover history, so peeking the
+/// PubSub directly returns no data even when frames are arriving normally.
+pub static LATEST_RC_INPUT:
+    BlockingMutex<CriticalSectionRawMutex, RefCell<Option<msgs::RcInput>>> =
+    BlockingMutex::new(RefCell::new(None));
+
+/// Most recent CRSF/GHST link statistics, same caching rationale as
+/// `LATEST_RC_INPUT`.
+pub static LATEST_RC_LINK_STATUS:
+    BlockingMutex<CriticalSectionRawMutex, RefCell<Option<msgs::RcLinkStatus>>> =
+    BlockingMutex::new(RefCell::new(None));
 
 pub type RcUart = hal::usart::BufferedUart<'static>;
 
@@ -19,13 +43,13 @@ pub type RcUart = hal::usart::BufferedUart<'static>;
 // ---------------------------------------------------------------------------
 
 /// RC arm channel index (0-based). Channel 6 on the transmitter (AUX2).
-const ARM_CHANNEL: usize = 5;
+pub(crate) const ARM_CHANNEL: usize = 5;
 /// PWM threshold: armed when channel value exceeds this (µs).
-const ARM_THRESHOLD: u16 = 1500;
+pub(crate) const ARM_THRESHOLD: u16 = 1500;
 /// Throttle channel index (AETR order: index 2 = throttle).
-const THROTTLE_CHANNEL: usize = 2;
+pub(crate) const THROTTLE_CHANNEL: usize = 2;
 /// Throttle must be below this to arm (µs). Matches BF `rxConfig.mincheck` default.
-const THROTTLE_MINCHECK: u16 = 1050;
+pub(crate) const THROTTLE_MINCHECK: u16 = 1050;
 /// Arm switch must be held for this long before arming (ms).
 /// BF does not debounce the arm switch; this is a cybflight safety addition.
 const ARM_SWITCH_HOLD_MS: u64 = 100;
@@ -36,9 +60,13 @@ const ARM_SWITCH_HOLD_MS: u64 = 100;
 /// gets one immediate "ARM rejected" line.
 const ARM_REJECT_SUMMARY_MS: u64 = 200;
 /// Minimum link quality to allow arming [0..100].
-const MIN_LINK_QUALITY: u8 = 50;
+pub(crate) const MIN_LINK_QUALITY: u8 = 50;
 /// Link stats older than this block arming (ms). Mirrors BF `ARMING_DISABLED_RX_FAILSAFE`.
-const LINK_STATS_MAX_AGE_MS: u64 = 500;
+pub(crate) const LINK_STATS_MAX_AGE_MS: u64 = 500;
+/// Tilt envelope: roll/pitch must be within this magnitude (degrees).
+pub(crate) const MAX_TILT_DEG: f32 = 30.0;
+/// ESKF/Mahony cross-check tolerance for roll & pitch (degrees).
+pub(crate) const MAX_ESKF_MAHONY_DISAGREE_DEG: f32 = 10.0;
 
 // ---------------------------------------------------------------------------
 // Arming state machine
@@ -81,7 +109,7 @@ struct ArmStateMachine {
 }
 
 #[derive(Clone, Copy, defmt::Format)]
-enum BlockReason {
+pub enum BlockReason {
     Failsafe,
     ThrottleNotMin { value: u16, max: u16 },
     LinkInactive,
@@ -120,6 +148,7 @@ impl ArmStateMachine {
     fn note_block(&mut self, now: Instant, reason: BlockReason) {
         self.switch_arm_start = None;
         self.last_block_reason = Some(reason);
+        LATEST_BLOCK_REASON.lock(|c| c.set(Some((reason, now))));
         if self.summary_printed {
             return;
         }
@@ -153,6 +182,7 @@ impl ArmStateMachine {
             self.attempt_start = None;
             self.summary_printed = false;
             self.last_block_reason = None;
+            LATEST_BLOCK_REASON.lock(|c| c.set(None));
             if self.armed {
                 self.armed = false;
                 defmt::info!(
@@ -237,6 +267,7 @@ impl ArmStateMachine {
         self.attempt_start = None;
         self.summary_printed = false;
         self.last_block_reason = None;
+        LATEST_BLOCK_REASON.lock(|c| c.set(None));
         defmt::info!(
             "ARMED (ch{}={}, throttle={}, lq={}%)",
             ARM_CHANNEL + 1,
@@ -296,11 +327,13 @@ pub mod crsf_runner {
                         match event {
                             CrsfEvent::RcChannelsPacked(rc)
                             | CrsfEvent::SubsetRcChannels(rc) => {
-                                rc_pub.publish_immediate(msgs::RcInput {
+                                let frame = msgs::RcInput {
                                     timestamp: now,
                                     channels: rc.channels,
                                     channel_count: rc.channel_count,
-                                });
+                                };
+                                rc_pub.publish_immediate(frame.clone());
+                                LATEST_RC_INPUT.lock(|c| c.replace(Some(frame)));
                                 arm.update_channels(&rc.channels, rc.channel_count);
 
                                 // Send one telemetry frame per RC frame received
@@ -309,13 +342,15 @@ pub mod crsf_runner {
                             CrsfEvent::LinkStatistics(stats)
                             | CrsfEvent::LinkStatisticsTx(stats) => {
                                 arm.update_link(stats.link_quality);
-                                link_pub.publish_immediate(msgs::RcLinkStatus {
+                                let link = msgs::RcLinkStatus {
                                     timestamp: now,
                                     rssi_dbm: stats.rssi_dbm,
                                     link_quality: stats.link_quality,
                                     snr: stats.snr,
                                     rf_mode: stats.rf_mode,
-                                });
+                                };
+                                link_pub.publish_immediate(link.clone());
+                                LATEST_RC_LINK_STATUS.lock(|c| c.replace(Some(link)));
                             }
                             CrsfEvent::SpeedProposal { port_id, baud } => {
                                 defmt::info!(
@@ -486,11 +521,13 @@ pub mod ghst_runner {
                                     );
                                 }
 
-                                rc_pub.publish_immediate(msgs::RcInput {
+                                let frame = msgs::RcInput {
                                     timestamp: now,
                                     channels: rc.channels,
                                     channel_count: rc.channel_count,
-                                });
+                                };
+                                rc_pub.publish_immediate(frame.clone());
+                                LATEST_RC_INPUT.lock(|c| c.replace(Some(frame)));
                                 arm.update_channels(&rc.channels, rc.channel_count);
 
                                 // Guard delay: GHST requires 1ms minimum gap after
@@ -507,13 +544,15 @@ pub mod ghst_runner {
                                     stats.link_quality,
                                     stats.rf_mode,
                                 );
-                                link_pub.publish_immediate(msgs::RcLinkStatus {
+                                let link = msgs::RcLinkStatus {
                                     timestamp: now,
                                     rssi_dbm: stats.rssi_dbm,
                                     link_quality: stats.link_quality,
                                     snr: stats.snr,
                                     rf_mode: stats.rf_mode,
-                                });
+                                };
+                                link_pub.publish_immediate(link.clone());
+                                LATEST_RC_LINK_STATUS.lock(|c| c.replace(Some(link)));
                             }
                             GhstEvent::Other { frame_type } => {
                                 defmt::debug!("GHST unknown frame type={:#x}", frame_type);

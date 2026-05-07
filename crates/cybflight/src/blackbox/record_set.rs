@@ -91,6 +91,7 @@ const TOPICS_MID: &[TopicDef] = &[
     topics::motors::DEF,
     topics::motor_state::DEF,
     topics::tracking_error::DEF,
+    topics::health::DEF,
 ];
 
 const TOPICS_LARGE: &[TopicDef] = &[
@@ -103,6 +104,7 @@ const TOPICS_LARGE: &[TopicDef] = &[
     topics::motor_state::DEF,
     topics::tracking_error::DEF,
     topics::imu::DEF,
+    topics::health::DEF,
 ];
 
 /// Recording tier. See module docs for byte-rate estimates per tier.
@@ -165,6 +167,14 @@ impl RecordSet {
 
     #[inline]
     pub const fn includes_motor_state(self) -> bool {
+        matches!(self, Self::Mid | Self::Large)
+    }
+
+    /// True for tiers that include the `/health` estimator-fault
+    /// snapshot (Mid + Large). Piggybacks on the `/odom` emit path
+    /// at the same ~100 Hz cadence.
+    #[inline]
+    pub const fn includes_health(self) -> bool {
         matches!(self, Self::Mid | Self::Large)
     }
 

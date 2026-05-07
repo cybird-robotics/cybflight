@@ -47,7 +47,7 @@
 use core::fmt::Write as _;
 use core::future::pending;
 
-use embassy_futures::select::{select6, Either6};
+use embassy_futures::select::{Either6, select6};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::pubsub::{Subscriber, WaitResult};
 use embassy_time::{Duration, Instant, Timer};
@@ -62,15 +62,15 @@ use super::record_set::RecordSet;
 use super::sdmmc_block::SdmmcBlockStore;
 use super::should_record;
 use super::topics::{
-    attitude, events, imu, motor_state, motors, mpc, odometry, rc, tracking_error,
+    attitude, events, health, imu, motor_state, motors, mpc, odometry, rc, tracking_error,
 };
+use crate::control::TrackingError as TrackErrMsg;
 use crate::control::failsafe::{FAILSAFE_ACTIVE, FAILSAFE_REASON, RC_LINK_HEALTHY};
 use crate::control::{
     ACTUATOR_MOTORS_TELEM, OCP_SOLVER_OUTPUT, PROCESSED_MOTOR_STATE, TRACKING_ERROR,
 };
-use crate::control::TrackingError as TrackErrMsg;
 #[cfg(feature = "outer_mpc")]
-use crate::control::{MissionState, MISSION_STATE};
+use crate::control::{MISSION_STATE, MissionState};
 use crate::estimation::ESTIMATOR_READY;
 use crate::msgs;
 use crate::sensors::{IMU_1, RC_INPUT, VEHICLE_ATTITUDE, VEHICLE_ODOMETRY};
@@ -156,6 +156,7 @@ pub struct FlightRecorder {
     motor_seq: u32,
     motor_state_seq: u32,
     track_err_seq: u32,
+    health_seq: u32,
     ev_seq: u32,
     /// Last-seen `FAILSAFE_ACTIVE` value. Edge-detected each
     /// iteration so we emit `KIND_FAILSAFE` / `KIND_FAILSAFE_CLEAR`
@@ -211,8 +212,14 @@ impl FileBody for FlightRecorder {
         // and a Large-tier file both call `/imu1` channel 1.
         let topic_set = self.record_set.topic_set();
         for def in topic_set.iter() {
-            mcap::write_schema(w, def.channel_id, def.schema_name, "jsonschema", def.schema_data)
-                .await?;
+            mcap::write_schema(
+                w,
+                def.channel_id,
+                def.schema_name,
+                "jsonschema",
+                def.schema_data,
+            )
+            .await?;
             total += (1
                 + 8
                 + 2
@@ -229,7 +236,7 @@ impl FileBody for FlightRecorder {
         }
 
         // ── ARM event ───────────────────────────────────────────
-        let mut scratch = [0u8; 192];
+        let mut scratch = [0u8; 256];
         if self.record_set.includes_events() {
             total += self
                 .emit_event(w, &mut scratch, events::KIND_ARM, 0)
@@ -414,14 +421,7 @@ impl FlightRecorder {
         };
         self.imu_seq = self.imu_seq.wrapping_add(1);
         let n = imu::encode(scratch, &m).unwrap_or(0);
-        let bytes = emit_msg(
-            w,
-            imu::CHANNEL_ID,
-            self.imu_seq,
-            m.timestamp,
-            &scratch[..n],
-        )
-        .await?;
+        let bytes = emit_msg(w, imu::CHANNEL_ID, self.imu_seq, m.timestamp, &scratch[..n]).await?;
         self.messages = self.messages.wrapping_add(1);
         Ok(bytes)
     }
@@ -460,14 +460,7 @@ impl FlightRecorder {
         };
         self.rc_seq = self.rc_seq.wrapping_add(1);
         let n = rc::encode(scratch, &m).unwrap_or(0);
-        let bytes = emit_msg(
-            w,
-            rc::CHANNEL_ID,
-            self.rc_seq,
-            m.timestamp,
-            &scratch[..n],
-        )
-        .await?;
+        let bytes = emit_msg(w, rc::CHANNEL_ID, self.rc_seq, m.timestamp, &scratch[..n]).await?;
         self.messages = self.messages.wrapping_add(1);
         Ok(bytes)
     }
@@ -483,7 +476,7 @@ impl FlightRecorder {
         };
         self.odom_seq = self.odom_seq.wrapping_add(1);
         let n = odometry::encode(scratch, &m).unwrap_or(0);
-        let bytes = emit_msg(
+        let mut bytes = emit_msg(
             w,
             odometry::CHANNEL_ID,
             self.odom_seq,
@@ -492,6 +485,28 @@ impl FlightRecorder {
         )
         .await?;
         self.messages = self.messages.wrapping_add(1);
+
+        // Piggyback `/health`: estimator fault snapshot at the same
+        // ~100 Hz cadence as `/odom`. Cheap (atomic loads + Cell
+        // get) and bounded (~80 B per record). The `/health` topic
+        // is in TOPICS_MID and TOPICS_LARGE — guard with the
+        // record_set predicate so Mid+ tiers emit, Small skips.
+        if self.record_set.includes_health() {
+            self.health_seq = self.health_seq.wrapping_add(1);
+            let n = health::encode(scratch, m.timestamp).unwrap_or(0);
+            bytes = bytes.saturating_add(
+                emit_msg(
+                    w,
+                    health::CHANNEL_ID,
+                    self.health_seq,
+                    m.timestamp,
+                    &scratch[..n],
+                )
+                .await?,
+            );
+            self.messages = self.messages.wrapping_add(1);
+        }
+
         Ok(bytes)
     }
 
@@ -506,14 +521,7 @@ impl FlightRecorder {
         };
         self.mpc_seq = self.mpc_seq.wrapping_add(1);
         let n = mpc::encode(scratch, &m).unwrap_or(0);
-        let bytes = emit_msg(
-            w,
-            mpc::CHANNEL_ID,
-            self.mpc_seq,
-            m.timestamp,
-            &scratch[..n],
-        )
-        .await?;
+        let bytes = emit_msg(w, mpc::CHANNEL_ID, self.mpc_seq, m.timestamp, &scratch[..n]).await?;
         self.messages = self.messages.wrapping_add(1);
         Ok(bytes)
     }
@@ -846,6 +854,7 @@ pub async fn run_session(
         motor_seq: 0,
         motor_state_seq: 0,
         track_err_seq: 0,
+        health_seq: 0,
         ev_seq: 0,
         prev_failsafe: FAILSAFE_ACTIVE.load(Ordering::Acquire),
         prev_est_ready: ESTIMATOR_READY.load(Ordering::Acquire),

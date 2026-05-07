@@ -14,6 +14,7 @@ pub mod comm;
 pub mod serial_logger;
 pub mod control;
 pub mod estimation;
+pub mod health;
 pub mod motors;
 pub use cybflight_msgs as msgs;
 pub mod params;

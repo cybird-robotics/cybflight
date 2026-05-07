@@ -169,6 +169,20 @@ impl NominalState {
     }
 }
 
+/// Cumulative ESKF counters and last-NIS per channel.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct EskfHealth {
+    pub nan_resets: u32,
+    pub gate_rejects_pos: u32,
+    pub gate_rejects_vel: u32,
+    pub gate_rejects_att: u32,
+    pub gate_rejects_baro: u32,
+    pub gate_rejects_mag: u32,
+    pub last_nis_pos: f32,
+    pub last_nis_vel: f32,
+    pub last_nis_att: f32,
+}
+
 /// 15-state Error-State Kalman Filter.
 ///
 /// State layout: [position(3), orientation_error(3), velocity(3),
@@ -179,6 +193,7 @@ pub struct Eskf {
     state: NominalState,
     cov: SMatrix<f32, 15, 15>,
     initialized: bool,
+    health: EskfHealth,
 }
 
 impl Eskf {
@@ -188,6 +203,7 @@ impl Eskf {
             state: NominalState::default(),
             cov: SMatrix::zeros(),
             initialized: false,
+            health: EskfHealth::default(),
         }
     }
 
@@ -242,6 +258,7 @@ impl Eskf {
         cov.fixed_view_mut::<3, 3>(12, 12).fill_diagonal(0.01); // gyro bias
         self.cov = cov;
         self.initialized = true;
+        // Health counters are intentionally not reset — re-init after NaN is itself a tracked event.
     }
 
     /// Propagate nominal state and covariance forward by `dt`.
@@ -317,6 +334,7 @@ impl Eskf {
         // NaN guard — forces re-init on the next mocap frame.
         if !self.state_is_finite() {
             self.initialized = false;
+            self.health.nan_resets = self.health.nan_resets.saturating_add(1);
         }
     }
 
@@ -765,10 +783,13 @@ impl Eskf {
         // that would have been silently dropped is now partially absorbed,
         // preventing dead-reckoning during sustained large innovations.
         let gamma = z.dot(&(s_inv * z)) / 3.0;
+        self.health.last_nis_pos = gamma;
         let gate_sq = self.config.gate_sigma * self.config.gate_sigma;
         let (r_eff, s_inv_eff, inflated) = if gamma > gate_sq {
             let inflate = gamma / gate_sq;
             if inflate > INFLATION_CAP {
+                self.health.gate_rejects_pos =
+                    self.health.gate_rejects_pos.saturating_add(1);
                 return UpdateOutcome::InflationCapExceeded;
             }
             let r_eff = r * inflate;
@@ -789,6 +810,7 @@ impl Eskf {
         self.clamp_covariance_diagonal();
         if !self.state_is_finite() {
             self.initialized = false;
+            self.health.nan_resets = self.health.nan_resets.saturating_add(1);
             return UpdateOutcome::NaNAfterUpdate;
         }
         UpdateOutcome::Accepted { inflated }
@@ -909,10 +931,13 @@ impl Eskf {
             return UpdateOutcome::InverseFailed;
         };
         let gamma = z.dot(&(s_inv * z)) / 3.0;
+        self.health.last_nis_vel = gamma;
         let gate_sq = self.config.gate_sigma * self.config.gate_sigma;
         let (r_eff, s_inv_eff, inflated) = if gamma > gate_sq {
             let inflate = gamma / gate_sq;
             if inflate > INFLATION_CAP {
+                self.health.gate_rejects_vel =
+                    self.health.gate_rejects_vel.saturating_add(1);
                 return UpdateOutcome::InflationCapExceeded;
             }
             let r_eff = r * inflate;
@@ -933,6 +958,7 @@ impl Eskf {
         self.clamp_covariance_diagonal();
         if !self.state_is_finite() {
             self.initialized = false;
+            self.health.nan_resets = self.health.nan_resets.saturating_add(1);
             return UpdateOutcome::NaNAfterUpdate;
         }
         UpdateOutcome::Accepted { inflated }
@@ -969,10 +995,13 @@ impl Eskf {
             return UpdateOutcome::InverseFailed;
         };
         let gamma = z.dot(&(s_inv * z)) / 3.0;
+        self.health.last_nis_att = gamma;
         let gate_sq = self.config.gate_sigma * self.config.gate_sigma;
         let (r_eff, s_inv_eff, inflated) = if gamma > gate_sq {
             let inflate = gamma / gate_sq;
             if inflate > INFLATION_CAP {
+                self.health.gate_rejects_att =
+                    self.health.gate_rejects_att.saturating_add(1);
                 return UpdateOutcome::InflationCapExceeded;
             }
             let r_eff = r * inflate;
@@ -996,6 +1025,7 @@ impl Eskf {
         self.renormalize_orientation();
         if !self.state_is_finite() {
             self.initialized = false;
+            self.health.nan_resets = self.health.nan_resets.saturating_add(1);
             return UpdateOutcome::NaNAfterUpdate;
         }
         UpdateOutcome::Accepted { inflated }
@@ -1016,6 +1046,8 @@ impl Eskf {
         let (r_eff, s_eff, inflated) = if gamma > gate_sq {
             let inflate = gamma / gate_sq;
             if inflate > INFLATION_CAP {
+                self.health.gate_rejects_baro =
+                    self.health.gate_rejects_baro.saturating_add(1);
                 return UpdateOutcome::InflationCapExceeded;
             }
             let r_eff = r * inflate;
@@ -1031,6 +1063,7 @@ impl Eskf {
         self.clamp_covariance_diagonal();
         if !self.state_is_finite() {
             self.initialized = false;
+            self.health.nan_resets = self.health.nan_resets.saturating_add(1);
             return UpdateOutcome::NaNAfterUpdate;
         }
         UpdateOutcome::Accepted { inflated }
@@ -1052,6 +1085,8 @@ impl Eskf {
         }
         let world_norm = mag_world_ref.norm();
         if (mag_body.norm() - world_norm).abs() > 0.3 * world_norm {
+            self.health.gate_rejects_mag =
+                self.health.gate_rejects_mag.saturating_add(1);
             return UpdateOutcome::InflationCapExceeded;
         }
         let m_b = self.state.orientation.inverse() * mag_world_ref;
@@ -1069,6 +1104,8 @@ impl Eskf {
         let (r_eff, s_inv_eff, inflated) = if gamma > gate_sq {
             let inflate = gamma / gate_sq;
             if inflate > INFLATION_CAP {
+                self.health.gate_rejects_mag =
+                    self.health.gate_rejects_mag.saturating_add(1);
                 return UpdateOutcome::InflationCapExceeded;
             }
             let r_eff = r * inflate;
@@ -1090,6 +1127,7 @@ impl Eskf {
         self.renormalize_orientation();
         if !self.state_is_finite() {
             self.initialized = false;
+            self.health.nan_resets = self.health.nan_resets.saturating_add(1);
             return UpdateOutcome::NaNAfterUpdate;
         }
         UpdateOutcome::Accepted { inflated }
@@ -1134,6 +1172,18 @@ impl Eskf {
         self.cov[(12, 12)] + self.cov[(13, 13)]
     }
 
+    pub fn pos_cov_trace(&self) -> f32 {
+        self.cov[(0, 0)] + self.cov[(1, 1)] + self.cov[(2, 2)]
+    }
+
+    pub fn vel_cov_trace(&self) -> f32 {
+        self.cov[(6, 6)] + self.cov[(7, 7)] + self.cov[(8, 8)]
+    }
+
+    pub fn health(&self) -> EskfHealth {
+        self.health
+    }
+
     pub fn is_initialized(&self) -> bool {
         self.initialized
     }
@@ -1171,5 +1221,87 @@ impl Eskf {
             && q.y.is_finite()
             && q.z.is_finite()
             && q.w.is_finite()
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    fn fresh_eskf() -> Eskf {
+        let mut e = Eskf::new(EskfConfig::default());
+        e.init(
+            Vector3::zeros(),
+            UnitQuaternion::identity(),
+            Vector3::zeros(),
+            Vector3::zeros(),
+        );
+        e
+    }
+
+    #[test]
+    fn fresh_filter_has_zero_counters() {
+        let e = fresh_eskf();
+        let h = e.health();
+        assert_eq!(h.nan_resets, 0);
+        assert_eq!(h.gate_rejects_pos, 0);
+        assert_eq!(h.gate_rejects_vel, 0);
+        assert_eq!(h.gate_rejects_att, 0);
+        assert_eq!(h.gate_rejects_baro, 0);
+        assert_eq!(h.gate_rejects_mag, 0);
+    }
+
+    #[test]
+    fn outlier_position_increments_gate_reject_pos() {
+        // 0.5m offset is below `MAX_POS_JUMP_M = 1.0` (so the absolute-jump
+        // gate doesn't pre-empt this), yet far enough above the tightened
+        // covariance that gamma >> gate²·INFLATION_CAP and the inflation
+        // path rejects via `gate_rejects_pos`.
+        let mut e = fresh_eskf();
+        // Tighten cov[0,0] from 1.0 to ~σ² = 1e-6 so a sub-jump-gate offset
+        // still clears the inflation cap.
+        let _ = e.update_pos(Vector3::zeros(), 0.001);
+        e.update_pos(Vector3::new(0.5, 0.0, 0.0), 0.001);
+        let h = e.health();
+        assert_eq!(h.gate_rejects_pos, 1);
+        assert!(h.last_nis_pos > e.config.gate_sigma * e.config.gate_sigma);
+    }
+
+    #[test]
+    fn inlier_position_does_not_increment_gate_reject() {
+        // 1 cm offset against σ=0.5m measurement: well inside the gate.
+        let mut e = fresh_eskf();
+        e.update_pos(Vector3::new(0.01, 0.0, 0.0), 0.5);
+        let h = e.health();
+        assert_eq!(h.gate_rejects_pos, 0);
+        assert!(h.last_nis_pos < e.config.gate_sigma * e.config.gate_sigma);
+    }
+
+    #[test]
+    fn nan_input_predict_increments_nan_resets() {
+        let mut e = fresh_eskf();
+        // Feed a NaN-laden accel; predict should detect it post-propagation.
+        e.predict(
+            Vector3::new(f32::NAN, 0.0, 0.0),
+            Vector3::zeros(),
+            0.001,
+        );
+        assert_eq!(e.health().nan_resets, 1);
+        assert!(!e.is_initialized());
+    }
+
+    #[test]
+    fn pos_cov_trace_reflects_init_diag() {
+        // init() sets P[0..3,0..3] diag = 1.0 each, so trace = 3.0.
+        let e = fresh_eskf();
+        assert!((e.pos_cov_trace() - 3.0).abs() < 1e-6);
+        assert!((e.vel_cov_trace() - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn baro_outlier_increments_baro_counter() {
+        let mut e = fresh_eskf();
+        e.update_altitude(10_000.0); // 10 km, way past gate.
+        assert_eq!(e.health().gate_rejects_baro, 1);
     }
 }

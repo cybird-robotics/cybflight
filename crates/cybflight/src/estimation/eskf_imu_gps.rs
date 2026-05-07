@@ -36,7 +36,13 @@ use cybflight_core::geodetic::{LlhOrigin, ned_to_enu};
 use core::f64::consts::PI;
 use core::sync::atomic::Ordering;
 
-use crate::estimation::{ESTIMATOR_READY, ESTIMATOR_STATUS, EstimatorPhase};
+use crate::estimation::{
+    attitude_health_bits, evaluate_faults, ATTITUDE_HEALTH, ESKF_DEGRADED, ESKF_FAULTS,
+    ESKF_HEALTH, ESKF_LAST_ATT_UPDATE, ESKF_LAST_JUMP_CASCADE, ESKF_LAST_NAN_RESET,
+    ESKF_LAST_POS_UPDATE, ESKF_LAST_REJECT_CASCADE, ESKF_LAST_VEL_UPDATE, ESKF_SEVERE_FAULT,
+    ESTIMATOR_READY, ESTIMATOR_STATUS, EstimatorPhase, FaultEvalInputs,
+};
+use crate::motors::IS_ARMED;
 use crate::sensors;
 use crate::sensors::gps::GpsNavPvt;
 use cybflight_msgs as msgs;
@@ -246,6 +252,19 @@ pub async fn estimation_task() {
                     continue;
                 }
 
+                // Per-sample attitude observability check — see
+                // mocap wrapper for rationale; same machinery.
+                let last_nan_reset = ESKF_LAST_NAN_RESET.lock(|c| c.get());
+                ATTITUDE_HEALTH.store(
+                    attitude_health_bits(
+                        &sample.accel_m_s2,
+                        &sample.gyro_rad_s,
+                        last_nan_reset,
+                        sample.timestamp,
+                    ),
+                    Ordering::Relaxed,
+                );
+
                 if !eskf.is_initialized() {
                     continue;
                 }
@@ -301,6 +320,33 @@ pub async fn estimation_task() {
                 }
                 prev_converged = cur_converged;
 
+                // Health snapshot + fault evaluation must run before
+                // the staleness gate — see eskf_imu_mocap.rs for the
+                // rationale (POS_STALE / VEL_STALE flags would freeze
+                // at zero if we skipped this path on stale ticks).
+                // GPS-only build: last_att_update stays None forever
+                // (no attitude measurement source), so ATT_STALE
+                // never fires. Same shape as the mocap wrapper
+                // otherwise.
+                ESKF_HEALTH.lock(|c| c.set(eskf.health()));
+                let now_ms = Instant::now();
+                let armed = IS_ARMED.load(Ordering::Relaxed);
+                let inputs = FaultEvalInputs {
+                    now: now_ms,
+                    last_pos_update: ESKF_LAST_POS_UPDATE.lock(|c| c.get()),
+                    last_vel_update: ESKF_LAST_VEL_UPDATE.lock(|c| c.get()),
+                    last_att_update: ESKF_LAST_ATT_UPDATE.lock(|c| c.get()),
+                    pos_cov_trace: eskf.pos_cov_trace(),
+                    last_nan_reset: ESKF_LAST_NAN_RESET.lock(|c| c.get()),
+                    last_jump_cascade: ESKF_LAST_JUMP_CASCADE.lock(|c| c.get()),
+                    last_reject_cascade: ESKF_LAST_REJECT_CASCADE.lock(|c| c.get()),
+                    armed,
+                };
+                let (flags, severe) = evaluate_faults(&inputs);
+                ESKF_FAULTS.store(flags, Ordering::Relaxed);
+                ESKF_DEGRADED.store(flags != 0 && !severe, Ordering::Relaxed);
+                ESKF_SEVERE_FAULT.store(severe, Ordering::Relaxed);
+
                 if tick.is_stale {
                     if !prev_stale {
                         defmt::warn!("ESKF: GPS stale — arming blocked");
@@ -347,7 +393,17 @@ pub async fn estimation_task() {
                 let outcome = guard.on_pvt(&mut eskf, &fix);
 
                 match outcome {
-                    GpsGuardOutcome::PvtAccepted { inflated, sigma_pos_m } => {
+                    GpsGuardOutcome::PvtAccepted {
+                        inflated,
+                        sigma_pos_m,
+                    } => {
+                        // PVT accept refreshes pos and vel last-update
+                        // clocks (the guard runs vel update in the same
+                        // call). last_att_update stays None — GPS
+                        // doesn't observe attitude.
+                        let now = pvt.timestamp;
+                        ESKF_LAST_POS_UPDATE.lock(|c| c.set(Some(now)));
+                        ESKF_LAST_VEL_UPDATE.lock(|c| c.set(Some(now)));
                         if inflated {
                             defmt::debug!(
                                 "ESKF: GPS pos inflated update sigma_pos={}m",
@@ -386,6 +442,7 @@ pub async fn estimation_task() {
                         // severity at a glance.
                         match cause {
                             ReinitCause::NanState => {
+                                ESKF_LAST_NAN_RESET.lock(|c| c.set(Some(Instant::now())));
                                 defmt::error!(
                                     "ESKF: re-initializing at GPS pos [{},{},{}] (nan-state)",
                                     at_enu.x,
@@ -413,6 +470,13 @@ pub async fn estimation_task() {
                         }
                     }
                     GpsGuardOutcome::DisarmedJumpCascade { consecutive } => {
+                        // Surface the cascade event to the fault
+                        // bitfield via a hold-down (see
+                        // estimation::CASCADE_HOLD_S). Without this
+                        // the live `health` view shows ready=no
+                        // faults=0x0000 — the converged drop is
+                        // invisible to operator + blackbox.
+                        ESKF_LAST_JUMP_CASCADE.lock(|c| c.set(Some(Instant::now())));
                         defmt::error!(
                             "ESKF: {} consecutive GPS jumps — arming blocked",
                             consecutive,
@@ -423,6 +487,7 @@ pub async fn estimation_task() {
                         }
                     }
                     GpsGuardOutcome::DisarmedRejectCascade { consecutive } => {
+                        ESKF_LAST_REJECT_CASCADE.lock(|c| c.set(Some(Instant::now())));
                         defmt::error!(
                             "ESKF: {} consecutive GPS rejections — arming blocked",
                             consecutive,

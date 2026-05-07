@@ -9,7 +9,7 @@ mod equivalence_test;
 #[cfg(test)]
 mod benchmark;
 
-pub use eskf::{Eskf, EskfConfig, UpdateOutcome};
+pub use eskf::{Eskf, EskfConfig, EskfHealth, UpdateOutcome};
 pub use failsafe::{
     ConvergenceAxes, DisarmCause, EskfFailsafe, EskfFailsafeConfig, FailsafeAction,
     FailsafeSnapshot,

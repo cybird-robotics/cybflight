@@ -52,6 +52,7 @@ const HELP_TEXT: &[u8] = b"\
   vicon                one-shot Vicon pose\r\n\
   timesync             one-shot time sync status\r\n\
   eskf                 one-shot estimator status\r\n\
+  health               aggregated arming/health snapshot\r\n\
   stream <topic> on    stream data on <topic>\r\n\
   stream <topic> off   stop data stream on <topic>\r\n\
                        (topics: imu1 imu2 att ocp rc rcstats dshot gps gpsrtk\r\n\
@@ -903,6 +904,53 @@ async fn dispatch<'d>(
         "stream eskf off" => {
             STREAM_ESKF.store(false, Ordering::Relaxed);
             write_all(class, b"ESKF status stream off\r\n").await?;
+        }
+        "health" => {
+            // Read from the latest-frame cells populated by the RC task.
+            // A fresh RC_LINK_STATUS / RC_INPUT subscriber has no history —
+            // try_next_message_pure() on it returns None even when frames
+            // are arriving every ~10 ms, which shows up as link=inactive
+            // in the report.
+            let link = crate::sensors::rc::LATEST_RC_LINK_STATUS
+                .lock(|c| c.borrow().clone())
+                .map(|s| crate::health::LinkSnapshot {
+                    active: true,
+                    // saturating_: the RC task tags `s.timestamp` from its
+                    // own `Instant::now()`; it can read as ahead of the
+                    // shell's `Instant::now()` by a microsecond if the two
+                    // tasks are scheduled across a tick boundary. Bare
+                    // `duration_since` would panic on backwards subtraction
+                    // and boot-loop the firmware after every `health` call.
+                    age_ms: Instant::now()
+                        .saturating_duration_since(s.timestamp)
+                        .as_millis(),
+                    quality: s.link_quality,
+                })
+                .unwrap_or(crate::health::LinkSnapshot {
+                    active: false,
+                    age_ms: 0,
+                    quality: 0,
+                });
+            let throttle = crate::sensors::rc::LATEST_RC_INPUT
+                .lock(|c| c.borrow().clone())
+                .and_then(|r| {
+                    // THROTTLE_CHANNEL is index 2; only trust if frame
+                    // had at least that many channels.
+                    if r.channel_count > 2 {
+                        Some(r.channels[2])
+                    } else {
+                        None
+                    }
+                });
+
+            let snap = crate::health::SystemHealth::snapshot(link, throttle);
+            // Write the report in chunks so we don't blow the 256-byte
+            // ShellLine buffer (the report is multi-line and easily
+            // exceeds 256 bytes once attitude/faults are included).
+            let mut buf = [0u8; 1024];
+            let mut w = WriteBuf::new(&mut buf);
+            let _ = snap.write_report(&mut w);
+            write_all(class, w.as_slice()).await?;
         }
         "reboot" => {
             write_all(class, b"rebooting...\r\n").await?;

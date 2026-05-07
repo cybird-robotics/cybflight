@@ -33,7 +33,13 @@ use cybflight_core::eskf::{
 
 use core::sync::atomic::Ordering;
 
-use crate::estimation::{ESTIMATOR_READY, ESTIMATOR_STATUS, EstimatorPhase};
+use crate::estimation::{
+    attitude_health_bits, evaluate_faults, ATTITUDE_HEALTH, ESKF_DEGRADED, ESKF_FAULTS,
+    ESKF_HEALTH, ESKF_LAST_ATT_UPDATE, ESKF_LAST_JUMP_CASCADE, ESKF_LAST_NAN_RESET,
+    ESKF_LAST_POS_UPDATE, ESKF_LAST_REJECT_CASCADE, ESKF_LAST_VEL_UPDATE, ESKF_SEVERE_FAULT,
+    ESTIMATOR_READY, ESTIMATOR_STATUS, EstimatorPhase, FaultEvalInputs,
+};
+use crate::motors::IS_ARMED;
 use crate::sensors;
 use cybflight_msgs as msgs;
 
@@ -179,6 +185,22 @@ pub async fn estimation_task() {
                     continue;
                 }
 
+                // Per-sample attitude observability check. Drives the
+                // arm-gate's att_health requirement and the blackbox
+                // ATTITUDE_HEALTH stream. Cheap (norm + bit ops) and
+                // independent of ESKF state, so we run it before the
+                // initialised-skip below.
+                let last_nan_reset = ESKF_LAST_NAN_RESET.lock(|c| c.get());
+                ATTITUDE_HEALTH.store(
+                    attitude_health_bits(
+                        &sample.accel_m_s2,
+                        &sample.gyro_rad_s,
+                        last_nan_reset,
+                        sample.timestamp,
+                    ),
+                    Ordering::Relaxed,
+                );
+
                 if !eskf.is_initialized() {
                     continue;
                 }
@@ -230,6 +252,36 @@ pub async fn estimation_task() {
                     );
                 }
                 prev_converged = cur_converged;
+
+                // Health snapshot + fault evaluation must run **before**
+                // the staleness gate — staleness is exactly what
+                // evaluate_faults turns into POS_STALE / ATT_STALE flags,
+                // and skipping the call when tick.is_stale=true would
+                // freeze ESKF_FAULTS at its last pre-stale value (zero
+                // for a clean takeoff). Counter snapshots run too: gate
+                // rejections can accumulate during the stale window
+                // (filter still ticks predict on IMU; corruption can
+                // still trigger NaN-after-update), and we want them
+                // visible to the live `health` shell verb and to
+                // /health BB records throughout.
+                ESKF_HEALTH.lock(|c| c.set(eskf.health()));
+                let now_ms = Instant::now();
+                let armed = IS_ARMED.load(Ordering::Relaxed);
+                let inputs = FaultEvalInputs {
+                    now: now_ms,
+                    last_pos_update: ESKF_LAST_POS_UPDATE.lock(|c| c.get()),
+                    last_vel_update: ESKF_LAST_VEL_UPDATE.lock(|c| c.get()),
+                    last_att_update: ESKF_LAST_ATT_UPDATE.lock(|c| c.get()),
+                    pos_cov_trace: eskf.pos_cov_trace(),
+                    last_nan_reset: ESKF_LAST_NAN_RESET.lock(|c| c.get()),
+                    last_jump_cascade: ESKF_LAST_JUMP_CASCADE.lock(|c| c.get()),
+                    last_reject_cascade: ESKF_LAST_REJECT_CASCADE.lock(|c| c.get()),
+                    armed,
+                };
+                let (flags, severe) = evaluate_faults(&inputs);
+                ESKF_FAULTS.store(flags, Ordering::Relaxed);
+                ESKF_DEGRADED.store(flags != 0 && !severe, Ordering::Relaxed);
+                ESKF_SEVERE_FAULT.store(severe, Ordering::Relaxed);
 
                 if tick.is_stale {
                     if !prev_stale {
@@ -286,6 +338,14 @@ pub async fn estimation_task() {
                         if inflated {
                             defmt::debug!("ESKF: mocap pose update inflated");
                         }
+                        // Pose accept refreshes both pos and att
+                        // last-update clocks (mocap is a joint pos+att
+                        // measurement). The fault evaluator reads these
+                        // to decide POS_STALE / ATT_STALE.
+                        let now = pose.timestamp;
+                        ESKF_LAST_POS_UPDATE.lock(|c| c.set(Some(now)));
+                        ESKF_LAST_ATT_UPDATE.lock(|c| c.set(Some(now)));
+                        ESKF_LAST_VEL_UPDATE.lock(|c| c.set(Some(now)));
                     }
                     MocapGuardOutcome::NonFinitePose => {
                         defmt::warn!("estimation: non-finite mocap frame, rejecting");
@@ -301,6 +361,12 @@ pub async fn estimation_task() {
                         defmt::warn!("ESKF: pose update rejected ({})", outcome_tag(reason));
                     }
                     MocapGuardOutcome::Reinitialised { at_pos, cause, .. } => {
+                        // NaN re-init starts a hold-down window for the
+                        // ATTITUDE_HEALTH NO_RECENT_NAN bit. JumpCascade
+                        // re-init isn't surfaced by mocap (policy: ride
+                        // out IMU), but if a future variant emits it the
+                        // same hold-down applies.
+                        ESKF_LAST_NAN_RESET.lock(|c| c.set(Some(Instant::now())));
                         // Mocap re-init only happens on NaN-state
                         // entry (no jump-cascade re-init policy on
                         // this path — see EskfMocapGuard rationale).
@@ -334,6 +400,12 @@ pub async fn estimation_task() {
                         }
                     }
                     MocapGuardOutcome::DisarmedJumpCascade { consecutive } => {
+                        // Record the cascade event so evaluate_faults
+                        // surfaces GUARD_JUMP_CASCADE for CASCADE_HOLD_S.
+                        // Without this the live `health` view shows
+                        // ready=no faults=0x0000 — the converged drop
+                        // is invisible.
+                        ESKF_LAST_JUMP_CASCADE.lock(|c| c.set(Some(Instant::now())));
                         defmt::error!(
                             "ESKF: {} consecutive pose jumps — arming blocked",
                             consecutive,
@@ -344,6 +416,7 @@ pub async fn estimation_task() {
                         }
                     }
                     MocapGuardOutcome::DisarmedRejectCascade { consecutive } => {
+                        ESKF_LAST_REJECT_CASCADE.lock(|c| c.set(Some(Instant::now())));
                         defmt::error!(
                             "ESKF: {} consecutive mocap rejections — arming blocked",
                             consecutive,

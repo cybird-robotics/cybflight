@@ -47,9 +47,7 @@ pub mod offline_mission;
 #[cfg(feature = "outer_mpc")]
 pub mod outer_loop;
 pub mod rc_interpreter;
-pub mod tracking_error_msg;
-
-pub use tracking_error_msg::{
+pub use msgs::{
     TrackingError, TRACKING_ERROR_SOURCE_CASCADE, TRACKING_ERROR_SOURCE_INDI,
     TRACKING_ERROR_SOURCE_MPC,
 };

@@ -9,10 +9,10 @@ use embassy_time::Timer;
 use crate::hal::usart::{UartRx, UartTx};
 use crate::{control, sensors};
 use cybflight_msgs::wire::{
-    self, WireArmDisarm, WireAttitudeControlSetpoint, WireDshotTelemetry, WireGpsFix, WireMessage,
-    WireMotorStateTelemetry, WireOcpSolverOutput, WirePing, WirePingResp, WirePose,
-    WirePowerStatus, WireRcInput, WireRcLinkStatus, WireTimeSync, WireTimeSyncStatus,
-    WireVehicleAttitude, WireVehicleOdometry,
+    self, WireArmDisarm, WireAttitudeControlSetpoint, WireDshotTelemetry, WireGpsFix,
+    WireGpsHealth, WireMessage, WireMotorStateTelemetry, WireOcpSolverOutput, WirePing,
+    WirePingResp, WirePose, WirePowerStatus, WireRcInput, WireRcLinkStatus, WireSystemHealth,
+    WireTimeSync, WireTimeSyncStatus, WireVehicleAttitude, WireVehicleOdometry,
 };
 #[cfg(feature = "dev_telem")]
 use cybflight_msgs::wire::{WireBaroSample, WireImu, WireMagSample};
@@ -122,6 +122,7 @@ const DECIM_DSHOT_TELEM: u32 = 4;               //  25 Hz — eRPM tuning
 const DECIM_MOTOR_STATE_TELEM: u32 = 4;         //  25 Hz — KF state tuning
 const DECIM_ACTUATOR_MOTORS: u32 = 4;           //  25 Hz — motor cmd
 const DECIM_POWER_STATUS: u32 = 100;            //   1 Hz — battery
+const DECIM_HEALTH: u32 = 100;                  //   1 Hz — system / GPS health snapshot
 #[cfg(feature = "dev_telem")]
 const DECIM_IMU: u32 = 4;                       //  25 Hz — raw IMU (debug)
 #[cfg(feature = "dev_telem")]
@@ -143,9 +144,15 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
     let mut rc_sub = crate::subscribe_or_park!(sensors::RC_INPUT, "RC_INPUT");
     let mut rc_link_sub = crate::subscribe_or_park!(sensors::RC_LINK_STATUS, "RC_LINK_STATUS");
     let mut dshot_sub = crate::subscribe_or_park!(control::PROCESSED_DSHOT_TELEM, "PROCESSED_DSHOT_TELEM");
+    // PROCESSED_MOTOR_STATE / POWER_STATUS — tuning-grade only;
+    // gated behind `dev_telem` because the GCS dashboard uses
+    // /health and /gpshealth instead. The wire types stay public in
+    // cybflight-msgs for future-compat consumers.
+    #[cfg(feature = "dev_telem")]
     let mut motor_state_sub = crate::subscribe_or_park!(control::PROCESSED_MOTOR_STATE, "PROCESSED_MOTOR_STATE");
     let mut ocp_sub = crate::subscribe_or_park!(control::OCP_SOLVER_OUTPUT, "OCP_SOLVER_OUTPUT");
     let mut gps_sub = crate::subscribe_or_park!(sensors::GPS_FIX, "GPS_FIX");
+    #[cfg(feature = "dev_telem")]
     let mut power_sub = crate::subscribe_or_park!(sensors::POWER_STATUS, "POWER_STATUS");
     let mut att_ctrl_sub = crate::subscribe_or_park!(control::ATTITUDE_CONTROL_SETPOINT, "ATTITUDE_CONTROL_SETPOINT");
     #[cfg(feature = "est_eskf")]
@@ -252,6 +259,7 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
                 pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
             }
         }
+        #[cfg(feature = "dev_telem")]
         if tick % DECIM_MOTOR_STATE_TELEM == 0 {
             if let Some(m) = drain_latest(&mut motor_state_sub) {
                 let mut w = WireMotorStateTelemetry::from_msg(&m);
@@ -298,13 +306,29 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
             pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
         }
 
-        // ── Battery @ 1 Hz ──
+        // ── Battery @ 1 Hz (dev_telem only) ──
+        #[cfg(feature = "dev_telem")]
         if tick % DECIM_POWER_STATUS == 0 {
             if let Some(m) = drain_latest(&mut power_sub) {
                 let mut w = WirePowerStatus::from_msg(&m);
                 w.timestamp_us = utc_ts(m.timestamp);
                 pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
             }
+        }
+
+        // ── Health snapshots @ 1 Hz ──
+        // Mirror what the live `health` / `gpshealth` shell commands
+        // print. Source-of-truth atomics are read by
+        // `comm::health_wire::snapshot_*`. Same wall-clock instant for
+        // both records so the GCS dashboard renders coherent state.
+        if tick % DECIM_HEALTH == 0 {
+            let now = embassy_time::Instant::now();
+            let mut sys = super::health_wire::snapshot_system(now);
+            sys.timestamp_us = utc_ts(now);
+            pos += encode_and_advance(&sys, &mut seq, &mut batch[pos..]);
+            let mut gps = super::health_wire::snapshot_gps(now);
+            gps.timestamp_us = utc_ts(now);
+            pos += encode_and_advance(&gps, &mut seq, &mut batch[pos..]);
         }
 
         // ── Dev-only raw channels (gated by `dev_telem`) @ 25 Hz ──

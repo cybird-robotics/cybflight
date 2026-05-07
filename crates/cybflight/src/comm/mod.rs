@@ -1,6 +1,7 @@
 //! ESP bridge communication — COBS framing utilities.
 
 pub mod esp_bridge;
+pub mod health_wire;
 pub mod time_sync;
 
 use cybflight_msgs::wire;

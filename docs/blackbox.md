@@ -334,7 +334,9 @@ crates/cybflight/src/blackbox/
     ├── mpc.rs        /mpc       channel id 6: OCP solver command + telemetry
     ├── motors.rs     /motors    channel id 7: INDI per-motor normalized output (100 Hz, commanded)
     ├── motor_state.rs /motor_state channel id 8: KF-fused per-motor ω + ω̇ + raw eRPM (100 Hz, achieved)
-    └── tracking_error.rs /tracking_error channel id 9: controller-reported `reference - actual` (cascade/MPC: 50–100 Hz, INDI: 100 Hz)
+    ├── tracking_error.rs /tracking_error channel id 9: controller-reported `reference - actual` (cascade/MPC: 50–100 Hz, INDI: 100 Hz)
+    ├── health.rs     /health    channel id 10: post-flight mirror of the live `health` shell line (20 Hz)
+    └── gps_health.rs /gps_health channel id 11: flat snapshot of GPS_HEALTH + LATEST_NAV_PVT (20 Hz; stays at NotConfigured on non-est_pos_gps builds)
 
 crates/cybflight-drivers/src/blackbox_storage.rs    BlockStore trait + BlockStoreError
 
@@ -408,8 +410,8 @@ After popping the card:
 mcap doctor flight_0001.mcap     # must print no issues
 mcap info   flight_0001.mcap     # channel count depends on tier:
                                  #   small=2 (events,rc),
-                                 #   mid=8 (+attitude,odometry,mpc,motors,motor_state,tracking_error),
-                                 #   large=9 (+imu1)
+                                 #   mid=10 (+attitude,odometry,mpc,motors,motor_state,tracking_error,health,gps_health),
+                                 #   large=11 (+imu1)
 python3 read_mcap.py flight_0001.mcap | head            # see ARM event up top
 python3 read_mcap.py flight_0001.mcap | tail            # see DISARM + LOG_END
 python3 read_mcap.py flight_0001.mcap | grep events     # all events in order

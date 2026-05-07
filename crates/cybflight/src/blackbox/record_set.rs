@@ -92,6 +92,7 @@ const TOPICS_MID: &[TopicDef] = &[
     topics::motor_state::DEF,
     topics::tracking_error::DEF,
     topics::health::DEF,
+    topics::gps_health::DEF,
 ];
 
 const TOPICS_LARGE: &[TopicDef] = &[
@@ -105,6 +106,7 @@ const TOPICS_LARGE: &[TopicDef] = &[
     topics::tracking_error::DEF,
     topics::imu::DEF,
     topics::health::DEF,
+    topics::gps_health::DEF,
 ];
 
 /// Recording tier. See module docs for byte-rate estimates per tier.
@@ -175,6 +177,15 @@ impl RecordSet {
     /// at the same ~100 Hz cadence.
     #[inline]
     pub const fn includes_health(self) -> bool {
+        matches!(self, Self::Mid | Self::Large)
+    }
+
+    /// True for tiers that include the `/gps_health` flat-snapshot
+    /// of `crate::sensors::gps::GPS_HEALTH` + `LATEST_NAV_PVT` (Mid +
+    /// Large). Self-throttled to the same 20 Hz as `/health` — see
+    /// [`crate::blackbox::topics::gps_health`].
+    #[inline]
+    pub const fn includes_gps_health(self) -> bool {
         matches!(self, Self::Mid | Self::Large)
     }
 

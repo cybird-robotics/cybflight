@@ -62,7 +62,8 @@ use super::record_set::RecordSet;
 use super::sdmmc_block::SdmmcBlockStore;
 use super::should_record;
 use super::topics::{
-    attitude, events, health, imu, motor_state, motors, mpc, odometry, rc, tracking_error,
+    attitude, events, gps_health, health, imu, motor_state, motors, mpc, odometry, rc,
+    tracking_error,
 };
 use crate::control::TrackingError as TrackErrMsg;
 use crate::control::failsafe::{FAILSAFE_ACTIVE, FAILSAFE_REASON, RC_LINK_HEALTHY};
@@ -184,6 +185,12 @@ pub struct FlightRecorder {
     /// least `HEALTH_EMIT_INTERVAL` has passed. Initialised to a value
     /// far in the past so the first iteration emits a baseline record.
     last_health_emit: Instant,
+    gps_health_seq: u32,
+    /// Wall-clock of the last `/gps_health` emit. Independent of
+    /// `last_health_emit` so the two topics can be cadence-tuned
+    /// separately if it ever matters; today they share
+    /// `HEALTH_EMIT_INTERVAL`.
+    last_gps_health_emit: Instant,
     ev_seq: u32,
     /// Last-seen `FAILSAFE_ACTIVE` value. Edge-detected each
     /// iteration so we emit `KIND_FAILSAFE` / `KIND_FAILSAFE_CLEAR`
@@ -481,12 +488,13 @@ impl FileBody for FlightRecorder {
                 total += self.emit_imu(w, &mut scratch, wr).await?;
             }
 
-            // ── /health periodic emit ───────────────────────────
-            // Detached from `/odom` (which it used to piggyback on)
-            // so failsafe progression stays observable when the
-            // estimator drops and `/odom` stops publishing. The
-            // function self-throttles to `HEALTH_EMIT_INTERVAL`.
+            // ── /health + /gps_health periodic emits ────────────
+            // Both detached from any data-topic emit so failsafe and
+            // GPS-loss progressions stay observable when their
+            // companion topics stop publishing. Each function self-
+            // throttles to `HEALTH_EMIT_INTERVAL`.
             total += self.emit_health(w, &mut scratch).await?;
+            total += self.emit_gps_health(w, &mut scratch).await?;
 
             // ── extraordinary-event edge poll ───────────────────
             // Poll the failsafe + estimator atomics once per outer
@@ -635,6 +643,43 @@ impl FlightRecorder {
         self.health_seq = self.health_seq.wrapping_add(1);
         let n = health::encode(scratch, now).unwrap_or(0);
         let bytes = emit_msg(w, health::CHANNEL_ID, self.health_seq, now, &scratch[..n]).await?;
+        self.messages = self.messages.wrapping_add(1);
+        Ok(bytes)
+    }
+
+    /// Emit one `/gps_health` record if at least `HEALTH_EMIT_INTERVAL`
+    /// has passed since the last one. Same self-throttle pattern as
+    /// `emit_health`; separate timestamp lets future tuning split the
+    /// two cadences. No-op when the active record set excludes
+    /// gps_health.
+    ///
+    /// On builds without `est_pos_gps` the source enum stays
+    /// `NotConfigured` for the whole session — the topic still emits
+    /// (~50 B/record) so the file carries an explicit "GPS not
+    /// present" marker rather than silently dropping the channel.
+    async fn emit_gps_health<W: Write>(
+        &mut self,
+        w: &mut W,
+        scratch: &mut [u8],
+    ) -> Result<u32, W::Error> {
+        if !self.record_set.includes_gps_health() {
+            return Ok(0);
+        }
+        let now = Instant::now();
+        if now.saturating_duration_since(self.last_gps_health_emit) < HEALTH_EMIT_INTERVAL {
+            return Ok(0);
+        }
+        self.last_gps_health_emit = now;
+        self.gps_health_seq = self.gps_health_seq.wrapping_add(1);
+        let n = gps_health::encode(scratch, now).unwrap_or(0);
+        let bytes = emit_msg(
+            w,
+            gps_health::CHANNEL_ID,
+            self.gps_health_seq,
+            now,
+            &scratch[..n],
+        )
+        .await?;
         self.messages = self.messages.wrapping_add(1);
         Ok(bytes)
     }
@@ -985,6 +1030,8 @@ pub async fn run_session(
         track_err_seq: 0,
         health_seq: 0,
         last_health_emit: Instant::from_ticks(0),
+        gps_health_seq: 0,
+        last_gps_health_emit: Instant::from_ticks(0),
         ev_seq: 0,
         prev_failsafe: FAILSAFE_ACTIVE.load(Ordering::Acquire),
         prev_est_ready: ESTIMATOR_READY.load(Ordering::Acquire),

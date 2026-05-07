@@ -35,6 +35,7 @@
 
 pub mod attitude;
 pub mod events;
+pub mod gps_health;
 pub mod health;
 pub mod imu;
 pub mod motor_state;

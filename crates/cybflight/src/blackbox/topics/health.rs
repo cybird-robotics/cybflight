@@ -13,9 +13,12 @@
 //! consistent by reading the **same** sources of truth -- there's no
 //! BB-specific shadow state.
 //!
-//! Cadence: piggybacks on the `/odom` emit path (ODOM_DECIMATION-tied
-//! ~100 Hz). High enough to catch sub-second transient faults, low
-//! enough that the ~100-byte CBOR map adds <15 KB/s to file growth.
+//! Cadence: 20 Hz, driven by the recorder's own loop tick (see
+//! `HEALTH_EMIT_INTERVAL` in `blackbox::recorder`). Decoupled from
+//! `/odom` so the failsafe progression — when `/odom` typically
+//! stops publishing — stays observable through to disarm. High
+//! enough to catch sub-second transient faults, low enough that the
+//! ~325-byte CBOR map adds <7 KB/s to file growth.
 
 use core::sync::atomic::Ordering;
 

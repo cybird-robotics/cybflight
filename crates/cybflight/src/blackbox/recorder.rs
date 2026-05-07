@@ -84,6 +84,28 @@ const MCAP_LIBRARY: &str = concat!("cybflight v", env!("CARGO_PKG_VERSION"));
 /// its own debounce upstream.
 const DISARM_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Cadence of the `/health` emit. 20 Hz matches what the old `/odom`
+/// piggyback delivered while the estimator was healthy, but is now
+/// driven by the recorder's own loop tick rather than `/odom`. That
+/// matters because the most interesting failsafe transitions happen
+/// *after* the estimator drops — and `/odom` stops publishing then,
+/// which used to take `/health` down with it. Decoupled, `/health`
+/// keeps emitting through the failsafe progression and disarm.
+const HEALTH_EMIT_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long the capture loop continues after `should_record()` flips
+/// false (i.e. after disarm). Exists so post-disarm state transitions
+/// land in the log — the most common case is the 2 s pos-staleness
+/// timeout firing after a measurement source vanishes right before /
+/// during disarm. Without the grace window, `LOG_END` lands ~50 ms
+/// after disarm and the STALE bits assert into a closed file.
+///
+/// 3 s = `POS_TIMEOUT_S` (2 s) + headroom for the loop's coarsest
+/// poll interval (50 ms) and for whatever brief overrun the SD-write
+/// path introduces. The DISARM event is still emitted at the actual
+/// disarm-edge moment; only LOG_END (the file-close marker) shifts.
+const POST_DISARM_GRACE: Duration = Duration::from_secs(3);
+
 /// Per-topic drain budget per outer iteration for **small/mid-tier**
 /// topics (`/rc`, `/attitude`, `/odometry`, `/mpc`). Chosen larger
 /// than every channel's `CAP` (max is 8 for `VEHICLE_ODOMETRY`) so a
@@ -157,6 +179,11 @@ pub struct FlightRecorder {
     motor_state_seq: u32,
     track_err_seq: u32,
     health_seq: u32,
+    /// Wall-clock of the last `/health` emit. The capture loop calls
+    /// `emit_health` every iteration; `emit_health` no-ops until at
+    /// least `HEALTH_EMIT_INTERVAL` has passed. Initialised to a value
+    /// far in the past so the first iteration emits a baseline record.
+    last_health_emit: Instant,
     ev_seq: u32,
     /// Last-seen `FAILSAFE_ACTIVE` value. Edge-detected each
     /// iteration so we emit `KIND_FAILSAFE` / `KIND_FAILSAFE_CLEAR`
@@ -236,7 +263,7 @@ impl FileBody for FlightRecorder {
         }
 
         // ── ARM event ───────────────────────────────────────────
-        let mut scratch = [0u8; 256];
+        let mut scratch = [0u8; 512];
         if self.record_set.includes_events() {
             total += self
                 .emit_event(w, &mut scratch, events::KIND_ARM, 0)
@@ -263,8 +290,26 @@ impl FileBody for FlightRecorder {
         // The fairness drain was added after a flight where a
         // `Large` tier session yielded 1037 IMU messages and zero
         // of everything else — including 8 kHz `/attitude`.
+        //
+        // Loop exit: when `should_record()` flips false we don't
+        // break immediately. Instead emit the DISARM event at that
+        // moment and continue running for `POST_DISARM_GRACE` so
+        // post-disarm transitions (notably the 2 s POS_TIMEOUT_S
+        // staleness assertion) land in the log. Re-arm during the
+        // grace window doesn't cancel — we're committed to closing.
+        let mut grace_deadline: Option<Instant> = None;
         loop {
-            if !should_record() {
+            if !should_record() && grace_deadline.is_none() {
+                if self.record_set.includes_events() {
+                    total += self
+                        .emit_event(w, &mut scratch, events::KIND_DISARM, 0)
+                        .await?;
+                }
+                grace_deadline = Some(Instant::now() + POST_DISARM_GRACE);
+            }
+            if let Some(deadline) = grace_deadline
+                && Instant::now() >= deadline
+            {
                 break;
             }
             let timer = Timer::after(DISARM_POLL_INTERVAL);
@@ -366,6 +411,13 @@ impl FileBody for FlightRecorder {
                 total += self.emit_imu(w, &mut scratch, wr).await?;
             }
 
+            // ── /health periodic emit ───────────────────────────
+            // Detached from `/odom` (which it used to piggyback on)
+            // so failsafe progression stays observable when the
+            // estimator drops and `/odom` stops publishing. The
+            // function self-throttles to `HEALTH_EMIT_INTERVAL`.
+            total += self.emit_health(w, &mut scratch).await?;
+
             // ── extraordinary-event edge poll ───────────────────
             // Poll the failsafe + estimator atomics once per outer
             // iteration and emit a `/events` record on each
@@ -380,11 +432,11 @@ impl FileBody for FlightRecorder {
             }
         }
 
-        // ── DISARM + LOG_END events ─────────────────────────────
+        // ── LOG_END event ───────────────────────────────────────
+        // DISARM is emitted at the disarm-edge inside the capture
+        // loop above; LOG_END marks the actual file-close moment,
+        // ~POST_DISARM_GRACE later.
         if self.record_set.includes_events() {
-            total += self
-                .emit_event(w, &mut scratch, events::KIND_DISARM, 0)
-                .await?;
             total += self
                 .emit_event(w, &mut scratch, events::KIND_LOG_END, 0)
                 .await?;
@@ -476,7 +528,7 @@ impl FlightRecorder {
         };
         self.odom_seq = self.odom_seq.wrapping_add(1);
         let n = odometry::encode(scratch, &m).unwrap_or(0);
-        let mut bytes = emit_msg(
+        let bytes = emit_msg(
             w,
             odometry::CHANNEL_ID,
             self.odom_seq,
@@ -485,28 +537,35 @@ impl FlightRecorder {
         )
         .await?;
         self.messages = self.messages.wrapping_add(1);
+        Ok(bytes)
+    }
 
-        // Piggyback `/health`: estimator fault snapshot at the same
-        // ~100 Hz cadence as `/odom`. Cheap (atomic loads + Cell
-        // get) and bounded (~80 B per record). The `/health` topic
-        // is in TOPICS_MID and TOPICS_LARGE — guard with the
-        // record_set predicate so Mid+ tiers emit, Small skips.
-        if self.record_set.includes_health() {
-            self.health_seq = self.health_seq.wrapping_add(1);
-            let n = health::encode(scratch, m.timestamp).unwrap_or(0);
-            bytes = bytes.saturating_add(
-                emit_msg(
-                    w,
-                    health::CHANNEL_ID,
-                    self.health_seq,
-                    m.timestamp,
-                    &scratch[..n],
-                )
-                .await?,
-            );
-            self.messages = self.messages.wrapping_add(1);
+    /// Emit one `/health` record if at least `HEALTH_EMIT_INTERVAL`
+    /// has passed since the last one. Called every loop iteration.
+    /// No-op when the active record set excludes health.
+    ///
+    /// Decoupled from `/odom` so the failsafe progression — which is
+    /// when `/odom` typically stops — stays observable. Worst-case
+    /// cadence is bounded by `DISARM_POLL_INTERVAL`: even if every
+    /// subscriber stalls, the loop still wakes every 50 ms and emits
+    /// one health record.
+    async fn emit_health<W: Write>(
+        &mut self,
+        w: &mut W,
+        scratch: &mut [u8],
+    ) -> Result<u32, W::Error> {
+        if !self.record_set.includes_health() {
+            return Ok(0);
         }
-
+        let now = Instant::now();
+        if now.saturating_duration_since(self.last_health_emit) < HEALTH_EMIT_INTERVAL {
+            return Ok(0);
+        }
+        self.last_health_emit = now;
+        self.health_seq = self.health_seq.wrapping_add(1);
+        let n = health::encode(scratch, now).unwrap_or(0);
+        let bytes = emit_msg(w, health::CHANNEL_ID, self.health_seq, now, &scratch[..n]).await?;
+        self.messages = self.messages.wrapping_add(1);
         Ok(bytes)
     }
 
@@ -855,6 +914,7 @@ pub async fn run_session(
         motor_state_seq: 0,
         track_err_seq: 0,
         health_seq: 0,
+        last_health_emit: Instant::from_ticks(0),
         ev_seq: 0,
         prev_failsafe: FAILSAFE_ACTIVE.load(Ordering::Acquire),
         prev_est_ready: ESTIMATOR_READY.load(Ordering::Acquire),

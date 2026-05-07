@@ -26,7 +26,7 @@ POS_SOURCE := env_var_or_default("POS_SOURCE", "mocap")
 #                cybflight's `position_sampler` feature.
 # Misuse with OUTER_LOOP=cascade is silently ignored — the cascade path
 # does not consume the sampler abstraction.
-SAMPLER := env_var_or_default("SAMPLER", "time")
+SAMPLER := env_var_or_default("SAMPLER", "position")
 
 # Compose the feature list for `cargo build`. The `outer_mpc` feature is
 # appended only when OUTER_LOOP=mpc; otherwise the cascade is used (the

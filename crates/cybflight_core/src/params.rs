@@ -33,7 +33,7 @@ use crate::trajectory_planning::sampler::PositionSamplerParams;
 use crate::trajectory_planning::types::Vec3;
 
 const MAGIC: u32 = 0x4359_4250; // "CYBP"
-const VERSION: u32 = 28;
+const VERSION: u32 = 29;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
 /// Total payload: 52 + 80 + 36 + 192 + 60 + 36 + 64 + 44 + 28 + 32 + 4 + 4 + 4 = 636 bytes
 /// (MpcParams grew from 60→64 in v28 with the addition of `pos_cost_mode`,

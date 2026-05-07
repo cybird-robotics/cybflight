@@ -186,8 +186,8 @@ impl QuadModel {
             grav,
             dt: vp.mpc.dt,
             u_bounds: [
-                [0.0_f32, max_collective_thrust_n * thrust_percentage],
-                // [0.0_f32, 36.0_f32],
+                // [0.0_f32, max_collective_thrust_n * thrust_percentage],
+                [0.0_f32, 36.0_f32],
                 [-mr[0], mr[0]],
                 [-mr[1], mr[1]],
                 [-mr[2], mr[2]],

@@ -180,6 +180,8 @@ fn build_outer_quad_model(vp: &VehicleParams) -> QuadModel {
                  forcing PosCostMode::Quadratic (Contouring requires the position sampler)"
             );
             model.pos_cost_mode = PosCostMode::Quadratic;
+            model.w_pos[1] = model.w_pos[0];
+            model.w_pos[2] = model.w_pos[0];
         }
     }
     if model.pos_cost_mode == PosCostMode::Contouring
@@ -192,6 +194,9 @@ fn build_outer_quad_model(vp: &VehicleParams) -> QuadModel {
             model.w_pos[2]
         );
         model.pos_cost_mode = PosCostMode::Quadratic;
+        model.w_pos[0] = 200.0;
+        model.w_pos[1] = 200.0;
+        model.w_pos[2] = 200.0;
     }
     model
 }

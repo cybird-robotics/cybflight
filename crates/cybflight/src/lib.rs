@@ -41,6 +41,7 @@ pub const GIT_HASH: &str = match option_env!("GIT_HASH") {
 
 use bsp_types::SensorAlign;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, pubsub::PubSubChannel};
+use embassy_time::Duration;
 use nalgebra::Vector3;
 
 /// Rotate a 3-axis sensor vector according to the board-defined alignment.
@@ -62,3 +63,61 @@ pub fn apply_alignment(align: SensorAlign, v: Vector3<f32>) -> Vector3<f32> {
 
 pub static ARM_DISARM: PubSubChannel<CriticalSectionRawMutex, msgs::ArmDisarm, 4, 4, 1> =
     PubSubChannel::new();
+
+/// Subscribe to a `PubSubChannel`, or park the calling task forever if the
+/// channel's compile-time `SUBS` capacity is exhausted.
+///
+/// The previous `.subscriber().unwrap()` / `.expect()` pattern panics when
+/// `SUBS` is hit, which on embassy translates to a fatal executor abort and
+/// usually a boot loop. That's the wrong response for an "eyes-only" PR
+/// that adds a new reader: one mis-sized const should not lose the FCU.
+///
+/// This macro logs to defmt **and** to the USB shell, then parks the
+/// calling async task on `core::future::pending()`. The rest of the
+/// firmware keeps flying — the only function lost is whatever this task
+/// was doing — and an operator with the shell open immediately sees
+/// which channel is starved and that the SUBS const needs raising.
+///
+/// Usage (in an async task body only):
+/// ```ignore
+/// let mut imu_sub = subscribe_or_park!(sensors::IMU_1, "IMU_1");
+/// ```
+///
+/// `loop { pending().await }` has type `!` so it coerces to the
+/// subscriber type; the bind site sees a regular subscriber on the happy
+/// path and never executes anything past it on the failure path.
+#[macro_export]
+macro_rules! subscribe_or_park {
+    ($channel:expr, $name:literal) => {
+        match ($channel).subscriber() {
+            Ok(s) => s,
+            Err(_) => {
+                ::defmt::error!(
+                    "{}: subscriber slot exhausted — task parked",
+                    $name
+                );
+                $crate::shell::shell_err(concat!(
+                    $name,
+                    ": subscriber slot exhausted — task parked"
+                ));
+                loop {
+                    ::core::future::pending::<()>().await;
+                }
+            }
+        }
+    };
+}
+
+pub trait ConvertToF32Secs {
+    fn as_secs_f32(&self) -> f32;
+}
+
+impl<T> ConvertToF32Secs for T
+where
+    T: Into<Duration> + Copy,
+{
+    fn as_secs_f32(&self) -> f32 {
+        let d: Duration = (*self).into();
+        d.as_micros() as f32 * 1e-6
+    }
+}

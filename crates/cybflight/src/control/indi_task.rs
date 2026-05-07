@@ -343,12 +343,12 @@ pub async fn indi_task() {
     let mut local_param_ver =
         crate::params::PARAM_VERSION.load(core::sync::atomic::Ordering::Acquire);
     // --- Subscribe to channels ---
-    let mut imu_sub = IMU_1.subscriber().unwrap();
-    let mut dshot_sub = DSHOT_TELEMETRY.subscriber().unwrap();
+    let mut imu_sub = crate::subscribe_or_park!(IMU_1, "IMU_1");
+    let mut dshot_sub = crate::subscribe_or_park!(DSHOT_TELEMETRY, "DSHOT_TELEMETRY");
     // Battery voltage from `power_task` (100 Hz). Consumed by the thrust
     // map in `Table` mode; ignored by the analytic models. Held between
     // updates with a staleness fallback to nominal — see VOLTAGE_* consts.
-    let mut power_sub = POWER_STATUS.subscriber().unwrap();
+    let mut power_sub = crate::subscribe_or_park!(POWER_STATUS, "POWER_STATUS");
     // Armed state read from IS_ARMED atomic (set by DShot task).
     let att_pub = super::ATTITUDE_CONTROL_SETPOINT.immediate_publisher();
     let motor_telem_pub = super::ACTUATOR_MOTORS_TELEM.immediate_publisher();

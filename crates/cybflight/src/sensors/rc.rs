@@ -29,6 +29,12 @@ const THROTTLE_MINCHECK: u16 = 1050;
 /// Arm switch must be held for this long before arming (ms).
 /// BF does not debounce the arm switch; this is a cybflight safety addition.
 const ARM_SWITCH_HOLD_MS: u64 = 100;
+
+/// Hold time after the arm switch is flipped before we print the rejection
+/// summary if gates have not passed. Long enough that a normal-debounce arm
+/// completes silently before the deadline; short enough that a stuck attempt
+/// gets one immediate "ARM rejected" line.
+const ARM_REJECT_SUMMARY_MS: u64 = 200;
 /// Minimum link quality to allow arming [0..100].
 const MIN_LINK_QUALITY: u8 = 50;
 /// Link stats older than this block arming (ms). Mirrors BF `ARMING_DISABLED_RX_FAILSAFE`.
@@ -48,10 +54,24 @@ const LINK_STATS_MAX_AGE_MS: u64 = 500;
 /// 4. Arm switch held for debounce duration (cybflight safety addition)
 ///
 /// Disarming via switch is always immediate (no debounce) for safety.
+///
+/// On every arm attempt (switch flipped to arm position), the state machine
+/// latches the latest gate-rejection reason and prints a single summary
+/// after `ARM_REJECT_SUMMARY_MS`, so the operator can confirm the FCU is
+/// alive and see *why* arming was refused.
 struct ArmStateMachine {
     armed: bool,
     /// Timestamp when arm switch first entered "arm" position (for hold debounce).
     switch_arm_start: Option<Instant>,
+    /// Sticky timestamp of the current arm attempt. Set on the rising edge of
+    /// the arm switch, cleared on the falling edge. Distinct from
+    /// `switch_arm_start` (which resets every time a gate fails).
+    attempt_start: Option<Instant>,
+    /// Whether we have already printed the rejection summary for the
+    /// current attempt. Reset on the falling edge.
+    summary_printed: bool,
+    /// Latest gate-rejection reason for the current attempt.
+    last_block_reason: Option<BlockReason>,
     /// Last known link quality [0..100].
     link_quality: u8,
     /// Whether any link stats frame has been received.
@@ -60,14 +80,54 @@ struct ArmStateMachine {
     link_stats_time: Instant,
 }
 
+#[derive(Clone, Copy, defmt::Format)]
+enum BlockReason {
+    Failsafe,
+    ThrottleNotMin { value: u16, max: u16 },
+    LinkInactive,
+    LinkStale { age_ms: u64 },
+    LinkLowQuality { quality: u8, min: u8 },
+    EstimatorNotReady,
+    TiltOutOfEnvelope { roll_deg: f32, pitch_deg: f32 },
+    SensorHealthDegraded { bits: u8, required: u8 },
+    EskfDegraded { faults: u32 },
+    MahonyNotReady,
+    EskfMahonyTiltDisagreement {
+        eskf_roll_deg: f32,
+        eskf_pitch_deg: f32,
+        mahony_roll_deg: f32,
+        mahony_pitch_deg: f32,
+    },
+}
+
 impl ArmStateMachine {
     fn new() -> Self {
         Self {
             armed: false,
             switch_arm_start: None,
+            attempt_start: None,
+            summary_printed: false,
+            last_block_reason: None,
             link_quality: 0,
             link_active: false,
             link_stats_time: Instant::now(),
+        }
+    }
+
+    /// Record a gate rejection. Latches the reason; if the attempt has
+    /// been ongoing for `ARM_REJECT_SUMMARY_MS` and we have not yet
+    /// printed a summary, emit one now.
+    fn note_block(&mut self, now: Instant, reason: BlockReason) {
+        self.switch_arm_start = None;
+        self.last_block_reason = Some(reason);
+        if self.summary_printed {
+            return;
+        }
+        if let Some(start) = self.attempt_start {
+            if now.duration_since(start).as_millis() as u64 >= ARM_REJECT_SUMMARY_MS {
+                defmt::info!("ARM rejected: {}", reason);
+                self.summary_printed = true;
+            }
         }
     }
 
@@ -90,6 +150,9 @@ impl ArmStateMachine {
         // --- Disarm: always immediate, no gates ---
         if !switch_armed {
             self.switch_arm_start = None;
+            self.attempt_start = None;
+            self.summary_printed = false;
+            self.last_block_reason = None;
             if self.armed {
                 self.armed = false;
                 defmt::info!(
@@ -113,31 +176,53 @@ impl ArmStateMachine {
             return; // already armed
         }
 
+        // Rising edge: open a new attempt window so the rejection summary
+        // is bounded to one print regardless of how long the user holds.
+        self.attempt_start.get_or_insert(now);
+
         // Gate 1: failsafe not active (BF: ARMING_DISABLED_FAILSAFE)
         if crate::control::failsafe::FAILSAFE_ACTIVE.load(Ordering::Acquire) {
-            self.switch_arm_start = None;
+            self.note_block(now, BlockReason::Failsafe);
             return;
         }
 
         // Gate 2: throttle at minimum (BF: ARMING_DISABLED_THROTTLE)
         if channels[THROTTLE_CHANNEL] > THROTTLE_MINCHECK {
-            self.switch_arm_start = None;
+            self.note_block(
+                now,
+                BlockReason::ThrottleNotMin {
+                    value: channels[THROTTLE_CHANNEL],
+                    max: THROTTLE_MINCHECK,
+                },
+            );
             return;
         }
 
         // Gate 3: link active & quality (BF: ARMING_DISABLED_RX_FAILSAFE)
-        if !self.link_active
-            || now.duration_since(self.link_stats_time).as_millis() > LINK_STATS_MAX_AGE_MS
-            || self.link_quality < MIN_LINK_QUALITY
-        {
-            self.switch_arm_start = None;
+        if !self.link_active {
+            self.note_block(now, BlockReason::LinkInactive);
+            return;
+        }
+        let link_age_ms = now.duration_since(self.link_stats_time).as_millis() as u64;
+        if link_age_ms > LINK_STATS_MAX_AGE_MS {
+            self.note_block(now, BlockReason::LinkStale { age_ms: link_age_ms });
+            return;
+        }
+        if self.link_quality < MIN_LINK_QUALITY {
+            self.note_block(
+                now,
+                BlockReason::LinkLowQuality {
+                    quality: self.link_quality,
+                    min: MIN_LINK_QUALITY,
+                },
+            );
             return;
         }
 
         // Gate 4: ESKF estimator ready (Mahony has no convergence phase)
         #[cfg(feature = "est_eskf")]
         if !crate::estimation::ESTIMATOR_READY.load(Ordering::Acquire) {
-            self.switch_arm_start = None;
+            self.note_block(now, BlockReason::EstimatorNotReady);
             return;
         }
 
@@ -149,6 +234,9 @@ impl ArmStateMachine {
 
         // All gates passed — arm
         self.armed = true;
+        self.attempt_start = None;
+        self.summary_printed = false;
+        self.last_block_reason = None;
         defmt::info!(
             "ARMED (ch{}={}, throttle={}, lq={}%)",
             ARM_CHANNEL + 1,

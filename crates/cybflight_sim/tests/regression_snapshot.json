@@ -70,11 +70,11 @@
     "peak_motor_saturation_pct": 27.749443
   },
   "mission_square_gps/mpc_indi": {
-    "rms_pos_err_m": 0.39954975,
-    "peak_pos_err_m": 0.713751,
-    "terminal_pos_err_m": 0.24520731,
-    "peak_tilt_rad": 0.5463486,
-    "peak_motor_saturation_pct": 28.928375
+    "rms_pos_err_m": 0.3294672,
+    "peak_pos_err_m": 0.66350895,
+    "terminal_pos_err_m": 0.20417279,
+    "peak_tilt_rad": 0.894446,
+    "peak_motor_saturation_pct": 37.662506
   },
   "mission_square_noisy/mpc_indi": {
     "rms_pos_err_m": 0.0026780756,

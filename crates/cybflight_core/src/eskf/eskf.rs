@@ -102,6 +102,38 @@ impl Default for EskfConfig {
     }
 }
 
+impl EskfConfig {
+    /// Explicit constructor. Lets callers (notably the host
+    /// simulation) freeze the tuning baseline against future
+    /// `Default` retunes — the firmware path through `est_pos_gps`
+    /// builds an `EskfConfig` literally too, where the
+    /// `max_pos_jump_m` field is widened to GPS-appropriate values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        accel_noise_density: f32,
+        gyro_noise_density: f32,
+        accel_bias_random_walk: f32,
+        gyro_bias_random_walk: f32,
+        baro_noise_std: f32,
+        mag_noise_std: f32,
+        gate_sigma: f32,
+        max_pos_jump_m: f32,
+        max_att_jump_rad: f32,
+    ) -> Self {
+        Self {
+            accel_noise_density,
+            gyro_noise_density,
+            accel_bias_random_walk,
+            gyro_bias_random_walk,
+            baro_noise_std,
+            mag_noise_std,
+            gate_sigma,
+            max_pos_jump_m,
+            max_att_jump_rad,
+        }
+    }
+}
+
 /// 15-state nominal state (gravity treated as constant).
 #[derive(Clone, Copy)]
 pub struct NominalState {

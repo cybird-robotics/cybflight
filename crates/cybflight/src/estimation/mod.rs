@@ -9,7 +9,6 @@ pub mod eskf_imu_mocap;
 pub mod eskf_imu_gps;
 pub mod rpm_estimator;
 
-use cybflight_core::eskf::UpdateOutcome;
 
 /// Estimator phase, exposed via `ESTIMATOR_STATUS` for shell queries.
 ///
@@ -91,19 +90,4 @@ pub static ESKF_GYRO_BIAS: Signal<CriticalSectionRawMutex, Vector3<f32>> = Signa
 /// Written by estimation_task every predict step, read by INDI task to
 /// bias-correct raw accel for specific force feedback.
 pub static ESKF_ACCEL_BIAS: Signal<CriticalSectionRawMutex, Vector3<f32>> = Signal::new();
-
-/// Map an `UpdateOutcome` to a short tag for defmt logging.
-/// `defmt` cannot format the enum directly without a `defmt::Format` impl,
-/// and the enum lives in `cybflight_core` which has no defmt dep.
-fn outcome_tag(outcome: UpdateOutcome) -> &'static str {
-    match outcome {
-        UpdateOutcome::Accepted { inflated: false } => "accepted",
-        UpdateOutcome::Accepted { inflated: true } => "inflated",
-        UpdateOutcome::NotInitialized => "not-init",
-        UpdateOutcome::InverseFailed => "inv-fail",
-        UpdateOutcome::InflationCapExceeded => "cap-exceeded",
-        UpdateOutcome::NaNAfterUpdate => "nan",
-        UpdateOutcome::JumpRejected => "jump",
-    }
-}
 

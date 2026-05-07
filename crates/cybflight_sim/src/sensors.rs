@@ -247,3 +247,95 @@ impl GpsModel for NoisyGps {
         }
     }
 }
+
+/// Time-windowed fault decorator. Wraps any `GpsModel` and adds a
+/// constant `bias_during_fault` to the reported position when sim time
+/// is within `[t_start_s, t_end_s)`. Outside the window, samples pass
+/// through unchanged.
+///
+/// Used by `tests/autotest_gps_failsafe.rs` to inject the position
+/// excursion that triggers `EskfGpsGuard`'s consecutive-jump cascade.
+pub struct FaultedGps<G: GpsModel> {
+    inner: G,
+    t_start_s: f32,
+    t_end_s: f32,
+    bias_during_fault: Vector3<f32>,
+}
+
+impl<G: GpsModel> FaultedGps<G> {
+    pub fn new(inner: G, t_start_s: f32, t_end_s: f32, bias_during_fault: Vector3<f32>) -> Self {
+        Self {
+            inner,
+            t_start_s,
+            t_end_s,
+            bias_during_fault,
+        }
+    }
+}
+
+impl<G: GpsModel> GpsModel for FaultedGps<G> {
+    fn rate_hz(&self) -> f32 {
+        self.inner.rate_hz()
+    }
+    fn sample(&mut self, plant: &QuadPlant) -> GpsMeasurement {
+        let mut m = self.inner.sample(plant);
+        let t = plant.time_s();
+        if t >= self.t_start_s && t < self.t_end_s {
+            m.position += self.bias_during_fault;
+        }
+        m
+    }
+}
+
+/// Time-windowed *outage* decorator: during `[t_start_s, t_end_s)`,
+/// reports a non-finite position. The guard's usability gate
+/// (`UsabilityReason::NonFinitePosition`) drops the frame outright,
+/// modelling a real GPS dropout where no NAV-PVT arrives at the
+/// firmware's `Signal`.
+///
+/// Used by the GPS-outage regression test in
+/// `tests/autotest_gps_failsafe.rs` to verify that a long outage
+/// followed by a fresh fix doesn't permanently wedge the estimator —
+/// the IMU drifts during the outage, post-outage frames look like
+/// jumps relative to the drifted estimate, the cascade fires, and
+/// the Phase-5 re-init heals it.
+pub struct OutageGps<G: GpsModel> {
+    inner: G,
+    t_start_s: f32,
+    t_end_s: f32,
+}
+
+impl<G: GpsModel> OutageGps<G> {
+    pub fn new(inner: G, t_start_s: f32, t_end_s: f32) -> Self {
+        Self {
+            inner,
+            t_start_s,
+            t_end_s,
+        }
+    }
+}
+
+impl<G: GpsModel> GpsModel for OutageGps<G> {
+    fn rate_hz(&self) -> f32 {
+        self.inner.rate_hz()
+    }
+    fn sample(&mut self, plant: &QuadPlant) -> GpsMeasurement {
+        let m = self.inner.sample(plant);
+        let t = plant.time_s();
+        if t >= self.t_start_s && t < self.t_end_s {
+            // Non-finite position is what the guard's usability
+            // predicate treats as "GPS not really delivering data" —
+            // same effect as no Signal::set call on the firmware
+            // side. The runner still ticks `next_gps_t`, so when
+            // the window ends, real fixes resume immediately.
+            GpsMeasurement {
+                position: Vector3::new(f32::NAN, f32::NAN, f32::NAN),
+                velocity: Vector3::zeros(),
+                sigma_pos: 0.5,
+                sigma_vel: 0.2,
+            }
+        } else {
+            m
+        }
+    }
+}

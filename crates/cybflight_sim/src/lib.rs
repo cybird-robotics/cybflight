@@ -25,6 +25,7 @@ pub use report::SimulationReport;
 pub use runner::{MissionRunner, RunnerConfig, StepRecord};
 pub use scenario::{default_vehicle, tweaked_vehicle, PassCriteria, Scenario, Verdict};
 pub use sensors::{
-    GpsMeasurement, GpsModel, ImuMeasurement, ImuModel, NoisyGps, NoisyImu, PerfectGps, PerfectImu,
+    FaultedGps, GpsMeasurement, GpsModel, ImuMeasurement, ImuModel, NoisyGps, NoisyImu, OutageGps,
+    PerfectGps, PerfectImu,
 };
 pub use trajectory::{MissionSetpoints, Setpoint, SetpointSource};

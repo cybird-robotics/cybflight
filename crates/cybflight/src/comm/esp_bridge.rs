@@ -139,39 +139,39 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
     // ── Subscribers, partitioned by purpose ──
     //
     // Always-on (visualization / control monitoring / health):
-    let mut att_sub = sensors::VEHICLE_ATTITUDE.subscriber().unwrap();
-    let mut rc_sub = sensors::RC_INPUT.subscriber().unwrap();
-    let mut rc_link_sub = sensors::RC_LINK_STATUS.subscriber().unwrap();
-    let mut dshot_sub = control::PROCESSED_DSHOT_TELEM.subscriber().unwrap();
-    let mut motor_state_sub = control::PROCESSED_MOTOR_STATE.subscriber().unwrap();
-    let mut ocp_sub = control::OCP_SOLVER_OUTPUT.subscriber().unwrap();
-    let mut gps_sub = sensors::GPS_FIX.subscriber().unwrap();
-    let mut power_sub = sensors::POWER_STATUS.subscriber().unwrap();
-    let mut att_ctrl_sub = control::ATTITUDE_CONTROL_SETPOINT.subscriber().unwrap();
+    let mut att_sub = crate::subscribe_or_park!(sensors::VEHICLE_ATTITUDE, "VEHICLE_ATTITUDE");
+    let mut rc_sub = crate::subscribe_or_park!(sensors::RC_INPUT, "RC_INPUT");
+    let mut rc_link_sub = crate::subscribe_or_park!(sensors::RC_LINK_STATUS, "RC_LINK_STATUS");
+    let mut dshot_sub = crate::subscribe_or_park!(control::PROCESSED_DSHOT_TELEM, "PROCESSED_DSHOT_TELEM");
+    let mut motor_state_sub = crate::subscribe_or_park!(control::PROCESSED_MOTOR_STATE, "PROCESSED_MOTOR_STATE");
+    let mut ocp_sub = crate::subscribe_or_park!(control::OCP_SOLVER_OUTPUT, "OCP_SOLVER_OUTPUT");
+    let mut gps_sub = crate::subscribe_or_park!(sensors::GPS_FIX, "GPS_FIX");
+    let mut power_sub = crate::subscribe_or_park!(sensors::POWER_STATUS, "POWER_STATUS");
+    let mut att_ctrl_sub = crate::subscribe_or_park!(control::ATTITUDE_CONTROL_SETPOINT, "ATTITUDE_CONTROL_SETPOINT");
     #[cfg(feature = "est_eskf")]
-    let mut pos_ctrl_sub = control::POSITION_CONTROL_SETPOINT.subscriber().unwrap();
-    let mut arm_sub = crate::ARM_DISARM.subscriber().unwrap();
-    let mut odom_sub = sensors::VEHICLE_ODOMETRY.subscriber().unwrap();
-    let mut motor_sub = control::ACTUATOR_MOTORS_TELEM.subscriber().unwrap();
+    let mut pos_ctrl_sub = crate::subscribe_or_park!(control::POSITION_CONTROL_SETPOINT, "POSITION_CONTROL_SETPOINT");
+    let mut arm_sub = crate::subscribe_or_park!(crate::ARM_DISARM, "ARM_DISARM");
+    let mut odom_sub = crate::subscribe_or_park!(sensors::VEHICLE_ODOMETRY, "VEHICLE_ODOMETRY");
+    let mut motor_sub = crate::subscribe_or_park!(control::ACTUATOR_MOTORS_TELEM, "ACTUATOR_MOTORS_TELEM");
     #[cfg(feature = "outer_mpc")]
-    let mut mission_status_sub = control::MISSION_STATUS.subscriber().unwrap();
+    let mut mission_status_sub = crate::subscribe_or_park!(control::MISSION_STATUS, "MISSION_STATUS");
 
     // Dev-only raw sensor channels — gated behind `dev_telem`. The ESKF
     // consumes these internally; the rerun viewport doesn't visualize
     // raw sensor signals during normal flight, so they're dropped on the
     // floor by default to free WiFi/Rerun bandwidth.
     #[cfg(feature = "dev_telem")]
-    let mut imu1_sub = sensors::IMU_1.subscriber().unwrap();
+    let mut imu1_sub = crate::subscribe_or_park!(sensors::IMU_1, "IMU_1");
     #[cfg(feature = "dev_telem")]
-    let mut imu2_sub = sensors::IMU_2.subscriber().unwrap();
+    let mut imu2_sub = crate::subscribe_or_park!(sensors::IMU_2, "IMU_2");
     #[cfg(feature = "dev_telem")]
-    let mut mag_ext_sub = sensors::MAG_EXT.subscriber().unwrap();
+    let mut mag_ext_sub = crate::subscribe_or_park!(sensors::MAG_EXT, "MAG_EXT");
     #[cfg(feature = "dev_telem")]
-    let mut mag_int_sub = sensors::MAG_INT.subscriber().unwrap();
+    let mut mag_int_sub = crate::subscribe_or_park!(sensors::MAG_INT, "MAG_INT");
     #[cfg(feature = "dev_telem")]
-    let mut baro1_sub = sensors::BARO_1.subscriber().unwrap();
+    let mut baro1_sub = crate::subscribe_or_park!(sensors::BARO_1, "BARO_1");
     #[cfg(feature = "dev_telem")]
-    let mut baro2_sub = sensors::BARO_2.subscriber().unwrap();
+    let mut baro2_sub = crate::subscribe_or_park!(sensors::BARO_2, "BARO_2");
 
     let mut seq: u8 = 0;
     // Batch buffer: holds all COBS-encoded frames for one tick.

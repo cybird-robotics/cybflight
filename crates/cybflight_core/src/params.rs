@@ -242,6 +242,9 @@ impl Default for PlannerParams {
 }
 
 impl PlannerParams {
+    /// Explicit constructor. `bfgs_trust` is a structural sub-config —
+    /// callers that don't tune it can pass `BfgsTrustParams::default()`
+    /// or `BfgsTrustParams::new(...)`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         max_vel_m_s: f32,
@@ -325,6 +328,24 @@ impl IndiEffectivenessParams {
             nonlinearity: [0.0; 4],
         }
     }
+
+    pub fn new(
+        g1_force: [[f32; 3]; 4],
+        g1_torque: [[f32; 3]; 4],
+        g2: [[f32; 3]; 4],
+        max_omega: [f32; 4],
+        time_const_s: [f32; 4],
+        nonlinearity: [f32; 4],
+    ) -> Self {
+        Self {
+            g1_force,
+            g1_torque,
+            g2,
+            max_omega,
+            time_const_s,
+            nonlinearity,
+        }
+    }
 }
 
 /// INDI controller tuning parameters.
@@ -377,6 +398,14 @@ impl IndiControllerParams {
 
     pub fn set_sync_filter_hz(&mut self, sync_filter_hz: f32) {
         self.sync_filter_hz = sync_filter_hz;
+    }
+
+    pub fn set_wls_wv(&mut self, wls_wv: [f32; 6]) {
+        self.wls_wv = wls_wv;
+    }
+
+    pub fn set_wls_wu(&mut self, wls_wu: [f32; 4]) {
+        self.wls_wu = wls_wu;
     }
 }
 

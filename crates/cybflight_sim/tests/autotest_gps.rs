@@ -49,15 +49,11 @@ fn gps_mpc_indi_mission() -> (Scenario, MpcIndiController) {
         ],
     )
     .with_gps(Box::new(NoisyGps::isotropic(0xDEADBEEF, 5.0, 0.5, 0.2)));
-    // Mirror `crates/cybflight/src/vehicle.rs::default_params()` under
-    // `est_pos_gps` so the autotest exercises the same INDI/MPC tuning
-    // the firmware will fly with. Keep these three fields in sync with
-    // the firmware. Must run before the controller is built —
-    // `from_params` snapshots the gains and a later override would not
-    // reach it.
-    scenario.vehicle_params.indi_controller.set_rate_gains([20.0, 20.0, 20.0]);
-    scenario.vehicle_params.indi_controller.set_sync_filter_hz(5.0);
-    scenario.vehicle_params.mpc.set_thrust_weight(6.0);
+    // The previous override of indi_controller.rate_gains / sync_filter_hz
+    // and mpc.thrust_weight is no longer needed: the sim baseline in
+    // `plant.rs::VehicleParamsBuilder::build` now sets these fields
+    // explicitly (schema-stability contract), so the values flow
+    // through without depending on `Default` impls in cybflight-core.
     // Looser terminal / RMS gates than the clean-sensor scenarios: the
     // ESKF filters σ=0.5 m GPS noise at 5 Hz, which at 3 s terminal hold
     // averages ~15 samples → ~0.13 m residual floor, plus estimator lag.

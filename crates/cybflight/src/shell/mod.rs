@@ -95,3 +95,19 @@ impl Default for ShellLine {
 }
 
 pub static SHELL_OUT: Channel<CriticalSectionRawMutex, ShellLine, 8> = Channel::new();
+
+/// Best-effort push of an `ERROR: …` line onto the shell output queue.
+/// Silently drops if the queue is full or the shell consumer hasn't
+/// started yet — the caller has bigger problems than a missed line.
+///
+/// Used by tasks that need to surface a degraded-but-alive condition
+/// (e.g. subscriber-slot exhaustion at boot) without panicking the FCU.
+pub fn shell_err(msg: &str) {
+    let mut line = ShellLine::new();
+    line.format(|w| {
+        let _ = w.write_str("ERROR: ");
+        let _ = w.write_str(msg);
+        let _ = w.write_str("\r\n");
+    });
+    SHELL_OUT.try_send(line).ok();
+}

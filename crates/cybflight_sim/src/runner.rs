@@ -18,7 +18,7 @@
 
 use nalgebra::{SVector, UnitQuaternion, Vector3};
 
-use cybflight_core::eskf::{Eskf, EskfConfig};
+use cybflight_core::eskf::{Eskf, EskfConfig, EskfGpsGuard, GpsFix, GpsGuardConfig, GuardSnapshot};
 use cybflight_core::mpc::{NU, NX};
 
 use crate::controller::Controller;
@@ -26,6 +26,52 @@ use crate::plant::QuadPlant;
 use crate::scenario::{PassCriteria, Scenario, Verdict};
 use crate::sensors::ImuMeasurement;
 use crate::trajectory::Setpoint;
+
+/// Sim-side `EskfConfig` baseline.
+///
+/// **Schema stability**: every field is set explicitly via
+/// `EskfConfig::new` so future changes to `EskfConfig::default()` in
+/// cybflight-core (noise density retunes, gate-sigma tweaks) do not
+/// propagate into the sim snapshot. The values here are the sim's
+/// frozen baseline; they match the firmware GPS path's tuning at the
+/// time of writing (notably `max_pos_jump_m = 3.0`, which mirrors
+/// `eskf_imu_gps.rs::GPS_MAX_POS_JUMP_M`).
+fn sim_eskf_config() -> EskfConfig {
+    EskfConfig::new(
+        0.01,    // accel_noise_density
+        0.0001,  // gyro_noise_density
+        0.001,   // accel_bias_random_walk
+        0.00001, // gyro_bias_random_walk
+        0.5,     // baro_noise_std
+        0.05,    // mag_noise_std
+        10.0,    // gate_sigma
+        3.0,     // max_pos_jump_m (GPS-widened, vs mocap default of 1.0)
+        0.7,     // max_att_jump_rad
+    )
+}
+
+/// Sim-side `GpsGuardConfig` baseline. Same schema-stability contract
+/// as [`sim_eskf_config`] — all fields explicit via
+/// `GpsGuardConfig::new` so the sim doesn't drift if firmware
+/// engineers retune the failsafe defaults.
+fn sim_gps_guard_config() -> GpsGuardConfig {
+    GpsGuardConfig::new(
+        2,      // max_consecutive_jumps
+        5,      // max_consecutive_rejects
+        2_000,  // gps_stale_ms
+        2_000,  // rtk_fix_debounce_ms
+        1_000,  // rtk_loss_debounce_ms
+        0.002,  // gyro_bias_cov_trace_xy_thresh
+        10.0,   // init_yaw_cov
+        6,      // gps_min_sv
+        50_000, // gps_h_acc_max_mm
+        0.05,   // pos_sigma_floor_fix_m
+        0.30,   // pos_sigma_floor_float_m
+        2.0,    // pos_sigma_floor_none_m
+        0.10,   // vel_sigma_floor_m_s
+        2,      // reinit_min_carr_soln
+    )
+}
 
 /// Match firmware: 8 IMU samples per predict. At 8 kHz IMU this is 1 kHz;
 /// at 100 Hz controller ticks it reduces to ~12.5 Hz — still above GPS
@@ -64,6 +110,14 @@ pub struct StepRecord {
     pub tilt_rad: f32,
     pub setpoint: Setpoint,
     pub motor_forces: [f32; 4],
+    /// In-sim ESKF guard state at this tick. `None` for non-GPS
+    /// scenarios. Tests use this to assert on ready-flag, jump
+    /// counters, RTK quality, etc. Skipped from `report.json` /
+    /// regression snapshot — those serialize only `summary` fields.
+    pub estimator: Option<GuardSnapshot>,
+    /// In-sim ESKF position estimate (ENU). `None` for non-GPS
+    /// scenarios. Tests assert on estimator-vs-truth divergence here.
+    pub estimator_position: Option<Vector3<f32>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -92,6 +146,10 @@ pub struct MissionRunner {
 
 struct InSimEskf {
     eskf: Eskf,
+    /// The same failsafe state machine the firmware GPS task drives.
+    /// Owns RTK debounce, jump/reject cascades, NaN re-init, staleness,
+    /// convergence, ready flag.
+    guard: EskfGpsGuard,
     gps_rate_hz: f32,
     next_gps_t: f32,
     last_predict_t: f32,
@@ -161,19 +219,25 @@ impl MissionRunner {
         let hover_per_motor = plant.params.body.mass_kg * 9.81 / NU as f32;
         let mut u_last = SVector::<f32, NU>::from_element(hover_per_motor);
 
-        // Spin up the in-sim ESKF if a GPS model is attached. Initialise
-        // from plant truth — mirrors the firmware `init(pos, orient, zero
-        // biases)` that `eskf_imu_mocap` does on the first mocap frame.
+        // Spin up the in-sim ESKF if a GPS model is attached. The
+        // `EskfGpsGuard` is the same one driving the firmware GPS task,
+        // so failsafe behaviour (jump cascade, RTK debounce, staleness)
+        // is exercised here too. Initialise the underlying filter from
+        // plant truth — the sim's `PerfectGps` reports an essentially
+        // truthy first fix, so this matches what the firmware does
+        // after its origin-anchor wait.
         let mut eskf_state: Option<InSimEskf> = scenario.gps_model.as_ref().map(|gps| {
-            let mut eskf = Eskf::new(EskfConfig::default());
+            let mut eskf = Eskf::new(sim_eskf_config());
             eskf.init(
                 plant.position(),
                 plant.attitude(),
                 Vector3::zeros(),
                 Vector3::zeros(),
             );
+            let anchor_ms = (plant.time_s() * 1000.0) as u64;
             InSimEskf {
                 eskf,
+                guard: EskfGpsGuard::new(sim_gps_guard_config(), anchor_ms),
                 gps_rate_hz: gps.rate_hz(),
                 next_gps_t: plant.time_s(),
                 last_predict_t: plant.time_s(),
@@ -211,15 +275,22 @@ impl MissionRunner {
                     es.last_predict_t = t;
                     es.predict_counter = 0;
                 }
-                // GPS update at its configured rate.
+                // GPS update at its configured rate. Position AND
+                // velocity updates flow through the guard — the
+                // guard owns the full PVT pipeline (failsafe + both
+                // measurement channels) so sim and firmware exercise
+                // the same code path.
                 if t >= es.next_gps_t {
                     if let Some(gps_model) = scenario.gps_model.as_mut() {
-                        let fix = gps_model.sample(plant);
-                        let _ = es.eskf.update_pos(fix.position, fix.sigma_pos);
-                        let _ = es.eskf.update_vel(fix.velocity, fix.sigma_vel);
+                        let m = gps_model.sample(plant);
+                        let fix = gps_measurement_to_fix(&m, t);
+                        let _ = es.guard.on_pvt(&mut es.eskf, &fix);
                     }
                     es.next_gps_t += 1.0 / es.gps_rate_hz;
                 }
+                let _ = es
+                    .guard
+                    .on_predict_tick(&es.eskf, (t * 1000.0) as u64);
                 owned_state = build_state_from_eskf(&es.eskf, &imu);
                 &owned_state
             } else {
@@ -230,6 +301,10 @@ impl MissionRunner {
             let motor_forces = [u[0], u[1], u[2], u[3]];
 
             if (tick_idx as u32) % history_stride == 0 {
+                let (estimator, estimator_position) = match eskf_state.as_ref() {
+                    Some(es) => (Some(es.guard.snapshot()), Some(es.eskf.position())),
+                    None => (None, None),
+                };
                 history.push(StepRecord {
                     t,
                     position: plant.position(),
@@ -239,6 +314,8 @@ impl MissionRunner {
                     tilt_rad: plant.tilt_rad(),
                     setpoint: sp0,
                     motor_forces,
+                    estimator,
+                    estimator_position,
                 });
             }
 
@@ -287,6 +364,29 @@ impl MissionRunner {
             verdict,
             failure_reasons,
         }
+    }
+}
+
+/// Translate a sim `GpsMeasurement` (already in ENU, no carrier-solution
+/// concept) into the guard's `GpsFix`. The synthetic fields
+/// (`carr_soln=2`, `num_sv=12`, `fix_type=3`) say "this is RTK-fixed
+/// open sky" — the sim isn't testing degraded-fix behaviour by default.
+/// `h_acc_mm` mirrors the model's reported `sigma_pos`; the same value
+/// is reused for `v_acc_mm` since `GpsMeasurement` doesn't track them
+/// separately.
+fn gps_measurement_to_fix(m: &crate::sensors::GpsMeasurement, t_s: f32) -> GpsFix {
+    let acc_mm = ((m.sigma_pos.max(0.001)) * 1000.0).round().max(1.0) as u32;
+    let s_acc_mm_s = ((m.sigma_vel.max(0.001)) * 1000.0).round().max(1.0) as u32;
+    GpsFix {
+        enu_pos: m.position,
+        enu_vel: m.velocity,
+        h_acc_mm: acc_mm,
+        v_acc_mm: acc_mm,
+        s_acc_mm_s,
+        num_sv: 12,
+        fix_type: 3,
+        carr_soln: 2,
+        timestamp_ms: (t_s * 1000.0) as u64,
     }
 }
 

@@ -85,7 +85,10 @@ pub static GPS_HEALTH: Mutex<CriticalSectionRawMutex, Cell<GpsHealth>> =
 /// Latest NAV-PVT snapshot, writeable from the GPS task and readable from
 /// any shell context. Held as `Option` so the shell can distinguish "no
 /// fix yet" from "stale fix"; pair the snapshot's `timestamp` with
-/// `Instant::now()` for age.
+/// `Instant::now()` for age. Post-flight inter-PVT-interval analysis
+/// reads the `timestamp` field of successive `/gps_health` records and
+/// diffs the unique values — no firmware-side jitter computation is
+/// needed, the raw arrival time is the source-of-truth.
 pub static LATEST_NAV_PVT: Mutex<CriticalSectionRawMutex, Cell<Option<GpsNavPvt>>> =
     Mutex::new(Cell::new(None));
 

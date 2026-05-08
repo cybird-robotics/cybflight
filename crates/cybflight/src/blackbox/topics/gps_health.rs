@@ -7,13 +7,34 @@
 //!   variant enum (NotConfigured / Initializing / UartInitFailed /
 //!   InitTimedOut / InitFailed / Waiting / Locked / ReadError),
 //!   flattened to `(state, err_kind, fix_type, num_sv, h_acc_mm,
-//!   diff_soln, carr_soln, last_fix_age_ms)`. Variant fields the
-//!   active state doesn't define are zero (or `UINT32_MAX` for
-//!   `last_fix_age_ms` to disambiguate "absent" from "0 ms old").
+//!   diff_soln, carr_soln)`. Variant fields the active state doesn't
+//!   define are zero.
 //! - [`crate::sensors::gps::LATEST_NAV_PVT`] --the latest NAV-PVT
 //!   accuracy + carrier-solution fields the `Locked` enum doesn't
 //!   carry: `v_acc_mm`, `s_acc_mm_s`, `gnss_fix_ok`, plus
-//!   `nav_pvt_age_ms`.
+//!   `nav_pvt_arrival_us` --the raw `Instant` of when the GPS task
+//!   parsed the most recent NAV-PVT.
+//!
+//! ## Inter-PVT interval / GPS jitter
+//!
+//! Previous schemas exposed `nav_pvt_age_ms` and `last_fix_age_ms`
+//! --snapshots of `<emit time> - <arrival time>`. Those misled
+//! readers into reading the recorder's sampling jitter as GPS-side
+//! jitter. Removed.
+//!
+//! Instead `nav_pvt_arrival_us` carries the raw arrival `Instant`.
+//! The post-flight tool computes whatever metric it actually wants:
+//!
+//! - **Liveness / pipeline-stuck**: `record.timestamp_ns/1000 -
+//!   record.nav_pvt_arrival_us`. Climbs into the seconds = GPS task
+//!   is stuck.
+//! - **Inter-PVT interval (the GPS-jitter signal)**: dedupe the
+//!   `nav_pvt_arrival_us` values across records (each PVT shows up
+//!   in multiple `/gps_health` records because the recorder emits
+//!   faster than NAV-PVT arrives), then diff successive unique
+//!   values. At 5 Hz the spread should be tight around 200 000 µs;
+//!   deviations are real receiver-side variability (sensor
+//!   scheduling, UART/parser delay, dropped frames).
 //!
 //! Cadence: same self-throttled 20 Hz as `/health` (see
 //! `HEALTH_EMIT_INTERVAL` in `blackbox::recorder`). The receiver only
@@ -67,10 +88,8 @@ pub const SCHEMA: &[u8] = br#"{
     "diff_soln":         { "type": "boolean", "description": "Differential corrections (e.g. RTCM3) applied. NAV-PVT flags bit 1." },
     "carr_soln":         { "type": "integer", "description": "RTK carrier-phase solution status. 0=none, 1=float, 2=fixed. NAV-PVT flags bits 6-7." },
     "gnss_fix_ok":       { "type": "boolean", "description": "Receiver believes the fix is valid. NAV-PVT flags bit 0. False when no NAV-PVT seen yet." },
-    "last_fix_age_ms":   { "type": "integer",
-                           "description": "Age of the Locked state's last_fix_at marker, ms. UINT32_MAX (4294967295) when the current state is not Locked --disambiguates 'no fix' from '0 ms old fix'." },
-    "nav_pvt_age_ms":    { "type": "integer",
-                           "description": "Age of the most recent NAV-PVT frame held in LATEST_NAV_PVT, ms. UINT32_MAX when no NAV-PVT has ever been received." }
+    "nav_pvt_arrival_us":         { "type": "integer",
+                                    "description": "`Instant` (microseconds since boot) when the GPS task parsed the most recent NAV-PVT, i.e. the source-of-truth arrival timestamp. 0 when no NAV-PVT has ever been received. Two derived metrics: liveness = (timestamp_ns/1000 - nav_pvt_arrival_us); inter-PVT interval (the GPS-jitter signal) = diff of unique nav_pvt_arrival_us values across records. The recorder oversamples relative to NAV-PVT, so successive records typically share an arrival timestamp -- dedupe before differencing." }
   }
 }"#;
 
@@ -125,13 +144,14 @@ struct Flat {
     diff_soln: bool,
     carr_soln: u8,
     gnss_fix_ok: bool,
-    /// `u32::MAX` when not applicable --see schema.
-    last_fix_age_ms: u32,
-    /// `u32::MAX` when no NAV-PVT seen.
-    nav_pvt_age_ms: u32,
+    /// Source-of-truth arrival timestamp of the most recent NAV-PVT,
+    /// in microseconds since boot. 0 when no NAV-PVT has ever been
+    /// received. Post-flight derives liveness AND inter-PVT interval
+    /// from this single field — see schema doc.
+    nav_pvt_arrival_us: u64,
 }
 
-fn snapshot(now: Instant) -> Flat {
+fn snapshot(_now: Instant) -> Flat {
     let mut f = Flat {
         state: STATE_NOT_CONFIGURED,
         err_kind: ERR_NONE,
@@ -143,8 +163,7 @@ fn snapshot(now: Instant) -> Flat {
         diff_soln: false,
         carr_soln: 0,
         gnss_fix_ok: false,
-        last_fix_age_ms: u32::MAX,
-        nav_pvt_age_ms: u32::MAX,
+        nav_pvt_arrival_us: 0,
     };
 
     // Enum → state + variant fields. The Mutex is contended only by
@@ -176,7 +195,7 @@ fn snapshot(now: Instant) -> Flat {
             h_acc_mm,
             diff_soln,
             carr_soln,
-            last_fix_at,
+            last_fix_at: _,
         } => {
             f.state = STATE_LOCKED;
             f.fix_type = fix_type;
@@ -184,10 +203,6 @@ fn snapshot(now: Instant) -> Flat {
             f.h_acc_mm = h_acc_mm;
             f.diff_soln = diff_soln;
             f.carr_soln = carr_soln;
-            f.last_fix_age_ms = now
-                .saturating_duration_since(last_fix_at)
-                .as_millis()
-                .min(u32::MAX as u64) as u32;
         }
         GpsHealth::ReadError(k) => {
             f.state = STATE_READ_ERROR;
@@ -196,17 +211,13 @@ fn snapshot(now: Instant) -> Flat {
     }
 
     // NAV-PVT supplies the accuracy fields the enum doesn't carry,
-    // plus an age of the last full frame (separate from
-    // `last_fix_age_ms` because NAV-PVT can update with a no-fix
-    // result that doesn't refresh `last_fix_at`).
+    // plus the raw arrival timestamp. Both liveness and inter-PVT
+    // jitter are derived from this single value in post.
     if let Some(p) = LATEST_NAV_PVT.lock(|c| c.get()) {
         f.v_acc_mm = p.v_acc_mm;
         f.s_acc_mm_s = p.s_acc_mm_s;
         f.gnss_fix_ok = p.gnss_fix_ok;
-        f.nav_pvt_age_ms = now
-            .saturating_duration_since(p.timestamp)
-            .as_millis()
-            .min(u32::MAX as u64) as u32;
+        f.nav_pvt_arrival_us = p.timestamp.as_micros();
     }
 
     f
@@ -219,7 +230,7 @@ pub fn encode(scratch: &mut [u8], now: Instant) -> cbor::Result<usize> {
     let f = snapshot(now);
 
     let mut w = CborWriter::new(scratch);
-    w.map(13)?;
+    w.map(12)?;
     w.str("timestamp_ns")?;
     w.u64(now.as_micros().saturating_mul(1_000))?;
     w.str("state")?;
@@ -242,9 +253,7 @@ pub fn encode(scratch: &mut [u8], now: Instant) -> cbor::Result<usize> {
     w.u64(f.carr_soln as u64)?;
     w.str("gnss_fix_ok")?;
     w.bool(f.gnss_fix_ok)?;
-    w.str("last_fix_age_ms")?;
-    w.u64(f.last_fix_age_ms as u64)?;
-    w.str("nav_pvt_age_ms")?;
-    w.u64(f.nav_pvt_age_ms as u64)?;
+    w.str("nav_pvt_arrival_us")?;
+    w.u64(f.nav_pvt_arrival_us)?;
     Ok(w.pos())
 }

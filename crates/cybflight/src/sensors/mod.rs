@@ -14,6 +14,14 @@ use embassy_sync::{
 // SUBS=6 (attitude + estimation + attitude_control + esp_bridge + shell stream + oneshot), PUBS=1.
 pub static IMU_1: PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 6, 1> = PubSubChannel::new();
 
+// IMU 1 raw (pre-biquad-LP): CAP=4, SUBS=6, PUBS=1. Mirror of IMU_1
+// emitted before the sensor task's accel/gyro biquads. Subscribed
+// by the blackbox recorder in the Sysid + Large tiers; left empty
+// on tiers that don't ask for it. Sized identically to IMU_1 so the
+// recorder's drain budgets / drop-priority logic stays uniform.
+pub static IMU_1_RAW: PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 6, 1> =
+    PubSubChannel::new();
+
 // IMU 2: same sizing as IMU_1. Empty on single-IMU boards (shell prints "no data").
 pub static IMU_2: PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 6, 1> = PubSubChannel::new();
 

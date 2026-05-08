@@ -26,6 +26,13 @@ pub async fn rc_interpreter_task() {
         .subscriber()
         .expect("rc_interpreter: RC_INPUT subscriber");
 
+    // Mirror of `RATE_COMMAND` for the blackbox recorder. INDI consumes
+    // the Signal via `try_take()`; we build the setpoint once and
+    // dispatch to both sinks so the logger doesn't race the inner loop.
+    let ctrl_sp_pub = super::CONTROL_SETPOINT_TELEM
+        .publisher()
+        .expect("rc_interpreter: CONTROL_SETPOINT_TELEM publisher");
+
     let pitch_cal = RateChannelCalibration::centered(1);
     let roll_cal = RateChannelCalibration::centered(0);
     let throttle_cal = RateChannelCalibration::throttle(2);
@@ -101,13 +108,15 @@ pub async fn rc_interpreter_task() {
         // Throttle 0→1 maps to 0→2×hover thrust (mid-stick ≈ hover).
         let collective_thrust_n = throttle_cmd * 2.0 * hover_thrust_n;
 
-        super::RATE_COMMAND.signal(cybflight_msgs::AttitudeControlSetpoint {
+        let setpoint = cybflight_msgs::AttitudeControlSetpoint {
             timestamp: Instant::now(),
             collective_thrust_n,
             attitude_quaternion: nalgebra::UnitQuaternion::identity(),
             body_rate_rad_s: rate_ref,
             torque_n_m: nalgebra::Vector3::zeros(),
-        });
+        };
+        super::RATE_COMMAND.signal(setpoint.clone());
+        ctrl_sp_pub.publish_immediate(setpoint);
     }
 }
 

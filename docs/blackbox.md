@@ -198,12 +198,17 @@ Bring back the user-facing knobs that the original WIP had:
 - `blackbox_rate_div` — per-topic rate divider; default 1 (full rate)
 - `blackbox_fields_disabled` — bitmask to mute high-rate topics
 - **record set tier** — DONE as a runtime atomic
-  ([`crate::blackbox::record_set`]). Four tiers (`none` / `small` /
-  `mid` / `large`); each is a strict superset of the previous one.
-  See [`record_set.rs`] module docs for the per-tier topic lists +
-  byte-rate estimates. Persisting via flash params is still TODO —
-  the value lives in an in-RAM `AtomicU8` and resets to
-  `RecordSet::DEFAULT` (Large) at boot.
+  ([`crate::blackbox::record_set`]). Four variants (`none` /
+  `small` / `mid` / `large`); strictly monotonic — each tier is a
+  superset of the previous. The cheap controller / sysid topics
+  (`/control_setpoint`, `/estimator_state`) live in Mid; only
+  `/imu1_raw` is gated on Large (the only topic with a meaningful
+  bandwidth cost). See [`record_set.rs`] module docs for the
+  per-tier topic lists + byte-rate estimates. The value lives in
+  an in-RAM `AtomicU8` and persists via the `blackbox_record_set`
+  param; out-of-range values (e.g. a downgraded firmware reading a
+  flash slot from a build with more variants) fall back to
+  `RecordSet::DEFAULT` (Mid).
 
 Plus runtime status:
 - `blackbox status` shell command — DONE for the recording-state +
@@ -335,8 +340,11 @@ crates/cybflight/src/blackbox/
     ├── motors.rs     /motors    channel id 7: INDI per-motor normalized output (100 Hz, commanded)
     ├── motor_state.rs /motor_state channel id 8: KF-fused per-motor ω + ω̇ + raw eRPM (100 Hz, achieved)
     ├── tracking_error.rs /tracking_error channel id 9: controller-reported `reference - actual` (cascade/MPC: 50–100 Hz, INDI: 100 Hz)
-    ├── health.rs     /health    channel id 10: post-flight mirror of the live `health` shell line (20 Hz)
-    └── gps_health.rs /gps_health channel id 11: flat snapshot of GPS_HEALTH + LATEST_NAV_PVT (20 Hz; stays at NotConfigured on non-est_pos_gps builds)
+    ├── imu_raw.rs    /imu1_raw  channel id 10: pre-biquad-LP IMU mirror of /imu1 (8 kHz; Large only)
+    ├── control_setpoint.rs /control_setpoint channel id 11: outer-loop RATE_COMMAND mirror (50–100 Hz; Mid+Large)
+    ├── estimator_state.rs /estimator_state channel id 12: ESKF gyro/accel bias snapshot (10 Hz; Mid+Large, est_eskf-gated)
+    ├── health.rs     /health    (channel id reserved): post-flight mirror of the live `health` shell line (20 Hz)
+    └── gps_health.rs /gps_health (channel id reserved): flat snapshot of GPS_HEALTH + LATEST_NAV_PVT (20 Hz; stays at NotConfigured on non-est_pos_gps builds)
 
 crates/cybflight-drivers/src/blackbox_storage.rs    BlockStore trait + BlockStoreError
 
@@ -361,8 +369,10 @@ The `[patch.crates-io]` for `block-device-driver` is **load-bearing**
 patch they're treated as different traits and `BufStream<StorageDevice>:
 ReadWriteSeek` fails to resolve.
 
-The `cybflight-msgs` `[patch.utadr]` is sandbox-local and may need
-adjusting per environment.
+The `cybflight-msgs` `[patch.utadr]` is **currently active** for
+local development on the `EstimatorBias` type added in
+cybflight-msgs 0.1.20. Re-comment after the new revision is
+published.
 
 ---
 
@@ -375,7 +385,7 @@ adjusting per environment.
 | `blackbox record on` | Set `RECORDER_HOLD = true` — recorder opens session on next 40 ms debounce-confirmed edge | `blackbox record: ON ...` |
 | `blackbox record off` | Clear `RECORDER_HOLD` — recorder closes after next 50 ms keep-going poll | `blackbox record: OFF ...` |
 | `blackbox status` | Read `IS_ARMED` + `RECORDER_HOLD` + active record set synchronously | state line + `IS_ARMED=…, RECORDER_HOLD=…` + `record_set=<tier>` |
-| `blackbox set <tier>` | Change active record set (`none\|small\|mid\|large`); takes effect on next session | `blackbox set: record_set = <tier>` |
+| `blackbox set <tier>` | Change active record set (`none\|small\|mid\|large\|sysid`); takes effect on next session | `blackbox set: record_set = <tier>` |
 | `blackbox ls` | List files in the FAT root; rejected with `Busy` while recorder is active | `N file(s)` header + one `/<name>  <size> bytes` line per entry (capped at `LS_MAX_ENTRIES = 16`) |
 
 ### Bench-test recipes
@@ -402,6 +412,23 @@ adjusting per environment.
 for a few seconds → `blackbox record off` → check the `bytes` /
 `drops` numbers in the closed-session defmt log.
 
+**INDI sysid recording**:
+```
+> blackbox set large
+> blackbox record on
+[ fly a chirp / step / aggressive maneuver — see analyze.py for fits ]
+> blackbox record off
+```
+Mid already carries everything `analyze.py` needs for the
+actuator / thrust+drag / moment fits (`/motors`, `/motor_state`,
+`/odometry`, `/control_setpoint`, `/tracking_error`,
+`/estimator_state`, post-LP IMU). Step up to Large when you also
+want pre-biquad-LP IMU for RPM-notch fits — that's the only
+sysid-relevant signal that's not in Mid. INDI sysid is easiest in
+`outer_rate` / `outer_geometric` (manual stick excitation); on
+`outer_mpc` builds the topic mix still works but the input
+excitation has to come from somewhere else.
+
 ### Verification on host
 
 After popping the card:
@@ -409,9 +436,11 @@ After popping the card:
 ```sh
 mcap doctor flight_0001.mcap     # must print no issues
 mcap info   flight_0001.mcap     # channel count depends on tier:
-                                 #   small=2 (events,rc),
-                                 #   mid=10 (+attitude,odometry,mpc,motors,motor_state,tracking_error,health,gps_health),
-                                 #   large=11 (+imu1)
+                                 #   small = 2  (events, rc),
+                                 #   mid   = 13 (+ attitude, odometry, mpc, motors, motor_state,
+                                 #               tracking_error, imu1, control_setpoint,
+                                 #               estimator_state, health, gps_health),
+                                 #   large = 14 (+ imu1_raw)
 python3 read_mcap.py flight_0001.mcap | head            # see ARM event up top
 python3 read_mcap.py flight_0001.mcap | tail            # see DISARM + LOG_END
 python3 read_mcap.py flight_0001.mcap | grep events     # all events in order

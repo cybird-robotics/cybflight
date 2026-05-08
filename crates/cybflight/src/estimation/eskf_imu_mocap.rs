@@ -49,6 +49,11 @@ const PREDICT_DECIMATION: u32 = 8;
 /// Odometry publish decimation relative to predict rate. 1 kHz / 1 = 1 kHz.
 const ODOM_DECIMATION: u32 = 1;
 
+/// Bias telemetry decimation relative to predict rate. 1 kHz / 100 = 10 Hz.
+/// Biases drift at seconds-scale; a slower channel keeps blackbox
+/// bandwidth bounded without losing meaningful information.
+const BIAS_TELEM_DECIMATION: u32 = 100;
+
 fn imu_is_valid(accel: &Vector3<f32>, gyro: &Vector3<f32>) -> bool {
     accel.iter().all(|v| v.is_finite()) && gyro.iter().all(|v| v.is_finite())
 }
@@ -78,6 +83,9 @@ pub async fn estimation_task() {
     let mut mocap_sub = crate::subscribe_or_park!(sensors::VICON_POSE, "VICON_POSE");
     let odom_pub = sensors::VEHICLE_ODOMETRY.immediate_publisher();
     let att_pub = sensors::VEHICLE_ATTITUDE.immediate_publisher();
+    let bias_pub = super::ESTIMATOR_BIAS_TELEM
+        .publisher()
+        .expect("eskf_imu_mocap: ESTIMATOR_BIAS_TELEM publisher");
 
     let cfg = MocapGuardConfig::default();
 
@@ -230,10 +238,24 @@ pub async fn estimation_task() {
                     continue;
                 }
 
-                super::ESKF_GYRO_BIAS.signal(eskf.gyro_bias());
-                super::ESKF_ACCEL_BIAS.signal(eskf.accel_bias());
+                let gb = eskf.gyro_bias();
+                let ab = eskf.accel_bias();
+                super::ESKF_GYRO_BIAS.signal(gb);
+                super::ESKF_ACCEL_BIAS.signal(ab);
 
                 predict_count = predict_count.wrapping_add(1);
+
+                // Decimated mirror onto the bias telemetry channel
+                // (~10 Hz). Same predict_count counter — no extra
+                // state, no race with the Signals above.
+                if predict_count.is_multiple_of(BIAS_TELEM_DECIMATION) {
+                    bias_pub.publish_immediate(msgs::EstimatorBias {
+                        timestamp: Instant::now(),
+                        gyro_bias_rad_s: gb,
+                        accel_bias_m_s2: ab,
+                    });
+                }
+
                 if !predict_count.is_multiple_of(ODOM_DECIMATION) {
                     continue;
                 }

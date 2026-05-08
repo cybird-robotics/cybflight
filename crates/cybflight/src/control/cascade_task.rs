@@ -58,6 +58,9 @@ pub async fn cascade_task() {
         .expect("cascade: VEHICLE_ODOMETRY subscriber");
     let pos_pub = super::POSITION_CONTROL_SETPOINT.immediate_publisher();
     let tracking_err_pub = super::TRACKING_ERROR.immediate_publisher();
+    let ctrl_sp_pub = super::CONTROL_SETPOINT_TELEM
+        .publisher()
+        .expect("cascade: CONTROL_SETPOINT_TELEM publisher");
 
     // Wait for ESKF convergence + setpoint seed from rc_interpreter.
     super::ACTIVE_SETPOINT_READY.wait().await;
@@ -137,7 +140,7 @@ pub async fn cascade_task() {
 
         // Publish rate command to INDI.
         let publish_time = Instant::now();
-        super::RATE_COMMAND.signal(msgs::AttitudeControlSetpoint {
+        let setpoint = msgs::AttitudeControlSetpoint {
             timestamp: publish_time,
             collective_thrust_n,
             attitude_quaternion: att_ref
@@ -145,7 +148,9 @@ pub async fn cascade_task() {
                 .unwrap_or(UnitQuaternion::identity()),
             body_rate_rad_s: rate_ref,
             torque_n_m: Vector3::zeros(),
-        });
+        };
+        super::RATE_COMMAND.signal(setpoint.clone());
+        ctrl_sp_pub.publish_immediate(setpoint);
 
         // Position telemetry (decimated to 10 Hz).
         pub_counter += 1;

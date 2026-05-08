@@ -233,14 +233,42 @@ pub static LAST_CONTROLLER_PUBLISH: blocking_mutex::Mutex<
 > = blocking_mutex::Mutex::new(Cell::new(None));
 
 /// Motor command telemetry: published by INDI task, subscribed by ESP
-/// bridge + blackbox recorder. SUBS=3 leaves headroom for one more
-/// downstream consumer.
+/// bridge + blackbox recorder.
+///
+/// CAP=4 / SUBS=4. CAP=4 ≈ 40 ms of drain-stall tolerance at the
+/// 100 Hz publish rate — comfortably absorbs the SD-card
+/// garbage-collection stalls (typically 50–100 ms on consumer
+/// cards) that briefly pause the recorder's drain loop. CAP=2 was
+/// the original sizing and dropped samples during exactly the
+/// high-activity periods that drive SD write rate up. SUBS=4
+/// covers ESP bridge + recorder + 2 spare for future shell-stream
+/// or sysid telemetry consumers.
 pub static ACTUATOR_MOTORS_TELEM: PubSubChannel<
     CriticalSectionRawMutex,
     msgs::ActuatorMotors,
-    2,
-    3,
+    4,
+    4,
     1,
+> = PubSubChannel::new();
+
+/// Control setpoint telemetry mirror of [`RATE_COMMAND`].
+///
+/// `RATE_COMMAND` is a `Signal` consumed by INDI via `try_take()` —
+/// reading it from a logger would race with the inner loop. Instead,
+/// the active outer-loop task publishes the same `AttitudeControlSetpoint`
+/// to this channel alongside the Signal, leaving INDI's hot path
+/// untouched. Subscribed by the blackbox recorder.
+///
+/// CAP=4 / SUBS=4 — same drain-stall tolerance rationale as
+/// `ACTUATOR_MOTORS_TELEM`. PUBS=3 covers all three concrete
+/// outer-loop publishers (`rc_interpreter`, `cascade_task`,
+/// `outer_loop`); only one is feature-active per build.
+pub static CONTROL_SETPOINT_TELEM: PubSubChannel<
+    CriticalSectionRawMutex,
+    msgs::AttitudeControlSetpoint,
+    4,
+    4,
+    3,
 > = PubSubChannel::new();
 
 /// Per-tick controller tracking error. Multi-publisher: the active
@@ -271,11 +299,14 @@ pub static PROCESSED_DSHOT_TELEM: PubSubChannel<
 > = PubSubChannel::new();
 
 /// Processed motor state telemetry (filtered omega + omega_dot + raw).
-/// SUBS=3 covers ESP bridge + blackbox recorder + one spare.
+///
+/// CAP=4 / SUBS=4 — same drain-stall tolerance rationale as
+/// `ACTUATOR_MOTORS_TELEM` (40 ms vs 20 ms at the original CAP=2),
+/// SUBS covers ESP bridge + recorder + 2 spare.
 pub static PROCESSED_MOTOR_STATE: PubSubChannel<
     CriticalSectionRawMutex,
     msgs::MotorStateTelemetry,
-    2,
-    3,
+    4,
+    4,
     1,
 > = PubSubChannel::new();

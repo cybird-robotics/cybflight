@@ -34,10 +34,14 @@
 //! cost.
 
 pub mod attitude;
+pub mod control_setpoint;
+#[cfg(feature = "est_eskf")]
+pub mod estimator_state;
 pub mod events;
 pub mod gps_health;
 pub mod health;
 pub mod imu;
+pub mod imu_raw;
 pub mod motor_state;
 pub mod motors;
 pub mod mpc;

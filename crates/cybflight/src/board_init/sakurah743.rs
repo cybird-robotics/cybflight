@@ -183,6 +183,7 @@ pub async fn init(
                 .spawn(icm_reader_task(
                     ImuReader::new(imu1, board.sensors.gyro1_align, 80.0, 200.0),
                     &crate::sensors::IMU_1,
+                    Some(&crate::sensors::IMU_1_RAW),
                 ))
                 .unwrap_or_else(|e| defmt::error!("Failed to spawn IMU1 reader task: {}", e));
         }
@@ -518,6 +519,7 @@ pub async fn init(
                     .spawn(icm_reader_task(
                         ImuReader::new(imu2, board.sensors.gyro2_align, 80.0, 200.0),
                         &crate::sensors::IMU_2,
+                        None,
                     ))
                     .unwrap_or_else(|e| defmt::error!("Failed to spawn IMU2 reader task: {}", e));
             }

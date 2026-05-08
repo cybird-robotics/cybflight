@@ -2,7 +2,9 @@ use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
 
 use cybflight_core::eskf::EskfHealth;
+use cybflight_msgs as msgs;
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
+use embassy_sync::pubsub::PubSubChannel;
 use embassy_sync::signal::Signal;
 use embassy_time::Instant;
 use nalgebra::Vector3;
@@ -94,6 +96,28 @@ pub static ESKF_GYRO_BIAS: Signal<CriticalSectionRawMutex, Vector3<f32>> = Signa
 /// Written by estimation_task every predict step, read by INDI task to
 /// bias-correct raw accel for specific force feedback.
 pub static ESKF_ACCEL_BIAS: Signal<CriticalSectionRawMutex, Vector3<f32>> = Signal::new();
+
+/// Decimated bias telemetry for the blackbox recorder.
+///
+/// The Signals above publish at the predict rate (~1 kHz) and use
+/// `try_take`-style consumption that races with any logger. Mirror
+/// them onto a slow PubSubChannel sized for sysid post-flight bias
+/// correction — ~10 Hz is more than enough for biases that drift at
+/// seconds-scale.
+///
+/// CAP=2 — at 10 Hz that's 200 ms of drain-stall tolerance, well
+/// above any plausible SD stall. SUBS=4 covers recorder + 3 spare
+/// for future GS / shell-stream / sysid-tooling consumers.
+/// PUBS=2: both ESKF source tasks declare a publisher; only one is
+/// feature-active per build (`est_pos_mocap` vs `est_pos_gps`),
+/// but PUBS counts declarations.
+pub static ESTIMATOR_BIAS_TELEM: PubSubChannel<
+    CriticalSectionRawMutex,
+    msgs::EstimatorBias,
+    2,
+    4,
+    2,
+> = PubSubChannel::new();
 
 // ---------------------------------------------------------------------------
 // Fault detection (cherry-picked from 6380f81; outcome_tag dropped because the

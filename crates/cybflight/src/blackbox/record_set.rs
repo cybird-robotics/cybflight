@@ -3,50 +3,56 @@
 //!
 //! ## Design
 //!
-//! The cybflight blackbox has a fixed catalogue of topics today
-//! (`/imu1`, `/attitude`, `/rc`, `/events`); future profiles will
-//! add more. Rather than letting each capture op hard-code its own
-//! topic list (the pre-Stage-7 status quo), the recorder reads
-//! [`BLACKBOX_RECORD_SET`] once at session start and emits exactly
-//! the topics in that tier's [`topic_set`](RecordSet::topic_set).
+//! The cybflight blackbox has a growing catalogue of topics. Rather
+//! than letting each capture op hard-code its own topic list, the
+//! recorder reads [`BLACKBOX_RECORD_SET`] once at session start and
+//! emits exactly the topics in that tier's
+//! [`topic_set`](RecordSet::topic_set).
 //!
 //! Tiers are **monotonic**: each level is a strict superset of the
-//! previous one. That keeps mental model simple ("turn it up
-//! one") and matches Betaflight's `blackbox_mode = NORMAL/ALWAYS`
-//! convention.
+//! previous one. One axis, one knob, "turn it up". The rule for
+//! adding a new topic is "the cheapest tier whose bandwidth budget
+//! the topic fits into" — cheap (< 100 KB/min) topics go in Mid;
+//! the only thing in Large today is the high-bandwidth sysid extra
+//! (`/imu1_raw`, ~30 MB/min on top of Mid's ~60 MB/min IMU stream).
 //!
 //! ## Tier definitions
 //!
-//! | Tier  | Topics                                           | Approx bytes / minute |
-//! |-------|--------------------------------------------------|---|
-//! | none  | (nothing — recording disabled)                   | 0     |
-//! | small | events + rc                                      | ~250 KB |
-//! | mid   | + attitude + odometry + mpc + motors + motor_state | ~22 MB |
-//! | large | + raw IMU1                                       | ~60 MB  |
+//! | Tier  | Topics added on top of previous                                                                                                                  | Approx bytes / minute |
+//! |-------|---------------------------------------------------------------------------------------------------------------------------------------------------|---|
+//! | none  | (nothing — recording disabled)                                                                                                                    | 0       |
+//! | small | events + rc                                                                                                                                       | ~250 KB |
+//! | mid   | + attitude + odometry + mpc + motors + motor_state + tracking_error + imu + control_setpoint + estimator_state + health + gps_health             | ~60 MB  |
+//! | large | + imu1_raw                                                                                                                                        | ~90 MB  |
 //!
-//! "Small" is the *cheap* tier: low byte rate, just enough to
-//! reconstruct what the pilot commanded and which arm/disarm
-//! brackets bound the session. "Mid" adds the full inner-control
-//! picture — the 8 kHz attitude estimate, the 1 kHz ESKF fused
-//! odometry (`/odometry`), and the outer-loop MPC commands
-//! (`/mpc`). That covers the typical flight-debug flow:
-//! `RC → MPC command → ESKF state → attitude estimate`. "Large"
-//! adds raw 6 DoF IMU on top — the high-bandwidth debug option for
-//! filter / sensor work.
+//! "Small" is the *cheap* tier — arm/disarm brackets and pilot
+//! intent only. "Mid" is the **default flight-debug tier**: the
+//! 8 kHz attitude estimate, 1 kHz ESKF fused odometry, 8 kHz
+//! post-LP IMU, outer-loop MPC commands, the
+//! commanded-vs-achieved motor pair (`/motors`, `/motor_state`),
+//! the rate-setpoint mirror (`/control_setpoint`) that completes
+//! the controller-input picture, and the slow estimator-bias
+//! snapshot (`/estimator_state`) for offline accel correction. That
+//! covers the typical flight-debug flow:
+//! `RC → MPC command → ESKF state → attitude estimate → motor`,
+//! plus the sysid signals on the cheap. "Large" adds the only
+//! topic with a real bandwidth cost — pre-biquad-LP raw IMU — for
+//! filter-tuning and analyse.py-style RPM-notch fits.
 //!
 //! ## Tier-aware drop priority
 //!
 //! Tiers are *also* a drop-priority ordering. Each iteration of the
 //! recorder loop drains topics in tier order — small, then mid,
-//! then large — and the large-tier drain (`/imu1`) uses a smaller
-//! per-iteration budget (`DRAIN_BUDGET_DEPRIO`, currently 4) than
-//! the small/mid drains (`DRAIN_BUDGET_NORMAL`, currently 16).
-//! When the SD pipeline keeps up with combined publisher rates,
-//! every drain finishes before its budget so the budgets are
-//! immaterial; every topic is emitted in full. When the SD
-//! pipeline can't keep up, the smaller IMU budget pushes the
-//! overflow onto IMU first, so `/rc`, `/attitude`, `/odometry`,
-//! and `/mpc` stay intact and IMU drops show up as `Lagged`
+//! then large — and the large-tier drains (`/imu1`, `/imu1_raw`)
+//! use a smaller per-iteration budget (`DRAIN_BUDGET_DEPRIO`,
+//! currently 4) than the small/mid drains (`DRAIN_BUDGET_NORMAL`,
+//! currently 16). When the SD pipeline keeps up with combined
+//! publisher rates, every drain finishes before its budget so the
+//! budgets are immaterial; every topic is emitted in full. When
+//! the SD pipeline can't keep up, the smaller IMU budget pushes
+//! the overflow onto IMU first (raw IMU before filtered IMU within
+//! the deprio block), so `/rc`, `/attitude`, `/odometry`, and the
+//! controller stream stay intact and IMU drops show up as `Lagged`
 //! samples (counted in the session summary). The motivating
 //! intuition: IMU is the high-bandwidth debug stream we're most
 //! willing to lose under contention; smaller, lower-rate
@@ -61,7 +67,7 @@
 //!
 //! Each topic carries a stable [`channel_id`](super::topics::TopicDef::channel_id)
 //! independent of its position in any per-tier slice. So `/imu1` is
-//! channel 1 in every file regardless of profile, `/attitude` is
+//! channel 1 in every file regardless of tier, `/attitude` is
 //! channel 2, etc. Foxglove / `mcap cat` consumers can rely on this
 //! across files captured at different tiers.
 
@@ -91,6 +97,10 @@ const TOPICS_MID: &[TopicDef] = &[
     topics::motors::DEF,
     topics::motor_state::DEF,
     topics::tracking_error::DEF,
+    topics::imu::DEF,
+    topics::control_setpoint::DEF,
+    #[cfg(feature = "est_eskf")]
+    topics::estimator_state::DEF,
     topics::health::DEF,
     topics::gps_health::DEF,
 ];
@@ -105,11 +115,16 @@ const TOPICS_LARGE: &[TopicDef] = &[
     topics::motor_state::DEF,
     topics::tracking_error::DEF,
     topics::imu::DEF,
+    topics::imu_raw::DEF,
+    topics::control_setpoint::DEF,
+    #[cfg(feature = "est_eskf")]
+    topics::estimator_state::DEF,
     topics::health::DEF,
     topics::gps_health::DEF,
 ];
 
-/// Recording tier. See module docs for byte-rate estimates per tier.
+/// Recording tier. See module docs for byte-rate estimates per tier
+/// and the monotonic-superset property.
 #[derive(Clone, Copy, PartialEq, Eq, defmt::Format)]
 #[repr(u8)]
 pub enum RecordSet {
@@ -121,20 +136,27 @@ pub enum RecordSet {
     /// Events + RC. Cheapest tier — preserves arm/disarm brackets
     /// and pilot intent without paying for high-rate state.
     Small = 1,
-    /// Events + RC + attitude. Adds the 8 kHz quaternion estimate;
-    /// useful for reconstructing what the airframe actually did.
+    /// Small + the full instrumented controller stream — attitude,
+    /// odometry, mpc, motors, motor_state, tracking_error, post-LP
+    /// IMU, control_setpoint, estimator_state, health, gps_health.
+    /// **The default flight-debug tier**: enough to reconstruct any
+    /// recent firmware decision, including INDI sysid signals on
+    /// the cheap, without paying for the raw IMU stream.
     Mid = 2,
-    /// Events + RC + attitude + raw IMU1. Full debug fidelity for
-    /// filter / sensor work. ~50 MB / minute.
+    /// Mid + pre-biquad-LP raw IMU (`/imu1_raw`). The only topic
+    /// that doubles the file size; opt-in for filter-tuning and
+    /// RPM-notch fit work.
     Large = 3,
 }
 
 impl RecordSet {
-    /// Compile-time default selected at boot. Conservative — preserves
-    /// existing behavior (all four topics) so this refactor is a
-    /// no-behavior-change refactor unless the user explicitly
-    /// changes tiers.
-    pub const DEFAULT: Self = Self::Large;
+    /// Compile-time default selected at boot.
+    ///
+    /// `Mid` covers the routine flight-debug case at ~60 MB/min.
+    /// Power users opt up to `Large` when they specifically want
+    /// the raw IMU stream; nobody opts up to `Large` "just in case"
+    /// and discovers a 1 GB file from an 8-minute flight.
+    pub const DEFAULT: Self = Self::Mid;
 
     /// True if this tier should record at all (anything except `None`).
     #[inline]
@@ -144,7 +166,7 @@ impl RecordSet {
 
     #[inline]
     pub const fn includes_imu(self) -> bool {
-        matches!(self, Self::Large)
+        matches!(self, Self::Mid | Self::Large)
     }
 
     #[inline]
@@ -173,17 +195,19 @@ impl RecordSet {
     }
 
     /// True for tiers that include the `/health` estimator-fault
-    /// snapshot (Mid + Large). Piggybacks on the `/odom` emit path
-    /// at the same ~100 Hz cadence.
+    /// snapshot (Mid + Large). Self-throttled to ~20 Hz inside the
+    /// recorder loop.
     #[inline]
     pub const fn includes_health(self) -> bool {
         matches!(self, Self::Mid | Self::Large)
     }
 
     /// True for tiers that include the `/gps_health` flat-snapshot
-    /// of `crate::sensors::gps::GPS_HEALTH` + `LATEST_NAV_PVT` (Mid +
-    /// Large). Self-throttled to the same 20 Hz as `/health` — see
-    /// [`crate::blackbox::topics::gps_health`].
+    /// of `crate::sensors::gps::GPS_HEALTH` + `LATEST_NAV_PVT`.
+    /// Self-throttled to ~20 Hz; stays at `NotConfigured` on
+    /// `est_pos_mocap` builds (still emits, just with the inert
+    /// payload, so a file always carries an explicit "GPS not
+    /// present" marker).
     #[inline]
     pub const fn includes_gps_health(self) -> bool {
         matches!(self, Self::Mid | Self::Large)
@@ -192,6 +216,36 @@ impl RecordSet {
     #[inline]
     pub const fn includes_tracking_error(self) -> bool {
         matches!(self, Self::Mid | Self::Large)
+    }
+
+    /// True for tiers that include the `/control_setpoint` topic
+    /// (mirror of `RATE_COMMAND` — outer-loop output to INDI).
+    /// Mid + Large: ~5 KB/min, completes the
+    /// `command → tracking_error → motor` triangle the rest of Mid
+    /// already carries.
+    #[inline]
+    pub const fn includes_control_setpoint(self) -> bool {
+        matches!(self, Self::Mid | Self::Large)
+    }
+
+    /// True for tiers that include the `/estimator_state` topic
+    /// (decimated ESKF gyro/accel bias estimates, ~10 Hz). Mid +
+    /// Large and `est_eskf`-only on the recorder side — pure-Mahony
+    /// builds have no biases to publish, so the topic is silently
+    /// absent from the file.
+    #[inline]
+    pub const fn includes_estimator_state(self) -> bool {
+        matches!(self, Self::Mid | Self::Large)
+    }
+
+    /// True for tiers that include the `/imu1_raw` topic
+    /// (pre-biquad-LP IMU samples at the same 8 kHz cadence as
+    /// `/imu1`). **Large only** — the only topic with a meaningful
+    /// bandwidth cost (~doubles the IMU bytes); opt-in for
+    /// filter-tuning / RPM-notch fit work.
+    #[inline]
+    pub const fn includes_imu_raw(self) -> bool {
+        matches!(self, Self::Large)
     }
 
     #[inline]
@@ -242,8 +296,10 @@ impl RecordSet {
 
     /// Decode the `repr(u8)` value back to `RecordSet`. Used to
     /// read [`BLACKBOX_RECORD_SET`] without an unsafe transmute.
-    /// Out-of-range bytes (only possible from a corrupted store)
-    /// fall back to [`Self::DEFAULT`].
+    /// Out-of-range bytes (only possible from a corrupted store
+    /// or a downgraded firmware reading a flash slot last written
+    /// by a build that defined more variants) fall back to
+    /// [`Self::DEFAULT`].
     pub fn from_u8(v: u8) -> Self {
         match v {
             0 => Self::None,

@@ -61,20 +61,25 @@ use super::mcap;
 use super::record_set::RecordSet;
 use super::sdmmc_block::SdmmcBlockStore;
 use super::should_record;
+#[cfg(feature = "est_eskf")]
+use super::topics::estimator_state;
 use super::topics::{
-    attitude, events, gps_health, health, imu, motor_state, motors, mpc, odometry, rc,
-    tracking_error,
+    attitude, control_setpoint, events, gps_health, health, imu, imu_raw, motor_state, motors, mpc,
+    odometry, rc, tracking_error,
 };
 use crate::control::TrackingError as TrackErrMsg;
 use crate::control::failsafe::{FAILSAFE_ACTIVE, FAILSAFE_REASON, RC_LINK_HEALTHY};
 use crate::control::{
-    ACTUATOR_MOTORS_TELEM, OCP_SOLVER_OUTPUT, PROCESSED_MOTOR_STATE, TRACKING_ERROR,
+    ACTUATOR_MOTORS_TELEM, CONTROL_SETPOINT_TELEM, OCP_SOLVER_OUTPUT, PROCESSED_MOTOR_STATE,
+    TRACKING_ERROR,
 };
 #[cfg(feature = "outer_mpc")]
 use crate::control::{MISSION_STATE, MissionState};
+#[cfg(feature = "est_eskf")]
+use crate::estimation::ESTIMATOR_BIAS_TELEM;
 use crate::estimation::ESTIMATOR_READY;
 use crate::msgs;
-use crate::sensors::{IMU_1, RC_INPUT, VEHICLE_ATTITUDE, VEHICLE_ODOMETRY};
+use crate::sensors::{IMU_1, IMU_1_RAW, RC_INPUT, VEHICLE_ATTITUDE, VEHICLE_ODOMETRY};
 
 const MCAP_LIBRARY: &str = concat!("cybflight v", env!("CARGO_PKG_VERSION"));
 
@@ -140,22 +145,37 @@ const DRAIN_BUDGET_NORMAL: usize = 16;
 const DRAIN_BUDGET_DEPRIO: usize = 4;
 
 type ImuSub = Subscriber<'static, CriticalSectionRawMutex, msgs::Imu, 4, 6, 1>;
+/// Raw (pre-biquad-LP) IMU subscriber over `IMU_1_RAW`. Same shape
+/// as `ImuSub`. Drains under `DRAIN_BUDGET_DEPRIO` like filtered
+/// IMU — both are 8 kHz high-bandwidth debug streams.
+type ImuRawSub = Subscriber<'static, CriticalSectionRawMutex, msgs::Imu, 4, 6, 1>;
 type AttSub = Subscriber<'static, CriticalSectionRawMutex, msgs::VehicleAttitude, 4, 6, 1>;
 type RcSub = Subscriber<'static, CriticalSectionRawMutex, msgs::RcInput, 4, 6, 1>;
 type OdomSub = Subscriber<'static, CriticalSectionRawMutex, msgs::VehicleOdometry, 8, 6, 1>;
 type McpSub = Subscriber<'static, CriticalSectionRawMutex, msgs::OcpSolverOutput, 4, 4, 1>;
-/// Motors subscriber over `ACTUATOR_MOTORS_TELEM`. CAP=2 matches the
-/// channel; SUBS=3 leaves one slot for a future shell stream consumer
-/// alongside esp_bridge + this recorder.
-type MotorSub = Subscriber<'static, CriticalSectionRawMutex, msgs::ActuatorMotors, 2, 3, 1>;
+/// Motors subscriber over `ACTUATOR_MOTORS_TELEM`. CAP=4 matches the
+/// channel (40 ms drain-stall tolerance at 100 Hz publish);
+/// SUBS=4 leaves headroom alongside esp_bridge + this recorder.
+type MotorSub = Subscriber<'static, CriticalSectionRawMutex, msgs::ActuatorMotors, 4, 4, 1>;
 /// Motor-state subscriber over `PROCESSED_MOTOR_STATE`. The
 /// `commanded vs achieved` companion to `MotorSub` — same shape,
-/// CAP=2/SUBS=3.
+/// CAP=4/SUBS=4.
 type MotorStateSub =
-    Subscriber<'static, CriticalSectionRawMutex, msgs::MotorStateTelemetry, 2, 3, 1>;
+    Subscriber<'static, CriticalSectionRawMutex, msgs::MotorStateTelemetry, 4, 4, 1>;
 /// Tracking-error subscriber over `TRACKING_ERROR`. CAP=4/SUBS=3/PUBS=3
 /// — see [`crate::control::TRACKING_ERROR`] for the rationale.
 type TrackErrSub = Subscriber<'static, CriticalSectionRawMutex, TrackErrMsg, 4, 3, 3>;
+/// Control-setpoint subscriber over `CONTROL_SETPOINT_TELEM`. The
+/// outer-loop counterpart to `MotorSub` — same shape, CAP=4/SUBS=4,
+/// PUBS=3 because all three outer-loop tasks declare a publisher.
+type CtrlSpSub =
+    Subscriber<'static, CriticalSectionRawMutex, msgs::AttitudeControlSetpoint, 4, 4, 3>;
+/// Estimator-bias subscriber over `ESTIMATOR_BIAS_TELEM`. Decimated
+/// ~10 Hz mirror of the per-predict-tick `ESKF_*_BIAS` Signals.
+/// CAP=2 (200 ms tolerance at 10 Hz is plenty); SUBS=4; PUBS=2 =
+/// both ESKF source tasks declare a publisher.
+#[cfg(feature = "est_eskf")]
+type EstStateSub = Subscriber<'static, CriticalSectionRawMutex, msgs::EstimatorBias, 2, 4, 2>;
 
 pub struct FlightRecorder {
     record_set: RecordSet,
@@ -164,6 +184,7 @@ pub struct FlightRecorder {
     /// — so a tier that excludes a topic doesn't even occupy a
     /// pubsub subscriber slot.
     imu_sub: Option<ImuSub>,
+    imu_raw_sub: Option<ImuRawSub>,
     att_sub: Option<AttSub>,
     rc_sub: Option<RcSub>,
     odom_sub: Option<OdomSub>,
@@ -171,7 +192,11 @@ pub struct FlightRecorder {
     motor_sub: Option<MotorSub>,
     motor_state_sub: Option<MotorStateSub>,
     track_err_sub: Option<TrackErrSub>,
+    ctrl_sp_sub: Option<CtrlSpSub>,
+    #[cfg(feature = "est_eskf")]
+    est_state_sub: Option<EstStateSub>,
     imu_seq: u32,
+    imu_raw_seq: u32,
     att_seq: u32,
     rc_seq: u32,
     odom_seq: u32,
@@ -179,6 +204,9 @@ pub struct FlightRecorder {
     motor_seq: u32,
     motor_state_seq: u32,
     track_err_seq: u32,
+    ctrl_sp_seq: u32,
+    #[cfg(feature = "est_eskf")]
+    est_state_seq: u32,
     health_seq: u32,
     /// Wall-clock of the last `/health` emit. The capture loop calls
     /// `emit_health` every iteration; `emit_health` no-ops until at
@@ -295,12 +323,7 @@ impl FileBody for FlightRecorder {
                 let summary_data = ((prior.header.reset_cause & 0x00FF_FFFF) << 8)
                     | (prior.fatal.kind as u32 & 0xFF);
                 total += self
-                    .emit_event(
-                        w,
-                        &mut scratch,
-                        events::KIND_BOOT_POSTMORTEM,
-                        summary_data,
-                    )
+                    .emit_event(w, &mut scratch, events::KIND_BOOT_POSTMORTEM, summary_data)
                     .await?;
                 // If the fatal slot is populated, emit a synthetic
                 // event with the fatal kind so post-flight tools
@@ -310,12 +333,8 @@ impl FileBody for FlightRecorder {
                 let fatal_kind = prior.fatal.kind;
                 let synth_kind = match crate::postmortem::record::FatalKind::from_u8(fatal_kind) {
                     crate::postmortem::record::FatalKind::Panic => Some(events::KIND_PANIC),
-                    crate::postmortem::record::FatalKind::HardFault => {
-                        Some(events::KIND_HARDFAULT)
-                    }
-                    crate::postmortem::record::FatalKind::Brownout => {
-                        Some(events::KIND_BROWNOUT)
-                    }
+                    crate::postmortem::record::FatalKind::HardFault => Some(events::KIND_HARDFAULT),
+                    crate::postmortem::record::FatalKind::Brownout => Some(events::KIND_BROWNOUT),
                     crate::postmortem::record::FatalKind::IwdgReset => {
                         Some(events::KIND_IWDG_RESET)
                     }
@@ -337,9 +356,7 @@ impl FileBody for FlightRecorder {
                 // see the prior session's RC/FAILSAFE/MISSION events
                 // inline, all between the BOOT_POSTMORTEM brackets.
                 for ev in prior.events_in_order() {
-                    total += self
-                        .emit_event(w, &mut scratch, ev.kind, ev.data)
-                        .await?;
+                    total += self.emit_event(w, &mut scratch, ev.kind, ev.data).await?;
                 }
                 total += self
                     .emit_event(w, &mut scratch, events::KIND_BOOT_POSTMORTEM, 0)
@@ -481,7 +498,39 @@ impl FileBody for FlightRecorder {
                 let Some(wr) = next else { break };
                 total += self.emit_track_err(w, &mut scratch, wr).await?;
             }
+            for _ in 0..DRAIN_BUDGET_NORMAL {
+                let next = self.ctrl_sp_sub.as_mut().and_then(|s| s.try_next_message());
+                let Some(wr) = next else { break };
+                total += self.emit_ctrl_sp(w, &mut scratch, wr).await?;
+            }
+            #[cfg(feature = "est_eskf")]
+            for _ in 0..DRAIN_BUDGET_NORMAL {
+                let next = self
+                    .est_state_sub
+                    .as_mut()
+                    .and_then(|s| s.try_next_message());
+                let Some(wr) = next else { break };
+                total += self.emit_est_state(w, &mut scratch, wr).await?;
+            }
             // ── large tier (deprioritised) ──────────────────────
+            // Raw IMU drains **before** filtered IMU. Large tier
+            // exists exclusively to capture the pre-LP stream for
+            // sysid / RPM-notch fits — filtered IMU is already in
+            // Mid, so anyone who's opted into Large is asking
+            // specifically for raw. Information density also favours
+            // raw: filtered IMU is a deterministic function of raw
+            // + biquad coefficients, so preserving raw preserves
+            // both views; preserving filtered loses raw forever.
+            // Under SD backpressure the shared deprio budget
+            // therefore biases drops onto filtered IMU instead.
+            for _ in 0..DRAIN_BUDGET_DEPRIO {
+                let next = self
+                    .imu_raw_sub
+                    .as_mut()
+                    .and_then(|s| s.try_next_message());
+                let Some(wr) = next else { break };
+                total += self.emit_imu_raw(w, &mut scratch, wr).await?;
+            }
             for _ in 0..DRAIN_BUDGET_DEPRIO {
                 let next = self.imu_sub.as_mut().and_then(|s| s.try_next_message());
                 let Some(wr) = next else { break };
@@ -552,6 +601,29 @@ impl FlightRecorder {
         self.imu_seq = self.imu_seq.wrapping_add(1);
         let n = imu::encode(scratch, &m).unwrap_or(0);
         let bytes = emit_msg(w, imu::CHANNEL_ID, self.imu_seq, m.timestamp, &scratch[..n]).await?;
+        self.messages = self.messages.wrapping_add(1);
+        Ok(bytes)
+    }
+
+    async fn emit_imu_raw<W: Write>(
+        &mut self,
+        w: &mut W,
+        scratch: &mut [u8],
+        wr: WaitResult<msgs::Imu>,
+    ) -> Result<u32, W::Error> {
+        let Some(m) = handle_wr(wr, &mut self.drops) else {
+            return Ok(0);
+        };
+        self.imu_raw_seq = self.imu_raw_seq.wrapping_add(1);
+        let n = imu_raw::encode(scratch, &m).unwrap_or(0);
+        let bytes = emit_msg(
+            w,
+            imu_raw::CHANNEL_ID,
+            self.imu_raw_seq,
+            m.timestamp,
+            &scratch[..n],
+        )
+        .await?;
         self.messages = self.messages.wrapping_add(1);
         Ok(bytes)
     }
@@ -769,6 +841,53 @@ impl FlightRecorder {
         Ok(bytes)
     }
 
+    async fn emit_ctrl_sp<W: Write>(
+        &mut self,
+        w: &mut W,
+        scratch: &mut [u8],
+        wr: WaitResult<msgs::AttitudeControlSetpoint>,
+    ) -> Result<u32, W::Error> {
+        let Some(m) = handle_wr(wr, &mut self.drops) else {
+            return Ok(0);
+        };
+        self.ctrl_sp_seq = self.ctrl_sp_seq.wrapping_add(1);
+        let n = control_setpoint::encode(scratch, &m).unwrap_or(0);
+        let bytes = emit_msg(
+            w,
+            control_setpoint::CHANNEL_ID,
+            self.ctrl_sp_seq,
+            m.timestamp,
+            &scratch[..n],
+        )
+        .await?;
+        self.messages = self.messages.wrapping_add(1);
+        Ok(bytes)
+    }
+
+    #[cfg(feature = "est_eskf")]
+    async fn emit_est_state<W: Write>(
+        &mut self,
+        w: &mut W,
+        scratch: &mut [u8],
+        wr: WaitResult<msgs::EstimatorBias>,
+    ) -> Result<u32, W::Error> {
+        let Some(m) = handle_wr(wr, &mut self.drops) else {
+            return Ok(0);
+        };
+        self.est_state_seq = self.est_state_seq.wrapping_add(1);
+        let n = estimator_state::encode(scratch, &m).unwrap_or(0);
+        let bytes = emit_msg(
+            w,
+            estimator_state::CHANNEL_ID,
+            self.est_state_seq,
+            m.timestamp,
+            &scratch[..n],
+        )
+        .await?;
+        self.messages = self.messages.wrapping_add(1);
+        Ok(bytes)
+    }
+
     /// Encode + emit one Event record on `/events`. Returns the byte
     /// count. Inlined here rather than going through TOPIC_SET because
     /// events have a tiny per-emit cost and the kind/data payload is
@@ -942,6 +1061,14 @@ pub async fn run_session(
     } else {
         None
     };
+    let imu_raw_sub = if record_set.includes_imu_raw() {
+        Some(IMU_1_RAW.subscriber().map_err(|_| {
+            defmt::warn!("recorder: IMU_1_RAW SUBS exhausted");
+            OpError::NoSubscriberSlot
+        })?)
+    } else {
+        None
+    };
     let att_sub = if record_set.includes_attitude() {
         Some(VEHICLE_ATTITUDE.subscriber().map_err(|_| {
             defmt::warn!("recorder: VEHICLE_ATTITUDE SUBS exhausted");
@@ -998,6 +1125,23 @@ pub async fn run_session(
     } else {
         None
     };
+    let ctrl_sp_sub = if record_set.includes_control_setpoint() {
+        Some(CONTROL_SETPOINT_TELEM.subscriber().map_err(|_| {
+            defmt::warn!("recorder: CONTROL_SETPOINT_TELEM SUBS exhausted");
+            OpError::NoSubscriberSlot
+        })?)
+    } else {
+        None
+    };
+    #[cfg(feature = "est_eskf")]
+    let est_state_sub = if record_set.includes_estimator_state() {
+        Some(ESTIMATOR_BIAS_TELEM.subscriber().map_err(|_| {
+            defmt::warn!("recorder: ESTIMATOR_BIAS_TELEM SUBS exhausted");
+            OpError::NoSubscriberSlot
+        })?)
+    } else {
+        None
+    };
 
     // Snapshot the failsafe / estimator / mission state at session
     // open. The capture loop's edge poll only emits `/events`
@@ -1013,6 +1157,7 @@ pub async fn run_session(
     let mut body = FlightRecorder {
         record_set,
         imu_sub,
+        imu_raw_sub,
         att_sub,
         rc_sub,
         odom_sub,
@@ -1020,7 +1165,11 @@ pub async fn run_session(
         motor_sub,
         motor_state_sub,
         track_err_sub,
+        ctrl_sp_sub,
+        #[cfg(feature = "est_eskf")]
+        est_state_sub,
         imu_seq: 0,
+        imu_raw_seq: 0,
         att_seq: 0,
         rc_seq: 0,
         odom_seq: 0,
@@ -1028,6 +1177,9 @@ pub async fn run_session(
         motor_seq: 0,
         motor_state_seq: 0,
         track_err_seq: 0,
+        ctrl_sp_seq: 0,
+        #[cfg(feature = "est_eskf")]
+        est_state_seq: 0,
         health_seq: 0,
         last_health_emit: Instant::from_ticks(0),
         gps_health_seq: 0,

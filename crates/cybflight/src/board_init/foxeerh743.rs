@@ -129,6 +129,7 @@ pub async fn init(
                                 GYRO_CUTOFF_HZ,
                             ),
                             &crate::sensors::IMU_1,
+                            Some(&crate::sensors::IMU_1_RAW),
                         ))
                         .unwrap();
                 }
@@ -149,6 +150,7 @@ pub async fn init(
                                 GYRO_CUTOFF_HZ,
                             ),
                             &crate::sensors::IMU_1,
+                            Some(&crate::sensors::IMU_1_RAW),
                         ))
                         .unwrap();
                 }

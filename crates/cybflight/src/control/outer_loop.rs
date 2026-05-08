@@ -226,6 +226,9 @@ pub async fn control_loop_task() {
     let ocp_pub = super::OCP_SOLVER_OUTPUT.immediate_publisher();
     let tracking_err_pub = super::TRACKING_ERROR.immediate_publisher();
     let mission_status_pub = super::MISSION_STATUS.immediate_publisher();
+    let ctrl_sp_pub = super::CONTROL_SETPOINT_TELEM
+        .publisher()
+        .expect("outer_loop: CONTROL_SETPOINT_TELEM publisher");
     let mut odom_sub = VEHICLE_ODOMETRY
         .subscriber()
         .expect("outer_loop: VEHICLE_ODOMETRY subscriber");
@@ -962,13 +965,15 @@ pub async fn control_loop_task() {
         let publish_time = Instant::now();
 
         // 9. Publish to the inner loop.
-        super::RATE_COMMAND.signal(msgs::AttitudeControlSetpoint {
+        let setpoint = msgs::AttitudeControlSetpoint {
             timestamp: publish_time,
             collective_thrust_n: u0[0],
             attitude_quaternion: ref_att,
             body_rate_rad_s: Vector3::new(u0[1], u0[2], u0[3]),
             torque_n_m: Vector3::zeros(),
-        });
+        };
+        super::RATE_COMMAND.signal(setpoint.clone());
+        ctrl_sp_pub.publish_immediate(setpoint);
 
         // 10. Publish telemetry for downlink (fulfils the promise in indi_task's
         //     comment that the MPC path delegates these to outer_loop).

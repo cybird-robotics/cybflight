@@ -100,14 +100,32 @@ impl<D: ReadImu> ImuReader<D> {
     pub async fn run(
         &mut self,
         channel: &'static PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 6, 1>,
+        raw_channel: Option<&'static PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 6, 1>>,
     ) -> ! {
         let publisher = channel.immediate_publisher();
+        // Optional pre-filter mirror for blackbox sysid. `None` on
+        // dual-IMU secondary slots and on boards that don't wire raw
+        // logging — the per-sample cost is one cmp + branch when not
+        // taken.
+        let raw_publisher = raw_channel.map(|c| c.immediate_publisher());
 
         loop {
             match self.imu.read().await {
                 Ok(reading) => {
                     let accel = apply_alignment(self.align, reading.accel_m_s2);
                     let gyro = apply_alignment(self.align, reading.gyro_rad_s);
+
+                    // Raw publish *before* the biquad apply — analyse.py
+                    // style RPM-notch fits need pre-filter samples.
+                    let timestamp = Instant::now();
+                    if let Some(raw) = &raw_publisher {
+                        raw.publish_immediate(msgs::Imu {
+                            accel_m_s2: accel,
+                            gyro_rad_s: gyro,
+                            temp_c: reading.temp_c,
+                            timestamp,
+                        });
+                    }
 
                     let af = self.accel_filter.apply(accel.into());
                     let gf = self.gyro_filter.apply(gyro.into());
@@ -116,7 +134,7 @@ impl<D: ReadImu> ImuReader<D> {
                         accel_m_s2: af.into(),
                         gyro_rad_s: gf.into(),
                         temp_c: reading.temp_c,
-                        timestamp: Instant::now(),
+                        timestamp,
                     });
                 }
                 Err(e) => {
@@ -141,14 +159,16 @@ impl<D: ReadImu> ImuReader<D> {
 pub async fn icm_reader_task(
     mut reader: ImuReader<IcmDev>,
     channel: &'static PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 6, 1>,
+    raw_channel: Option<&'static PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 6, 1>>,
 ) {
-    reader.run(channel).await;
+    reader.run(channel, raw_channel).await;
 }
 
 #[embassy_executor::task(pool_size = 2)]
 pub async fn mpu_reader_task(
     mut reader: ImuReader<MpuDev>,
     channel: &'static PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 6, 1>,
+    raw_channel: Option<&'static PubSubChannel<CriticalSectionRawMutex, msgs::Imu, 4, 6, 1>>,
 ) {
-    reader.run(channel).await;
+    reader.run(channel, raw_channel).await;
 }

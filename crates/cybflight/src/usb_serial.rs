@@ -72,7 +72,8 @@ const HELP_TEXT: &[u8] = b"\
   blackbox record off  stop the manual flight log\r\n\
   blackbox status      show current recording state and what's triggering it\r\n\
   blackbox set <tier>  set the record-set tier (none|small|mid|large)\r\n\
-                       small=events+rc, mid=+attitude, large=+imu (default), none=disabled\r\n\
+                       small=events+rc, mid=+full controller stream (default), large=+raw IMU,\r\n\
+                       none=disabled\r\n\
   blackbox ls          list files in the FAT root (rejected while recording)\r\n\
                        (recorder also auto-starts on real ARM_STATE arm: RC switch / failsafe path)\r\n\
                        (file numbering picks up after the highest existing flight_NNNN; survives reboots)\r\n\
@@ -1146,8 +1147,8 @@ async fn dispatch_blackbox_set<'d>(
                 b"usage: blackbox set <none|small|mid|large>\r\n\
                   \x20  none  - recorder muted (arm-edges produce no file)\r\n\
                   \x20  small - events + rc\r\n\
-                  \x20  mid   - events + rc + attitude\r\n\
-                  \x20  large - events + rc + attitude + imu1 (default)\r\n",
+                  \x20  mid   - + full controller stream (default)\r\n\
+                  \x20  large - + raw IMU (analyse.py-style RPM-notch fits)\r\n",
             )
             .await
         }

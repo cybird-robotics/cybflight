@@ -19,7 +19,10 @@ use crate::estimation::{
     ATTITUDE_HEALTH, ESKF_DEGRADED, ESKF_FAULTS, ESKF_HEALTH, ESKF_LAST_ATT_UPDATE,
     ESKF_LAST_POS_UPDATE, ESKF_LAST_VEL_UPDATE, ESKF_SEVERE_FAULT, ESTIMATOR_READY,
 };
-use crate::sensors::gps::{GPS_HEALTH, GpsErrKind, GpsHealth, LATEST_NAV_PVT};
+use crate::sensors::gps::{
+    GpsErrKind, GpsHealth, GPS_HEALTH, LATEST_NAV_PVT, NAV_PVT_MAX_INTERVAL_RECENT_US,
+    NAV_PVT_MEAN_INTERVAL_RECENT_US,
+};
 
 fn encode_err(k: GpsErrKind) -> u8 {
     match k {
@@ -75,11 +78,12 @@ pub fn snapshot_system(now: Instant) -> WireSystemHealth {
 pub fn snapshot_gps(now: Instant) -> WireGpsHealth {
     let mut s = WireGpsHealth {
         timestamp_us: now.as_micros(),
+        nav_pvt_arrival_us: 0,
         h_acc_mm: 0,
         v_acc_mm: 0,
         s_acc_mm_s: 0,
-        last_fix_age_ms: u32::MAX,
-        nav_pvt_age_ms: u32::MAX,
+        nav_pvt_max_interval_recent_us: u32::MAX,
+        nav_pvt_mean_interval_recent_us: u32::MAX,
         state: wire::GPS_STATE_NOT_CONFIGURED,
         err_kind: wire::GPS_ERR_NONE,
         fix_type: 0,
@@ -116,7 +120,7 @@ pub fn snapshot_gps(now: Instant) -> WireGpsHealth {
             h_acc_mm,
             diff_soln,
             carr_soln,
-            last_fix_at,
+            last_fix_at: _,
         } => {
             s.state = wire::GPS_STATE_LOCKED;
             s.fix_type = fix_type;
@@ -124,10 +128,6 @@ pub fn snapshot_gps(now: Instant) -> WireGpsHealth {
             s.h_acc_mm = h_acc_mm;
             s.diff_soln = u8::from(diff_soln);
             s.carr_soln = carr_soln;
-            s.last_fix_age_ms = now
-                .saturating_duration_since(last_fix_at)
-                .as_millis()
-                .min(u32::MAX as u64) as u32;
         }
         GpsHealth::ReadError(k) => {
             s.state = wire::GPS_STATE_READ_ERROR;
@@ -139,11 +139,11 @@ pub fn snapshot_gps(now: Instant) -> WireGpsHealth {
         s.v_acc_mm = p.v_acc_mm;
         s.s_acc_mm_s = p.s_acc_mm_s;
         s.gnss_fix_ok = u8::from(p.gnss_fix_ok);
-        s.nav_pvt_age_ms = now
-            .saturating_duration_since(p.timestamp)
-            .as_millis()
-            .min(u32::MAX as u64) as u32;
+        s.nav_pvt_arrival_us = p.timestamp.as_micros();
     }
+
+    s.nav_pvt_max_interval_recent_us = NAV_PVT_MAX_INTERVAL_RECENT_US.load(Ordering::Relaxed);
+    s.nav_pvt_mean_interval_recent_us = NAV_PVT_MEAN_INTERVAL_RECENT_US.load(Ordering::Relaxed);
 
     s
 }

@@ -58,11 +58,16 @@
 //! present" markers, which doubles as a build-config breadcrumb in
 //! the file itself.
 
+use core::sync::atomic::Ordering;
+
 use embassy_time::Instant;
 
 use super::TopicDef;
 use crate::blackbox::cbor::{self, CborWriter};
-use crate::sensors::gps::{GPS_HEALTH, GpsErrKind, GpsHealth, LATEST_NAV_PVT};
+use crate::sensors::gps::{
+    GpsErrKind, GpsHealth, GPS_HEALTH, LATEST_NAV_PVT, NAV_PVT_MAX_INTERVAL_RECENT_US,
+    NAV_PVT_MEAN_INTERVAL_RECENT_US,
+};
 
 /// MCAP channel id for `/gps_health`. Stable across all record-set
 /// profiles.
@@ -89,7 +94,11 @@ pub const SCHEMA: &[u8] = br#"{
     "carr_soln":         { "type": "integer", "description": "RTK carrier-phase solution status. 0=none, 1=float, 2=fixed. NAV-PVT flags bits 6-7." },
     "gnss_fix_ok":       { "type": "boolean", "description": "Receiver believes the fix is valid. NAV-PVT flags bit 0. False when no NAV-PVT seen yet." },
     "nav_pvt_arrival_us":         { "type": "integer",
-                                    "description": "`Instant` (microseconds since boot) when the GPS task parsed the most recent NAV-PVT, i.e. the source-of-truth arrival timestamp. 0 when no NAV-PVT has ever been received. Two derived metrics: liveness = (timestamp_ns/1000 - nav_pvt_arrival_us); inter-PVT interval (the GPS-jitter signal) = diff of unique nav_pvt_arrival_us values across records. The recorder oversamples relative to NAV-PVT, so successive records typically share an arrival timestamp -- dedupe before differencing." }
+                                    "description": "`Instant` (microseconds since boot) when the GPS task parsed the most recent NAV-PVT, i.e. the source-of-truth arrival timestamp. 0 when no NAV-PVT has ever been received. Two derived metrics: liveness = (timestamp_ns/1000 - nav_pvt_arrival_us); inter-PVT interval (the GPS-jitter signal) = diff of unique nav_pvt_arrival_us values across records. The recorder oversamples relative to NAV-PVT, so successive records typically share an arrival timestamp -- dedupe before differencing." },
+    "nav_pvt_max_interval_recent_us":  { "type": "integer",
+                                         "description": "Worst-case inter-arrival interval among the most recent NAV_PVT_JITTER_WINDOW (=16) NAV-PVTs, in microseconds. Firmware-side dropout detector -- a single 1s gap among fifteen 200ms gaps spikes this from 200000 to 1000000. UINT32_MAX until at least two PVTs have been parsed since boot. Compare against the configured measurement period: much larger than expected = receiver is dropping or delaying frames." },
+    "nav_pvt_mean_interval_recent_us": { "type": "integer",
+                                         "description": "Mean inter-arrival interval over the same 16-PVT window, in microseconds. ROS `topic hz`-style typical-rate view (Hz = 1e6 / value). Where max_interval captures dropouts, this captures sustained rate -- a receiver that drops from 5 Hz to 2 Hz steadily moves this from 200000 to 500000. UINT32_MAX until at least two PVTs have been parsed." }
   }
 }"#;
 
@@ -149,6 +158,13 @@ struct Flat {
     /// received. Post-flight derives liveness AND inter-PVT interval
     /// from this single field — see schema doc.
     nav_pvt_arrival_us: u64,
+    /// Firmware-side jitter health metric: largest inter-arrival gap
+    /// among the most recent `NAV_PVT_JITTER_WINDOW` NAV-PVTs.
+    /// `u32::MAX` until ≥2 PVTs have been parsed.
+    nav_pvt_max_interval_recent_us: u32,
+    /// Mean inter-arrival interval over the same window. `u32::MAX`
+    /// until ≥2 PVTs have been parsed.
+    nav_pvt_mean_interval_recent_us: u32,
 }
 
 fn snapshot(_now: Instant) -> Flat {
@@ -164,6 +180,8 @@ fn snapshot(_now: Instant) -> Flat {
         carr_soln: 0,
         gnss_fix_ok: false,
         nav_pvt_arrival_us: 0,
+        nav_pvt_max_interval_recent_us: u32::MAX,
+        nav_pvt_mean_interval_recent_us: u32::MAX,
     };
 
     // Enum → state + variant fields. The Mutex is contended only by
@@ -220,6 +238,9 @@ fn snapshot(_now: Instant) -> Flat {
         f.nav_pvt_arrival_us = p.timestamp.as_micros();
     }
 
+    f.nav_pvt_max_interval_recent_us = NAV_PVT_MAX_INTERVAL_RECENT_US.load(Ordering::Relaxed);
+    f.nav_pvt_mean_interval_recent_us = NAV_PVT_MEAN_INTERVAL_RECENT_US.load(Ordering::Relaxed);
+
     f
 }
 
@@ -230,7 +251,7 @@ pub fn encode(scratch: &mut [u8], now: Instant) -> cbor::Result<usize> {
     let f = snapshot(now);
 
     let mut w = CborWriter::new(scratch);
-    w.map(12)?;
+    w.map(14)?;
     w.str("timestamp_ns")?;
     w.u64(now.as_micros().saturating_mul(1_000))?;
     w.str("state")?;
@@ -255,5 +276,9 @@ pub fn encode(scratch: &mut [u8], now: Instant) -> cbor::Result<usize> {
     w.bool(f.gnss_fix_ok)?;
     w.str("nav_pvt_arrival_us")?;
     w.u64(f.nav_pvt_arrival_us)?;
+    w.str("nav_pvt_max_interval_recent_us")?;
+    w.u64(f.nav_pvt_max_interval_recent_us as u64)?;
+    w.str("nav_pvt_mean_interval_recent_us")?;
+    w.u64(f.nav_pvt_mean_interval_recent_us as u64)?;
     Ok(w.pos())
 }

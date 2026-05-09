@@ -10,7 +10,10 @@ use crate::hal;
 use crate::motors::ACTUATOR_MOTORS;
 use crate::msgs;
 use crate::platform;
-use crate::sensors::gps::{carr_soln_str, GPS_HEALTH, LATEST_NAV_PVT};
+use crate::sensors::gps::{
+    carr_soln_str, GPS_HEALTH, LATEST_NAV_PVT, NAV_PVT_MAX_INTERVAL_RECENT_US,
+    NAV_PVT_MEAN_INTERVAL_RECENT_US,
+};
 use crate::sensors::{
     BARO_1, BARO_2, DSHOT_TELEMETRY, GPS_FIX, IMU_1, IMU_2, MAG_EXT, MAG_INT, POWER_STATUS,
     RC_INPUT, RC_LINK_STATUS, VEHICLE_ATTITUDE, VICON_POSE,
@@ -722,9 +725,31 @@ async fn dispatch<'d>(
         }
         "gpshealth" => {
             let health = GPS_HEALTH.lock(|c| c.get());
-            let mut buf = [0u8; 192];
+            let max_iv = NAV_PVT_MAX_INTERVAL_RECENT_US.load(Ordering::Relaxed);
+            let mean_iv = NAV_PVT_MEAN_INTERVAL_RECENT_US.load(Ordering::Relaxed);
+            let mut buf = [0u8; 320];
             let mut w = WriteBuf::new(&mut buf);
             write!(w, "{}\r\n", health).ok();
+            if max_iv == u32::MAX || mean_iv == u32::MAX {
+                write!(w, "  cadence: <2 PVTs seen>\r\n").ok();
+            } else {
+                // Integer Hz×100 → "X.YY Hz" without floating point.
+                // 0 mean defends against /0 if span_us collapsed.
+                let hz_x100: u32 = if mean_iv == 0 {
+                    0
+                } else {
+                    (100_000_000u64 / mean_iv as u64).min(u32::MAX as u64) as u32
+                };
+                write!(
+                    w,
+                    "  cadence (last 16 PVTs): mean={}us ({}.{:02} Hz), max={}us\r\n",
+                    mean_iv,
+                    hz_x100 / 100,
+                    hz_x100 % 100,
+                    max_iv
+                )
+                .ok();
+            }
             write_all(class, w.as_slice()).await?;
         }
         "gpsrtk" => {

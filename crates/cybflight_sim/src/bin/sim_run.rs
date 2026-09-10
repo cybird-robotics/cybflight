@@ -6,7 +6,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 use cybflight_sim::{
-    controller::{CascadeController, Controller, MpcDirectController, MpcIndiController},
+    controller::{
+        CascadeController, Controller, GeometricIndiController, MpcDirectController,
+        MpcFullIndiController, MpcIndiController, TinyMpcIndiController,
+    },
     plant::QuadPlant,
     report,
     runner::MissionRunner,
@@ -20,6 +23,17 @@ use nalgebra::Vector3;
 enum ControllerKind {
     /// 10-state MPC at 100 Hz + INDI at 8 kHz (firmware-match topology).
     MpcIndi,
+    /// TinyMPC (ADMM, hover-linearised model) at 100 Hz + INDI at 8 kHz.
+    TinympcIndi,
+    /// Geometric tracking controller (RPG position controller port) at
+    /// 500 Hz + INDI at 8 kHz.
+    GeometricIndi,
+    /// 13-state MPC at 100 Hz → (T_d, α_d) → INDI α loop at 8 kHz
+    /// (`outer_loop: mpc_full` prototype, Sun et al. T-RO 2022 Fig. 3).
+    MpcFullIndi,
+    /// Same, but the inner loop degrades to static inversion (no INDI
+    /// increments) — the paper's "NMPC w/o INDI" ablation.
+    MpcFullNoindi,
     /// 13-state MPC at 100 Hz, per-motor output (diagnostic upper bound).
     MpcDirect,
     /// PD position + geometric attitude + rate-P + mixer (legacy baseline).
@@ -80,7 +94,9 @@ struct Args {
     #[arg(long, default_value = "mission_square")]
     scenario: String,
 
-    /// Controller: mpc-indi (default, firmware-match), mpc-direct, or cascade.
+    /// Controller: mpc-indi (default, firmware-match), mpc-full-indi
+    /// (full-model NMPC + INDI α inner loop), mpc-full-noindi (its
+    /// static-inversion ablation), mpc-direct, or cascade.
     #[arg(long, value_enum, default_value_t = ControllerKind::MpcIndi)]
     controller: ControllerKind,
 
@@ -134,16 +150,30 @@ fn main() -> ExitCode {
     // Plant dt must match the runner's dt_sim (default 1/8000) so the
     // runner's tick accounting and the plant's integration clock stay in
     // lockstep. Matches what autotest_mission and autotest_noisy use.
-    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), 1.0 / 8000.0);
+    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), &scenario.sim_params, 1.0 / 8000.0);
     let mut controller: Box<dyn Controller> = match args.controller {
         ControllerKind::MpcIndi => {
             Box::new(MpcIndiController::from_params(&scenario.vehicle_params))
         }
+        ControllerKind::TinympcIndi => {
+            Box::new(TinyMpcIndiController::from_params(&scenario.vehicle_params))
+        }
+        ControllerKind::GeometricIndi => {
+            Box::new(GeometricIndiController::from_params(&scenario.vehicle_params))
+        }
+        ControllerKind::MpcFullIndi => {
+            Box::new(MpcFullIndiController::from_params(&scenario.vehicle_params))
+        }
+        ControllerKind::MpcFullNoindi => Box::new(MpcFullIndiController::with_options(
+            &scenario.vehicle_params,
+            100.0,
+            false,
+        )),
         ControllerKind::MpcDirect => {
-            Box::new(MpcDirectController::from_params(&scenario.vehicle_params))
+            Box::new(MpcDirectController::from_params(&scenario.vehicle_params, &scenario.sim_params))
         }
         ControllerKind::Cascade => {
-            Box::new(CascadeController::from_params(&scenario.vehicle_params))
+            Box::new(CascadeController::from_params(&scenario.vehicle_params, &scenario.sim_params))
         }
     };
     let controller_name = controller.name();

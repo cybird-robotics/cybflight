@@ -68,7 +68,7 @@ fn gps_mpc_indi_mission() -> (Scenario, MpcIndiController) {
 #[test]
 fn mpc_indi_tracks_through_noisy_gps() {
     let (mut scenario, mut controller) = gps_mpc_indi_mission();
-    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), 1.0 / 8000.0);
+    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), &scenario.sim_params, 1.0 / 8000.0);
     let runner = MissionRunner::new(Default::default());
     let out = runner.run(&mut scenario, &mut plant, &mut controller);
 
@@ -84,6 +84,11 @@ fn mpc_indi_tracks_through_noisy_gps() {
         out.verdict,
         json.display(),
     );
+    println!(
+        "  estimator ready at {:?}s; pre-mission hold peak tilt {:.1}° (reported, not scored)",
+        out.summary.estimator_ready_s,
+        out.summary.pre_mission_peak_tilt_rad.to_degrees(),
+    );
     for r in &out.failure_reasons {
         println!("  fail: {r}");
     }
@@ -93,4 +98,27 @@ fn mpc_indi_tracks_through_noisy_gps() {
     // will ring out harder, which is why we care about peak, not just
     // rms. Tighter bounds belong in the regression snapshot.
     assert_eq!(out.verdict, Verdict::Pass, "{:?}", out.failure_reasons);
+
+    // The mission must actually have waited for the estimator rather than
+    // the wait cap quietly releasing it — otherwise this test would be
+    // scoring the unconverged window again without saying so.
+    assert!(
+        out.summary.estimator_ready_s.is_some_and(|t| t < 5.0),
+        "guard never reported ready ({:?}); the mission started on the \
+         MAX_ESTIMATOR_WAIT_S cap and the scored window is not what this \
+         test claims to measure",
+        out.summary.estimator_ready_s
+    );
+    // The hold is not scored, but it is still flight: station-keeping on
+    // an unconverged estimate is ugly (≈100° of tilt against a 1.2 m
+    // estimator error at σ=0.5 m / 5 Hz) and that is expected. What is
+    // NOT acceptable is losing the airframe — a diverging loop tumbles
+    // past 150°. Bound it loosely so this window cannot become a place
+    // where real failures hide.
+    assert!(
+        out.summary.pre_mission_peak_tilt_rad.to_degrees() < 120.0,
+        "pre-mission hold tumbled to {:.1}° — that is loss of control, \
+         not an aggressive correction",
+        out.summary.pre_mission_peak_tilt_rad.to_degrees()
+    );
 }

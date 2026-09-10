@@ -17,9 +17,8 @@
 //!       --test minco_snap_offline`
 
 use cybflight_core::rotation::quaternion_to_euler_angles_rpy;
-use cybflight_core::trajectory_planning::minco_snap::{
-    flatness_to_state_tilt_yaw, MincoSnap,
-};
+use cybflight_core::trajectory_planning::flatness::flatness_to_state_tilt_yaw;
+use cybflight_core::trajectory_planning::minco_snap::MincoSnap;
 use cybflight_core::trajectory_planning::piecewise_polynomial::PiecewisePolynomial;
 use cybflight_core::trajectory_planning::types::{Vec3, ZERO3};
 

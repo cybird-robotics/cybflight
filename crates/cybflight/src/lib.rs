@@ -4,9 +4,12 @@
 pub use bsp_sakurah743 as bsp;
 #[cfg(feature = "board_foxeerh743")]
 pub use bsp_foxeerh743 as bsp;
+#[cfg(feature = "board_micoair743v2")]
+pub use bsp_micoair743v2 as bsp;
 
 pub use bsp::hal;
 
+pub mod clocks;
 pub mod arm_led;
 pub mod blackbox;
 pub mod board_init;
@@ -14,11 +17,15 @@ pub mod comm;
 pub mod serial_logger;
 pub mod control;
 pub mod estimation;
+#[cfg(feature = "role_chaser")]
+pub mod gimbal;
 pub mod health;
 pub mod motors;
 pub use cybflight_msgs as msgs;
 pub mod params;
 pub mod platform;
+pub mod rates;
+pub mod reset_cause;
 #[cfg(feature = "postmortem")]
 pub mod postmortem;
 pub mod sensors;
@@ -28,6 +35,10 @@ pub mod thrust_tables;
 pub mod usb_serial;
 pub mod vehicle;
 pub mod watchdog;
+
+// Gimbal roles are optional (absence = unchanged firmware) but mutually exclusive.
+#[cfg(all(feature = "role_leader", feature = "role_chaser"))]
+compile_error!("role_leader and role_chaser are mutually exclusive — pick one");
 
 /// Firmware version from `Cargo.toml`.
 pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");

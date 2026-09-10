@@ -83,31 +83,141 @@ pub enum SpinDir {
     Ccw = -1,
 }
 
+/// Flash/shell encoding for [`SpinDir`]: Cw = 1, Ccw = 0 (matches the
+/// pre-registry blob encoding). Out-of-range values map to Ccw.
+impl crate::param_registry::ParamEnum for SpinDir {
+    fn to_u8(self) -> u8 {
+        match self {
+            SpinDir::Cw => 1,
+            SpinDir::Ccw => 0,
+        }
+    }
+    fn from_u8(v: u8) -> Self {
+        if v == 1 { SpinDir::Cw } else { SpinDir::Ccw }
+    }
+}
+
+/// Motor time constant [s] used when a vehicle does not identify its own —
+/// the historical `INDI_MOTOR_PARAMS` const. A zero here is structurally
+/// meaningless (the G2 scaler divides by it), so unlike mass or geometry
+/// this field carries a real default rather than a zero sentinel.
+pub const DEFAULT_MOTOR_TAU_S: f32 = 0.02;
+
+/// Motor max speed [rad/s] used when a vehicle does not identify its own:
+/// 40 000 RPM, the historical `INDI_MOTOR_PARAMS` const. Same
+/// no-zero-sentinel reasoning as [`DEFAULT_MOTOR_TAU_S`].
+pub const DEFAULT_MOTOR_MAX_OMEGA_RAD_S: f32 = 4188.79;
+
 /// Physical and geometric parameters for one motor + propeller combination.
-#[derive(Clone, Copy, Debug)]
+///
+/// Everything here is an *actuator fact* — measured from the motor, ESC and
+/// propeller, independent of which controller happens to read it. The
+/// dynamics fields (`tau`, `omega_max`, `g2_*`, `nonlin`) live here rather
+/// than under an `indi_` prefix for exactly that reason: they would be
+/// identical under a geometric or rate controller, and INDI is merely their
+/// only current consumer.
+///
+/// Two flavours of field, distinguished by how they reach the firmware:
+///
+/// - **Geometry/identity** (`px`, `py`, `spin`, `thrust`, `torque`) comes
+///   from the REQUIRED `airframe.motors` list in the vehicle YAML and has
+///   no default — a wrong value flies and looks plausible, so it must be
+///   stated.
+/// - **Identified dynamics** (`tau`, `omega_max`, `g2_*`, `nonlin`) is
+///   optional, carries a real default (or a documented zero sentinel), and
+///   is pinned per vehicle under `tuning:` once bench-identified.
+///
+/// Param keys are exposed with a per-motor prefix (`m0_px`, `m1_spin`, …)
+/// via the `nested_array` field in `AirframeParams`.
+#[derive(Clone, Copy, Debug, cybflight_params_derive::Params)]
 pub struct MotorParams {
     /// Motor position in body XY plane [x_m, y_m] in FLU frame.
     /// x = forward, y = left.
+    #[param(keys = "px,py", unit = "m", min = -1.0, max = 1.0, reboot)]
     pub position_m: [f32; 2],
     /// Propeller spin direction (viewed from above).
+    #[param(enum_u8, key = "spin", reboot)]
     pub spin_dir: SpinDir,
     /// Maximum thrust this motor+propeller produces at full throttle (Newtons).
+    #[param(key = "thrust", unit = "N", min = 0.1, max = 200.0, reboot)]
     pub max_thrust_n: f32,
     /// Reaction torque per unit thrust (metres). Ratio of yaw reaction torque to
     /// thrust force. Typically 0.005–0.02 for a 5" propeller.
+    #[param(key = "torque", unit = "m", min = 0.0, max = 0.2, reboot)]
     pub torque_coeff_m: f32,
+    /// First-order spool-up time constant of motor+ESC+prop [s], from a
+    /// throttle-step bench test. Feeds the INDI G2 scaler
+    /// (`ω_max²/(2·τ)`), the actuator-state PT1 and the RPM estimator.
+    #[param(key = "tau", unit = "s", min = 0.001, max = 1.0)]
+    pub time_const_s: f32,
+    /// Motor speed at full throttle [rad/s] — Kv × pack voltage, or read
+    /// off RPM telemetry at full stick.
+    #[param(key = "omega_max", unit = "rad/s", min = 50.0, max = 20000.0)]
+    pub max_omega_rad_s: f32,
+    /// G2 rate-dependent effectiveness [roll, pitch, yaw]: the angular
+    /// acceleration induced by *rotor* angular acceleration (rotor polar
+    /// inertia against vehicle inertia). Only the yaw entry is non-zero
+    /// for a standard multirotor, and its sign follows spin direction
+    /// (CW +, CCW −) — which is why this stays per-motor rather than
+    /// collapsing to one scalar.
+    ///
+    /// Range mirrors the controller's `G_MAG_MAX` (±1e4) so an
+    /// implausible magnitude is rejected at the write, not first
+    /// discovered by the apply-path degrade.
+    #[param(keys = "g2_rr,g2_rp,g2_ry", min = -1e4, max = 1e4)]
+    pub g2: [f32; 3],
+    /// Thrust-curve nonlinearity `k` for this motor+prop. **0 selects the
+    /// compile-time fallback matched to the vehicle's `thrust_model`** —
+    /// the one deliberate zero sentinel here.
+    ///
+    /// Range mirrors the hard clamp in
+    /// `indi::linearization::ThrustLinearization::new` (`[0.025, 1.0]`):
+    /// below the floor the quadratic inverse degenerates, and 1.0 is the
+    /// physical ceiling (thrust ∝ d² exactly). The two must stay equal —
+    /// advertising a wider range here would let a value validate, persist
+    /// and display while the controller silently flew the clamped one.
+    #[param(key = "nonlin", min = 0.025, max = 1.0)]
+    pub nonlinearity: f32,
 }
 
 /// Vehicle rigid-body parameters.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, cybflight_params_derive::Params)]
 pub struct RigidBodyParams {
     /// Vehicle mass (kg).
+    #[param(key = "mass", unit = "kg", min = 0.05, max = 20.0, reboot)]
     pub mass_kg: f32,
     /// Inertia tensor stored row-major: [Ixx, Ixy, Ixz, Iyx, Iyy, Iyz, Izx, Izy, Izz].
     /// For a symmetric body, off-diagonal terms are zero.
     /// Stored as a flat array for `const`-compatible initialization.
+    #[param(keys = "ixx,ixy,ixz,iyx,iyy,iyz,izx,izy,izz", unit = "kg·m²", min = -1.0, max = 1.0, reboot)]
     pub inertia_kg_m2: [f32; 9],
+    #[param(keys = "max_rate_r,max_rate_p,max_rate_y", unit = "rad/s", min = 0.1, max = 50.0, reboot)]
     pub max_rate_rad_s: [f32; 3],
+}
+
+impl MotorParams {
+    /// Zeroed geometry plus stock actuator dynamics — the base for
+    /// struct-update construction where only geometry is being stated:
+    ///
+    /// ```ignore
+    /// MotorParams { position_m: [-0.075, -0.1], spin_dir: SpinDir::Cw,
+    ///               max_thrust_n: 12.0, torque_coeff_m: 0.022,
+    ///               ..MotorParams::STOCK_DYNAMICS }
+    /// ```
+    ///
+    /// This is *not* a `Default` impl, deliberately: geometry must always
+    /// be stated (a zero mass or motor arm is unflyable by construction),
+    /// so there is no whole-struct default to reach for by accident.
+    pub const STOCK_DYNAMICS: Self = Self {
+        position_m: [0.0, 0.0],
+        spin_dir: SpinDir::Ccw,
+        max_thrust_n: 0.0,
+        torque_coeff_m: 0.0,
+        time_const_s: DEFAULT_MOTOR_TAU_S,
+        max_omega_rad_s: DEFAULT_MOTOR_MAX_OMEGA_RAD_S,
+        g2: [0.0; 3],
+        nonlinearity: 0.0,
+    };
 }
 
 impl RigidBodyParams {
@@ -245,6 +355,7 @@ mod tests {
                 spin_dir: SpinDir::Cw,
                 max_thrust_n: T_MAX,
                 torque_coeff_m: C,
+                ..MotorParams::STOCK_DYNAMICS
             },
             // M1 FRONT_RIGHT: x=+d, y=−d
             MotorParams {
@@ -252,6 +363,7 @@ mod tests {
                 spin_dir: SpinDir::Ccw,
                 max_thrust_n: T_MAX,
                 torque_coeff_m: C,
+                ..MotorParams::STOCK_DYNAMICS
             },
             // M2 REAR_LEFT:   x=−d, y=+d (left = positive y in FLU)
             MotorParams {
@@ -259,6 +371,7 @@ mod tests {
                 spin_dir: SpinDir::Ccw,
                 max_thrust_n: T_MAX,
                 torque_coeff_m: C,
+                ..MotorParams::STOCK_DYNAMICS
             },
             // M3 FRONT_LEFT:  x=+d, y=+d
             MotorParams {
@@ -266,6 +379,7 @@ mod tests {
                 spin_dir: SpinDir::Cw,
                 max_thrust_n: T_MAX,
                 torque_coeff_m: C,
+                ..MotorParams::STOCK_DYNAMICS
             },
         ]
     }

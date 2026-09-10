@@ -33,6 +33,21 @@ pub const NC: usize = NU + NV;
 
 /// INDI controller configuration.
 pub struct IndiConfig {
+    /// Master INDI switch. `true` (the normal build) runs the full
+    /// incremental law. `false` permanently drops the incremental terms —
+    /// the same `do_indi = false` path the controller already takes on the
+    /// ground — leaving a plain rate controller: rate error × `rate_gains`
+    /// → desired angular acceleration → WLS allocation through G1 →
+    /// thrust linearization. This is indiflight's `useIncrement = false`
+    /// (NDI, or more precisely linDI); see `src/main/flight/indi.h`.
+    ///
+    /// Selected by the vehicle YAML `build: indi:` knob (cargo feature
+    /// `indi_off`), so on a normal build the `false` branch folds away.
+    /// Note the degraded law is proportional-only: without the increment
+    /// there is no integral action, so a steady disturbance (mass
+    /// imbalance, wind) leaves a standing rate error the outer loop has
+    /// to absorb.
+    pub indi_enabled: bool,
     /// Rate error → angular acceleration gains (rad/s² per rad/s).
     pub rate_gains: Vector3<f32>,
     /// Biquad low-pass cutoff frequency (Hz) for `spf`, `u_state`, `omega`
@@ -44,10 +59,6 @@ pub struct IndiConfig {
     pub rate_dot_sg_window_size: i32,
     /// Savitzky–Golay polynomial order (1 ≤ n ≤ 3, n < window_size).
     pub rate_dot_sg_order: i32,
-    /// Target SG sample rate. The controller decimates the loop-rate gyro
-    /// stream to the nearest integer divisor of this rate before feeding it
-    /// to the SG derivative filter.
-    pub rate_dot_sg_target_rate_hz: f32,
     /// Motor parameters (from vehicle definition).
     pub motors: [MotorParams; NU],
     /// Body rigid-body parameters.
@@ -72,6 +83,14 @@ pub struct IndiConfig {
     pub wls_imax: usize,
     /// Consecutive WLS NaN failures before failsafe.
     pub nan_limit: u16,
+    /// Per-tick multiplier applied to the held actuator state while the
+    /// WLS allocator is returning NaN.
+    ///
+    /// Ramps the motors down instead of holding the last good command
+    /// indefinitely or cutting them dead. Its effective time constant is
+    /// per *control* tick, so it is coupled to `indi_ctrl_div` and the
+    /// loop rate: the same fraction decays faster at a higher rate.
+    pub nan_rampdown: f32,
     /// Consecutive invalid RPM frames before zeroing G2 column (per motor).
     pub rpm_invalid_limit: u16,
     /// Consecutive frames with ALL motors invalid before failsafe.
@@ -80,6 +99,16 @@ pub struct IndiConfig {
     pub rpm_recovery_count: u16,
     /// Motor pole count (for eRPM → RPM conversion).
     pub motor_pole_count: u8,
+    /// Ground-contact detection: gyro magnitude below this counts as
+    /// "not flying" [rad/s].
+    pub ground_gyro_rad_s: f32,
+    /// Ground-contact detection: specific-force magnitude above this
+    /// counts as "resting on its skids" [m/s²]. Normally slightly below
+    /// 1 g — a vehicle in free flight reads less.
+    pub ground_accel_m_s2: f32,
+    /// Ground-contact detection: vertical thrust setpoint below this
+    /// counts as "not commanding flight" [m/s²].
+    pub ground_thrust_sp_m_s2: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +123,16 @@ pub struct IndiController {
     linearization: [ThrustLinearization; NU],
     thrust_model: ThrustModel,
 
+    indi_enabled: bool,
     rate_gains: Vector3<f32>,
+    /// Effective (Nyquist-clamped) cutoff shared by every sync filter.
+    sync_filter_hz: f32,
+
+    /// Ground-contact detection thresholds (gyro [rad/s], specific
+    /// force [m/s²], vertical thrust setpoint [m/s²]).
+    ground_gyro_rad_s: f32,
+    ground_accel_m_s2: f32,
+    ground_thrust_sp_m_s2: f32,
 
     rate_dot_estimator: RateDotEstimator,
     spf_filter: [Biquad; 3],
@@ -121,6 +159,7 @@ pub struct IndiController {
     wls_theta: f32,
     wls_imax: usize,
     nan_limit: u16,
+    nan_rampdown: f32,
     rpm_invalid_limit: u16,
     rpm_all_invalid_limit: u16,
     rpm_recovery_count: u16,
@@ -159,17 +198,42 @@ pub struct IndiOutput {
     pub nan_failsafe: bool,
 }
 
-/// Intermediate signals from the INDI step, exposed for the learner.
-///
-/// These are the raw (pre-INDI-sync-filter) signals that the learner needs
-/// for its own matched filtering. The learner applies its own filters at
-/// a different cutoff frequency.
+/// Intermediate signals from the INDI step, exposed for external
+/// observers (raw, pre-INDI-sync-filter).
 #[derive(Clone, Copy)]
 pub struct IndiStepState {
     /// SG first-derivative output (rad/s²), pre-post-biquad.
     pub rate_dot_raw: Vector3<f32>,
     /// True if the ground-detection heuristic thinks the vehicle is on the ground.
     pub touching_ground: bool,
+}
+
+/// How the G1 block of [`crate::params::IndiEffectivenessParams`] resolved
+/// in [`IndiController::apply_effectiveness_params`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum G1Application {
+    /// G1 block all-zero (the "not configured" sentinel): the
+    /// geometry-derived G1 was (re)stored.
+    Geometric,
+    /// Configured G1 validated and applied.
+    Configured,
+    /// Configured G1 present but invalid: geometric restored. Degraded but
+    /// flyable — zero control authority is structurally impossible.
+    RejectedKeptGeometric,
+}
+
+/// Per-call outcome of [`IndiController::apply_effectiveness_params`]. The
+/// firmware maps these flags to `defmt` warnings; core stays log-free.
+#[derive(Clone, Copy, Debug)]
+pub struct EffectivenessApplyReport {
+    /// How the G1 block resolved.
+    pub g1: G1Application,
+    /// False if any G2 entry was non-finite or beyond the magnitude bound
+    /// (previous G2 kept).
+    pub g2_ok: bool,
+    /// Per-motor: false if tau/omega was non-finite or ≤ 0 (previous value
+    /// kept for that motor).
+    pub motor_dynamics_ok: [bool; NU],
 }
 
 impl IndiController {
@@ -187,11 +251,18 @@ impl IndiController {
             )
         });
 
+        // One clamped cutoff for every synchronized filter. The whole point
+        // of `sync_filter_hz` is that `spf_fs`, `u_state_fs`, `omega_fs` and
+        // the `rate_dot` post-biquad share a group delay, so they must share
+        // a cutoff — including after the Nyquist clamp, which only binds on
+        // low loop rates (see `super::clamp_cutoff_hz`).
+        let sync_filter_hz = super::clamp_cutoff_hz(config.sync_filter_hz, loop_rate_hz);
+
         let make_biquad = || {
             let cfg = BiquadFilterConfigBuilder::direct_form_2()
                 .sample_frequency_hz(loop_rate_hz)
                 .filter_type(BiquadFilterType::LowPass)
-                .cutoff_frequency_hz(config.sync_filter_hz)
+                .cutoff_frequency_hz(sync_filter_hz)
                 .build()
                 .expect("indi: biquad filter config invalid");
             BiquadFilter::new(cfg)
@@ -207,8 +278,7 @@ impl IndiController {
             &RateDotEstimatorConfig {
                 sg_window_size: config.rate_dot_sg_window_size,
                 sg_order: config.rate_dot_sg_order,
-                sg_target_rate_hz: config.rate_dot_sg_target_rate_hz,
-                post_cutoff_hz: config.sync_filter_hz,
+                post_cutoff_hz: sync_filter_hz,
             },
         );
 
@@ -219,7 +289,12 @@ impl IndiController {
             effectiveness,
             linearization,
             thrust_model: config.thrust_model,
+            indi_enabled: config.indi_enabled,
             rate_gains: config.rate_gains,
+            sync_filter_hz,
+            ground_gyro_rad_s: config.ground_gyro_rad_s,
+            ground_accel_m_s2: config.ground_accel_m_s2,
+            ground_thrust_sp_m_s2: config.ground_thrust_sp_m_s2,
             rate_dot_estimator,
             spf_filter: core::array::from_fn(|_| make_biquad()),
             u_state_filter: core::array::from_fn(|_| make_biquad()),
@@ -240,6 +315,7 @@ impl IndiController {
             wls_theta: config.wls_theta,
             wls_imax: config.wls_imax,
             nan_limit: config.nan_limit,
+            nan_rampdown: config.nan_rampdown,
             rpm_invalid_limit: config.rpm_invalid_limit,
             rpm_all_invalid_limit: config.rpm_all_invalid_limit,
             rpm_recovery_count: config.rpm_recovery_count,
@@ -247,56 +323,116 @@ impl IndiController {
         }
     }
 
-    /// Apply learned parameters to the controller.
+    /// Apply the effectiveness param block to the controller. Call while
+    /// disarmed only (boot + the disarmed param hot-reload) — it swaps the
+    /// allocator's B matrix and the actuator-state dynamics mid-loop.
     ///
-    /// Updates effectiveness (G1/G2), linearization (nonlinearity), PT1 time
-    /// constants, and rate gains. Validates all values before applying.
-    /// Returns `true` if applied, `false` if validation failed.
-    pub fn apply_learned_params(&mut self, learned: &super::learner::LearnedParams) -> bool {
-        if !learned.valid {
-            return false;
-        }
-        // Validate and apply effectiveness
-        if !self.effectiveness.update_from_learned(
-            &learned.g1,
-            &learned.g2,
-            &learned.max_omega,
-            &learned.time_const_s,
-        ) {
-            return false;
-        }
-        // Update PT1 time constants for actuator state estimation
+    /// Range authority is the schema `ParamMeta` (enforced at shell set,
+    /// YAML bake, and flash replay); this function performs only structural
+    /// safety checks (finite, positive, magnitude) and therefore can never
+    /// disagree with the schema ranges — the old `update_from_learned`
+    /// duplicated a *tighter* tau range and silently rejected legal values.
+    ///
+    /// The actuator facts (`tau`, `omega_max`, `g2_*`, `nonlin`) come from
+    /// `motors` — the airframe group — and only the identified G1 override
+    /// comes from `p`. They are separate arguments rather than one struct
+    /// because they answer to different owners: `motors` describes the
+    /// hardware, `p` supersedes a computation over it.
+    ///
+    /// Per-block semantics (each block independent — a bad value in one
+    /// never blocks the others):
+    /// - **tau/omega** per motor: accepted iff finite and > 0; updates
+    ///   `max_omega`, the G2 scaler, and the PT1 actuator-state alpha.
+    /// - **G2**: copied verbatim from `motors` (it IS the G2 source; there
+    ///   is no const seed) iff every entry is finite and bounded.
+    /// - **G1**: all-zero block = "derive geometrically" sentinel → the
+    ///   geometry-derived matrix is (re)stored. A configured block is
+    ///   validated; on failure the geometric matrix is restored. Zero
+    ///   control authority is structurally impossible.
+    /// - **nonlinearity** per motor: param if > 0, else `fallback_k` (the
+    ///   thrust-model-matched compile-time default).
+    pub fn apply_effectiveness_params(
+        &mut self,
+        motors: &[MotorParams; NU],
+        p: &crate::params::IndiEffectivenessParams,
+        fallback_k: f32,
+    ) -> EffectivenessApplyReport {
+        // Magnitude bound: ~30× the largest geometric G1 entry for a
+        // typical micro-quad. Anything beyond is a corrupted config, not a
+        // real vehicle.
+        const G_MAG_MAX: f32 = 1e4;
+        let g_valid = |v: f32| v.is_finite() && v.abs() <= G_MAG_MAX;
+
+        // Motor dynamics (tau/omega), per motor.
         let dt = 1.0 / self.freq;
+        let mut motor_dynamics_ok = [true; NU];
         for i in 0..NU {
-            self.pt1_alpha[i] = dt / (learned.time_const_s[i] + dt);
+            let tau = motors[i].time_const_s;
+            let omega = motors[i].max_omega_rad_s;
+            if tau.is_finite() && tau > 0.0 && omega.is_finite() && omega > 0.0 {
+                self.effectiveness.max_omega[i] = omega;
+                self.effectiveness.g2_scaler[i] = 0.5 * omega * omega / tau;
+                self.pt1_alpha[i] = dt / (tau + dt);
+            } else {
+                motor_dynamics_ok[i] = false;
+            }
         }
-        // Update linearization
+
+        // G2: airframe matrix verbatim.
+        let g2_ok = motors.iter().flat_map(|m| m.g2.iter()).all(|&v| g_valid(v));
+        if g2_ok {
+            for i in 0..NU {
+                for j in 0..3 {
+                    self.effectiveness.g2[(j, i)] = motors[i].g2[j];
+                }
+            }
+        }
+
+        // G1: zero-sentinel → geometric; configured → validate or restore
+        // geometric.
+        let g1_entries = || p.g1_force.iter().flatten().chain(p.g1_torque.iter().flatten());
+        let g1 = if g1_entries().all(|&v| v == 0.0) {
+            self.effectiveness.g1 = self.effectiveness.g1_geometric;
+            G1Application::Geometric
+        } else if g1_entries().all(|&v| g_valid(v)) {
+            for i in 0..NU {
+                for j in 0..3 {
+                    self.effectiveness.g1[(j, i)] = p.g1_force[i][j];
+                    self.effectiveness.g1[(j + 3, i)] = p.g1_torque[i][j];
+                }
+            }
+            G1Application::Configured
+        } else {
+            self.effectiveness.g1 = self.effectiveness.g1_geometric;
+            G1Application::RejectedKeptGeometric
+        };
+
+        // Nonlinearity: per-motor param with model-matched fallback.
         for i in 0..NU {
+            let k = motors[i].nonlinearity;
+            let k = if k.is_finite() && k > 0.0 { k } else { fallback_k };
             self.linearization[i] = super::linearization::ThrustLinearization::new(
-                learned.nonlinearity[i],
+                k,
                 self.thrust_model,
                 self.linearization[i].per_motor_max_n(),
             );
         }
-        // Update rate gains
-        if learned.rate_gain.is_finite() && learned.rate_gain > 0.0 {
-            self.rate_gains = Vector3::new(learned.rate_gain, learned.rate_gain, learned.rate_gain);
+
+        EffectivenessApplyReport {
+            g1,
+            g2_ok,
+            motor_dynamics_ok,
         }
-        true
     }
 
-    /// Reset effectiveness to geometric G1 with zero G2.
-    ///
-    /// Used when entering learner-prearm mode: reverts to the physics-based
-    /// effectiveness derived from motor geometry, ensuring no learned G2 or
-    /// G1 is active during a data-collection flight.
-    pub fn reset_to_geometric(
-        &mut self,
-        motors: &[crate::mixer::MotorParams; NU],
-        body: &crate::mixer::RigidBodyParams,
-        indi_params: &[IndiMotorParams; NU],
-    ) {
-        self.effectiveness = IndiEffectiveness::new(motors, body, indi_params);
+    /// The cutoff actually in use by every synchronized filter, after the
+    /// Nyquist clamp against the loop rate. Callers that build their own
+    /// filters feeding [`MotorState::External`] must use THIS value, not
+    /// the requested `sync_filter_hz`, or the delay match INDI depends on
+    /// silently breaks. Also lets the firmware log when a parameter was
+    /// clamped (core stays log-free).
+    pub fn effective_sync_filter_hz(&self) -> f32 {
+        self.sync_filter_hz
     }
 
     /// Update actuator state estimation from last motor command.
@@ -330,16 +466,91 @@ impl IndiController {
         (result.g2_valid, result.failsafe)
     }
 
-    /// Run one INDI iteration.
+    /// Run one INDI iteration from a body-rate setpoint (legacy entry).
+    ///
+    /// The rate-error stage `rate_dot_sp = rate_gains ∘ (rate_sp − gyro)`
+    /// runs here; everything downstream is shared with [`Self::step_alpha`]
+    /// via `step_rate_dot`.
     ///
     /// Returns `(IndiOutput, IndiStepState)`. The `IndiStepState` exposes
-    /// intermediate signals needed by the learner (raw rate_dot, ground
-    /// detection). The learner applies its own matched filters.
+    /// raw intermediate signals (pre-sync-filter rate_dot, ground
+    /// detection) for external observers.
     pub fn step(
         &mut self,
         gyro_rad_s: &Vector3<f32>,
         accel_m_s2: &Vector3<f32>,
         rate_sp: &Vector3<f32>,
+        spf_sp_z: f32,
+        armed: bool,
+        g2_valid: &[bool; NU],
+        motor_state: MotorState<'_>,
+        voltage_v: f32,
+    ) -> (IndiOutput, IndiStepState) {
+        // --- Rate controller (the ONLY consumer of `rate_gains`) ---
+        let rate_err = *rate_sp - *gyro_rad_s;
+        let rate_dot_sp = self.rate_gains.component_mul(&rate_err);
+        self.step_rate_dot(
+            gyro_rad_s,
+            accel_m_s2,
+            &rate_dot_sp,
+            spf_sp_z,
+            armed,
+            g2_valid,
+            motor_state,
+            voltage_v,
+        )
+    }
+
+    /// Run one INDI iteration from an angular-acceleration setpoint.
+    ///
+    /// Entry point for the `mpc_full` architecture (Sun et al., T-RO 2022,
+    /// Fig. 3): the outer full-model NMPC supplies the desired angular
+    /// acceleration `α_d` directly (see
+    /// `mpc::FullQuadModel::inner_setpoint`), so **no rate gains are
+    /// involved** — the rate loop lives inside the optimizer. The torque
+    /// loop below still runs at full IMU rate: with INDI enabled the
+    /// increment `α_d − ω̇_f` plus rotor-speed feedback rejects unmodeled
+    /// torque (paper eq. 33–35); with INDI disabled (`indi_enabled =
+    /// false` / on ground / disarmed) this degrades to the paper's
+    /// "NMPC w/o INDI" baseline — model-based static inversion of `α_d`
+    /// through G1 alone (eq. 29–30).
+    ///
+    /// `α_d` is expected to be *held* between outer-loop solves; the
+    /// incremental correction re-evaluates against fresh gyro/rotor data
+    /// every call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_alpha(
+        &mut self,
+        gyro_rad_s: &Vector3<f32>,
+        accel_m_s2: &Vector3<f32>,
+        alpha_sp_rad_s2: &Vector3<f32>,
+        spf_sp_z: f32,
+        armed: bool,
+        g2_valid: &[bool; NU],
+        motor_state: MotorState<'_>,
+        voltage_v: f32,
+    ) -> (IndiOutput, IndiStepState) {
+        self.step_rate_dot(
+            gyro_rad_s,
+            accel_m_s2,
+            alpha_sp_rad_s2,
+            spf_sp_z,
+            armed,
+            g2_valid,
+            motor_state,
+            voltage_v,
+        )
+    }
+
+    /// Shared INDI pipeline downstream of the pseudo-control input:
+    /// sensor processing, takeoff detection, incremental pseudo-control,
+    /// WLS allocation, NaN protection, motor-command linearization.
+    #[allow(clippy::too_many_arguments)]
+    fn step_rate_dot(
+        &mut self,
+        gyro_rad_s: &Vector3<f32>,
+        accel_m_s2: &Vector3<f32>,
+        rate_dot_sp: &Vector3<f32>,
         spf_sp_z: f32,
         armed: bool,
         g2_valid: &[bool; NU],
@@ -377,12 +588,10 @@ impl IndiController {
             _ => {
                 let mut omega_dot = SVector::<f32, NU>::zeros();
                 for i in 0..NU {
-                    let inv_thresh = 0.1 * self.effectiveness.max_omega[i];
-                    let omega_inv = if self.prev_omega_fs[i].abs() > inv_thresh {
-                        1.0 / self.prev_omega_fs[i]
-                    } else {
-                        1.0 / inv_thresh
-                    };
+                    let omega_inv = super::effectiveness::omega_inv_guarded(
+                        self.prev_omega_fs[i],
+                        self.effectiveness.max_omega[i],
+                    );
                     omega_dot[i] = self.prev_du[i] * self.effectiveness.g2_scaler[i] * omega_inv;
                 }
                 (self.prev_omega_fs, omega_dot)
@@ -399,28 +608,37 @@ impl IndiController {
         // --- 2. Takeoff detection ---
         let gyro_mag_sq = gyro_rad_s.norm_squared();
         let accel_mag_sq = accel_m_s2.norm_squared();
-        let gyro_thresh = 100.0_f32 * core::f32::consts::PI / 180.0;
+        let gyro_thresh = self.ground_gyro_rad_s;
         let gyro_low = gyro_mag_sq < gyro_thresh * gyro_thresh;
-        let accel_high = accel_mag_sq > (0.8 * 9.81) * (0.8 * 9.81);
-        let thrust_low = spf_sp_z < 3.0;
+        let accel_thresh = self.ground_accel_m_s2;
+        let accel_high = accel_mag_sq > accel_thresh * accel_thresh;
+        let thrust_low = spf_sp_z < self.ground_thrust_sp_m_s2;
         let touching_ground = gyro_low && accel_high && thrust_low;
-        let do_indi = !touching_ground && armed;
+        let do_indi = self.indi_enabled && !touching_ground && armed;
         let do_indi_f = do_indi as u32 as f32;
 
-        // --- 3. Rate controller ---
-        let rate_err = *rate_sp - *gyro_rad_s;
-        let rate_dot_sp = self.rate_gains.component_mul(&rate_err);
+        // G2 models the yaw reaction torque of a motor *acceleration*, so
+        // its columns are only meaningful against an incremental `du`.
+        // Whenever the increment is off — INDI disabled, disarmed, or
+        // sitting on the ground — `du` IS the absolute command, and adding
+        // G2 to G1 would mix two different input definitions in one B
+        // matrix. Allocate through G1 alone in all three cases; `do_indi`
+        // is exactly that condition.
+        let g2_eff: [bool; NU] = if do_indi { *g2_valid } else { [false; NU] };
 
-        // --- 4. Pseudo-control ---
+        // --- 3. Pseudo-control ---
+        // (The rate controller, when used, ran in `step` — `rate_dot_sp`
+        // arrives here as the α-space pseudo-control input.)
         let dv = stack![
             Vector3::new(0.0, 0.0, spf_sp_z - do_indi_f * spf_fs.z);
-            rate_dot_sp - do_indi_f * rate_dot_fs + do_indi_f * self.effectiveness.g2 * omega_dot_fs
+            *rate_dot_sp - do_indi_f * rate_dot_fs
+                + do_indi_f * self.effectiveness.g2 * omega_dot_fs
         ];
 
-        // --- 5. Combined effectiveness matrix ---
-        let g1g2: SMatrix<f32, NV, NU> = self.effectiveness.combined_g1g2(&omega_fs_vec, g2_valid);
+        // --- 4. Combined effectiveness matrix ---
+        let g1g2: SMatrix<f32, NV, NU> = self.effectiveness.combined_g1g2(&omega_fs_vec, &g2_eff);
 
-        // --- 6. WLS allocation ---
+        // --- 5. WLS allocation ---
         let wv = self.wls_wv;
         let mut wu = self.wls_wu;
 
@@ -445,7 +663,7 @@ impl IndiController {
             self.wls_imax,
         );
 
-        // --- 7. NaN protection ---
+        // --- 6. NaN protection ---
         let nan_exit =
             stats.exit_code == ExitCode::NanFoundQ || stats.exit_code == ExitCode::NanFoundUs;
         if nan_exit {
@@ -456,12 +674,13 @@ impl IndiController {
         }
         let nan_failsafe = self.nan_counter > self.nan_limit;
 
-        // --- 8. Motor commands ---
+        // --- 7. Motor commands ---
         let u = if !nan_exit {
             self.u_state_fs
                 .zip_map(&du, |u_fs, du| (do_indi_f * u_fs + du).max(0.0))
         } else {
-            self.u_state_fs.map(|u_fs| (u_fs * 0.95).max(0.0))
+            self.u_state_fs
+                .map(|u_fs| (u_fs * self.nan_rampdown).max(0.0))
         }
         .inf(&self.act_limit);
 
@@ -511,35 +730,42 @@ mod tests {
 
     fn test_config() -> IndiConfig {
         IndiConfig {
+            indi_enabled: true,
+            ground_gyro_rad_s: 100.0_f32 * core::f32::consts::PI / 180.0,
+            ground_accel_m_s2: 0.8 * 9.81,
+            ground_thrust_sp_m_s2: 3.0,
             rate_gains: Vector3::new(20.0, 20.0, 20.0),
             sync_filter_hz: 15.0,
             rate_dot_sg_window_size: 7,
             rate_dot_sg_order: 2,
-            rate_dot_sg_target_rate_hz: 1000.0,
             motors: [
                 MotorParams {
                     position_m: [-0.075, -0.1],
                     spin_dir: SpinDir::Cw,
                     max_thrust_n: 8.5,
                     torque_coeff_m: 0.022,
+                    ..MotorParams::STOCK_DYNAMICS
                 },
                 MotorParams {
                     position_m: [0.075, -0.1],
                     spin_dir: SpinDir::Ccw,
                     max_thrust_n: 8.5,
                     torque_coeff_m: 0.022,
+                    ..MotorParams::STOCK_DYNAMICS
                 },
                 MotorParams {
                     position_m: [-0.075, 0.1],
                     spin_dir: SpinDir::Ccw,
                     max_thrust_n: 8.5,
                     torque_coeff_m: 0.022,
+                    ..MotorParams::STOCK_DYNAMICS
                 },
                 MotorParams {
                     position_m: [0.075, 0.1],
                     spin_dir: SpinDir::Cw,
                     max_thrust_n: 8.5,
                     torque_coeff_m: 0.022,
+                    ..MotorParams::STOCK_DYNAMICS
                 },
             ],
             body: RigidBodyParams {
@@ -561,6 +787,7 @@ mod tests {
             wls_theta: 1e-4,
             wls_imax: 1,
             nan_limit: 20,
+            nan_rampdown: 0.95,
             rpm_invalid_limit: 50,
             rpm_all_invalid_limit: 50,
             rpm_recovery_count: 10,
@@ -582,6 +809,109 @@ mod tests {
         let _ctrl = IndiController::new(&test_config(), LOOP_HZ);
     }
 
+    /// `step_alpha` must be bit-identical to `step` when fed the exact
+    /// pseudo-control the legacy rate stage would have produced —
+    /// guarantees the refactor changed no numerics for existing users.
+    #[test]
+    fn step_alpha_equals_step_for_equivalent_pseudo_control() {
+        let cfg = test_config();
+        let mut ctrl_rate = IndiController::new(&cfg, LOOP_HZ);
+        let mut ctrl_alpha = IndiController::new(&cfg, LOOP_HZ);
+        let g2 = [true; NU];
+
+        // Drive both controllers through an identical, non-trivial input
+        // sequence: varying gyro + rate setpoints so filters and actuator
+        // state evolve away from init.
+        for k in 0..200 {
+            let t = k as f32 / LOOP_HZ;
+            let gyro = Vector3::new(
+                0.6 * libm::sinf(40.0 * t),
+                -0.4 * libm::cosf(25.0 * t),
+                0.2 * libm::sinf(10.0 * t),
+            );
+            let accel = Vector3::new(0.3, -0.2, GRAVITY + 0.5 * libm::sinf(30.0 * t));
+            let rate_sp = Vector3::new(1.0, -0.5, 0.25);
+            let spf = GRAVITY + 1.0;
+
+            let (out_rate, _) = ctrl_rate.step(
+                &gyro, &accel, &rate_sp, spf, true, &g2, MotorState::Internal, V_NOM,
+            );
+            // The equivalent pseudo-control the legacy stage computes.
+            let alpha_sp = cfg.rate_gains.component_mul(&(rate_sp - gyro));
+            let (out_alpha, _) = ctrl_alpha.step_alpha(
+                &gyro, &accel, &alpha_sp, spf, true, &g2, MotorState::Internal, V_NOM,
+            );
+            assert_eq!(
+                out_rate.motor_commands, out_alpha.motor_commands,
+                "diverged at step {k}"
+            );
+        }
+    }
+
+    /// With INDI disabled, `step_alpha` degrades to model-based static
+    /// inversion of the commanded angular acceleration through G1 (the
+    /// paper's "NMPC w/o INDI" baseline): a positive roll-α command must
+    /// load the left motors (M2/M3, +y in FLU) more than the right pair.
+    #[test]
+    fn step_alpha_static_inversion_roll_sign() {
+        let cfg = IndiConfig {
+            indi_enabled: false,
+            ..test_config()
+        };
+        let mut ctrl = IndiController::new(&cfg, LOOP_HZ);
+        let g2 = [false; NU];
+        let gyro = Vector3::zeros();
+        let accel = Vector3::new(0.0, 0.0, GRAVITY);
+
+        // Positive roll angular-acceleration demand at hover thrust.
+        let alpha_sp = Vector3::new(200.0, 0.0, 0.0);
+        let mut out = ctrl
+            .step_alpha(&gyro, &accel, &alpha_sp, GRAVITY, true, &g2, MotorState::Internal, V_NOM)
+            .0;
+        for _ in 0..50 {
+            out = ctrl
+                .step_alpha(
+                    &gyro, &accel, &alpha_sp, GRAVITY, true, &g2, MotorState::Internal, V_NOM,
+                )
+                .0;
+        }
+        let m = out.motor_commands;
+        assert!(m.iter().all(|v| v.is_finite()), "commands must be finite");
+        let left = m[2] + m[3];
+        let right = m[0] + m[1];
+        assert!(
+            left > right + 1e-4,
+            "positive roll α must load left motors: left={left}, right={right}"
+        );
+    }
+
+    /// The `imu_1khz` firmware setup: 1 kHz loop, SG window 5, SG target =
+    /// loop rate, SG window 5 (its delay-budgeted value). Mirrors
+    /// `hover_produces_equal_motor_commands` so both flight rates get a
+    /// construction + convergence smoke test.
+    #[test]
+    fn hover_converges_at_1khz() {
+        let mut config = test_config();
+        config.rate_dot_sg_window_size = 5;
+        let mut ctrl = IndiController::new(&config, 1000.0);
+        let (gyro, accel, rate_sp, spf_sp_z) = hover_inputs();
+        let g2 = [false; NU];
+        let mut out = ctrl.step(&gyro, &accel, &rate_sp, spf_sp_z, true, &g2, MotorState::Internal, V_NOM).0;
+        for _ in 0..200 {
+            out = ctrl.step(&gyro, &accel, &rate_sp, spf_sp_z, true, &g2, MotorState::Internal, V_NOM).0;
+        }
+        let mean = out.motor_commands.iter().sum::<f32>() / NU as f32;
+        for (i, &c) in out.motor_commands.iter().enumerate() {
+            assert!(c >= 0.0 && c <= 1.0, "motor {i} out of bounds: {c}");
+            assert!(
+                (c - mean).abs() < 0.05,
+                "motor {i} diverges: {c} vs mean {mean}"
+            );
+        }
+        assert!(mean > 0.1 && mean < 0.7, "hover mean={mean} unexpected");
+        assert!(!out.nan_failsafe);
+    }
+
     #[test]
     fn hover_produces_equal_motor_commands() {
         let mut ctrl = IndiController::new(&test_config(), LOOP_HZ);
@@ -601,6 +931,78 @@ mod tests {
         }
         assert!(mean > 0.1 && mean < 0.7, "hover mean={mean} unexpected");
         assert!(!out.nan_failsafe);
+    }
+
+    /// `indi_enabled: false` still hovers and still tracks a rate command
+    /// — it is a rate controller, just not an incremental one.
+    #[test]
+    fn indi_disabled_hovers_and_tracks_rate() {
+        let cfg = IndiConfig {
+            indi_enabled: false,
+            ..test_config()
+        };
+        let a = Vector3::new(0.0, 0.0, GRAVITY);
+        let g2 = [true; NU]; // G2 is dropped internally; assert it's harmless
+
+        let mut ctrl = IndiController::new(&cfg, LOOP_HZ);
+        let mut out = ctrl.step(&Vector3::zeros(), &a, &Vector3::zeros(), GRAVITY, true, &g2, MotorState::Internal, V_NOM).0;
+        for _ in 0..200 {
+            out = ctrl
+                .step(&Vector3::zeros(), &a, &Vector3::zeros(), GRAVITY, true, &g2, MotorState::Internal, V_NOM)
+                .0;
+        }
+        let mean = out.motor_commands.iter().sum::<f32>() / NU as f32;
+        for (i, &c) in out.motor_commands.iter().enumerate() {
+            assert!((0.0..=1.0).contains(&c), "motor {i} out of bounds: {c}");
+            assert!((c - mean).abs() < 0.05, "motor {i} diverges: {c} vs {mean}");
+        }
+        assert!(mean > 0.1 && mean < 0.7, "hover mean={mean} unexpected");
+        assert!(!out.nan_failsafe);
+
+        // Roll-rate command → differential thrust, correct direction.
+        let rate_sp = Vector3::new(3.0, 0.0, 0.0);
+        for _ in 0..50 {
+            out = ctrl
+                .step(&Vector3::zeros(), &a, &rate_sp, GRAVITY, true, &g2, MotorState::Internal, V_NOM)
+                .0;
+        }
+        let left = (out.motor_commands[2] + out.motor_commands[3]) / 2.0;
+        let right = (out.motor_commands[0] + out.motor_commands[1]) / 2.0;
+        assert!(left > right, "INDI off: roll left={left} should > right={right}");
+    }
+
+    /// The discriminator between the two laws: a persistent gap between the
+    /// commanded and measured specific force. INDI reads it as "I need this
+    /// much MORE, every tick" and integrates the command to saturation;
+    /// without the increment the same gap is an absolute demand that settles
+    /// at hover. If `indi_enabled` ever stopped cutting the feedback path,
+    /// this test would see both controllers saturate.
+    #[test]
+    fn indi_disabled_drops_the_incremental_feedback() {
+        let a_free_fall = Vector3::zeros(); // spf reads 0, setpoint asks for 1 g
+        let g2 = [false; NU];
+        let run = |enabled: bool| {
+            let cfg = IndiConfig {
+                indi_enabled: enabled,
+                ..test_config()
+            };
+            let mut ctrl = IndiController::new(&cfg, LOOP_HZ);
+            let mut out = ctrl
+                .step(&Vector3::zeros(), &a_free_fall, &Vector3::zeros(), GRAVITY, true, &g2, MotorState::Internal, V_NOM)
+                .0;
+            // 1 s at LOOP_HZ — long enough for the actuator PT1 + 15 Hz
+            // sync filter to close the u_fs ← u loop the increment rides on.
+            for _ in 0..(LOOP_HZ as usize) {
+                out = ctrl
+                    .step(&Vector3::zeros(), &a_free_fall, &Vector3::zeros(), GRAVITY, true, &g2, MotorState::Internal, V_NOM)
+                    .0;
+            }
+            out.motor_commands.iter().sum::<f32>() / NU as f32
+        };
+        let on = run(true);
+        let off = run(false);
+        assert!(on > 0.95, "INDI on: sustained spf gap should saturate, got {on}");
+        assert!(off < 0.7, "INDI off: should settle near hover, got {off}");
     }
 
     #[test]
@@ -737,6 +1139,9 @@ mod tests {
     #[test]
     fn update_rpm_all_invalid_failsafe() {
         let cfg = IndiConfig {
+            ground_gyro_rad_s: 100.0_f32 * core::f32::consts::PI / 180.0,
+            ground_accel_m_s2: 0.8 * 9.81,
+            ground_thrust_sp_m_s2: 3.0,
             rpm_invalid_limit: 5,
             rpm_all_invalid_limit: 10,
             ..test_config()
@@ -756,6 +1161,9 @@ mod tests {
     fn asymmetric_limits_respected() {
         use nalgebra::Vector4;
         let cfg = IndiConfig {
+            ground_gyro_rad_s: 100.0_f32 * core::f32::consts::PI / 180.0,
+            ground_accel_m_s2: 0.8 * 9.81,
+            ground_thrust_sp_m_s2: 3.0,
             act_limit: Vector4::new(0.8, 1.0, 1.0, 1.0),
             ..test_config()
         };
@@ -903,6 +1311,9 @@ mod tests {
     #[test]
     fn g2_valid_affects_allocation() {
         let cfg = IndiConfig {
+            ground_gyro_rad_s: 100.0_f32 * core::f32::consts::PI / 180.0,
+            ground_accel_m_s2: 0.8 * 9.81,
+            ground_thrust_sp_m_s2: 3.0,
             indi_motors: [IndiMotorParams {
                 time_const_s: 0.025,
                 max_rpm: 40000.0,
@@ -941,6 +1352,9 @@ mod tests {
     fn g2_config() -> IndiConfig {
         // FLU sign convention: CW motors get positive G2 yaw, CCW get negative
         IndiConfig {
+            ground_gyro_rad_s: 100.0_f32 * core::f32::consts::PI / 180.0,
+            ground_accel_m_s2: 0.8 * 9.81,
+            ground_thrust_sp_m_s2: 3.0,
             indi_motors: [
                 IndiMotorParams {
                     time_const_s: 0.025,
@@ -1359,6 +1773,185 @@ mod tests {
         .0;
         for (i, &v) in ctrl.prev_du.iter().enumerate() {
             assert_eq!(v, 0.0, "prev_du[{i}] should be zeroed after External step, got {v}");
+        }
+    }
+
+    // ── apply_effectiveness_params ─────────────────────────────────────
+
+    use crate::mixer::{DEFAULT_MOTOR_MAX_OMEGA_RAD_S, DEFAULT_MOTOR_TAU_S};
+    use crate::params::IndiEffectivenessParams;
+
+    /// The airframe's motors at their schema defaults — the actuator side
+    /// of an apply call when nothing has been identified.
+    fn stock_motors() -> [MotorParams; NU] {
+        test_config().motors
+    }
+
+    /// Motors carrying a full identified dynamics set: tuned tau/omega,
+    /// per-motor G2 yaw (sign follows spin), explicit nonlinearity.
+    fn configured_motors() -> [MotorParams; NU] {
+        let mut m = stock_motors();
+        let g2_yaw = [0.002, -0.002, -0.002, 0.002];
+        for (i, motor) in m.iter_mut().enumerate() {
+            motor.time_const_s = 0.03;
+            motor.max_omega_rad_s = 4000.0;
+            motor.g2 = [0.0, 0.0, g2_yaw[i]];
+            motor.nonlinearity = 0.4;
+        }
+        m
+    }
+
+    /// A fully-populated, valid configured G1 block distinct from geometric.
+    fn configured_effectiveness() -> IndiEffectivenessParams {
+        IndiEffectivenessParams {
+            g1_force: [[0.0, 0.0, 14.0]; 4],
+            g1_torque: [
+                [-300.0, 280.0, 40.0],
+                [-300.0, -280.0, -40.0],
+                [300.0, 280.0, -40.0],
+                [300.0, -280.0, 40.0],
+            ],
+        }
+    }
+
+    #[test]
+    fn apply_zero_g1_block_restores_geometric() {
+        let mut ctrl = IndiController::new(&test_config(), LOOP_HZ);
+        let geometric = ctrl.effectiveness.g1;
+        let p = IndiEffectivenessParams::default(); // G1 zero
+        let report = ctrl.apply_effectiveness_params(&stock_motors(), &p, 0.5);
+        assert_eq!(report.g1, G1Application::Geometric);
+        assert!(report.g2_ok);
+        assert!(report.motor_dynamics_ok.iter().all(|&ok| ok));
+        assert_eq!(ctrl.effectiveness.g1, geometric, "G1 must stay geometric");
+        // Motor dynamics from the airframe defaults were applied.
+        let (omega, tau) = (DEFAULT_MOTOR_MAX_OMEGA_RAD_S, DEFAULT_MOTOR_TAU_S);
+        for i in 0..NU {
+            assert!((ctrl.effectiveness.max_omega[i] - omega).abs() < 1e-3);
+            let expect_scaler = 0.5 * omega * omega / tau;
+            assert!((ctrl.effectiveness.g2_scaler[i] - expect_scaler).abs() / expect_scaler < 1e-5);
+        }
+    }
+
+    #[test]
+    fn apply_valid_configured_g1() {
+        let mut ctrl = IndiController::new(&test_config(), LOOP_HZ);
+        let p = configured_effectiveness();
+        let report = ctrl.apply_effectiveness_params(&configured_motors(), &p, 0.5);
+        assert_eq!(report.g1, G1Application::Configured);
+        assert!((ctrl.effectiveness.g1[(2, 0)] - 14.0).abs() < 1e-6);
+        assert!((ctrl.effectiveness.g1[(3, 0)] - (-300.0)).abs() < 1e-6);
+        // G2 verbatim from the airframe motors.
+        assert!((ctrl.effectiveness.g2[(2, 0)] - 0.002).abs() < 1e-9);
+        assert!((ctrl.effectiveness.g2[(2, 1)] - (-0.002)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_invalid_g1_restores_geometric_even_after_configured() {
+        let mut ctrl = IndiController::new(&test_config(), LOOP_HZ);
+        let geometric = ctrl.effectiveness.g1;
+
+        // First apply a valid configured G1...
+        let p = configured_effectiveness();
+        let motors = configured_motors();
+        assert_eq!(
+            ctrl.apply_effectiveness_params(&motors, &p, 0.5).g1,
+            G1Application::Configured
+        );
+        assert_ne!(ctrl.effectiveness.g1, geometric);
+
+        // ...then an invalid one: geometric must be RESTORED, not the stale
+        // configured matrix kept and not zero authority.
+        let mut bad = configured_effectiveness();
+        bad.g1_torque[2][1] = f32::NAN;
+        let report = ctrl.apply_effectiveness_params(&motors, &bad, 0.5);
+        assert_eq!(report.g1, G1Application::RejectedKeptGeometric);
+        assert_eq!(ctrl.effectiveness.g1, geometric);
+    }
+
+    #[test]
+    fn apply_partial_config_never_zeroes_authority() {
+        // The old plumbing's failure mode: tau/omega set, G1 left zero →
+        // all-zero G1 applied to the allocator. Must resolve to Geometric.
+        let mut ctrl = IndiController::new(&test_config(), LOOP_HZ);
+        let geometric = ctrl.effectiveness.g1;
+        let p = IndiEffectivenessParams::default();
+        let report = ctrl.apply_effectiveness_params(&configured_motors(), &p, 0.5);
+        assert_eq!(report.g1, G1Application::Geometric);
+        assert_eq!(ctrl.effectiveness.g1, geometric);
+        assert!(ctrl.effectiveness.g1.iter().any(|&v| v != 0.0));
+        // And the motor dynamics WERE applied (per-block independence).
+        assert!((ctrl.effectiveness.max_omega[0] - 4000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apply_invalid_g2_keeps_previous() {
+        let mut ctrl = IndiController::new(&test_config(), LOOP_HZ);
+        let before = ctrl.effectiveness.g2;
+        let mut motors = configured_motors();
+        motors[1].g2[2] = f32::INFINITY;
+        let report = ctrl.apply_effectiveness_params(&motors, &IndiEffectivenessParams::default(), 0.5);
+        assert!(!report.g2_ok);
+        assert_eq!(ctrl.effectiveness.g2, before);
+    }
+
+    #[test]
+    fn apply_invalid_motor_dynamics_keeps_previous_for_that_motor() {
+        let mut ctrl = IndiController::new(&test_config(), LOOP_HZ);
+        let omega_before = ctrl.effectiveness.max_omega;
+        let alpha_before = ctrl.pt1_alpha;
+        let mut motors = configured_motors();
+        motors[1].time_const_s = 0.0; // structurally invalid
+        motors[2].max_omega_rad_s = f32::NAN;
+        let report =
+            ctrl.apply_effectiveness_params(&motors, &IndiEffectivenessParams::default(), 0.5);
+        assert!(report.motor_dynamics_ok[0]);
+        assert!(!report.motor_dynamics_ok[1]);
+        assert!(!report.motor_dynamics_ok[2]);
+        assert!(report.motor_dynamics_ok[3]);
+        assert_eq!(ctrl.effectiveness.max_omega[1], omega_before[1]);
+        assert_eq!(ctrl.pt1_alpha[1], alpha_before[1]);
+        assert_eq!(ctrl.effectiveness.max_omega[2], omega_before[2]);
+    }
+
+    #[test]
+    fn apply_pt1_alpha_recomputed_from_tau() {
+        let mut ctrl = IndiController::new(&test_config(), LOOP_HZ);
+        let mut motors = stock_motors();
+        for m in motors.iter_mut() {
+            m.time_const_s = 0.04;
+        }
+        ctrl.apply_effectiveness_params(&motors, &IndiEffectivenessParams::default(), 0.5);
+        let dt = 1.0 / LOOP_HZ;
+        let expect = dt / (0.04 + dt);
+        for i in 0..NU {
+            assert!((ctrl.pt1_alpha[i] - expect).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn apply_nonlinearity_zero_uses_fallback() {
+        let mut ctrl = IndiController::new(&test_config(), LOOP_HZ);
+        let mut motors = stock_motors();
+        for (m, k) in motors.iter_mut().zip([0.0, 0.7, 0.0, 0.3]) {
+            m.nonlinearity = k;
+        }
+        ctrl.apply_effectiveness_params(&motors, &IndiEffectivenessParams::default(), 0.55);
+        // Compare against freshly-built linearizations: fallback for the
+        // zero entries, param value otherwise. output_curve at a probe
+        // point discriminates the k values.
+        let probe = |ctrl: &IndiController, i: usize| ctrl.linearization[i].output_curve(0.5, V_NOM);
+        let expect_k = [0.55, 0.7, 0.55, 0.3];
+        for i in 0..NU {
+            let reference = super::super::linearization::ThrustLinearization::new(
+                expect_k[i],
+                ThrustModel::Quadratic,
+                8.5,
+            );
+            assert!(
+                (probe(&ctrl, i) - reference.output_curve(0.5, V_NOM)).abs() < 1e-6,
+                "motor {i} nonlinearity mismatch"
+            );
         }
     }
 }

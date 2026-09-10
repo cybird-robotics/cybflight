@@ -25,7 +25,7 @@ fn out_dir(name: &str) -> PathBuf {
 }
 
 fn run_with<C: Controller>(mut scenario: Scenario, mut controller: C) -> RunOutput {
-    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), 1.0 / 8000.0);
+    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), &scenario.sim_params, 1.0 / 8000.0);
     let runner = MissionRunner::new(Default::default());
     let out = runner.run(&mut scenario, &mut plant, &mut controller);
 
@@ -87,11 +87,11 @@ fn mpc_indi(scenario: &Scenario) -> MpcIndiController {
 }
 
 fn mpc_direct(scenario: &Scenario) -> MpcDirectController {
-    MpcDirectController::from_params(&scenario.vehicle_params)
+    MpcDirectController::from_params(&scenario.vehicle_params, &scenario.sim_params)
 }
 
 fn cascade(scenario: &Scenario) -> CascadeController {
-    CascadeController::from_params(&scenario.vehicle_params)
+    CascadeController::from_params(&scenario.vehicle_params, &scenario.sim_params)
 }
 
 // ── Authoritative MPC+INDI tests (firmware-match topology) ──────────────────
@@ -166,7 +166,7 @@ fn cascade_baseline_all_scenarios() {
 #[test]
 fn mpc_indi_heavier_vehicle_still_tracks() {
     let vp = tweaked_vehicle(|p| {
-        p.body.mass_kg *= 1.5;
+        p.airframe.body.mass_kg *= 1.5;
     });
     let scenario = Scenario::mission_with_params(
         "mission_square_heavy",

@@ -8,6 +8,7 @@ publish = false
 std = ["nalgebra/std"]
 
 [dependencies]
+cybflight-params-derive = { path = "../params_derive" }
 crc32fast = { version = "1.5", default-features = false }
 float-cmp = { version = "0.10.0", default-features = false }
 nalgebra = { version = "0.34.1", default-features = false, features = ["libm", "macros"] }

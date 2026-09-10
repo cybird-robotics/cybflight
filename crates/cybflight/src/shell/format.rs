@@ -98,12 +98,13 @@ impl fmt::Display for ShellMsg<'_, msgs::OcpSolverOutput> {
         let s = self.0;
         write!(
             f,
-            "OcpSolverOutput(timestamp={:.4}, command={:?}, iterations={}, converged={}, solve_time_ms={})",
+            "OcpSolverOutput(timestamp={:.4}, command={:?}, iterations={}, converged={}, solve_time_ms={}, policy_time_ms={})",
             s.timestamp.as_millis(),
             s.command.as_slice(),
             s.iterations,
             s.converged,
-            s.solve_time_us as f64 / 1000.0
+            s.solve_time_us as f64 / 1000.0,
+            s.policy_time_us as f64 / 1000.0
         )
     }
 }

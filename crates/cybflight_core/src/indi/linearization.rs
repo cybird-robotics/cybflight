@@ -9,10 +9,22 @@
 //   Quadratic:    u = k·d² + (1−k)·d                 (original indiflight port)
 //   SqrtSquared:  u = (k·d + (1−k)·√d)²              (steady-state ω mix, T ∝ ω²)
 //
-// In both k ∈ [0.025, 0.7]. The Quadratic endpoints are k=0 linear,
+// In both k ∈ [0.025, 1.0]. The Quadratic endpoints are k=0 linear,
 // k=1 pure quadratic in d. The SqrtSquared endpoints are k=0 → u=d
 // (linear) and k=1 → u=d² (pure quadratic in d); intermediate k blends
 // a linear-in-d ω term with a √d-loaded-prop term before squaring.
+//
+// The upper bound is the PHYSICAL one, not a numerical one: a rotor whose
+// speed is linear in command gives thrust ∝ d² exactly, i.e. k = 1, and
+// nothing real curves harder. The inverse below is exact to machine
+// precision across the whole range — conditioning in fact *improves* as
+// k → 1, where a → 1 and b, c → 0. The degenerate end is k → 0 (at the
+// 0.025 floor, a = 40 and b = 380), which is what the lower bound guards.
+//
+// This ceiling was 0.7 until a bench-identified 5-inch prop curve came in
+// at k ≈ 0.8 (0.95 raw, softened to ~0.8 by the ESC idle offset) and could
+// not be represented: the clamp silently flew 0.7 instead, mis-linearizing
+// by ~6 % at mid-throttle and ~16 % near idle.
 //
 // Both inverses share the same precomputed (a, b, c):
 //   a = 1/k,  b = (1−k)² / (4k²),  c = (k−1) / (2k)
@@ -69,12 +81,14 @@ impl ThrustLinearization {
     /// Create linearization parameters from motor nonlinearity factor and
     /// per-motor maximum thrust.
     ///
-    /// `nonlinearity` is in [0.0, 1.0]; clamped internally to [0.025, 0.7]
-    /// to avoid degenerate curves (div-by-0 at k=0; over-curved at k→1).
+    /// `nonlinearity` is in [0.0, 1.0]; clamped internally to [0.025, 1.0].
+    /// The lower bound avoids the degenerate curve at k=0 (div-by-0); the
+    /// upper bound is the physical limit (thrust ∝ d² exactly), and the
+    /// inverse stays exact right up to it.
     /// `per_motor_max_n` is only used by `ThrustModel::Table`; pass any
     /// finite value (the motor's `max_thrust_n`) for the analytic models.
     pub fn new(nonlinearity: f32, model: ThrustModel, per_motor_max_n: f32) -> Self {
-        let k = nonlinearity.clamp(0.025, 0.7);
+        let k = nonlinearity.clamp(0.025, 1.0);
         let a = 1.0 / k;
         let b = (k * k - 2.0 * k + 1.0) / (4.0 * k * k);
         let c = (k - 1.0) / (2.0 * k);

@@ -76,10 +76,14 @@ impl PiecewisePolynomial {
 
     /// Find the piece index and local time for a given global time.
     /// Uses binary search on precomputed cumulative durations for O(log N).
-    /// Clamps to the last piece if t exceeds total duration.
+    ///
+    /// `t` is clamped to `[0, total_duration]`: times past the end resolve
+    /// to the last piece at its full duration, negative times to the first
+    /// piece at `0` (they used to extrapolate the first polynomial backward).
     #[inline]
     pub fn locate_piece(&self, t: f32) -> (usize, f32) {
         debug_assert!(self.n > 0);
+        let t = t.clamp(0.0, self.total_duration());
         // Binary search: find first i where cum_dur[i] >= t
         let cum = &self.cum_dur[..self.n];
         let mut lo = 0usize;
@@ -169,5 +173,34 @@ impl PiecewisePolynomial {
 impl Default for PiecewisePolynomial {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::polynomial::Polynomial;
+
+    fn two_linear_pieces() -> PiecewisePolynomial {
+        // p0(t) = (t, 0, 0) on [0,1];  p1(t) = (1 + 2t, 0, 0) on [0,2].
+        let p0 = Polynomial::new(1, 1.0, &[ZERO3, Vec3::new(1.0, 0.0, 0.0)]);
+        let p1 = Polynomial::new(1, 2.0, &[Vec3::new(1.0, 0.0, 0.0), Vec3::new(2.0, 0.0, 0.0)]);
+        PiecewisePolynomial::from_pieces(&[p0, p1])
+    }
+
+    #[test]
+    fn locate_piece_clamps_both_ends() {
+        let pp = two_linear_pieces();
+        assert_eq!(pp.locate_piece(-5.0), (0, 0.0));
+        assert_eq!(pp.get_pos(-5.0), pp.get_pos(0.0));
+        let (idx, lt) = pp.locate_piece(10.0);
+        assert_eq!(idx, 1);
+        assert!((lt - 2.0).abs() < 1e-6);
+        assert_eq!(pp.get_pos(10.0), pp.get_pos(pp.total_duration()));
+        // Interior lookups are unchanged.
+        assert_eq!(pp.locate_piece(0.5), (0, 0.5));
+        let (idx, lt) = pp.locate_piece(1.5);
+        assert_eq!(idx, 1);
+        assert!((lt - 0.5).abs() < 1e-6);
     }
 }

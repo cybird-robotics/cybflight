@@ -3,11 +3,14 @@ pub mod model_utils;
 pub mod mpc_problem;
 pub mod quad_model;
 pub mod sqp_solver;
+pub mod tinympc;
+pub mod cost_adapt;
 
 pub use full_quad_model::{normalize_quat, FullQuadModel, N, NU, NX};
 pub use mpc_problem::{FullQuadProblem, MpcProblem, Propagation, SimpleQuadProblem};
 pub use quad_model::QuadModel;
 pub use sqp_solver::{FullSqpSolver, SimpleSqpSolver, SolverResult, SqpSolver};
+pub use tinympc::{TinyMpc, TinyResult, TinySettings};
 
 use nalgebra::{SMatrix, SVector};
 
@@ -72,6 +75,17 @@ pub trait QuadDynamicsModel<const NX: usize, const NU: usize> {
         grad_x: &mut SVector<f32, NX>,
         hess_xx: &mut SMatrix<f32, NX, NX>,
     ) -> f32;
+    /// Terminal-stage Hessian + gradient. Defaults to the stage state
+    /// cost; models with separate terminal weights override it.
+    fn terminal_cost_hess_grad(
+        &self,
+        x: &SVector<f32, NX>,
+        xref: &SVector<f32, NX>,
+        grad_x: &mut SVector<f32, NX>,
+        hess_xx: &mut SMatrix<f32, NX, NX>,
+    ) -> f32 {
+        self.state_cost_hess_grad(x, xref, grad_x, hess_xx)
+    }
     fn input_cost_grad(
         &self,
         u: &SVector<f32, NU>,
@@ -264,6 +278,15 @@ impl QuadDynamicsModel<{ quad_model::NX }, { quad_model::NU }> for QuadModel {
     ) -> f32 {
         QuadModel::state_cost_hess_grad(self, x, xref, grad_x, hess_xx)
     }
+    fn terminal_cost_hess_grad(
+        &self,
+        x: &SVector<f32, { quad_model::NX }>,
+        xref: &SVector<f32, { quad_model::NX }>,
+        grad_x: &mut SVector<f32, { quad_model::NX }>,
+        hess_xx: &mut SMatrix<f32, { quad_model::NX }, { quad_model::NX }>,
+    ) -> f32 {
+        QuadModel::terminal_cost_hess_grad(self, x, xref, grad_x, hess_xx)
+    }
     #[inline]
     fn input_cost_grad(
         &self,
@@ -304,3 +327,4 @@ impl QuadDynamicsModel<{ quad_model::NX }, { quad_model::NU }> for QuadModel {
         QuadModel::clamp_control(self, u)
     }
 }
+

@@ -64,8 +64,8 @@ pub fn normalize_quat(x: &mut SVector<f32, NX>) {
 /// `‖vel_ref‖ < VEL_EPS` (hover, mission start, terminal), the cost
 /// degenerates to the `w_contour · ‖e‖²` form (lag term vanishes).
 ///
-/// **Sampler-pairing safety invariant.** `Contouring` requires
-/// [`PositionSampler`] (firmware feature `position_sampler`). The position
+/// **Sampler-pairing safety invariant.** `Contouring` requires the
+/// position sampler (`sampler_kind` param = `Position`). The position
 /// sampler's closest-point search produces an `xref[7..10]` tangent that
 /// is meaningful at every horizon step — so the contour/lag decomposition
 /// reflects the geometric path. Pairing `Contouring` with `TimeSampler`
@@ -75,14 +75,33 @@ pub fn normalize_quat(x: &mut SVector<f32, NX>) {
 /// `VEL_EPS` fallback inconsistently and chattering between contour and
 /// isotropic regimes. The firmware enforces this invariant in
 /// `outer_loop::build_outer_quad_model`, which clamps `pos_cost_mode` to
-/// `Quadratic` whenever the `position_sampler` feature is off,
-/// regardless of `vp.mpc.pos_cost_mode`.
+/// `Quadratic` (with a warning) whenever `sampler_kind != Position`,
+/// at boot and on every hot-reload, regardless of `vp.mpc.pos_cost_mode`.
 ///
 /// [`PositionSampler`]: crate::trajectory_planning::sampler::PositionSampler
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum PosCostMode {
     Quadratic,
     Contouring,
+}
+
+/// Flash/shell encoding: 0 = Quadratic, 1 = Contouring (matches the
+/// pre-registry blob encoding). Out-of-range values map to Quadratic —
+/// the conservative default.
+impl crate::param_registry::ParamEnum for PosCostMode {
+    fn to_u8(self) -> u8 {
+        match self {
+            PosCostMode::Quadratic => 0,
+            PosCostMode::Contouring => 1,
+        }
+    }
+    fn from_u8(v: u8) -> Self {
+        if v == 1 {
+            PosCostMode::Contouring
+        } else {
+            PosCostMode::Quadratic
+        }
+    }
 }
 
 impl PosCostMode {
@@ -113,6 +132,14 @@ pub struct QuadModel {
     pub w_pos: [f32; 3],
     pub w_vel: [f32; 3],
     pub w_att: [f32; 3],
+    /// Terminal-stage state weights. Default to the stage weights, which
+    /// reproduces the historical "terminal = stage state cost" behaviour
+    /// exactly; only the adaptive-cost path (`mpc::cost_adapt`) sets them
+    /// independently. In `Contouring` mode `w_pos_n[0]` / `w_pos_n[2]`
+    /// are the terminal contour / lag weights, as for `w_pos`.
+    pub w_pos_n: [f32; 3],
+    pub w_vel_n: [f32; 3],
+    pub w_att_n: [f32; 3],
     /// Per-component input weight: `w_input[0]` weights collective thrust [N²],
     /// `w_input[1..4]` weight body-rate commands [(rad/s)²]. Per-element
     /// (rather than scalar) because the four control channels are physically
@@ -124,63 +151,76 @@ pub struct QuadModel {
     /// byte-identical to the pre-MPCTC behavior; switch to
     /// [`PosCostMode::Contouring`] to activate MPCTC. See the enum doc.
     pub pos_cost_mode: PosCostMode,
-}
-
-impl Default for QuadModel {
-    /// Default mass matches `vehicle.rs::QUADROTOR_BODY` (0.55 kg). Default
-    /// weights are taken from `MpcParams::default()` for position / velocity /
-    /// attitude blocks; the input-weight default is uniform 1.0. Default
-    /// control bounds:
-    /// - Thrust ceiling = 4 × 8.5 N = 34 N (sum of per-motor `max_thrust_n`
-    ///   from `vehicle.rs::QUADROTOR_MOTORS`); thrust floor = m·g·0.1.
-    /// - Body-rate ceiling matches `QUADROTOR_BODY.max_rate_rad_s` =
-    ///   [10, 10, 6] rad/s (roll, pitch, yaw).
-    fn default() -> Self {
-        let mass = 0.58;
-        let grav = 9.81;
-        // Sum of per-motor max thrusts from QUADROTOR_MOTORS (4 × 8.5 N).
-        let max_collective_thrust_n: f32 = 4.0 * 12.0;
-        Self {
-            mass,
-            grav,
-            dt: 0.05,
-            u_bounds: [
-                [0.0_f32, max_collective_thrust_n],
-                [-10.0, 10.0],
-                [-10.0, 10.0],
-                [-6.0, 6.0],
-            ],
-            mass_inv: 1.0 / mass,
-            w_pos: [200.0, 200.0, 200.0],
-            w_vel: [10.0, 10.0, 10.0],
-            w_att: [5.0, 5.0, 200.0],
-            w_input: Vector4::new(1.0, 20.0, 20.0, 20.0),
-            rho: 1e4,
-            pos_cost_mode: PosCostMode::Quadratic,
-        }
-    }
+    // ── Maximum-tilt STATE constraint (relaxed log-barrier, cos space) ──
+    //
+    // Same envelope fence as `FullQuadModel` (attitude is a state in both
+    // models). See `model_utils::write_tilt_barrier_cost_grad`.
+    /// cos(θ_max): the constraint is `1 − 2(qx²+qy²) ≥ cos_max_tilt`.
+    pub tilt_cos_max: f32,
+    /// Tilt barrier weight τ. **`0.0` disables the constraint entirely.**
+    pub tilt_barrier_tau: f32,
+    /// Relaxation margin δ in cos units.
+    pub tilt_barrier_delta: f32,
+    // ── Rotor drag (system-identification model) ────────────────────────
+    /// Body-frame rotor-drag coefficients `c = −m·k` [N·s²/(m·rad)] as
+    /// identified by `analysis/sysid_mcap.py` (`sim: aero_drag` in the
+    /// vehicle YAML). Zero = no drag in the prediction model.
+    pub drag_coeff: [f32; 3],
+    /// Per-motor thrust coefficient `c_T = max_thrust_n / ω_max²` [N·s²],
+    /// used to recover `Σω` from the commanded collective. `0` disables
+    /// the drag term.
+    pub thrust_coeff: f32,
+    /// Quadratic body-drag coefficients `½ρC_dA` per body axis [N·s²/m²]
+    /// (`mpc_bodydrag_*`; the `v_b|v_b|` regressor of the sysid fit). Zero
+    /// = off. Dominant above ~30 m/s.
+    pub body_drag_coeff: [f32; 3],
 }
 
 impl QuadModel {
     /// Construct from firmware vehicle parameters.
     ///
-    /// Mass and `grav` come from `vp.body`. Cost weights, integration timestep,
-    /// and constraint penalty are sourced from `vp.mpc`. Control bounds:
+    /// Mass comes from `vp.airframe.body`, `grav` from `vp.site`. Cost
+    /// weights, integration timestep, and constraint penalty are sourced
+    /// from `vp.mpc`. Control bounds:
     /// - Collective thrust upper bound = sum of per-motor `max_thrust_n` from
-    ///   `vp.motors[*]` — the actual physical ceiling of the airframe.
-    /// - Collective thrust lower bound = `mass·g·0.1` (10% of hover) as a
-    ///   minimum-throttle margin so the model never commands cut-off.
-    /// - Per-axis body-rate bounds = `±vp.body.max_rate_rad_s[i]`.
-    pub fn from_vehicle_params(vp: &crate::params::VehicleParams) -> Self {
-        let mass = vp.body.mass_kg;
-        let grav = 9.81;
-        let mr = vp.body.max_rate_rad_s;
+    ///   `vp.airframe.motors[*]`, derated by `vp.mpc.thrust_frac` — the
+    ///   usable ceiling of the airframe.
+    /// - Collective thrust lower bound = 0. (The `mass·g·0.1` floor this
+    ///   doc used to claim is `QuadPlanningConfig`'s, not this model's:
+    ///   the SQP needs a bound that admits free-fall descent, and the
+    ///   cubic penalty already keeps it off the boundary.)
+    /// - Per-axis body-rate bounds = `±vp.airframe.body.max_rate_rad_s[i]`.
+    pub fn from_vehicle_params(vp: &crate::params::FirmwareConfig) -> Self {
+        let mass = vp.airframe.body.mass_kg;
+        let grav = vp.site.gravity_m_s2;
+        let mr = vp.airframe.body.max_rate_rad_s;
         // Total collective thrust ceiling = Σ per-motor max thrusts.
         let mut max_collective_thrust_n = 0.0_f32;
-        for m in &vp.motors {
+        for m in &vp.airframe.motors {
             max_collective_thrust_n += m.max_thrust_n;
         }
-        let thrust_percentage = 0.75;
+        let thrust_percentage = vp.mpc.thrust_frac;
+        // Identified drag model (mpc_drag_* / mpc_bodydrag_*). Σω is
+        // reconstructed from collective thrust through c_T =
+        // max_thrust_n/ω_max² (mean over motors), so the drag scale is
+        // only right when the airframe motor block comes from the same
+        // sysid fit. c_T stays 0 (drag path disabled) unless a rotor-drag
+        // coefficient is actually set.
+        let drag_coeff = vp.mpc.drag_coeff;
+        let mut thrust_coeff = 0.0_f32;
+        if drag_coeff != [0.0; 3] {
+            let mut acc = 0.0_f32;
+            let mut n = 0.0_f32;
+            for m in &vp.airframe.motors {
+                if m.max_omega_rad_s > 0.0 {
+                    acc += m.max_thrust_n / (m.max_omega_rad_s * m.max_omega_rad_s);
+                    n += 1.0;
+                }
+            }
+            if n > 0.0 {
+                thrust_coeff = acc / n;
+            }
+        }
         Self {
             mass,
             grav,
@@ -196,6 +236,9 @@ impl QuadModel {
             w_pos: vp.mpc.pos_weight,
             w_vel: vp.mpc.vel_weight,
             w_att: vp.mpc.att_weight,
+            w_pos_n: vp.mpc.pos_weight,
+            w_vel_n: vp.mpc.vel_weight,
+            w_att_n: vp.mpc.att_weight,
             // Input cost is heterogeneous in this model (thrust + 3 rates),
             // so we replicate `vp.mpc.thrust_weight` (a scalar) across all four
             // channels. Override the struct field directly if asymmetric tuning
@@ -208,30 +251,26 @@ impl QuadModel {
             ),
             rho: vp.mpc.rho,
             pos_cost_mode: vp.mpc.pos_cost_mode,
+            tilt_cos_max: libm::cosf(vp.mpc.tilt_max_deg.to_radians()),
+            tilt_barrier_tau: vp.mpc.tilt_barrier_tau,
+            tilt_barrier_delta: vp.mpc.tilt_barrier_delta,
+            drag_coeff,
+            thrust_coeff,
+            body_drag_coeff: vp.mpc.body_drag,
         }
     }
 
-    /// Construct with overridden mass / gravity / dt; everything else
-    /// (including the per-motor-sum thrust ceiling) is inherited from
-    /// `Default::default()`. Only the thrust *floor* is rescaled to track
-    /// the new mass (`mass·g·0.1` minimum-throttle margin).
-    pub fn new(mass: f32, grav: f32, dt: f32) -> Self {
-        let base = Self {
-            mass,
-            grav,
-            dt,
-            ..Default::default()
-        };
-        Self {
-            u_bounds: [
-                [0.0_f32, base.u_bounds[0][1]],
-                base.u_bounds[1],
-                base.u_bounds[2],
-                base.u_bounds[3],
-            ],
-            mass_inv: 1.0 / mass,
-            ..base
-        }
+    /// Enable the identified quadratic body-drag term (`½ρC_dA` per axis).
+    pub fn set_body_drag(&mut self, coeff: [f32; 3]) {
+        self.body_drag_coeff = coeff;
+    }
+
+    /// Enable the identified rotor-drag term in the prediction model:
+    /// `coeff` = `sim: aero_drag` [N·s²/(m·rad)], `c_t` = per-motor
+    /// thrust coefficient [N·s²] (`max_thrust_n / ω_max²`).
+    pub fn set_rotor_drag(&mut self, coeff: [f32; 3], c_t: f32) {
+        self.drag_coeff = coeff;
+        self.thrust_coeff = c_t;
     }
 
     /// Continuous-time dynamics: ẋ = f(x, u).
@@ -259,6 +298,20 @@ impl QuadModel {
         xdot[7] = 2.0 * (qw * qy + qx * qz) * ct_m;
         xdot[8] = 2.0 * (qy * qz - qw * qx) * ct_m;
         xdot[9] = (1.0 - 2.0 * qx * qx - 2.0 * qy * qy) * ct_m - self.grav;
+        if self.thrust_coeff > 0.0 || self.body_drag_coeff != [0.0; 3] {
+            let (a, _, _, _) = model_utils::drag_accel_jac(
+                [qx, qy, qz, qw],
+                nalgebra::Vector3::new(vx, vy, vz),
+                c,
+                &self.drag_coeff,
+                self.thrust_coeff,
+                &self.body_drag_coeff,
+                m_inv,
+            );
+            xdot[7] += a.x;
+            xdot[8] += a.y;
+            xdot[9] += a.z;
+        }
         xdot
     }
 
@@ -275,7 +328,7 @@ impl QuadModel {
 
         let ct_m = c * m_inv;
 
-        let xdot = vector![
+        let mut xdot = vector![
             vx,
             vy,
             vz,
@@ -356,6 +409,29 @@ impl QuadModel {
         ju[(6, 1)] = -hq_x;
         ju[(6, 2)] = -hq_y;
         ju[(6, 3)] = -hq_z;
+
+        // ── Rotor drag: a(q, v, T) added to rows 7-9 ──
+        if self.thrust_coeff > 0.0 || self.body_drag_coeff != [0.0; 3] {
+            let (a, da_dv, da_dq, da_dt) = model_utils::drag_accel_jac(
+                [qx, qy, qz, qw],
+                nalgebra::Vector3::new(vx, vy, vz),
+                c,
+                &self.drag_coeff,
+                self.thrust_coeff,
+                &self.body_drag_coeff,
+                m_inv,
+            );
+            for i in 0..3 {
+                xdot[7 + i] += a[i];
+                for j in 0..3 {
+                    jx[(7 + i, 7 + j)] += da_dv[(i, j)];
+                }
+                for j in 0..4 {
+                    jx[(7 + i, 3 + j)] += da_dq[(i, j)];
+                }
+                ju[(7 + i, 0)] += da_dt[i];
+            }
+        }
 
         (xdot, jx, ju)
     }
@@ -448,14 +524,58 @@ impl QuadModel {
         };
         let (ea, de, dqa_dq) = model_utils::attitude_error(x, xref);
         cost += model_utils::write_quat_cost_grad(&ea, &de, &dqa_dq, &self.w_att, dt, grad_x);
+        // Maximum-tilt state constraint (relaxed log-barrier). τ = 0 → off.
+        if self.tilt_barrier_tau > 0.0 {
+            cost += model_utils::write_tilt_barrier_cost_grad(
+                x,
+                self.tilt_cos_max,
+                self.tilt_barrier_tau,
+                self.tilt_barrier_delta,
+                grad_x,
+            );
+        }
         cost
     }
 
-    /// Gauss-Newton Hessian + gradient in a single pass.
+    /// Gauss-Newton Hessian + gradient in a single pass (stage weights).
     pub fn state_cost_hess_grad(
         &self,
         x: &SVector<f32, NX>,
         xref: &SVector<f32, NX>,
+        grad_x: &mut SVector<f32, NX>,
+        hess_xx: &mut SMatrix<f32, NX, NX>,
+    ) -> f32 {
+        self.state_cost_hess_grad_w(x, xref, &self.w_pos, &self.w_vel, &self.w_att, grad_x, hess_xx)
+    }
+
+    /// Terminal-stage Hessian + gradient: the stage state cost evaluated
+    /// with the terminal weights `w_pos_n / w_vel_n / w_att_n`.
+    pub fn terminal_cost_hess_grad(
+        &self,
+        x: &SVector<f32, NX>,
+        xref: &SVector<f32, NX>,
+        grad_x: &mut SVector<f32, NX>,
+        hess_xx: &mut SMatrix<f32, NX, NX>,
+    ) -> f32 {
+        self.state_cost_hess_grad_w(
+            x,
+            xref,
+            &self.w_pos_n,
+            &self.w_vel_n,
+            &self.w_att_n,
+            grad_x,
+            hess_xx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn state_cost_hess_grad_w(
+        &self,
+        x: &SVector<f32, NX>,
+        xref: &SVector<f32, NX>,
+        w_pos: &[f32; 3],
+        w_vel: &[f32; 3],
+        w_att: &[f32; 3],
         grad_x: &mut SVector<f32, NX>,
         hess_xx: &mut SMatrix<f32, NX, NX>,
     ) -> f32 {
@@ -464,45 +584,61 @@ impl QuadModel {
         // ── Pos + vel cost/gradient (mode-dependent for pos) ──
         let mut cost = match self.pos_cost_mode {
             PosCostMode::Quadratic => {
-                model_utils::write_pos_vel_cost_grad(x, xref, &self.w_pos, &self.w_vel, dt, grad_x)
+                model_utils::write_pos_vel_cost_grad(x, xref, w_pos, w_vel, dt, grad_x)
             }
             PosCostMode::Contouring => {
                 let pos = model_utils::write_contour_lag_cost_grad(
                     x,
                     xref,
-                    self.w_pos[0],
-                    self.w_pos[2],
+                    w_pos[0],
+                    w_pos[2],
                     PosCostMode::VEL_EPS,
                     dt,
                     grad_x,
                 );
-                pos + model_utils::write_vel_cost_grad(x, xref, &self.w_vel, dt, grad_x)
+                pos + model_utils::write_vel_cost_grad(x, xref, w_vel, dt, grad_x)
             }
         };
 
         // ── Quaternion cost/gradient via shared helpers ──
         let (ea, de, dqa_dq) = model_utils::attitude_error(x, xref);
-        cost += model_utils::write_quat_cost_grad(&ea, &de, &dqa_dq, &self.w_att, dt, grad_x);
+        cost += model_utils::write_quat_cost_grad(&ea, &de, &dqa_dq, w_att, dt, grad_x);
 
         // ── Hessian ──
         hess_xx.fill(0.0);
         match self.pos_cost_mode {
-            PosCostMode::Quadratic => {
-                model_utils::write_pos_vel_hess(&self.w_pos, &self.w_vel, dt, hess_xx)
-            }
+            PosCostMode::Quadratic => model_utils::write_pos_vel_hess(w_pos, w_vel, dt, hess_xx),
             PosCostMode::Contouring => {
                 model_utils::write_contour_lag_hess(
                     xref,
-                    self.w_pos[0],
-                    self.w_pos[2],
+                    w_pos[0],
+                    w_pos[2],
                     PosCostMode::VEL_EPS,
                     dt,
                     hess_xx,
                 );
-                model_utils::write_vel_hess(&self.w_vel, dt, hess_xx);
+                model_utils::write_vel_hess(w_vel, dt, hess_xx);
             }
         };
-        model_utils::write_quat_hess(&de, &dqa_dq, &self.w_att, dt, hess_xx);
+        model_utils::write_quat_hess(&de, &dqa_dq, w_att, dt, hess_xx);
+
+        // ── Maximum-tilt state constraint (relaxed log-barrier, τ = 0 → off) ──
+        if self.tilt_barrier_tau > 0.0 {
+            cost += model_utils::write_tilt_barrier_cost_grad(
+                x,
+                self.tilt_cos_max,
+                self.tilt_barrier_tau,
+                self.tilt_barrier_delta,
+                grad_x,
+            );
+            model_utils::write_tilt_barrier_hess(
+                x,
+                self.tilt_cos_max,
+                self.tilt_barrier_tau,
+                self.tilt_barrier_delta,
+                hess_xx,
+            );
+        }
 
         cost
     }
@@ -557,5 +693,85 @@ impl QuadModel {
     /// Clamp control to bounds.
     pub fn clamp_control(&self, u: &SVector<f32, NU>) -> SVector<f32, NU> {
         model_utils::clamp_control(u, &self.u_bounds)
+    }
+}
+
+#[cfg(test)]
+mod drag_tests {
+    use super::*;
+
+    fn model() -> QuadModel {
+        let mut m = QuadModel {
+            mass: 0.6,
+            grav: 9.81,
+            dt: 0.05,
+            u_bounds: [[0.0, 30.0], [-10.0, 10.0], [-10.0, 10.0], [-6.0, 6.0]],
+            mass_inv: 1.0 / 0.6,
+            w_pos: [500.0, 500.0, 200.0],
+            w_vel: [10.0; 3],
+            w_att: [50.0, 50.0, 200.0],
+            w_pos_n: [500.0, 500.0, 200.0],
+            w_vel_n: [10.0; 3],
+            w_att_n: [50.0, 50.0, 200.0],
+            w_input: Vector4::new(1.0, 10.0, 10.0, 10.0),
+            rho: 1e4,
+            pos_cost_mode: PosCostMode::Contouring,
+            tilt_cos_max: -1.0,
+            tilt_barrier_tau: 0.0,
+            tilt_barrier_delta: 0.05,
+            drag_coeff: [0.0; 3],
+            thrust_coeff: 0.0,
+            body_drag_coeff: [0.0; 3],
+        };
+        // sim_baseline `aero_drag` and the leader's 10 N / 4800 rad/s motors,
+        // plus a quadratic body drag of C_dA ≈ 0.02 m².
+        m.set_rotor_drag([2.6675e-5, 4.004e-5, 1.0e-5], 10.0 / (4800.0f32 * 4800.0));
+        m.set_body_drag([0.012, 0.012, 0.024]);
+        m
+    }
+
+    /// The analytic drag Jacobians must match central differences of the
+    /// dynamics at a banked, fast state.
+    #[test]
+    fn drag_jacobian_matches_finite_differences() {
+        let m = model();
+        let q = nalgebra::UnitQuaternion::from_euler_angles(0.6, -0.4, 0.9);
+        let x = SVector::<f32, NX>::from_row_slice(&[
+            1.0, -2.0, 1.5, q.i, q.j, q.k, q.w, 8.0, -3.0, 1.5,
+        ]);
+        let u = SVector::<f32, NU>::from_row_slice(&[12.0, 1.0, -0.5, 0.3]);
+        let (xdot, jx, ju) = m.dynamics_jac(&x, &u);
+        assert!((xdot - m.dynamics(&x, &u)).norm() < 1e-6);
+        let eps = 1e-3f32;
+        for c in 0..NX {
+            let (mut xp, mut xm) = (x, x);
+            xp[c] += eps;
+            xm[c] -= eps;
+            let fd = (m.dynamics(&xp, &u) - m.dynamics(&xm, &u)) / (2.0 * eps);
+            for r in 7..10 {
+                assert!((jx[(r, c)] - fd[r]).abs() < 2e-2, "jx({r},{c}) {} vs fd {}", jx[(r, c)], fd[r]);
+            }
+        }
+        let (mut up, mut um) = (u, u);
+        up[0] += eps;
+        um[0] -= eps;
+        let fd = (m.dynamics(&x, &up) - m.dynamics(&x, &um)) / (2.0 * eps);
+        for r in 7..10 {
+            assert!((ju[(r, 0)] - fd[r]).abs() < 2e-2, "ju({r},0) {} vs fd {}", ju[(r, 0)], fd[r]);
+        }
+        // Sanity: the drag term alone opposes motion and is a few m/s² at
+        // 8.6 m/s (Σω ≈ 2·√(12/4.3e-7) ≈ 10 500 rad/s, c/m ≈ 4.4e-5).
+        let (a, _, _, _) = model_utils::drag_accel_jac(
+            [x[3], x[4], x[5], x[6]],
+            nalgebra::Vector3::new(x[7], x[8], x[9]),
+            u[0],
+            &m.drag_coeff,
+            m.thrust_coeff,
+            &m.body_drag_coeff,
+            m.mass_inv,
+        );
+        let v = nalgebra::Vector3::new(x[7], x[8], x[9]);
+        assert!(a.dot(&v) < 0.0, "drag must oppose motion: {a}");
+        assert!(a.norm() > 1.0 && a.norm() < 12.0, "drag magnitude {}", a.norm());
     }
 }

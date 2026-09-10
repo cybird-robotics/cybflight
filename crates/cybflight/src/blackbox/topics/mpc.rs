@@ -24,7 +24,9 @@ pub const SCHEMA: &[u8] = br#"{
                        "description": "Solver-output command vector (size depends on OCP problem)" },
     "iterations":    { "type": "integer" },
     "converged":     { "type": "boolean" },
-    "solve_time_us": { "type": "integer" }
+    "solve_time_us": { "type": "integer" },
+    "policy_time_us": { "type": "integer",
+                        "description": "Learned cost policy obs+inference wall time this tick (0 = disabled)" }
   }
 }"#;
 
@@ -37,7 +39,7 @@ pub const DEF: TopicDef = TopicDef {
 
 pub fn encode(scratch: &mut [u8], m: &msgs::OcpSolverOutput) -> cbor::Result<usize> {
     let mut w = CborWriter::new(scratch);
-    w.map(5)?;
+    w.map(6)?;
     w.str("timestamp_ns")?;
     w.u64(m.timestamp.as_micros().saturating_mul(1_000))?;
     w.str("command")?;
@@ -52,5 +54,7 @@ pub fn encode(scratch: &mut [u8], m: &msgs::OcpSolverOutput) -> cbor::Result<usi
     w.bool(m.converged)?;
     w.str("solve_time_us")?;
     w.u64(m.solve_time_us)?;
+    w.str("policy_time_us")?;
+    w.u64(m.policy_time_us as u64)?;
     Ok(w.pos())
 }

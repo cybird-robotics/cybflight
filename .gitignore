@@ -5,3 +5,7 @@ tmp
 .vscode
 tests/indi_golden/gen_golden
 .env
+logs
+__pycache__
+analysis/paper/figs/
+*.mcap

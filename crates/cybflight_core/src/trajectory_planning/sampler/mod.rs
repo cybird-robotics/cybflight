@@ -13,8 +13,8 @@
 //!   introduced.
 //! - [`PositionSampler`] — closest-point search on the trajectory in a
 //!   weighted (position, time-anchor) cost, then horizon fill from the
-//!   resolved `τ`. Selected at compile time via the `position_sampler`
-//!   feature on the firmware crate.
+//!   resolved `τ`. Selected at runtime by the `sampler_kind` param (see
+//!   [`SamplerKind`]); both variants are always compiled.
 //!
 //! The samplers are pure: they read inputs and write into a caller-owned
 //! `&mut [SamplerNode]`. They do not touch mission state, the active
@@ -96,7 +96,41 @@ pub struct SampleResult {
     pub mission_done: bool,
 }
 
-/// Compile-time dispatch over the available samplers. `outer_loop` holds
+/// Runtime sampler selection (`sampler_kind` param: 0 = Time,
+/// 1 = Position). Both variants are always compiled; the outer loop
+/// constructs the selected one at boot and on the disarmed param
+/// hot-reload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SamplerKind {
+    /// Time-anchored sampling (`τ_k = τ₀ + k·dt`). Stateless; pairs with
+    /// `PosCostMode::Quadratic`.
+    Time,
+    /// Closest-point (contouring) sampling. Required by
+    /// `PosCostMode::Contouring` — the outer loop clamps the cost mode to
+    /// Quadratic when this is not selected.
+    Position,
+}
+
+impl crate::param_registry::ParamEnum for SamplerKind {
+    fn to_u8(self) -> u8 {
+        match self {
+            SamplerKind::Time => 0,
+            SamplerKind::Position => 1,
+        }
+    }
+    fn from_u8(v: u8) -> Self {
+        // Out-of-range falls back to the schema default (Position) so a
+        // corrupt byte cannot silently demote a Contouring flight tune —
+        // the Contouring↔Position pairing stays intact.
+        if v == 0 {
+            SamplerKind::Time
+        } else {
+            SamplerKind::Position
+        }
+    }
+}
+
+/// Runtime dispatch over the available samplers. `outer_loop` holds
 /// one of these as a task-local. New variants drop in as additional
 /// `Sampler::*` cases without changing the call-site contract.
 pub enum Sampler {

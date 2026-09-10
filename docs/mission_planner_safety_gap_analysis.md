@@ -1,5 +1,33 @@
 # Mission Planner Safety Gap Analysis — Cybflight vs. ArduPilot
 
+> **STATUS: HISTORICAL (as of 2026-08-07).** This is a point-in-time
+> research deliverable, kept for the record. It predates the
+> configuration-plane refactor, the baked mission tables, and both ESKF
+> guards, so **every file:line reference below is stale** and several
+> listed gaps are closed. Do not use it as a current gap list; see
+> `docs/safety_protocol.md` and `docs/parameters.md`.
+>
+> Specifically superseded:
+> - **Gap 2 (no VICON link-quality gate)** — closed. `EskfMocapGuard`
+>   (`crates/cybflight_core/src/eskf/mocap_guard.rs`) implements jump and
+>   reject cascades plus a staleness window (`eskf_mocap_stale_s`,
+>   default 0.1 s) that drops `ESTIMATOR_READY`, and a disarmed-only
+>   re-anchor hatch. It no longer waits for the controller watchdog.
+> - **Gap 3 (no geofence)** — partly closed for stick input:
+>   `fence_enable` / `fence_x_m` / `fence_y_m` / `fence_z_max_m` /
+>   `fence_z_min_m` are params. Mission waypoints are still unclamped, so
+>   the mission-planner half of this gap stands.
+> - **"Hardcoded circular waypoints"** — obsolete. Missions are
+>   `missions/*.yaml`, baked by `build.rs`.
+> - **"Stick Z clamped to 5 m"** — obsolete; now `fence_z_max_m`
+>   (default 2.0).
+> - **"100 Hz outer MPC"** — obsolete; `mpc_rate_hz` defaults to 50.
+> - **Gap 13 (no ADC wired)** — obsolete; `BatteryParams` and
+>   `sensors/power.rs` exist.
+> - **Gap 14 ("cybflight intentionally mocap-only")** — scope has
+>   expanded: `pos_source` is `mocap` or `gps` per vehicle, and most
+>   vehicles in `vehicles/` are now GPS.
+
 ## Context
 
 The user asked for a comparison between cybflight's current mission planner workflow

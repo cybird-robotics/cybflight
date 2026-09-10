@@ -1,0 +1,10 @@
+[package]
+name = "vehicle-yaml"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+cybflight-core = { path = "../cybflight_core" }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"

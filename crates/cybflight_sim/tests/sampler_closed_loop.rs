@@ -25,8 +25,7 @@
 //! Both invariants are tested for `Sampler::Time` and `Sampler::Position`
 //! so a regression in either path is loud.
 
-use cybflight_core::mpc::NU as MPC_NU;
-use cybflight_core::params::VehicleParams;
+use cybflight_core::params::FirmwareConfig;
 use cybflight_core::trajectory_planning::bfgs_trust::BfgsWorkspace;
 use cybflight_core::trajectory_planning::piecewise_polynomial::PiecewisePolynomial;
 use cybflight_core::trajectory_planning::planner::{plan_with_workspace, PlannerInput};
@@ -36,9 +35,10 @@ use cybflight_core::trajectory_planning::sampler::{
 };
 use cybflight_core::trajectory_planning::types::ZERO3;
 use cybflight_sim::{
-    Controller, ImuModel, MpcIndiController, PerfectImu, QuadPlant, Setpoint, VEHICLE,
+    Controller, ImuModel, MpcIndiController, PerfectImu, PerfectRotorTelemetry, QuadPlant,
+    RotorModel, Setpoint, VEHICLE,
 };
-use nalgebra::{SVector, Vector3};
+use nalgebra::Vector3;
 
 const MPC_HORIZON_NODES: usize = 21; // SIMPLE_N + 1 in the firmware
 const MPC_HORIZON_DT: f32 = 0.05; // SIMPLE_MPC_DT in the firmware
@@ -163,6 +163,7 @@ impl MissionDriver {
                         pos: p,
                         vel: Vector3::zeros(),
                         acc: Vector3::zeros(),
+                        jerk: Vector3::zeros(),
                         past_end: false,
                     };
                 }
@@ -194,8 +195,9 @@ fn plan_short_mission(start: Vector3<f32>, target: Vector3<f32>) -> PiecewisePol
 
 /// Build plant + controller with default vehicle params, plant initialised
 /// at `start_pos` with zero velocity and identity attitude.
-fn build_rig(vp: VehicleParams, start_pos: Vector3<f32>) -> (QuadPlant, MpcIndiController) {
-    let mut plant = QuadPlant::new(vp.clone(), SIM_DT);
+fn build_rig(vp: FirmwareConfig, start_pos: Vector3<f32>) -> (QuadPlant, MpcIndiController) {
+    let sim = cybflight_sim::scenario::default_sim_params();
+    let mut plant = QuadPlant::new(vp.clone(), &sim, SIM_DT);
     plant.reset(
         start_pos,
         Vector3::zeros(),
@@ -220,14 +222,12 @@ fn run_loop(
     let n_ticks = (duration_s * TICK_HZ).round() as u32;
     let mut sample_buf = vec![SamplerNode::default(); MPC_HORIZON_NODES];
     let mut idle_at: Option<f32> = None;
-    // Drag-free quadrotor specific force = body-z * Σthrust / mass. Seed
-    // the previous-tick u with hover so the *very first* IMU sample
-    // reports 1g body-z (matching what a real accelerometer reads with
-    // the vehicle about to take off) instead of zero — INDI's takeoff
-    // detector treats zero specific force as free-fall.
-    let hover_per_motor = plant.params.body.mass_kg * 9.81 / MPC_NU as f32;
-    let mut u_last = SVector::<f32, MPC_NU>::from_element(hover_per_motor);
+    // The plant resets with rotors already at hover speed, so the very
+    // first IMU sample reads 1 g on body-z (what a real accelerometer
+    // shows with the vehicle about to take off) instead of zero — INDI's
+    // takeoff detector treats zero specific force as free-fall.
     let mut imu_model = PerfectImu;
+    let mut rotor_model = PerfectRotorTelemetry;
     for tick_idx in 0..n_ticks {
         let now_s = plant.time_s();
         rc_callback(now_s, driver);
@@ -239,12 +239,12 @@ fn run_loop(
             idle_at = Some(now_s);
         }
 
-        let imu = imu_model.sample(plant, &u_last);
-        let u = ctl.step(plant.raw_state(), &imu, &horizon);
+        let imu = imu_model.sample(plant);
+        let rotor = rotor_model.sample(plant);
+        let u = ctl.step(&plant.control_state(), &imu, &rotor, &horizon);
         for _ in 0..SUBSTEPS_PER_TICK {
             plant.step(&u);
         }
-        u_last = u;
 
         if !plant.position().x.is_finite() {
             panic!("plant diverged at tick {tick_idx} t={now_s:.3}");
@@ -335,7 +335,7 @@ fn time_sampler_completes_mission_and_transitions_to_idle() {
 
 #[test]
 fn position_sampler_completes_mission_and_transitions_to_idle() {
-    let params = VEHICLE.build().sampler.to_position_sampler_params();
+    let params = VEHICLE.build().trajectory.sampler.to_position_sampler_params();
     mission_completion_for_sampler(
         "position",
         Sampler::Position(PositionSampler::new(params)),
@@ -427,7 +427,7 @@ fn time_sampler_honours_rc_setpoint_change() {
 
 #[test]
 fn position_sampler_honours_rc_setpoint_change() {
-    let params = VEHICLE.build().sampler.to_position_sampler_params();
+    let params = VEHICLE.build().trajectory.sampler.to_position_sampler_params();
     rc_setpoint_change_for_sampler(
         "position",
         Sampler::Position(PositionSampler::new(params)),
@@ -462,7 +462,7 @@ fn time_sampler_idle_hover_holds() {
 
 #[test]
 fn position_sampler_idle_hover_holds() {
-    let params = VEHICLE.build().sampler.to_position_sampler_params();
+    let params = VEHICLE.build().trajectory.sampler.to_position_sampler_params();
     hover_holds_for_sampler(
         "position",
         Sampler::Position(PositionSampler::new(params)),

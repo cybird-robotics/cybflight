@@ -27,14 +27,14 @@ use embassy_time::Instant;
 use nalgebra::Vector3;
 
 use cybflight_core::eskf::{
-    Eskf, EskfConfig, EskfMocapGuard, MocapGuardConfig, MocapGuardOutcome, MocapPose,
+    Eskf, EskfMocapGuard, MocapGuardOutcome, MocapPose,
     ReinitCause,
 };
 
 use core::sync::atomic::Ordering;
 
 use crate::estimation::{
-    attitude_health_bits, evaluate_faults, ATTITUDE_HEALTH, ESKF_DEGRADED, ESKF_FAULTS,
+    attitude_health_bits, evaluate_faults, AttitudeHealthParams, ATTITUDE_HEALTH, ESKF_DEGRADED, ESKF_FAULTS,
     ESKF_HEALTH, ESKF_LAST_ATT_UPDATE, ESKF_LAST_JUMP_CASCADE, ESKF_LAST_NAN_RESET,
     ESKF_LAST_POS_UPDATE, ESKF_LAST_REJECT_CASCADE, ESKF_LAST_VEL_UPDATE, ESKF_SEVERE_FAULT,
     ESTIMATOR_READY, ESTIMATOR_STATUS, EstimatorPhase, FaultEvalInputs,
@@ -43,16 +43,16 @@ use crate::motors::IS_ARMED;
 use crate::sensors;
 use cybflight_msgs as msgs;
 
-/// ESKF predict rate after decimation. 8 kHz IMU / 8 = 1 kHz.
-const PREDICT_DECIMATION: u32 = 8;
+/// ESKF predict rate after decimation — IMU rate → ~1 kHz predict in every
+/// build (8 kHz → 8, 1 kHz `imu_1khz` → 1). Predict dt is measured from
+/// sample timestamps, so the divisor only sets the rate, not the model.
+const PREDICT_DECIMATION: u32 = {
+    let d = (crate::rates::IMU_ODR_HZ / 1000.0) as u32;
+    if d == 0 { 1 } else { d }
+};
 
 /// Odometry publish decimation relative to predict rate. 1 kHz / 1 = 1 kHz.
 const ODOM_DECIMATION: u32 = 1;
-
-/// Bias telemetry decimation relative to predict rate. 1 kHz / 100 = 10 Hz.
-/// Biases drift at seconds-scale; a slower channel keeps blackbox
-/// bandwidth bounded without losing meaningful information.
-const BIAS_TELEM_DECIMATION: u32 = 100;
 
 fn imu_is_valid(accel: &Vector3<f32>, gyro: &Vector3<f32>) -> bool {
     accel.iter().all(|v| v.is_finite()) && gyro.iter().all(|v| v.is_finite())
@@ -82,12 +82,29 @@ pub async fn estimation_task() {
     let mut imu_sub = crate::subscribe_or_park!(sensors::IMU_1, "IMU_1");
     let mut mocap_sub = crate::subscribe_or_park!(sensors::VICON_POSE, "VICON_POSE");
     let odom_pub = sensors::VEHICLE_ODOMETRY.immediate_publisher();
+    // Decimated mirror for the blackbox (`sensors::BLACKBOX_ODOMETRY`):
+    // thinned here, at the publisher, so the recorder's channel buffers
+    // records instead of samples it is about to discard. See
+    // `rates::BLACKBOX_ODOM_DECIM`.
+    let bb_odom_pub = sensors::BLACKBOX_ODOMETRY.immediate_publisher();
+    let mut bb_odom_ctr: u32 = 0;
     let att_pub = sensors::VEHICLE_ATTITUDE.immediate_publisher();
     let bias_pub = super::ESTIMATOR_BIAS_TELEM
         .publisher()
         .expect("eskf_imu_mocap: ESTIMATOR_BIAS_TELEM publisher");
 
-    let cfg = MocapGuardConfig::default();
+    // Guard tuning is fully parameterised (`eskf.mocap_guard`, reboot-
+    // flagged): the pose measurement σ, staleness window, convergence
+    // threshold and the failsafe cascade limits all come from the
+    // vehicle YAML / flash overrides rather than code defaults.
+    let cfg = crate::params::get().eskf.mocap_guard.to_mocap_guard_config();
+
+    // Hot-path param snapshots. Both source groups are reboot-flagged,
+    // and both of these feed code that runs at the IMU / predict rate —
+    // reading them inline would clone the whole FirmwareConfig inside a
+    // critical section thousands of times a second.
+    let att_health_params = AttitudeHealthParams::snapshot();
+    let fault_params = super::fault_params();
 
     // --- Wait for first mocap pose ---
     let first_pose = loop {
@@ -98,7 +115,12 @@ pub async fn estimation_task() {
     };
 
     // --- Initialise ESKF from mocap pose, zero biases ---
-    let mut eskf = Eskf::new(EskfConfig::default());
+    // Filter tuning in full from `eskf.filter` (vehicle YAML / flash
+    // overrides) — noise densities *and* the structural jump gates.
+    let mut eskf = Eskf::new(crate::params::get().eskf.filter.to_eskf_config());
+    // Read once: the predict path runs at ~1 kHz and `params::get()`
+    // deep-clones the config inside a critical section.
+    let max_predict_dt_s = super::max_predict_dt_s(&crate::params::get());
     eskf.init(
         first_pose.position,
         first_pose.orientation,
@@ -205,6 +227,7 @@ pub async fn estimation_task() {
                         &sample.gyro_rad_s,
                         last_nan_reset,
                         sample.timestamp,
+                        &att_health_params,
                     ),
                     Ordering::Relaxed,
                 );
@@ -220,10 +243,27 @@ pub async fn estimation_task() {
                 imu_skip = 0;
 
                 let now = sample.timestamp;
-                let dt = now.duration_since(last_predict_ts).as_micros() as f32 / 1_000_000.0;
+                // `saturating_duration_since`, NOT `duration_since`: the
+                // sample can legitimately be OLDER than `last_predict_ts`.
+                // While this task waits for the first pose, the IMU_1
+                // subscriber accumulates a full CAP-deep backlog of stale
+                // samples; `last_predict_ts` is seeded with `Instant::now()`
+                // at init, so the first queued sample sits up to CAP
+                // sample-periods in its past. `duration_since` panics on
+                // that underflow (`checked_sub(...).unwrap()`), which
+                // parked the core and IWDG-rebooted the board on every
+                // vicon-stream start — but only on `imu_1khz` builds:
+                // at 8 kHz PREDICT_DECIMATION=8 consumed the ≤4-deep
+                // backlog in the `imu_skip` path before any timestamp
+                // reached this subtraction, masking the bug. Saturated,
+                // a stale sample yields dt = 0 and the `dt <= 0.0` guard
+                // below skips it; the clock still advances to `now`, so
+                // the first fresh sample computes a sane dt.
+                let dt = now.saturating_duration_since(last_predict_ts).as_micros() as f32
+                    / 1_000_000.0;
                 last_predict_ts = now;
 
-                if dt <= 0.0 || dt > 0.05 {
+                if dt <= 0.0 || dt > max_predict_dt_s {
                     continue;
                 }
 
@@ -248,7 +288,7 @@ pub async fn estimation_task() {
                 // Decimated mirror onto the bias telemetry channel
                 // (~10 Hz). Same predict_count counter — no extra
                 // state, no race with the Signals above.
-                if predict_count.is_multiple_of(BIAS_TELEM_DECIMATION) {
+                if predict_count.is_multiple_of(super::BIAS_TELEM_DECIMATION) {
                     bias_pub.publish_immediate(msgs::EstimatorBias {
                         timestamp: Instant::now(),
                         gyro_bias_rad_s: gb,
@@ -290,6 +330,7 @@ pub async fn estimation_task() {
                 let now_ms = Instant::now();
                 let armed = IS_ARMED.load(Ordering::Relaxed);
                 let inputs = FaultEvalInputs {
+                    fault_params,
                     now: now_ms,
                     last_pos_update: ESKF_LAST_POS_UPDATE.lock(|c| c.get()),
                     last_vel_update: ESKF_LAST_VEL_UPDATE.lock(|c| c.get()),
@@ -305,20 +346,40 @@ pub async fn estimation_task() {
                 ESKF_DEGRADED.store(flags != 0 && !severe, Ordering::Relaxed);
                 ESKF_SEVERE_FAULT.store(severe, Ordering::Relaxed);
 
-                if tick.is_stale {
-                    if !prev_stale {
-                        defmt::warn!("ESKF: mocap stale — arming blocked");
+                // Staleness gates *arming and annunciation*, not the
+                // state stream. `EskfMocapGuard`'s stated policy is to
+                // ride out the gap on IMU dead-reckoning (mocap is
+                // 100–360 Hz, so the window is O(100 ms) — well inside
+                // the IMU's drift budget). Publishing has to follow the
+                // same policy, because withholding odometry cascades:
+                // >50 ms of silence starves the outer loop's
+                // ODOM_STALE_TIMEOUT, which stops RATE_COMMAND, which
+                // trips INDI's CMD_STALE_TIMEOUT, which lets the DShot
+                // MOTOR_CMD_STALE watchdog force idle throttle. That put
+                // the motors at idle ~110 ms into a routine marker
+                // occlusion, then disarmed ~500 ms later — half a second
+                // of armed free-fall from a dropout the filter was
+                // designed to absorb.
+                //
+                // A *sustained* outage is still caught, but by the fault
+                // path (POS_STALE → eskf_fault_pos_timeout_s → severe →
+                // failsafe disarm), which is a deliberate, annunciated
+                // action rather than a silent thrust cut.
+                if tick.is_stale != prev_stale {
+                    if tick.is_stale {
+                        defmt::warn!(
+                            "ESKF: mocap stale — arming blocked, dead-reckoning on IMU"
+                        );
+                    } else {
+                        defmt::info!("ESKF: mocap stream recovered");
                     }
-                    prev_stale = true;
-                    if prev_ready {
-                        ESTIMATOR_READY.store(false, Ordering::Release);
-                        prev_ready = false;
-                    }
-                    publish_status(&eskf, &guard);
-                    continue;
+                    prev_stale = tick.is_stale;
                 }
-                prev_stale = false;
 
+                // `is_ready` already collapses to false while stale —
+                // `EskfMocapGuard::on_predict_tick` clears `converged`
+                // on the stale edge — so the arming gate closes here
+                // without a separate branch.
                 if tick.is_ready != prev_ready {
                     ESTIMATOR_READY.store(tick.is_ready, Ordering::Release);
                     prev_ready = tick.is_ready;
@@ -329,8 +390,13 @@ pub async fn estimation_task() {
                 let q = eskf.orientation();
                 let gb = eskf.gyro_bias();
                 let now_publish = Instant::now();
-                odom_pub.publish_immediate(msgs::VehicleOdometry {
-                    timestamp: now_publish,
+                let odom_msg = msgs::VehicleOdometry {
+                    // The epoch the state is valid at: the predict propagated
+                    // it to this IMU sample. `Instant::now()` here would add
+                    // this task's scheduling latency to the label — measured
+                    // sigma 5.0 ms against the stamper's 0.01 ms (flight_0009).
+                    // `twist.angular` below is already taken from `sample`.
+                    timestamp: sample.timestamp,
                     pose: msgs::Pose {
                         position: eskf.position(),
                         orientation: q,
@@ -339,7 +405,13 @@ pub async fn estimation_task() {
                         linear: eskf.velocity(),
                         angular: sample.gyro_rad_s - gb,
                     },
-                });
+                };
+                odom_pub.publish_immediate(odom_msg.clone());
+                bb_odom_ctr += 1;
+                if bb_odom_ctr >= crate::rates::BLACKBOX_ODOM_DECIM {
+                    bb_odom_ctr = 0;
+                    bb_odom_pub.publish_immediate(odom_msg);
+                }
                 att_pub.publish_immediate(msgs::VehicleAttitude {
                     timestamp: now_publish,
                     orientation: q,
@@ -349,21 +421,37 @@ pub async fn estimation_task() {
             Either::Second(result) => {
                 let pose = match result {
                     WaitResult::Message(m) => m,
-                    WaitResult::Lagged(_) => continue,
+                    WaitResult::Lagged(n) => {
+                        // Same annunciation as the IMU branch: dropping
+                        // pose frames silently hides the one condition
+                        // that matters most on a mocap build.
+                        defmt::warn!("estimation: dropped {} mocap poses", n);
+                        continue;
+                    }
                 };
 
                 let mocap_pose = pose_to_mocap(&pose);
-                let outcome = guard.on_pose(&mut eskf, &mocap_pose);
+                // `armed` gates the guard's re-anchor escape hatch —
+                // in flight the ride-out-IMU policy stays absolute.
+                let outcome = guard.on_pose(
+                    &mut eskf,
+                    &mocap_pose,
+                    IS_ARMED.load(Ordering::Relaxed),
+                );
 
                 match outcome {
                     MocapGuardOutcome::Accepted { inflated } => {
                         if inflated {
                             defmt::debug!("ESKF: mocap pose update inflated");
                         }
-                        // Pose accept refreshes both pos and att
-                        // last-update clocks (mocap is a joint pos+att
-                        // measurement). The fault evaluator reads these
-                        // to decide POS_STALE / ATT_STALE.
+                        // Pose accept refreshes the pos, att *and* vel
+                        // last-update clocks. Mocap is a joint pos+att
+                        // measurement, and velocity is observable
+                        // through the pose sequence, so all three are
+                        // genuinely fresh. The fault evaluator reads
+                        // these to decide POS_STALE / ATT_STALE /
+                        // VEL_STALE — note this means VEL_STALE can
+                        // never assert on a mocap build, by design.
                         let now = pose.timestamp;
                         ESKF_LAST_POS_UPDATE.lock(|c| c.set(Some(now)));
                         ESKF_LAST_ATT_UPDATE.lock(|c| c.set(Some(now)));
@@ -383,15 +471,9 @@ pub async fn estimation_task() {
                         defmt::warn!("ESKF: pose update rejected ({})", outcome_tag(reason));
                     }
                     MocapGuardOutcome::Reinitialised { at_pos, cause, .. } => {
-                        // NaN re-init starts a hold-down window for the
-                        // ATTITUDE_HEALTH NO_RECENT_NAN bit. JumpCascade
-                        // re-init isn't surfaced by mocap (policy: ride
-                        // out IMU), but if a future variant emits it the
-                        // same hold-down applies.
+                        // Both re-init causes start a hold-down window
+                        // for the ATTITUDE_HEALTH NO_RECENT_NAN bit.
                         ESKF_LAST_NAN_RESET.lock(|c| c.set(Some(Instant::now())));
-                        // Mocap re-init only happens on NaN-state
-                        // entry (no jump-cascade re-init policy on
-                        // this path — see EskfMocapGuard rationale).
                         match cause {
                             ReinitCause::NanState => {
                                 defmt::error!(
@@ -403,11 +485,15 @@ pub async fn estimation_task() {
                                 );
                             }
                             ReinitCause::JumpCascade => {
-                                // Mocap shouldn't surface this; if a
-                                // future variant adds a jump-cascade
-                                // re-init policy, log it here.
+                                // Disarmed-only escape hatch: the pose
+                                // stream agreed with itself for
+                                // REANCHOR_FRAMES while the filter was
+                                // wedged outside the jump gate. Logged
+                                // at error level because it means the
+                                // filter had genuinely lost the
+                                // airframe, not merely dropped frames.
                                 defmt::error!(
-                                    "ESKF: re-anchoring from mocap (jump-cascade) \
+                                    "ESKF: re-anchoring from mocap (jump-cascade, disarmed) \
                                      pos=[{},{},{}]",
                                     at_pos.x,
                                     at_pos.y,

@@ -1,0 +1,38 @@
+\begin{table}[t]
+\centering
+\caption{Controller ablation on the figure-8, one single-flag change per row
+off the nominal configuration ($N=20$, $\Delta t$ fixed, one real-time-iteration
+SQP step per tick, contouring position cost, position-based reference sampler).
+The planned trajectory is identical in every row; only the controller changes.
+Note that the time-sampled quadratic cost does not simply track worse --- it
+buys a lower time lag $\tau$ with a larger contour error, which is the
+trade-off the contouring formulation is designed to make. The two-iteration
+row is a real-time result: the solve no longer fits the 10\,ms control
+period, and the achieved loop rate roughly halves. Single flight per row.
+$^{\dagger}$Median cadence of the logged solver telemetry; the on-board
+recorder drops messages under load, so this is a lower bound on the true
+rate and is only compared across rows, never against the 100\,Hz
+set point. Solver telemetry was not recorded in the nominal mid flight.}
+\label{tab:ablation}
+\begin{tabular}{lrrrrrrrr}
+\toprule
+& \multicolumn{4}{c}{Contour error [cm]} & & \multicolumn{2}{c}{Solver} & \\
+\cmidrule(lr){2-5}\cmidrule(lr){7-8}
+Configuration & RMS & $\Delta$ & p95 & max
+ & $\tau_{\mathrm{rms}}$ [ms] & $t_{\mathrm{solve}}$ [ms] & rate$^{\dagger}$ [Hz]
+ & sat.\ [\%] \\
+\midrule
+\multicolumn{9}{l}{\emph{Mid profile ($v_{\max}=7.5$\,m/s)}} \\
+Proposed (contouring, RTI, nominal mass) & 12.3 & \textemdash & 24.1 & 26.1 & 144 & \textemdash & \textemdash & 0.0 \\
+\quad $\rightarrow$ time-sampled quadratic cost & 16.6 & +35\% & 29.8 & 35.2 & 32 & 4.64 & 63 & 0.0 \\
+\quad $\rightarrow$ 2 SQP iterations & 16.2 & +31\% & 33.6 & 47.8 & 146 & 9.37 & 37 & 0.0 \\
+\quad $\rightarrow$ unknown payload & 11.5 & -7\% & 20.8 & 25.6 & 115 & 4.29 & 83 & 0.0 \\
+\midrule
+\multicolumn{9}{l}{\emph{Time-opt. profile ($v_{\max}=12.8$\,m/s)}} \\
+Proposed (contouring, RTI, nominal mass) & 24.4 & \textemdash & 41.1 & 51.7 & 63 & 4.28 & 85 & 30.7 \\
+\quad $\rightarrow$ time-sampled quadratic cost & 36.7 & +50\% & 58.5 & 68.6 & 24 & 4.64 & 68 & 34.0 \\
+\quad $\rightarrow$ 2 SQP iterations & 36.6 & +50\% & 63.5 & 87.1 & 77 & 9.34 & 37 & 77.5 \\
+\quad $\rightarrow$ unknown payload & 33.9 & +39\% & 61.4 & 77.8 & 64 & 4.67 & 64 & 72.7 \\
+\bottomrule
+\end{tabular}
+\end{table}

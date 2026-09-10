@@ -5,7 +5,8 @@
 //! This keeps the single-function-frame size tiny, preventing stack
 //! overflow on embedded targets (e.g. STM32H743 task stacks ≈ 4-8 KB).
 //!
-//! The workspace itself is ~35 KB for MAX_VARS = 80; place it on the
+//! The workspace itself is ~55 KiB for MAX_VARS = 80 (two 80×80 f32
+//! matrices dominate); place it on the
 //! main stack, in a `static`, or in DTCM as the deployment requires.
 
 #[allow(unused_imports)]
@@ -22,12 +23,45 @@ const MAX_VARS: usize = 4 * super::MAX_PLANNED_PIECES; // 80
 const MAX_VARS_SQ: usize = MAX_VARS * MAX_VARS; // 6400
 const MAX_PAST: usize = 16;
 
+/// Default trust radius below which the dogleg can no longer make
+/// progress. Reaching it is a failure
+/// ([`BfgsTrustResult::TrustRegionCollapsed`]), not convergence.
+///
+/// The live value is `BfgsTrustParams::delta_collapse`
+/// (`plan_bfgs_delta_collapse`); this is the schema default and the
+/// fallback for a non-finite or non-positive configured value.
+pub const DEFAULT_DELTA_COLLAPSE: f32 = 1e-7;
+
+/// The configured collapse radius, degrading to
+/// [`DEFAULT_DELTA_COLLAPSE`] if it is not usable. A non-positive value
+/// would make the collapse test unreachable and let a stuck solve spin
+/// against the iteration cap instead of reporting failure.
+#[inline]
+fn delta_collapse_of(params: &BfgsTrustParams) -> f32 {
+    let v = params.delta_collapse;
+    if v.is_finite() && v > 0.0 {
+        v
+    } else {
+        DEFAULT_DELTA_COLLAPSE
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BfgsTrustResult {
+    /// Gradient test met: ‖g‖∞ / max(1, ‖x‖∞) < `g_epsilon`.
     Convergence,
+    /// Stopped making progress after at least one accepted step: either the
+    /// cost stagnated over `past` accepted iterations (`delta_conv`), or the
+    /// trust radius shrank below the step tolerance. `x` is the best iterate
+    /// found. In f32 the gradient test is rarely reachable at the default
+    /// `g_epsilon`, so this is the common successful terminal status.
     Stop,
     MaxIterations,
     InvalidValue,
+    /// The trust radius collapsed **before any step was accepted**. `x` is
+    /// still the initial guess — nothing was optimized. Callers must treat
+    /// this as a failure; it used to be reported as `Convergence`.
+    TrustRegionCollapsed,
     /// Caller-supplied `keep_going` callback returned `false` before the
     /// optimizer had converged. Used to implement wall-clock time budgets
     /// from an embedded caller (which has a clock the solver itself
@@ -102,8 +136,17 @@ pub struct BfgsWorkspace {
     pc_norm: f32,
     /// Dogleg cache: g·g.
     gtg: f32,
-    /// Active length of the past-f ring buffer.
+    /// Active length of the past-f ring buffer (`past_n + 1`).
     past_len: usize,
+    /// Effective stagnation lookback, clamped to `MAX_PAST - 1`.
+    ///
+    /// Kept separate from `params.past` because the ring buffer is capped at
+    /// [`MAX_PAST`]: using an unclamped `params.past` for the lookback while
+    /// the buffer was clamped made the two indices alias. At `past == 16` the
+    /// old and current slots coincided, so the stagnation rate was always 0
+    /// and the solver stopped on the first eligible step; at `past == 20` it
+    /// silently behaved as 4.
+    past_n: usize,
     /// Active problem dimension `n` captured at `init`.
     n: usize,
 }
@@ -138,6 +181,7 @@ impl BfgsWorkspace {
             pc_norm: 0.0,
             gtg: 0.0,
             past_len: 0,
+            past_n: 0,
             n: 0,
         }
     }
@@ -255,8 +299,10 @@ where
         ws.hess[i * n + i] = 1.0;
     }
 
-    // Past-f ring buffer (bounded by MAX_PAST regardless of user `past` config).
-    ws.past_len = (params.past + 1).min(MAX_PAST);
+    // Past-f ring buffer. The lookback and the buffer length must be clamped
+    // together (see `past_n`) or the two indices alias.
+    ws.past_n = params.past.min(MAX_PAST - 1);
+    ws.past_len = ws.past_n + 1;
     for v in &mut ws.past_f[..ws.past_len] {
         *v = 0.0;
     }
@@ -274,7 +320,7 @@ where
     if !ws.fx.is_finite() {
         return Some(BfgsTrustResult::InvalidValue);
     }
-    if params.past > 0 {
+    if ws.past_n > 0 {
         ws.past_f[0] = ws.fx;
     }
     None
@@ -391,7 +437,16 @@ where
         );
 
         if pred.abs() < 1e-7 {
-            return Some(BfgsTrustResult::Convergence);
+            // A negligible predicted reduction with the gradient test not
+            // yet satisfied means the step itself is negligible. If that is
+            // because the radius has already collapsed, say so — this path
+            // used to report `Convergence` on a tiny `delta_init` with the
+            // seed untouched.
+            return Some(if ws.delta > delta_collapse_of(params) {
+                BfgsTrustResult::Convergence
+            } else {
+                collapse_status(ws)
+            });
         }
 
         // Evaluate trial point.
@@ -400,8 +455,17 @@ where
         }
         let fx_trial = cost_grad(&ws.x_trial[..n], &mut ws.g_new[..n]);
 
-        let actual = ws.fx - fx_trial;
-        let rho = if pred.abs() > 1e-7 { actual / pred } else { 0.0 };
+        // A non-finite trial cost makes `rho` NaN, and every comparison
+        // against NaN is false — so without this branch the trust radius
+        // would not shrink, `cache_valid` would stay set, and the identical
+        // trial point would be recomputed until `max_iterations` ran out.
+        // Treat it as the worst possible step instead.
+        let rho = if fx_trial.is_finite() {
+            let actual = ws.fx - fx_trial;
+            if pred.abs() > 1e-7 { actual / pred } else { 0.0 }
+        } else {
+            f32::NEG_INFINITY
+        };
 
         // Update trust radius.
         if rho < 0.25 {
@@ -440,11 +504,11 @@ where
             // Cost-stagnation convergence test using a ring of past accepted
             // cost values. Index advances only on accepts → `past` counts
             // accepted iterations regardless of how many trials were rejected.
-            if params.past > 0 && ws.past_len > 0 {
+            if ws.past_n > 0 {
                 let idx = ws.accepted % ws.past_len;
                 ws.past_f[idx] = ws.fx;
-                if ws.accepted > params.past {
-                    let old_idx = (ws.accepted - params.past) % ws.past_len;
+                if ws.accepted > ws.past_n {
+                    let old_idx = (ws.accepted - ws.past_n) % ws.past_len;
                     let rate = (ws.past_f[old_idx] - ws.fx).abs() / ws.fx.abs().max(1.0);
                     if rate < params.delta_conv {
                         ws.k += 1;
@@ -454,9 +518,9 @@ where
             }
         }
 
-        if ws.delta < 1e-7 {
+        if ws.delta < delta_collapse_of(params) {
             ws.k += 1;
-            return Some(BfgsTrustResult::Convergence);
+            return Some(collapse_status(ws));
         }
 
         ws.k += 1;
@@ -464,6 +528,17 @@ where
     }
 
     Some(BfgsTrustResult::MaxIterations)
+}
+
+/// Terminal status for a collapsed trust radius: a step-tolerance `Stop`
+/// once something has been accepted, a hard failure if `x` is still the seed.
+#[inline]
+fn collapse_status(ws: &BfgsWorkspace) -> BfgsTrustResult {
+    if ws.accepted > 0 {
+        BfgsTrustResult::Stop
+    } else {
+        BfgsTrustResult::TrustRegionCollapsed
+    }
 }
 
 /// Dogleg step from pre-computed Newton & Cauchy points.
@@ -513,9 +588,14 @@ fn dogleg_step_cached(
     //    B·p = (σ · −α_c) · bg, avoiding a fresh mat_vec.
     if !newton_ok || pc_norm >= delta {
         let scale = delta / pc_norm;
-        // p_cauchy = −α_c · g, so p = scale · p_cauchy = (scale · −α_c) · g.
-        let coeff = -scale * (vec_dot(&g[..n], &p_cauchy[..n]) / gtg.max(1e-20));
-        // Equivalent direct form:
+        // p_cauchy = −α_c · g, so p = scale · p_cauchy = (scale · −α_c) · g,
+        // and B·p = (scale · −α_c) · bg. Recover (scale · −α_c) from the
+        // cached dot product: g·p_cauchy = −α_c · gtg, so
+        //   (g·p_cauchy / gtg) = −α_c   and   coeff = scale · (g·p_cauchy / gtg).
+        // (The leading minus that used to sit here negated B·p, inflating
+        // `pred` by pᵀBp and making rho too small — the trust region then
+        // shrank on steps that should have been accepted.)
+        let coeff = scale * (vec_dot(&g[..n], &p_cauchy[..n]) / gtg.max(1e-20));
         for i in 0..n {
             p[i] = scale * p_cauchy[i];
         }
@@ -811,5 +891,155 @@ mod tests {
             bfgs_trust_optimize(&mut x, &mut eval, &BfgsTrustParams::default(), &mut ws);
         eprintln!("Ill-cond (κ=1000): status={status:?}, cost={cost:.2e}, iters={iters}");
         assert!(cost < 1e-10);
+    }
+
+    /// Every dogleg branch must agree with the reference
+    /// `predicted_reduction` evaluated on the step it returns. Branch 3
+    /// (Cauchy point scaled to the trust boundary) used to negate `B·p`
+    /// when reusing the cached `bg`, overstating `pred` by pᵀBp.
+    #[test]
+    fn dogleg_branches_match_reference_predicted_reduction() {
+        const N: usize = 4;
+        // SPD B = M Mᵀ + I, fixed entries so the test is deterministic.
+        let m = [
+            [1.7, -0.3, 0.9, 0.2],
+            [0.4, 1.1, -0.6, 0.8],
+            [-0.5, 0.7, 1.3, -0.2],
+            [0.6, -0.9, 0.1, 1.5],
+        ];
+        let mut b = [0.0f32; N * N];
+        for i in 0..N {
+            for j in 0..N {
+                let mut acc = if i == j { 1.0 } else { 0.0 };
+                for k in 0..N {
+                    acc += m[i][k] * m[j][k];
+                }
+                b[i * N + j] = acc;
+            }
+        }
+        let g = [0.8, -1.2, 0.5, 1.9];
+
+        let mut bg = [0.0; N];
+        mat_vec(&b, &g, &mut bg, N);
+        let gtg = vec_dot(&g, &g);
+        let g_bg = vec_dot(&g, &bg);
+        let alpha_c = gtg / g_bg;
+        let mut p_cauchy = [0.0; N];
+        for i in 0..N {
+            p_cauchy[i] = -alpha_c * g[i];
+        }
+        let pc_norm = vec_norm(&p_cauchy);
+
+        let mut l = [0.0; N * N];
+        let mut y = [0.0; N];
+        let mut p_newton = [0.0; N];
+        let newton_ok = cholesky_solve(&b, &g, &mut p_newton, &mut l, &mut y, N);
+        assert!(newton_ok);
+        let pn_norm = vec_norm(&p_newton);
+
+        // Branch 1 (Newton inside), 3 (Cauchy scaled), 4 (dogleg) in turn.
+        for (label, delta, force_no_newton) in [
+            ("newton", pn_norm * 2.0, false),
+            ("cauchy-scaled", pc_norm * 0.5, false),
+            ("cauchy-no-newton", pc_norm * 1.5, true),
+            ("dogleg", 0.5 * (pc_norm + pn_norm), false),
+        ] {
+            let mut p = [0.0; N];
+            let mut d = [0.0; N];
+            let mut bp = [0.0; N];
+            let pred = dogleg_step_cached(
+                &b, &g, &bg, delta, &p_newton, newton_ok && !force_no_newton, pn_norm,
+                &p_cauchy, pc_norm, gtg, &mut p, &mut d, &mut bp, N,
+            );
+            let mut bp_ref = [0.0; N];
+            let reference = predicted_reduction(&b, &g, &p, &mut bp_ref, N);
+            assert!(
+                (pred - reference).abs() <= 1e-5 * reference.abs().max(1.0),
+                "{label}: dogleg pred {pred} != reference {reference}"
+            );
+            assert!(reference > 0.0, "{label}: step must predict a decrease");
+        }
+    }
+
+    /// A trust radius that can only shrink must be reported as a failure,
+    /// not as `Convergence` with the initial guess still in `x`.
+    #[test]
+    fn collapsed_trust_region_is_not_convergence() {
+        let mut x = [3.0, -4.0];
+        let mut eval = |xv: &[f32], g: &mut [f32]| -> f32 {
+            g[0] = 2.0 * xv[0];
+            g[1] = 2.0 * xv[1];
+            xv[0] * xv[0] + xv[1] * xv[1]
+        };
+        let params = BfgsTrustParams {
+            delta_init: 1e-8,
+            delta_max: 1e-8,
+            ..BfgsTrustParams::default()
+        };
+        let mut ws = BfgsWorkspace::new();
+        let (status, _, _) = bfgs_trust_optimize(&mut x, &mut eval, &params, &mut ws);
+        assert_eq!(status, BfgsTrustResult::TrustRegionCollapsed);
+        assert_eq!(x, [3.0, -4.0], "nothing was optimized");
+    }
+
+    /// A non-finite trial cost must shrink the trust region and move on,
+    /// not re-evaluate the same trial until `max_iterations`.
+    #[test]
+    fn non_finite_trial_does_not_burn_the_iteration_budget() {
+        // f = x² inside |x| < 1, NaN outside. From x = 0.5 with delta_init = 10
+        // the first trial lands in the NaN region.
+        let mut x = [0.5];
+        let mut eval = |xv: &[f32], g: &mut [f32]| -> f32 {
+            if xv[0].abs() < 1.0 {
+                g[0] = 2.0 * xv[0];
+                xv[0] * xv[0]
+            } else {
+                g[0] = f32::NAN;
+                f32::NAN
+            }
+        };
+        let params = BfgsTrustParams {
+            delta_init: 10.0,
+            max_iterations: 500,
+            ..BfgsTrustParams::default()
+        };
+        let mut ws = BfgsWorkspace::new();
+        let (status, cost, iters) = bfgs_trust_optimize(&mut x, &mut eval, &params, &mut ws);
+        assert!(
+            matches!(status, BfgsTrustResult::Convergence | BfgsTrustResult::Stop),
+            "status {status:?}"
+        );
+        assert!(iters < 50, "spent {iters} iterations recovering from one NaN trial");
+        assert!(cost < 1e-6 && x[0].abs() < 1e-3);
+    }
+
+    /// `past` beyond the ring-buffer cap must clamp *with* the buffer, not
+    /// alias the old/new slots (which made the stagnation rate always 0).
+    #[test]
+    fn past_beyond_ring_cap_clamps_instead_of_aliasing() {
+        let eval = |xv: &[f32], g: &mut [f32]| -> f32 {
+            let a = 1.0 - xv[0];
+            let b = xv[1] - xv[0] * xv[0];
+            g[0] = -2.0 * a - 400.0 * xv[0] * b;
+            g[1] = 200.0 * b;
+            a * a + 100.0 * b * b
+        };
+        let run = |past: usize| {
+            let mut x = [-1.0, 1.0];
+            let mut e = eval;
+            let params = BfgsTrustParams {
+                past,
+                max_iterations: 500,
+                ..BfgsTrustParams::default()
+            };
+            let mut ws = BfgsWorkspace::new();
+            bfgs_trust_optimize(&mut x, &mut e, &params, &mut ws)
+        };
+        let (s15, c15, i15) = run(MAX_PAST - 1);
+        let (s16, c16, i16) = run(MAX_PAST);
+        let (s40, c40, i40) = run(40);
+        assert_eq!((s15, c15, i15), (s16, c16, i16), "past=16 must behave as 15");
+        assert_eq!((s15, c15, i15), (s40, c40, i40), "past=40 must behave as 15");
+        assert!(c15 < 1e-4, "clamped run must still reach the optimum, cost={c15}");
     }
 }

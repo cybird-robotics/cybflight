@@ -1,0 +1,32 @@
+\begin{table}[t]
+\centering
+\caption{Rejection of an unknown added mass. The controller is given no
+knowledge of the payload: the model, the weights and the plan are unchanged
+from the nominal flight. \textbf{TODO: state the payload mass and its
+fraction of the 0.6\,kg vehicle mass, and where it was mounted.}
+Tracking is essentially unchanged at the mid profile --- the disturbance is
+absorbed into control effort, visible in $\bar{u}$ --- and degrades only at
+the time-optimal profile, where the extra thrust demand pushes the vehicle
+into actuator saturation for most of the mission. ``Trim spread'' is the
+spread of the four per-motor mean commands: it roughly doubles under the
+payload in every case, which says the added mass sits off the centre of
+gravity, so the disturbance is a moment as well as a force. Single flight per
+cell; differences below the run-to-run spread should not be read as
+improvements, and the negative $\Delta$ entries are noise, not gains.}
+\label{tab:payload}
+\begin{tabular}{llrrrrrrrrr}
+\toprule
+& & \multicolumn{3}{c}{Contour RMS [cm]} & \multicolumn{2}{c}{Mean cmd.\ $\bar{u}$}
+  & \multicolumn{2}{c}{Trim spread} & \multicolumn{2}{c}{Saturated [\%]} \\
+\cmidrule(lr){3-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}\cmidrule(lr){10-11}
+Path & Profile & nom. & payload & $\Delta$ & nom. & payload & nom. & payload
+ & nom. & payload \\
+\midrule
+Circle & Mid & 14.8 & 12.0 & -19\% & 0.295 & 0.503 & 0.022 & 0.053 & 0.0 & 40.3 \\
+Figure-8 & Mid & 12.3 & 11.5 & -7\% & 0.268 & 0.439 & 0.025 & 0.056 & 0.0 & 0.0 \\
+Slalom & Mid & 11.1 & 13.2 & +19\% & 0.263 & 0.402 & 0.019 & 0.042 & 0.1 & 4.7 \\
+Splits & Mid & 10.1 & 11.1 & +10\% & 0.253 & 0.399 & 0.027 & 0.047 & 0.0 & 0.0 \\
+Figure-8 & Time-opt. & 24.4 & 33.9 & +39\% & 0.558 & 0.734 & 0.051 & 0.067 & 30.7 & 72.7 \\
+\bottomrule
+\end{tabular}
+\end{table}

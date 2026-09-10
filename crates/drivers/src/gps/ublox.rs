@@ -239,6 +239,11 @@ where
         }
     }
 
+    /// Read the next driver event. u-blox only produces position fixes.
+    pub async fn read_event(&mut self) -> Result<super::GpsEvent, Error<RW::Error>> {
+        Ok(super::GpsEvent::Fix(self.read_fix().await?))
+    }
+
     /// Sync on UBX header, return (class, id, payload_length).
     async fn read_header(&mut self) -> Result<(u8, u8, u16), Error<RW::Error>> {
         loop {

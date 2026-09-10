@@ -1,102 +1,47 @@
-use cybflight_core::mixer::{
-    LinearAllocator, MotorEffectiveness, MotorParams, RigidBodyParams, SpinDir,
-};
+//! Baked vehicle configuration.
+//!
+//! There is no "default drone" anymore: the physical identity (mass,
+//! inertia, motor geometry/thrust) comes from `vehicles/<VEHICLE>.yaml`,
+//! selected via the `VEHICLE` env var (see `.env` / Justfile) and
+//! validated at **build time** by `build.rs` — a missing identity field is
+//! a compile error, and a typo'd tuning key is a compile error.
+//!
+//! `default_params()` reconstructs the baked [`FirmwareConfig`] from the
+//! generated full-snapshot table. Runtime `param set` + `param save`
+//! overrides (the KV store) layer on top per-key at boot.
 
-// ---------------------------------------------------------------------------
-// Quadrotor physical parameters — Betaflight QuadX motor ordering, FLU frame.
-//
-// Body frame: FLU (Forward-Left-Up): x = forward, y = left, z = up.
-//
-// Motor index convention (Betaflight QuadX):
-//   0 = REAR_RIGHT  (CW  from above) — position (−d, −d): rear and right = negative y
-//   1 = FRONT_RIGHT (CCW from above) — position (+d, −d)
-//   2 = REAR_LEFT   (CCW from above) — position (−d, +d): left = positive y
-//   3 = FRONT_LEFT  (CW  from above) — position (+d, +d)
-//
-// Arm length 100 mm at 45° → motor offset d = 0.1 / √2 ≈ 70.7 mm.
-// ---------------------------------------------------------------------------
+use cybflight_core::params::FirmwareConfig;
 
-pub const QUADROTOR_BODY: RigidBodyParams = RigidBodyParams {
-    mass_kg: 0.6,
-    // Diagonal inertia [Ixx, Ixy, Ixz, Iyx, Iyy, Iyz, Izx, Izy, Izz] (kg·m²).
-    // Roll/pitch symmetric (Ixx = Iyy = 0.02), yaw larger (Izz = 0.04).
-    // Calibrate from a bifilar pendulum test or CAD model.
-    inertia_kg_m2: [0.0021, 0.0, 0.0, 0.0, 0.0018, 0.0, 0.0, 0.0, 0.003],
-    max_rate_rad_s: [10.0, 10.0, 6.0],
-};
+include!(concat!(env!("OUT_DIR"), "/baked_params.rs"));
 
-const MAX_THRUST_N: f32 = 12.0;
+// Schema-drift guard: the table is generated against the same
+// cybflight-core the firmware links, so the counts must agree.
+const _: () = assert!(BAKED_PARAMS.len() == cybflight_core::params::PARAM_COUNT);
 
-pub const QUADROTOR_MOTORS: [MotorParams; 4] = [
-    // M0: REAR_RIGHT — CW, position (−d, −d) in FLU (right = −y).
-    MotorParams {
-        position_m: [-0.075, -0.1],
-        spin_dir: SpinDir::Cw,
-        max_thrust_n: MAX_THRUST_N, // ~600 g per motor for a 5" prop. Calibrate from test stand.
-        torque_coeff_m: 0.022,
-    },
-    // M1: FRONT_RIGHT — CCW, position (+d, −d) in FLU.
-    MotorParams {
-        position_m: [0.075, -0.1],
-        spin_dir: SpinDir::Ccw,
-        max_thrust_n: MAX_THRUST_N,
-        torque_coeff_m: 0.022,
-    },
-    // M2: REAR_LEFT — CCW, position (−d, +d) in FLU (left = +y).
-    MotorParams {
-        position_m: [-0.075, 0.1],
-        spin_dir: SpinDir::Ccw,
-        max_thrust_n: MAX_THRUST_N,
-        torque_coeff_m: 0.022,
-    },
-    // M3: FRONT_LEFT — CW, position (+d, +d) in FLU.
-    MotorParams {
-        position_m: [0.075, 0.1],
-        spin_dir: SpinDir::Cw,
-        max_thrust_n: MAX_THRUST_N,
-        torque_coeff_m: 0.022,
-    },
-];
-
-/// Compile-time default control gains matching the inner-loop hardcoded values.
-pub const DEFAULT_CONTROL_GAINS: cybflight_core::params::ControlGains =
-    cybflight_core::params::ControlGains {
-        pos_kp: [4.0, 4.0, 8.0],
-        pos_kd: [4.0, 4.0, 6.0],
-        att_k_rate: [3.0, 3.0, 1.0],
-    };
-
-/// Return the compile-time default vehicle parameters.
-pub fn default_params() -> cybflight_core::params::VehicleParams {
-    cybflight_core::params::VehicleParams {
-        body: QUADROTOR_BODY,
-        motors: QUADROTOR_MOTORS,
-        control: DEFAULT_CONTROL_GAINS,
-        indi_effectiveness: cybflight_core::params::IndiEffectivenessParams::default(),
-        indi_controller: cybflight_core::params::IndiControllerParams::default(),
-        learner: cybflight_core::params::LearnerParams::default(),
-        mpc: cybflight_core::params::MpcParams::default(),
-        planner: cybflight_core::params::PlannerParams::default(),
-        sampler: cybflight_core::params::SamplerParams::default(),
-        #[cfg(feature = "outer_mpc")]
-        mission_profile: crate::control::offline_mission::DEFAULT_PROFILE_INDEX,
-        #[cfg(not(feature = "outer_mpc"))]
-        mission_profile: 0,
-        // Default ON so a fresh-flashed board with blank flash lights up
-        // immediately at power-on — matches the test-bench workflow where
-        // the LED is used as a power-good / firmware-alive indicator.
-        arm_led_enabled: true,
-        // RecordSet::Large = 3. Conservative default that preserves the
-        // pre-Stage-7 "log everything" behaviour. Persisted in flash;
-        // tweakable via `blackbox set <tier>`.
-        blackbox_record_set: 3,
-    }
-}
-
-/// Construct the quadrotor linear allocator.
+/// The baked configuration for this build's vehicle
+/// ([`BAKED_VEHICLE`]).
 ///
-/// Called once at firmware startup (e.g. in `board_init` or the attitude task).
-/// Panics at construction time if the motor geometry is degenerate.
-pub fn quadrotor_allocator() -> LinearAllocator<4> {
-    LinearAllocator::new(MotorEffectiveness::from_motors(&QUADROTOR_MOTORS))
+/// Serves as both the boot-time base (KV overrides are replayed on top)
+/// and the "baked defaults" reference the KV store diffs and prunes
+/// against.
+pub fn default_params() -> FirmwareConfig {
+    let mut cfg = FirmwareConfig::scaffold();
+    for (name, value) in BAKED_PARAMS {
+        // Hard assert (release too): a baked name the registry doesn't
+        // know would silently leave the scaffold's ZEROED airframe in
+        // place — a zero mass flowing into 1/mass paths is strictly
+        // worse than a loud disarmed boot panic. Unreachable in practice
+        // (table and registry come from the same schema), which is
+        // exactly why it must not be a debug_assert.
+        assert!(cfg.set_named(name, value), "baked param not in registry");
+    }
+    // The offline-mission default is a firmware/feature decision
+    // (BUILD_ENV-dependent), not a vehicle property — it overrides
+    // whatever the scaffold/YAML carried. A KV override (from `mission
+    // set` + save) still wins at boot.
+    #[cfg(feature = "outer_mpc")]
+    {
+        cfg.trajectory.mission_profile = crate::control::offline_mission::DEFAULT_PROFILE_INDEX;
+    }
+    cfg
 }

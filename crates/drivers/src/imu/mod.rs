@@ -1,3 +1,4 @@
+pub mod bmi270;
 pub mod icm426xx;
 pub mod mpu6x00;
 

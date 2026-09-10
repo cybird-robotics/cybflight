@@ -1,0 +1,22 @@
+# Offline-planned mission schedule, baked at build time by
+# crates/cybflight/build.rs (see control/offline_mission.rs for the MINCO
+# waypoint contract). Migrated verbatim from the hand-transcribed arrays
+# (originally copied from tmp/planning_results/). `timestamps` are
+# absolute times of arrival [s]; planner-native `durations` (per-segment)
+# are accepted instead.
+env: outdoor
+variant: drag-large
+speed: mid
+start: [0.0, 0.0, 3.0]
+waypoints:
+  - [-0.0, 0.2116, 3.0]
+  - [-0.0, 2.08, 3.0]
+  - [-0.0, 6.0, 3.0]
+  - [-0.0, 9.92, 3.0]
+  - [-0.0, 11.79, 3.0]
+  - [0.0, 12.0, 3.0]
+timestamps: [0.396, 0.792, 1.188, 1.584, 1.98, 2.376]
+lookahead: false
+yaw_lookahead_dt_s: 0.5
+yaw_lookahead_max_rate_rad_s: 4.0
+flatness_map: tilt_yaw

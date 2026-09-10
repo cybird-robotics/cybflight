@@ -142,7 +142,16 @@ fn encode_err(k: GpsErrKind) -> u8 {
 /// Flattened snapshot --populated by [`snapshot`] from the
 /// [`GpsHealth`] enum + the latest NAV-PVT cell. All zero-or-sentinel
 /// initial values; per-variant logic fills the slots that apply.
-struct Flat {
+/// Flattened GPS-health snapshot.
+///
+/// `PartialEq` is the point: on a non-`est_pos_gps` build every field
+/// is a compile-time constant, so the recorder can compare successive
+/// snapshots and emit only on change plus a slow heartbeat instead of
+/// re-serialising the same 264 bytes 20 times a second. On a GPS build
+/// `nav_pvt_arrival_us` advances with every NAV-PVT, so change
+/// detection reproduces the previous cadence on its own.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Flat {
     state: u8,
     err_kind: u8,
     fix_type: u8,
@@ -167,7 +176,12 @@ struct Flat {
     nav_pvt_mean_interval_recent_us: u32,
 }
 
-fn snapshot(_now: Instant) -> Flat {
+/// Sample every GPS-health source into a comparable value.
+///
+/// Takes a critical-section lock on `GPS_HEALTH`, so callers should
+/// keep the call rate bounded — `blackbox::recorder` polls it at
+/// `HEALTH_EMIT_INTERVAL`, not once per capture-loop iteration.
+pub fn snapshot() -> Flat {
     let mut f = Flat {
         state: STATE_NOT_CONFIGURED,
         err_kind: ERR_NONE,
@@ -244,12 +258,13 @@ fn snapshot(_now: Instant) -> Flat {
     f
 }
 
-/// Encode one `/gps_health` record at `now`. Mirrors the layout of
-/// [`super::health::encode`] --same throttle path in
-/// `blackbox::recorder::emit_gps_health`.
-pub fn encode(scratch: &mut [u8], now: Instant) -> cbor::Result<usize> {
-    let f = snapshot(now);
-
+/// Encode one `/gps_health` record at `now` from an already-taken
+/// [`snapshot`].
+///
+/// The snapshot is passed in rather than taken here so the caller can
+/// compare it against the previous one and skip the encode entirely —
+/// see `blackbox::recorder::emit_gps_health`.
+pub fn encode(scratch: &mut [u8], now: Instant, f: &Flat) -> cbor::Result<usize> {
     let mut w = CborWriter::new(scratch);
     w.map(14)?;
     w.str("timestamp_ns")?;

@@ -48,7 +48,11 @@ impl UpdateOutcome {
 /// `sqrt(100) · 5σ = 50σ` are still partially absorbed; anything
 /// larger is rejected. Catches meter-scale glitches while letting
 /// cm-scale latency residuals through.
-const INFLATION_CAP: f32 = 100.0;
+pub const DEFAULT_INFLATION_CAP: f32 = 100.0;
+
+/// Default magnetometer norm gate: reject a sample whose field magnitude
+/// deviates from the reference by more than this fraction.
+pub const DEFAULT_MAG_NORM_GATE: f32 = 0.3;
 
 /// ESKF noise / measurement configuration.
 pub struct EskfConfig {
@@ -84,6 +88,47 @@ pub struct EskfConfig {
     /// change at 1000°/s × 10 ms mocap period, well below the smallest
     /// dangerous flip (90° axis swap, 180° quaternion flip).
     pub max_att_jump_rad: f32,
+
+    // ── Initial covariance P₀ ────────────────────────────────────────
+    //
+    // P₀ is not merely a transient: the arming gate compares
+    // `gyro_bias_cov_trace()` — literally the P[12..15] diagonal seeded
+    // here — against the guards' `gyro_bias_cov_trace_thresh`, so these
+    // values and that threshold jointly set time-to-arm. An
+    // over-confident P₀ also shrinks the innovation covariance
+    // `S = HPHᵀ + R`, inflating normalized innovations and feeding the
+    // guards' reject cascade. Both are reasons they are configuration,
+    // not literals.
+    /// Initial position variance [m²] on all three axes.
+    pub init_pos_var: f32,
+    /// Initial velocity variance [(m/s)²] on all three axes.
+    pub init_vel_var: f32,
+    /// Initial accelerometer-bias variance [(m/s²)²] per axis.
+    pub init_accel_bias_var: f32,
+    /// Initial gyro-bias variance [(rad/s)²] per axis. Sets where the
+    /// convergence trace starts its decay toward the guard threshold.
+    pub init_gyro_bias_var: f32,
+    /// Initial roll/pitch orientation variance [rad²]. Both axes are
+    /// observable from the gravity vector at bootstrap regardless of
+    /// position source, so this is source-independent — unlike yaw,
+    /// whose initial variance is owned by the per-source guard
+    /// (`init_yaw_cov`) because GPS-only cannot observe it at all.
+    pub init_att_var_rp: f32,
+    /// Hard cap on the `R`-inflation factor. A residual that would need
+    /// more inflation than this is treated as a true outlier and
+    /// Rejected, so the failsafe can count it, instead of being absorbed.
+    ///
+    /// Read together with [`Self::gate_sigma`]: the pair decides how big
+    /// a residual is still "latency", since residuals up to
+    /// `sqrt(cap) · gate_sigma` σ are partially absorbed. Changing one
+    /// silently changes what the other means.
+    pub inflation_cap: f32,
+    /// Magnetometer norm gate: reject a sample whose field magnitude
+    /// differs from the world reference by more than this fraction.
+    ///
+    /// The only magnetometer quality check in the filter. A site with
+    /// local ferrous distortion is the reason to tighten it.
+    pub mag_norm_gate: f32,
 }
 
 impl Default for EskfConfig {
@@ -98,6 +143,13 @@ impl Default for EskfConfig {
             gate_sigma: 10.0,
             max_pos_jump_m: 1.0,
             max_att_jump_rad: 0.7,
+            init_pos_var: 1.0,
+            init_vel_var: 1.0,
+            init_accel_bias_var: 0.01,
+            init_gyro_bias_var: 0.01,
+            init_att_var_rp: 0.1,
+            inflation_cap: DEFAULT_INFLATION_CAP,
+            mag_norm_gate: DEFAULT_MAG_NORM_GATE,
         }
     }
 }
@@ -119,6 +171,11 @@ impl EskfConfig {
         gate_sigma: f32,
         max_pos_jump_m: f32,
         max_att_jump_rad: f32,
+        init_pos_var: f32,
+        init_vel_var: f32,
+        init_accel_bias_var: f32,
+        init_gyro_bias_var: f32,
+        init_att_var_rp: f32,
     ) -> Self {
         Self {
             accel_noise_density,
@@ -130,6 +187,15 @@ impl EskfConfig {
             gate_sigma,
             max_pos_jump_m,
             max_att_jump_rad,
+            init_pos_var,
+            init_vel_var,
+            init_accel_bias_var,
+            init_gyro_bias_var,
+            init_att_var_rp,
+            // Robustness knobs keep their defaults; a caller freezing a
+            // baseline sets the fields directly.
+            inflation_cap: DEFAULT_INFLATION_CAP,
+            mag_norm_gate: DEFAULT_MAG_NORM_GATE,
         }
     }
 }
@@ -197,6 +263,15 @@ pub struct Eskf {
 }
 
 impl Eskf {
+    /// The filter's noise/initialisation configuration.
+    ///
+    /// Exposed so a guard driving a re-initialisation can seed the new
+    /// covariance from the same configured values the bootstrap used,
+    /// instead of repeating literals that then drift from the schema.
+    pub fn config(&self) -> &EskfConfig {
+        &self.config
+    }
+
     pub fn new(config: EskfConfig) -> Self {
         Self {
             config,
@@ -208,10 +283,11 @@ impl Eskf {
     }
 
     /// Initialise filter with a known pose and sensor biases; resets covariance.
-    /// Orientation diagonal is set to 0.1 on all three axes — appropriate when
-    /// every axis is observable from the bootstrap measurement (e.g. mocap pose).
-    /// For exteroceptive sources that don't observe all axes (GPS-only has no
-    /// yaw measurement), use `init_with_cov` to set per-axis values.
+    /// Orientation diagonal is `config.init_att_var_rp` on all three axes —
+    /// appropriate when every axis is observable from the bootstrap
+    /// measurement (e.g. mocap pose). For exteroceptive sources that don't
+    /// observe all axes (GPS-only has no yaw measurement), use
+    /// `init_with_cov` to set per-axis values.
     pub fn init(
         &mut self,
         position: Vector3<f32>,
@@ -219,12 +295,13 @@ impl Eskf {
         gyro_bias: Vector3<f32>,
         accel_bias: Vector3<f32>,
     ) {
+        let v = self.config.init_att_var_rp;
         self.init_with_cov(
             position,
             orientation,
             gyro_bias,
             accel_bias,
-            Vector3::new(0.1, 0.1, 0.1),
+            Vector3::new(v, v, v),
         );
     }
 
@@ -249,13 +326,17 @@ impl Eskf {
             gyro_bias,
         };
         let mut cov = SMatrix::<f32, 15, 15>::zeros();
-        cov.fixed_view_mut::<3, 3>(0, 0).fill_diagonal(1.0); // position
+        cov.fixed_view_mut::<3, 3>(0, 0)
+            .fill_diagonal(self.config.init_pos_var);
         cov[(3, 3)] = orientation_cov_diag.x;
         cov[(4, 4)] = orientation_cov_diag.y;
         cov[(5, 5)] = orientation_cov_diag.z;
-        cov.fixed_view_mut::<3, 3>(6, 6).fill_diagonal(1.0); // velocity
-        cov.fixed_view_mut::<3, 3>(9, 9).fill_diagonal(0.01); // accel bias
-        cov.fixed_view_mut::<3, 3>(12, 12).fill_diagonal(0.01); // gyro bias
+        cov.fixed_view_mut::<3, 3>(6, 6)
+            .fill_diagonal(self.config.init_vel_var);
+        cov.fixed_view_mut::<3, 3>(9, 9)
+            .fill_diagonal(self.config.init_accel_bias_var);
+        cov.fixed_view_mut::<3, 3>(12, 12)
+            .fill_diagonal(self.config.init_gyro_bias_var);
         self.cov = cov;
         self.initialized = true;
         // Health counters are intentionally not reset — re-init after NaN is itself a tracked event.
@@ -618,7 +699,7 @@ impl Eskf {
         let gate_sq = self.config.gate_sigma * self.config.gate_sigma;
         let (r_eff, s_inv_eff, inflated) = if gamma > gate_sq {
             let inflate = gamma / gate_sq;
-            if inflate > INFLATION_CAP {
+            if inflate > self.config.inflation_cap {
                 return UpdateOutcome::InflationCapExceeded;
             }
             let r_eff = r * inflate;
@@ -714,7 +795,7 @@ impl Eskf {
         let gate_sq = self.config.gate_sigma * self.config.gate_sigma;
         let (r_eff, s_inv_eff, inflated) = if gamma > gate_sq {
             let inflate = gamma / gate_sq;
-            if inflate > INFLATION_CAP {
+            if inflate > self.config.inflation_cap {
                 return UpdateOutcome::InflationCapExceeded;
             }
             let r_eff = r * inflate;
@@ -787,7 +868,7 @@ impl Eskf {
         let gate_sq = self.config.gate_sigma * self.config.gate_sigma;
         let (r_eff, s_inv_eff, inflated) = if gamma > gate_sq {
             let inflate = gamma / gate_sq;
-            if inflate > INFLATION_CAP {
+            if inflate > self.config.inflation_cap {
                 self.health.gate_rejects_pos =
                     self.health.gate_rejects_pos.saturating_add(1);
                 return UpdateOutcome::InflationCapExceeded;
@@ -865,7 +946,7 @@ impl Eskf {
         let gate_sq = self.config.gate_sigma * self.config.gate_sigma;
         let (r_eff, s_inv_eff, inflated) = if gamma > gate_sq {
             let inflate = gamma / gate_sq;
-            if inflate > INFLATION_CAP {
+            if inflate > self.config.inflation_cap {
                 return UpdateOutcome::InflationCapExceeded;
             }
             let r_eff = r * inflate;
@@ -915,6 +996,11 @@ impl Eskf {
     }
 
     /// Velocity measurement update (ENU). `vel_std` is std-dev in m/s.
+    ///
+    /// NOTE: GNSS velocity is fed raw, at the ANT1 phase centre — there is no
+    /// lever-arm ω×r compensation to the IMU frame. The error is small for a
+    /// short baseline / low body rates; TODO: add the ω×r term if a high-rate
+    /// platform shows velocity fighting the IMU.
     pub fn update_vel(&mut self, vel: Vector3<f32>, vel_std: f32) -> UpdateOutcome {
         if !self.initialized {
             return UpdateOutcome::NotInitialized;
@@ -935,7 +1021,7 @@ impl Eskf {
         let gate_sq = self.config.gate_sigma * self.config.gate_sigma;
         let (r_eff, s_inv_eff, inflated) = if gamma > gate_sq {
             let inflate = gamma / gate_sq;
-            if inflate > INFLATION_CAP {
+            if inflate > self.config.inflation_cap {
                 self.health.gate_rejects_vel =
                     self.health.gate_rejects_vel.saturating_add(1);
                 return UpdateOutcome::InflationCapExceeded;
@@ -999,7 +1085,7 @@ impl Eskf {
         let gate_sq = self.config.gate_sigma * self.config.gate_sigma;
         let (r_eff, s_inv_eff, inflated) = if gamma > gate_sq {
             let inflate = gamma / gate_sq;
-            if inflate > INFLATION_CAP {
+            if inflate > self.config.inflation_cap {
                 self.health.gate_rejects_att =
                     self.health.gate_rejects_att.saturating_add(1);
                 return UpdateOutcome::InflationCapExceeded;
@@ -1045,7 +1131,7 @@ impl Eskf {
         let gate_sq = self.config.gate_sigma * self.config.gate_sigma;
         let (r_eff, s_eff, inflated) = if gamma > gate_sq {
             let inflate = gamma / gate_sq;
-            if inflate > INFLATION_CAP {
+            if inflate > self.config.inflation_cap {
                 self.health.gate_rejects_baro =
                     self.health.gate_rejects_baro.saturating_add(1);
                 return UpdateOutcome::InflationCapExceeded;
@@ -1084,7 +1170,7 @@ impl Eskf {
             return UpdateOutcome::NotInitialized;
         }
         let world_norm = mag_world_ref.norm();
-        if (mag_body.norm() - world_norm).abs() > 0.3 * world_norm {
+        if (mag_body.norm() - world_norm).abs() > self.config.mag_norm_gate * world_norm {
             self.health.gate_rejects_mag =
                 self.health.gate_rejects_mag.saturating_add(1);
             return UpdateOutcome::InflationCapExceeded;
@@ -1103,9 +1189,109 @@ impl Eskf {
         let gate_sq = self.config.gate_sigma * self.config.gate_sigma;
         let (r_eff, s_inv_eff, inflated) = if gamma > gate_sq {
             let inflate = gamma / gate_sq;
-            if inflate > INFLATION_CAP {
+            if inflate > self.config.inflation_cap {
                 self.health.gate_rejects_mag =
                     self.health.gate_rejects_mag.saturating_add(1);
+                return UpdateOutcome::InflationCapExceeded;
+            }
+            let r_eff = r * inflate;
+            let s_eff = h * self.cov * h.transpose() + r_eff;
+            let Some(s_inv_eff) = s_eff.try_inverse() else {
+                self.initialized = false;
+                return UpdateOutcome::InverseFailed;
+            };
+            (r_eff, s_inv_eff, true)
+        } else {
+            (r, s_inv, false)
+        };
+        let k = self.cov * h.transpose() * s_inv_eff;
+        self.state = self.state.boxplus(&(k * z));
+        let i_kh = SMatrix::<f32, 15, 15>::identity() - k * h;
+        self.cov = i_kh * self.cov * i_kh.transpose() + k * r_eff * k.transpose();
+        self.cov = (self.cov + self.cov.transpose()) * 0.5;
+        self.clamp_covariance_diagonal();
+        self.renormalize_orientation();
+        if !self.state_is_finite() {
+            self.initialized = false;
+            self.health.nan_resets = self.health.nan_resets.saturating_add(1);
+            return UpdateOutcome::NaNAfterUpdate;
+        }
+        UpdateOutcome::Accepted { inflated }
+    }
+
+    /// Dual-antenna heading update (GPS yaw aiding).
+    ///
+    /// A body-fixed unit baseline `b_body` (e.g. `(0,-1,0)` for the
+    /// ANT1→ANT2 vector of a left/right-mounted pair) is measured as a
+    /// **world-frame** unit direction `b_world_meas`, reconstructed from the
+    /// receiver's heading + pitch. `sigma_rad` is the angular 1-σ of that
+    /// direction.
+    ///
+    /// Unlike a scalar-yaw update, this predicts the baseline in the world
+    /// frame, so `H_att = -R·[b_body]×` — rank 2 at **every** attitude (it is
+    /// blind only to rotation *about* the baseline, never to yaw specifically).
+    /// There is no `quaternion_to_yaw` singularity through vertical / inverted
+    /// flight, which makes it the correct heading aid for acrobatic use. It
+    /// makes yaw observable in GPS-only builds.
+    ///
+    /// The measured direction is renormalised so its (unobservable) radial
+    /// component injects no spurious innovation.
+    pub fn update_baseline(
+        &mut self,
+        b_world_meas: Vector3<f32>,
+        b_body: Vector3<f32>,
+        sigma_heading_rad: f32,
+        sigma_pitch_rad: f32,
+    ) -> UpdateOutcome {
+        if !self.initialized {
+            return UpdateOutcome::NotInitialized;
+        }
+        let Some(b_meas) = b_world_meas.try_normalize(1e-6) else {
+            return UpdateOutcome::InverseFailed;
+        };
+        let b_pred = self.state.orientation * b_body;
+        let z = b_meas - b_pred;
+        let rmat = *self.state.orientation.to_rotation_matrix().matrix();
+        let mut h = SMatrix::<f32, 3, 15>::zeros();
+        h.fixed_view_mut::<3, 3>(0, 3).copy_from(&(-rmat * hat(&b_body)));
+        // Anisotropic 2-axis measurement covariance. A single 3-D baseline is a
+        // rank-2 attitude measurement: heading noise acts along the azimuth
+        // tangent `u × b` (magnitude cos(elevation), so it vanishes smoothly as
+        // the baseline nears vertical, where azimuth is genuinely undetermined),
+        // pitch noise along the elevation tangent. The radial axis carries no
+        // information (H annihilates it: H^T·b_pred = hat(b_body)·b_body = 0), so
+        // it gets a moderate isotropic regularizer — large enough the 2nd-order
+        // radial innovation can't inflate the NIS, irrelevant to the state update.
+        const SIGMA_FLOOR: f32 = 1e-3;
+        const RADIAL_SIGMA: f32 = 0.1;
+        const COS_ELEV_MIN_SQ: f32 = 0.02;
+        let sh = sigma_heading_rad.max(SIGMA_FLOOR);
+        let sp = sigma_pitch_rad.max(SIGMA_FLOOR);
+        let up = Vector3::new(0.0_f32, 0.0, 1.0);
+        let az = up.cross(&b_meas); // azimuth tangent; |az| = cos(elevation)
+        let n2 = az.norm_squared();
+        let reg2 = RADIAL_SIGMA * RADIAL_SIGMA;
+        let r = if n2 > COS_ELEV_MIN_SQ {
+            let el = b_meas.cross(&az).normalize(); // unit elevation tangent (no_std: avoid f32::sqrt)
+            az * az.transpose() * (sh * sh)
+                + el * el.transpose() * (sp * sp)
+                + b_meas * b_meas.transpose() * reg2
+        } else {
+            // Baseline ~vertical: azimuth tangent degenerate -> isotropic.
+            Matrix3::identity() * (sp * sp).max(reg2)
+        };
+        let s_mat = h * self.cov * h.transpose() + r;
+        let Some(s_inv) = s_mat.try_inverse() else {
+            self.initialized = false;
+            return UpdateOutcome::InverseFailed;
+        };
+        let gamma = z.dot(&(s_inv * z)) / 3.0;
+        self.health.last_nis_att = gamma;
+        let gate_sq = self.config.gate_sigma * self.config.gate_sigma;
+        let (r_eff, s_inv_eff, inflated) = if gamma > gate_sq {
+            let inflate = gamma / gate_sq;
+            if inflate > self.config.inflation_cap {
+                self.health.gate_rejects_att = self.health.gate_rejects_att.saturating_add(1);
                 return UpdateOutcome::InflationCapExceeded;
             }
             let r_eff = r * inflate;
@@ -1303,5 +1489,96 @@ mod health_tests {
         let mut e = fresh_eskf();
         e.update_altitude(10_000.0); // 10 km, way past gate.
         assert_eq!(e.health().gate_rejects_baro, 1);
+    }
+
+    // ---- dual-antenna heading (update_baseline) ----
+
+    /// A baseline measurement consistent with a yawed truth pulls the filter's
+    /// orientation toward that truth (yaw becomes observable).
+    #[test]
+    fn baseline_update_corrects_yaw_toward_truth() {
+        let b_body = Vector3::new(0.0, -1.0, 0.0); // ANT1(L)->ANT2(R)
+        let mut e = fresh_eskf(); // q_nom = identity
+        let q_true = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 0.5236); // +30° yaw
+        let b_meas = q_true * b_body; // world direction the true attitude produces
+        let err_before = e.orientation().angle_to(&q_true);
+        let out = e.update_baseline(b_meas, b_body, 0.02, 0.02);
+        let err_after = e.orientation().angle_to(&q_true);
+        assert!(matches!(out, UpdateOutcome::Accepted { .. }));
+        assert!(
+            err_after < err_before,
+            "attitude error should shrink toward truth: {err_before} -> {err_after}"
+        );
+    }
+
+    /// The key acro property: at +90° pitch (nose vertical) — where a scalar
+    /// `quaternion_to_yaw` update is singular — the vector update is still
+    /// finite, accepted, and corrects toward truth.
+    #[test]
+    fn baseline_update_nonsingular_at_vertical_nose() {
+        let b_body = Vector3::new(0.0, -1.0, 0.0);
+        let q_pitch =
+            UnitQuaternion::from_axis_angle(&Vector3::y_axis(), core::f32::consts::FRAC_PI_2);
+        let mut e = Eskf::new(EskfConfig::default());
+        e.init(Vector3::zeros(), q_pitch, Vector3::zeros(), Vector3::zeros());
+        // Truth: nose-up AND yawed 20° about world-up (a heading error).
+        let q_true = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 0.349) * q_pitch;
+        let b_meas = q_true * b_body;
+        let err_before = e.orientation().angle_to(&q_true);
+        let out = e.update_baseline(b_meas, b_body, 0.02, 0.02);
+        let err_after = e.orientation().angle_to(&q_true);
+        assert!(
+            matches!(out, UpdateOutcome::Accepted { .. }),
+            "must not blow up at vertical nose"
+        );
+        assert!(
+            e.orientation().into_inner().coords.iter().all(|c| c.is_finite()),
+            "orientation must stay finite at vertical nose"
+        );
+        assert!(
+            err_after < err_before,
+            "error should shrink even at 90° pitch: {err_before} -> {err_after}"
+        );
+    }
+
+    /// A measurement equal to the prediction leaves the state untouched.
+    #[test]
+    fn baseline_update_perfect_measurement_is_noop() {
+        let b_body = Vector3::new(0.0, -1.0, 0.0);
+        let mut e = fresh_eskf();
+        let q0 = e.orientation();
+        let b_meas = q0 * b_body; // exactly the predicted world direction
+        let out = e.update_baseline(b_meas, b_body, 0.02, 0.02);
+        assert!(matches!(out, UpdateOutcome::Accepted { .. }));
+        assert!(
+            e.orientation().angle_to(&q0) < 1e-4,
+            "perfect measurement should not move the state"
+        );
+    }
+
+    /// 90° roll puts the left-right baseline vertical: the azimuth tangent
+    /// collapses, so the 2-axis R takes its isotropic fallback. The update must
+    /// stay finite and accepted (no divide-by-zero at the pole).
+    #[test]
+    fn baseline_update_vertical_baseline_fallback_is_finite() {
+        let b_body = Vector3::new(0.0, -1.0, 0.0);
+        let q_roll =
+            UnitQuaternion::from_axis_angle(&Vector3::x_axis(), core::f32::consts::FRAC_PI_2);
+        let mut e = Eskf::new(EskfConfig::default());
+        e.init(Vector3::zeros(), q_roll, Vector3::zeros(), Vector3::zeros());
+        let q_true = UnitQuaternion::from_axis_angle(
+            &Vector3::x_axis(),
+            core::f32::consts::FRAC_PI_2 + 0.1,
+        );
+        let b_meas = q_true * b_body;
+        let out = e.update_baseline(b_meas, b_body, 0.02, 0.02);
+        assert!(
+            matches!(out, UpdateOutcome::Accepted { .. }),
+            "vertical-baseline fallback must be accepted"
+        );
+        assert!(
+            e.orientation().into_inner().coords.iter().all(|c| c.is_finite()),
+            "orientation must stay finite in the fallback path"
+        );
     }
 }

@@ -27,10 +27,7 @@ use core::fmt;
 
 use embassy_time::Instant;
 
-use crate::sensors::rc::{
-    BlockReason, LATEST_BLOCK_REASON, LINK_STATS_MAX_AGE_MS, MAX_ESKF_MAHONY_DISAGREE_DEG,
-    MAX_TILT_DEG, MIN_LINK_QUALITY, THROTTLE_MINCHECK,
-};
+use crate::sensors::rc::{arm_config, BlockReason, LATEST_BLOCK_REASON};
 
 /// Live link snapshot supplied by the caller. We don't read this from a
 /// global because the canonical source is the ArmStateMachine running on
@@ -218,29 +215,32 @@ impl SystemHealth {
     /// `ArmStateMachine` evaluates them. Returns `None` if all gates pass
     /// (the bird is ready to arm — modulo the debounce hold).
     pub fn first_blocker(&self) -> Option<BlockReason> {
+        // Same cached snapshot the ArmStateMachine gates on, so this
+        // view can never disagree with the real decision.
+        let cfg = arm_config();
         if self.failsafe_active {
             return Some(BlockReason::Failsafe);
         }
         if let Some(thr) = self.throttle {
-            if thr > THROTTLE_MINCHECK {
+            if thr > cfg.throttle_mincheck_us {
                 return Some(BlockReason::ThrottleNotMin {
                     value: thr,
-                    max: THROTTLE_MINCHECK,
+                    max: cfg.throttle_mincheck_us,
                 });
             }
         }
         if !self.link.active {
             return Some(BlockReason::LinkInactive);
         }
-        if self.link.age_ms > LINK_STATS_MAX_AGE_MS {
+        if self.link.age_ms > cfg.link_stats_max_age_ms {
             return Some(BlockReason::LinkStale {
                 age_ms: self.link.age_ms,
             });
         }
-        if self.link.quality < MIN_LINK_QUALITY {
+        if self.link.quality < cfg.min_link_quality {
             return Some(BlockReason::LinkLowQuality {
                 quality: self.link.quality,
-                min: MIN_LINK_QUALITY,
+                min: cfg.min_link_quality,
             });
         }
         if !self.estimator_ready {
@@ -260,7 +260,7 @@ impl SystemHealth {
             _ => None,
         };
         if let Some((r, p)) = attitude_rp {
-            if r.abs() > MAX_TILT_DEG || p.abs() > MAX_TILT_DEG {
+            if r.abs() > cfg.max_tilt_deg || p.abs() > cfg.max_tilt_deg {
                 return Some(BlockReason::TiltOutOfEnvelope {
                     roll_deg: r,
                     pitch_deg: p,
@@ -276,6 +276,10 @@ impl SystemHealth {
                 required: self.attitude_health_required,
             });
         }
+        // `estimator_degraded` is `flags != 0 && !severe`, and `severe`
+        // is itself gated on `armed` — so pre-arm it is always false and
+        // this branch sees every asserted fault bit. No separate severe
+        // check is needed (or reachable) here.
         if self.estimator_degraded {
             return Some(BlockReason::EskfDegraded {
                 faults: self.estimator_faults,
@@ -285,8 +289,8 @@ impl SystemHealth {
             return Some(BlockReason::MahonyNotReady);
         }
         if let (Some((er, ep)), Some((mr, mp, _))) = (attitude_rp, self.mahony_attitude_deg) {
-            if (er - mr).abs() > MAX_ESKF_MAHONY_DISAGREE_DEG
-                || (ep - mp).abs() > MAX_ESKF_MAHONY_DISAGREE_DEG
+            if (er - mr).abs() > cfg.max_eskf_mahony_disagree_deg
+                || (ep - mp).abs() > cfg.max_eskf_mahony_disagree_deg
             {
                 return Some(BlockReason::EskfMahonyTiltDisagreement {
                     eskf_roll_deg: er,
@@ -312,6 +316,7 @@ impl SystemHealth {
         if !tl_dr.is_empty() {
             writeln!(w, "{}", tl_dr)?;
         }
+        let cfg = arm_config();
         writeln!(
             w,
             "  failsafe_active : {}",
@@ -324,13 +329,13 @@ impl SystemHealth {
             yes_no(self.link.active),
             self.link.age_ms,
             self.link.quality,
-            MIN_LINK_QUALITY,
+            cfg.min_link_quality,
         )?;
         match self.throttle {
             Some(v) => writeln!(
                 w,
                 "  throttle        : {}us (max for arm: {}us)",
-                v, THROTTLE_MINCHECK
+                v, cfg.throttle_mincheck_us
             )?,
             None => writeln!(w, "  throttle        : (no recent RC frame)")?,
         }
@@ -400,7 +405,7 @@ impl SystemHealth {
         writeln!(
             w,
             " (stale at >{}ms)",
-            (crate::estimation::POS_TIMEOUT_S * 1000.0) as u32,
+            (crate::params::get().eskf.faults.pos_timeout_s * 1000.0) as u32,
         )?;
         // Decoded breakdown of the fault bits — only emitted when at
         // least one bit is set, so the healthy report stays clean.

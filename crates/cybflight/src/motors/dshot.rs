@@ -11,10 +11,47 @@ use cybflight_drivers::dshot::{
     DSHOT_MAX_THROTTLE, DSHOT_MIN_THROTTLE, MAX_GCR_EDGES, MIN_GCR_EDGES,
 };
 
+/// If no motor command arrives for this long while armed, the controller
+/// has gone silent (stale odometry, NaN, a starved task). Drop to idle
+/// throttle so the airframe does not hold stale thrust while waiting for
+/// the failsafe watchdog to disarm.
+///
+/// This is the *first* stage of a two-stage degradation, and it only
+/// exists if the second stage is meaningfully later: `fs_ctrl_timeout_s`
+/// must stay well above it or the vehicle disarms before it ever idles.
+/// That ordering used to be asserted only in prose; it is now checked at
+/// two levels — [`MIN_CTRL_TIMEOUT_RATIO`] against the live parameter at
+/// boot, and a compile-time assertion against the schema's own minimum
+/// in `control::failsafe`.
+pub const MOTOR_CMD_STALE: embassy_time::Duration = embassy_time::Duration::from_millis(10);
+
+/// [`MOTOR_CMD_STALE`] in seconds, for the compile-time comparison
+/// against the `fs_ctrl_timeout_s` schema minimum.
+pub const MOTOR_CMD_STALE_S: f32 = 0.010;
+
+/// How many times [`MOTOR_CMD_STALE`] the failsafe control timeout must
+/// be for the idle stage to be worth having.
+///
+/// At 3× the airframe spends at least two stale windows at idle before
+/// the disarm lands, which is enough for the stage to be observable in a
+/// log. Below that the two stages collapse into one and the graceful
+/// ramp is theatre.
+pub const MIN_CTRL_TIMEOUT_RATIO: f32 = 3.0;
+
+/// Pin-mode stabilization delay before handing the line back to the
+/// timer, in CPU cycles.
+///
+/// `cortex_m::asm::delay` counts cycles, so the ~0.42 µs this used to be
+/// was a property of the 480 MHz core rather than a stated requirement.
+/// Derived from SYSCLK so it stays the same wall-clock time on a board
+/// clocked differently.
+const PIN_SETTLE_NS: u32 = 420;
+const PIN_SETTLE_CYCLES: u32 = (crate::bsp::SYSCLK_HZ / 1_000_000) * PIN_SETTLE_NS / 1_000;
+
 const DSHOT_THROTTLE_RANGE: u16 = DSHOT_MAX_THROTTLE - DSHOT_MIN_THROTTLE;
 /// Minimum DShot throttle sent when motors are armed and controller commands
 /// a non-zero output. Prevents motor stall at very low throttle.
-/// 0.5% of throttle range ≈ 10 DShot steps above DSHOT_MIN_THROTTLE.
+/// 5% of throttle range (≈100 DShot steps above DSHOT_MIN_THROTTLE).
 const DSHOT_IDLE_THROTTLE: u16 = DSHOT_MIN_THROTTLE + (DSHOT_THROTTLE_RANGE / 20);
 
 use cybflight_msgs::{ActuatorMotors, DshotMotorTelemetry, DshotTelemetry};
@@ -95,12 +132,6 @@ pub async fn dshot_task(
     let mut dshot_throttle: [u16; 4] = [DSHOT_CMD_MOTOR_STOP; 4];
     let mut armed = false;
     let mut last_motor_cmd_time: Option<Instant> = None;
-
-    /// If no motor command arrives for this long while armed, the controller
-    /// has gone silent (stale odom, NaN, etc.). Drop to idle throttle so the
-    /// drone doesn't hold stale thrust while waiting for the failsafe watchdog
-    /// (500 ms) to disarm. Must be much shorter than the failsafe CTRL_TIMEOUT.
-    const MOTOR_CMD_STALE: embassy_time::Duration = embassy_time::Duration::from_millis(10);
 
     // --- Bidirectional DShot frame loop ---
     loop {
@@ -433,8 +464,11 @@ pub async fn dshot_task(
             config.timers[i].egr().write(|w| w.set_ug(true));
         }
 
-        // Brief stabilization before switching pin back to timer AF
-        cortex_m::asm::delay(200);
+        // Brief stabilization before switching the pin back to timer AF.
+        // `asm::delay` counts CPU cycles, so the wall-clock duration
+        // depends on SYSCLK; expressed here as a time and converted, it
+        // no longer silently shortens if the core clock changes.
+        cortex_m::asm::delay(PIN_SETTLE_CYCLES);
 
         for m in 0..4 {
             let gpio = config.motors[m].gpio_port;

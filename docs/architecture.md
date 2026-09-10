@@ -174,7 +174,6 @@ Only one board module compiles per build. The others are excluded entirely.
 ```toml
 # crates/cybflight/Cargo.toml
 [features]
-default = ["board_sakurah743"]
 board_sakurah743  = ["dep:bsp-sakurah743"]
 board_foxeerh743  = ["dep:bsp-foxeerh743"]
 
@@ -182,6 +181,13 @@ board_foxeerh743  = ["dep:bsp-foxeerh743"]
 bsp-sakurah743  = { path = "../bsp/sakurah743",  optional = true }
 bsp-foxeerh743  = { path = "../bsp/foxeerh743",  optional = true }
 ```
+
+In practice you never hand-compose the feature list: the **vehicle YAML's
+`build:` section selects it** (see "The Configuration Plane" below), and
+`just build [<vehicle>]` derives `--features` via
+`tools/vehicle_features.py`. The vehicle is the recipe's optional
+positional argument, defaulting to `VEHICLE=` in `.env`; `just vehicles`
+lists them, and an unknown name is a hard error rather than a fallback.
 
 The `cybflight` lib.rs re-exports the selected BSP so other modules use `crate::bsp`:
 
@@ -277,6 +283,29 @@ These rules ensure the final binary contains ONLY the code for the target board:
 6. **Task pool_size can use max across all boards** — `pool_size = 2` for
    imu_reader_task is fine even on single-gyro boards. The cost is one unused
    static task struct.
+
+7. **Rules 1–3 remove code, not RAM.** What the linker can drop depends on
+   what kind of cost it is:
+
+   | Cost | Eliminated by | Correct gate |
+   |---|---|---|
+   | `.text` / `.rodata` | LTO + `--gc-sections`, reliably | nothing — a `const` flag for readability |
+   | `static` (`.bss` / `.data`) | only if **no surviving code names it** | **cargo feature** |
+   | an `async` task's future (`POOL`) | never by const-folding — it is the union of every arm's live state, laid out before LLVM sees the flag | **cargo feature, one task body per variant** |
+
+   A `StaticCell` is "free at rest" in flash, not in RAM: a `static` that
+   any surviving code names occupies `.bss` whether or not `init()` ever
+   runs, and `if CONST { small().await } else { big().await }` sizes the
+   task future for `big` even when `CONST` is `true`. The mission planner
+   paid 109 KiB of `.bss` this way for an online solver that a
+   `const bool` had disabled (`mission_planner.rs`, `plan_online`). So:
+   `cybflight-core` owns **no** `static` storage — every solver takes a
+   `&mut Workspace` from its caller, which is why it can stay
+   unconditionally compiled and host-testable — and every `static` and
+   every subsystem gate lives in `crates/cybflight`, where a cargo feature
+   can actually leave the state out. Size inline storage by the
+   consumer's bound (`MincoSnapN<OFFLINE_MAX_PIECES, …>`), not by a
+   global cap. `just size` reports the result.
 
 ## How to Add a New Board
 
@@ -377,6 +406,206 @@ objects or dyn dispatch for sensors.
 3. Create a new driver in `crates/drivers/src/imu/`
 4. Add a new concrete task in `crates/cybflight/src/sensors/imu.rs`
 5. Add the dispatch arm in the relevant `board_init/` module
+
+## The Configuration Plane
+
+Everything tunable or vehicle-specific lives in **one YAML file per
+vehicle** (`vehicles/<name>.yaml`, selected by `VEHICLE=` in `.env`),
+plus one YAML file per offline mission (`missions/<name>.yaml`). The
+firmware never parses YAML at runtime — both are validated and **baked at
+compile time** by `crates/cybflight/build.rs`, through the shared
+host-side loader crate `crates/vehicle_yaml` (also used by the sim, so
+firmware and sim can never drift on format).
+
+### Vehicle YAML anatomy
+
+```yaml
+build:                      # compile-time hardware selections → cargo features
+  board: sakurah743         #   a vehicle IS a PCB + wiring; build.rs
+  rc_protocol: crsf         #   cross-checks these against the ACTIVE
+  outer_loop: mpc           #   features and fails a mismatched pairing.
+                            #   mpc = 10-state NMPC → (thrust, rate sp) → INDI;
+                            #   mpc_full = 13-state NMPC → (T_d, τ_d) → INDI α
+                            #   inner loop, no rate gains (docs/mpc_full_indi_plan.md);
+                            #   cascade | rate = legacy outer loops
+  pos_source: gps
+  gps_model: ublox
+  role: chaser
+  imu_rate: 8khz            #   or 1khz: ICM low-noise mode, 1 kHz inner loop
+  indi: yes                 #   or no: inner loop degrades to a rate controller
+  plan_online: no           #   or yes: compile the online BFGS planner
+                            #   (~110 KiB of solver .bss + task state)
+
+default_mission: outdoor_splits_slow   # boot default, by mission name
+
+airframe:                   # REQUIRED physical identity — no defaults.
+  thrust_model: { type: table, table: a2rl_0114 }  # REQUIRED, baked
+  mass_kg: 0.6              #   missing mass/inertia/motors/thrust model
+  inertia_kg_m2: [...]      #   = BUILD ERROR ("no default mass" rule)
+  max_rate_rad_s: [...]
+  motors: [...]
+
+tuning:                     # optional flat map of registry param names.
+  pos_kp_x: 4.0             #   Unknown name or out-of-range value =
+  m0_tau: 0.02              #   build error. Hardware-coupled keys should
+  batt_nominal_v: 23.0      #   be pinned explicitly (bake warns if not).
+```
+
+### Parameter registry (schema in Rust, values in YAML)
+
+The schema is the `#[derive(Params)]` structs in
+`cybflight_core/src/params.rs` — per-subsystem groups (`airframe`,
+`sensors`, `eskf`, `mahony`, `battery`, `rc`, `site`, `safety`, `indi`,
+`rpm_notch`, `cascade`, `mpc`, `trajectory`, `system`) composed into
+`FirmwareConfig`.
+
+A constant that shapes flight behaviour but lives in source is a
+parameter that nobody can reach. `docs/hardcoded_constants_audit.md`
+sweeps the workspace for them and records, per constant, whether it
+should be in the registry, is sizing that cannot be, or is a physical
+fact that must not be. Consult it before adding a new tunable literal —
+and before assuming an existing one is deliberate.
+
+Group membership follows one test: *what would have to change for this
+value to be wrong?* `airframe` holds what a different physical vehicle
+would invalidate — rigid body, motor geometry, the identified actuator
+dynamics (`m*_tau`, `m*_omega_max`, `m*_g2_*`, `m*_nonlin`) and the
+sensor install extrinsics (`airframe.install`: antenna lever arm,
+baseline, magnetometer hard iron). Consumer-named prefixes are avoided
+deliberately: a motor time constant reads the same under any controller,
+so filing it under `indi_` would have described who happens to read it
+rather than what it is. `site` holds what a different *place* would
+invalidate (gravity, the stick-integrator envelope); `battery` what a
+different pack would. The derive
+generates a flat, name-addressed registry of typed scalars with
+`ParamMeta` (unit, min/max range, doc line, reboot flag). Adding a
+parameter is **one struct field with an attribute** — the registry, shell
+surface, YAML bake, flash persistence, and `docs/parameters.md` all
+follow from it (`just params-doc` regenerates the reference).
+
+Value layering, lowest to highest precedence:
+
+1. **Schema defaults** (`Default` impls) — fleet-wide starting points.
+2. **Vehicle YAML bake** — per-vehicle values, applied at compile time
+   into `BAKED_PARAMS`. Groups are never cfg-gated out of the schema, so
+   a flash image ports across feature builds.
+3. **KV flash overrides** — `param set` + `param save` appends name-keyed
+   records to the log in bank-2 flash sectors 6+7 (`cybflight_core::param_store`;
+   replayed over the baked defaults at boot, range-validated).
+
+The layering is per-key and flash wins, so layer 3 shadows a layer-2
+edit: change a value in the vehicle YAML, re-flash, and a param you
+once `param save`d keeps its stored value. That is by design, but the
+log has no tombstone record — it can only say "override this key to X",
+never "this key has no override" — so `param reset` + plain `param save`
+records the *current* baked value rather than removing the key, and the
+key stays pinned against the **next** YAML edit. `param save --prune`
+rewrites the store as exactly the set differing from baked, which is the
+only way a key stops being overridden. Reach for it in two places:
+
+- A YAML edit that isn't taking effect (`param diff` names the culprits):
+  `param reset <name>`, then `param save --prune`.
+- After flashing a **different vehicle** onto a board. Records carry a
+  name hash and a value, never a vehicle identity, so the previous
+  airframe's saved mass/inertia/thrust replay onto the new one's
+  defaults and pass range validation. `param reset all` + `param save
+  --prune` is the clean slate.
+
+Pruning costs a ~1-2 s blocking erase (watchdog-extended, refused while
+armed) and reuses the compaction rewrite path, so plain `param save`
+stays erase-free for routine tuning.
+
+Range validation runs at all three entry points (shell `param set`, YAML
+bake, flash replay); consumers additionally guard structurally
+(finite, > 0) and **degrade, never panic** — a config problem must not
+boot-loop the flight controller (see `docs/safety_protocol.md`).
+
+The bench→git loop: tune over USB (`param set`, hot-reload applies
+disarmed), `param save`, then `just param-sync` merges `param diff
+--yaml` back into the vehicle file for review + commit. The firmware
+never writes YAML. Syncing is also the *preferred* fix for a shadowed
+YAML value — the flash tune is usually the value you actually want, and
+once the two layers agree the shadowing is moot.
+
+### Runtime params vs compile-time features
+
+The boundary, decided per knob and recorded here so it doesn't drift:
+
+- **Runtime params** (both variants always compiled): controller gains
+  and weights, loop rates (`mpc_rate_hz`, `cascade_rate_hz`), sampler
+  selection (`sampler_kind`), GPS velocity fusion (`gps_fuse_vel` — a
+  *policy*, not a hardware fact: it works with any receiver and a
+  multipath site is reason enough to turn it off), `peer_pose_en`,
+  battery facts, RPM-notch config.
+- **Compile-time features, selected by the YAML `build:` section**.
+  Two things qualify a knob for this list.
+
+  *It selects code*: board (linker/peripheral singletons), RC protocol
+  (physically different wiring), outer-loop controller (~85 KB dead BSS
+  if both compiled + safety-critical arming branches), mission-planning
+  schema (`plan_online` — ~110 KiB of solver `.bss` + task-future state
+  that a `const bool` cannot remove; see optimization rule 7), position source,
+  GPS driver (monomorphized, no-dyn rule), gimbal role (USART2
+  ownership), IMU rate (`imu_rate: 8khz|1khz` → `imu_1khz` — programs
+  hardware registers at init and re-times the IMU path; every
+  IMU-rate const derives from `rates::IMU_ODR_HZ` at compile time,
+  keeping the default 8 kHz build bit-identical. The *control* rate is
+  a separate, runtime choice: `indi_ctrl_div` (vehicle param, reboot)
+  makes INDI step on every Nth IMU sample — 8 kHz / 4 = 2 kHz on the
+  8 kHz vehicles, because an INDI step does not fit the 125 µs an
+  8 kHz tick allows on the control executor, and 2 kHz is far above the
+  motor dynamics it closes the loop around. Sensor rate buys filter
+  margin and sysid data; control rate buys loop bandwidth — they are
+  not the same number), INDI on/off
+  (`indi: yes|no` → `indi_off` — selects which control law flies the
+  airframe, which also decides how `indi_rate_*` must be tuned; a
+  runtime toggle would let a `param set` swap the law under an armed
+  vehicle, and the two laws want different gains).
+
+  *Or it is an immutable hardware fact whose consistency with another
+  `build:` knob is worth enforcing at compile time*: `gps_dual_antenna`
+  (is ANT2 fitted?). It gates almost no code — `GPS_HAS_HEADING` already
+  dead-codes the fusion path — but it must agree with `gps_model`, and
+  only here can that be a build error instead of a boot warning on a
+  link nobody watches. The pairing is checked in `BuildYaml::validate`.
+  Note the split it implies, which mirrors `gps_model` vs `gps_ant_*`:
+  the *capability* is compile-time, the *calibration* that goes with it
+  (`gps_base_*`, the baseline direction) stays a runtime param.
+- **Env-only dev knobs** (not vehicle facts): `DEFMT_UART`, `ESTIMATOR`
+  (link-time singletons — cannot be runtime by construction).
+
+Env vars of the `build:` knob names (`BOARD=`, `OUTER_LOOP=`, …) remain
+as deliberate dev overrides; `vehicle_features.py` warns on divergence
+and the build.rs guard downgrades to a warning for overridden knobs —
+except `board`, which never downgrades (flashing one board's pin mapping
+with another vehicle's airframe params is the exact hazard the guard
+exists to kill).
+
+### Missions
+
+Offline-planned trajectories are data files: one `missions/<name>.yaml`
+per profile, in the planner's native format (`start` / `waypoints` /
+per-segment `durations`, or absolute `timestamps`). The bake converts,
+validates (finite, matching lengths, strictly increasing timing, piece
+cap), and generates the `PROFILES` table `include!`d by
+`control/offline_mission.rs`. Adding a mission = dropping the planner's
+output file in `missions/` and rebuilding. Select at runtime with
+`mission set <name>` (persisted via `mission_profile`; note the persisted
+value is an index into the *name-sorted* table — re-select after changing
+the mission set).
+
+### How to add a parameter
+
+1. Add one field to the right `*Params` struct in
+   `cybflight_core/src/params.rs` with a `#[param(key = "...", unit,
+   min, max[, reboot])]` attribute and a doc comment (first line becomes
+   the generated description).
+2. Bump `VERSION` (blob layout changes with `PARAM_COUNT`).
+3. Update `scaffold()` / `tests_support::test_config` (compile-enforced)
+   and the name-presence test.
+4. Consume it; if hardware-coupled, pin it in the vehicle YAMLs and add
+   it to `HW_COUPLED_KEYS` in `build.rs`.
+5. `just params-doc` and commit the regenerated `docs/parameters.md`.
 
 ## Future Improvements
 

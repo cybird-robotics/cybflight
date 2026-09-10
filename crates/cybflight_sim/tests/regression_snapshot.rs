@@ -121,9 +121,9 @@ fn build_scenario(name: &str) -> Scenario {
             // rationale. Keep these three fields in sync with the
             // firmware so the snapshot validates the same configuration
             // the firmware actually flies.
-            s.vehicle_params.indi_controller.set_rate_gains([20.0, 20.0, 20.0]);
-            s.vehicle_params.indi_controller.set_sync_filter_hz(5.0);
-            s.vehicle_params.mpc.set_thrust_weight(6.0);
+            s.vehicle_params.indi.controller.rate_gains = [20.0, 20.0, 20.0];
+            s.vehicle_params.indi.controller.sync_filter_hz = 5.0;
+            s.vehicle_params.mpc.thrust_weight = 6.0;
             // Same looser pass_criteria as the autotest — but the
             // snapshot test itself doesn't gate on verdict, so these
             // only matter for the occasional sim-run inspection.
@@ -137,9 +137,10 @@ fn build_scenario(name: &str) -> Scenario {
 
 fn build_controller(name: &str, scenario: &Scenario) -> Box<dyn Controller> {
     let vp = &scenario.vehicle_params;
+    let sim = &scenario.sim_params;
     match name {
-        "cascade" => Box::new(CascadeController::from_params(vp)),
-        "mpc_direct" => Box::new(MpcDirectController::from_params(vp)),
+        "cascade" => Box::new(CascadeController::from_params(vp, sim)),
+        "mpc_direct" => Box::new(MpcDirectController::from_params(vp, sim)),
         "mpc_indi" => Box::new(MpcIndiController::from_params(vp)),
         "mpc_indi_contouring" => Box::new(MpcIndiController::from_params_with_mode(
             vp,
@@ -179,7 +180,7 @@ fn compute_current() -> BTreeMap<String, Row> {
 fn run_one(scenario_name: &str, controller_name: &str) -> Row {
     let mut scenario = build_scenario(scenario_name);
     let mut controller = build_controller(controller_name, &scenario);
-    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), 1.0 / 8000.0);
+    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), &scenario.sim_params, 1.0 / 8000.0);
     let runner = MissionRunner::new(Default::default());
     let run_out = runner.run(&mut scenario, &mut plant, &mut *controller);
     (&run_out).into()

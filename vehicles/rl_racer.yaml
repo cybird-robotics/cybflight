@@ -1,0 +1,108 @@
+# The identified 5-inch racing quad from the RL project
+# (optimal_quad_control_RL/randomization.py::params_5inch), expressed in
+# cybflight's airframe schema.
+#
+# This is the airframe the gate-racing neural policy was TRAINED on. It is
+# separate from `sim_baseline.yaml` on purpose: sim_baseline is frozen
+# against the regression snapshot and is a materially less powerful
+# aircraft (TWR 6.3 vs 11.0 here), so flying the policy against it would
+# measure the authority gap rather than the policy.
+#
+# ── Derivation ────────────────────────────────────────────────────────────
+# Every upstream coefficient is *specific* — regressed against accelerometer
+# and gyro data, so each carries a hidden 1/m or 1/I. Mass and inertia are
+# therefore free; they are pinned to the values that reproduce a physically
+# sensible 5-inch airframe, and every geometric quantity below is DERIVED
+# from them so the specific coefficients come out exactly right:
+#
+#   c_T      = m · k_w                        = 1.3695e-6 N·s²/rad²
+#   T_max    = c_T · ω_max²                   = 14.8732 N per motor (TWR 11.0)
+#   |l_y,i|  = k_p,i · I_xx / c_T             (roll arm, per motor)
+#   |l_x,i|  = k_q,i · I_yy / c_T             (pitch arm, per motor)
+#   c_Q      = k_r · I_zz / (c_T · ω_hover)   = 0.023618 m
+#   J_r      = I_zz · k_rd                    = 5.91e-6 kg·m²
+#   c_drag   = m · [k_x, k_y]
+#
+# The per-motor arm asymmetry is not noise-fitting: the upstream regression
+# solved for four independent k_p and k_q, and cybflight's schema carries
+# per-motor positions, so the asymmetry is representable exactly.
+#
+# ── Known model gap ───────────────────────────────────────────────────────
+# Upstream yaw is LINEAR in ω (`ṙ = k_r·(−ω₁+ω₂+ω₃−ω₄) + k_rd·(…ω̇…)`), a
+# fitting choice, not physics. cybflight's plant uses the physical
+# quadratic form (yaw torque ∝ thrust ∝ ω²). c_Q above matches the two at
+# hover; they diverge to ~3.3× at full throttle, with cybflight the more
+# aggressive. This is the dominant structural difference between this
+# vehicle and `RlReferencePlant`, and it is what the ablation in
+# `tests/nn_gate_race.rs` measures.
+
+airframe:
+  # Identity of the physical airframe this describes. Not one of the
+  # bench drones: it is the upstream RL project's identified 5-inch quad,
+  # which exists only in simulation.
+  name: rl_racer_5inch
+  mass_kg: 0.55
+  inertia_kg_m2: [0.0021, 0.0, 0.0, 0.0, 0.0018, 0.0, 0.0, 0.0, 0.003]
+  # Racing rates — the policy commands well past the sim_baseline limits.
+  max_rate_rad_s: [30.0, 30.0, 20.0]
+  # Betaflight QuadX order: rear-right, front-right, rear-left, front-left.
+  # Matches the upstream motor numbering 1..4 exactly (derived from the sign
+  # pattern of its roll/pitch/yaw moment equations), so the policy's output
+  # index maps to the vehicle's motor index with no permutation.
+  motors:
+    - { pos_m: [-0.06940, -0.10044], spin: cw,  max_thrust_n: 14.8732, torque_coeff_m: 0.023618 }
+    - { pos_m: [ 0.07702, -0.10136], spin: ccw, max_thrust_n: 14.8732, torque_coeff_m: 0.023618 }
+    - { pos_m: [-0.06637,  0.09752], spin: ccw, max_thrust_n: 14.8732, torque_coeff_m: 0.023618 }
+    - { pos_m: [ 0.07742,  0.10228], spin: cw,  max_thrust_n: 14.8732, torque_coeff_m: 0.023618 }
+
+sim:
+  # Rotor drag, body FLU, N·s²/(m·rad): m · [k_x, k_y]. z was never
+  # identified upstream and stays 0.
+  aero_drag: [2.6675e-5, 4.004e-5, 0.0]
+  # ESC idle floor, identified directly.
+  rotor_omega_min_rad_s: 238.49
+  # Rotor + prop polar inertia: I_zz · k_rd.
+  rotor_inertia_kg_m2: 5.91e-6
+  # Identified throttle curvature.
+  rotor_throttle_curve_k: 0.95
+
+tuning:
+  # Keys are flat registry names; the heading above each block names the
+  # schema group they belong to (`param list`, docs/parameters.md).
+
+  # ── airframe.motors — identified rotor dynamics ──
+  # ω_max and τ are the plant's actuator limits: `PlantParams::from_config`
+  # reads them straight off `airframe.motors`. The neural controller does
+  # not use INDI at all — these are here because the plant sources them
+  # from this group.
+  m0_omega_max: 3295.50
+  m1_omega_max: 3295.50
+  m2_omega_max: 3295.50
+  m3_omega_max: 3295.50
+  m0_tau: 0.04
+  m1_tau: 0.04
+  m2_tau: 0.04
+  m3_tau: 0.04
+  # Controller-side throttle-curve inverse (unused on the NN path; set to
+  # the plant's true curvature so an INDI comparison run is fair).
+  m0_nonlin: 0.95
+  m1_nonlin: 0.95
+  m2_nonlin: 0.95
+  m3_nonlin: 0.95
+  # G2 yaw = ±J_r/I_zz = ±k_rd, sign following the G1 yaw row; motor order
+  # is [cw, ccw, ccw, cw].
+  m0_g2_ry:  0.00197
+  m1_g2_ry: -0.00197
+  m2_g2_ry: -0.00197
+  m3_g2_ry:  0.00197
+
+  # ── site — local gravity ──
+  # Read by the plant as well as by the controllers, so it is pinned here
+  # rather than inherited: the upstream identification assumed 9.81, and
+  # the policy's hover throttle is calibrated against it.
+  gravity_m_s2: 9.81
+
+  # ── system — device/UX toggles ──
+  # Host sim has no LED strip or blackbox.
+  arm_led: 0
+  blackbox_tier: 0

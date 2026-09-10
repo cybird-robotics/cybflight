@@ -19,7 +19,7 @@
 use nalgebra::{SVector, UnitQuaternion, Vector3};
 
 use cybflight_core::eskf::{Eskf, EskfConfig, EskfGpsGuard, GpsFix, GpsGuardConfig, GuardSnapshot};
-use cybflight_core::mpc::{NU, NX};
+use cybflight_core::mpc::NX;
 
 use crate::controller::Controller;
 use crate::plant::QuadPlant;
@@ -35,7 +35,7 @@ use crate::trajectory::Setpoint;
 /// propagate into the sim snapshot. The values here are the sim's
 /// frozen baseline; they match the firmware GPS path's tuning at the
 /// time of writing (notably `max_pos_jump_m = 3.0`, which mirrors
-/// `eskf_imu_gps.rs::GPS_MAX_POS_JUMP_M`).
+/// the GPS vehicles' pinned `eskf_max_pos_jump_m`).
 fn sim_eskf_config() -> EskfConfig {
     EskfConfig::new(
         0.01,    // accel_noise_density
@@ -47,6 +47,11 @@ fn sim_eskf_config() -> EskfConfig {
         10.0,    // gate_sigma
         3.0,     // max_pos_jump_m (GPS-widened, vs mocap default of 1.0)
         0.7,     // max_att_jump_rad
+        1.0,     // init_pos_var
+        1.0,     // init_vel_var
+        0.01,    // init_accel_bias_var
+        0.01,    // init_gyro_bias_var
+        0.1,     // init_att_var_rp
     )
 }
 
@@ -69,6 +74,7 @@ fn sim_gps_guard_config() -> GpsGuardConfig {
         0.30,   // pos_sigma_floor_float_m
         2.0,    // pos_sigma_floor_none_m
         0.10,   // vel_sigma_floor_m_s
+        true,   // fuse_velocity
         2,      // reinit_min_carr_soln
     )
 }
@@ -77,6 +83,18 @@ fn sim_gps_guard_config() -> GpsGuardConfig {
 /// at 100 Hz controller ticks it reduces to ~12.5 Hz — still above GPS
 /// rate, and still representative of IMU-aided filtering.
 const PREDICT_DECIMATION: u32 = 8;
+
+/// Cap on the pre-mission wait for `EskfGpsGuard::is_ready()` [s].
+///
+/// The firmware gates flight on estimator readiness; the sim mirrors that
+/// so a scenario is not scored on a transient the real vehicle would never
+/// fly. The cap exists because some scenarios deliberately keep the guard
+/// un-ready (GPS outage / fault injection) and still need to fly — there,
+/// the mission starts anyway and the degraded estimate is the point.
+///
+/// 8 s clears the guard's own `rtk_fix_debounce_ms` (2 s) plus covariance
+/// convergence with margin; the GPS baseline reports ready at ≈2.6 s.
+const MAX_ESTIMATOR_WAIT_S: f32 = 8.0;
 
 #[derive(Clone, Debug)]
 pub struct RunnerConfig {
@@ -109,7 +127,18 @@ pub struct StepRecord {
     pub body_rate: Vector3<f32>,
     pub tilt_rad: f32,
     pub setpoint: Setpoint,
+    /// Normalized ESC commands `d ∈ [0,1]` emitted by the controller.
+    pub motor_commands: [f32; 4],
+    /// Per-rotor thrust [N] the plant actually produced at these rotor
+    /// speeds — lags `motor_commands` by the actuator time constant.
     pub motor_forces: [f32; 4],
+    /// Rotor speeds [rad/s].
+    pub rotor_omega: [f32; 4],
+    /// False while the runner is holding station waiting for the
+    /// estimator to converge. Scored metrics ignore these records — see
+    /// [`summarize`] — but they stay in `history` so the hold is still
+    /// visible to the reporter and the viz.
+    pub in_mission: bool,
     /// In-sim ESKF guard state at this tick. `None` for non-GPS
     /// scenarios. Tests use this to assert on ready-flag, jump
     /// counters, RTK quality, etc. Skipped from `report.json` /
@@ -131,6 +160,17 @@ pub struct SummaryMetrics {
     pub total_sim_time_s: f32,
     pub trajectory_duration_s: f32,
     pub early_exit_reason: Option<String>,
+    /// Wall-clock time at which the in-sim ESKF guard first reported
+    /// ready, and the mission clock therefore started. `None` when no
+    /// estimator was in the loop (mission starts at t=0) or when the
+    /// guard never converged and the wait cap released it instead.
+    pub estimator_ready_s: Option<f32>,
+    /// Peak tilt observed during the pre-mission estimator hold, if there
+    /// was one. Reported rather than scored: the real vehicle is on the
+    /// ground and disarmed until the guard reports ready, so this window
+    /// is not a flight the pass criteria should judge — but it must stay
+    /// visible, because a wild excursion here is still a signal.
+    pub pre_mission_peak_tilt_rad: f32,
 }
 
 pub struct RunOutput {
@@ -193,39 +233,45 @@ impl MissionRunner {
             scenario.terminal_hold_s.max(5.0)
         };
         let sim_deadline_s = terminal_time_s.min(self.cfg.max_sim_time_s);
-        let max_ticks = ((sim_deadline_s * controller.tick_rate_hz()).ceil() as usize).max(1);
+        // The mission clock does not start until the estimator is usable
+        // (see `mission_start_s` below), so wall-clock has to allow for
+        // that hold on top of the trajectory itself.
+        let wall_deadline_s =
+            (sim_deadline_s + MAX_ESTIMATOR_WAIT_S).min(self.cfg.max_sim_time_s.max(sim_deadline_s));
+        let max_ticks = ((wall_deadline_s * controller.tick_rate_hz()).ceil() as usize).max(1);
 
         let expected_records = (max_ticks / history_stride as usize) + 2;
         let mut history = Vec::with_capacity(expected_records);
         let mut early_exit: Option<String> = None;
         let mut geofence_violation = false;
-
-        let per_motor_max = plant
-            .params
-            .motors
-            .iter()
-            .map(|m| m.max_thrust_n)
-            .fold(0.0f32, f32::max)
-            .max(1e-6);
+        // Sampled every tick, not only on history records — a brief clip
+        // between two decimated samples is still a clip.
+        let mut peak_saturation = 0.0f32;
 
         let horizon_len = controller.horizon_samples().max(1);
         let horizon_stride_s = controller.horizon_stride_s();
         let mut horizon: Vec<Setpoint> = Vec::with_capacity(horizon_len);
 
-        // Seed `u_last` at per-motor hover so the IMU model's first sample
-        // reports [0, 0, g] (matching a real accelerometer with the vehicle
-        // about to take off) rather than zero, which would look like free
-        // fall to INDI's takeoff detector.
-        let hover_per_motor = plant.params.body.mass_kg * 9.81 / NU as f32;
-        let mut u_last = SVector::<f32, NU>::from_element(hover_per_motor);
+        // Pre-mission hold: station-keep at the start pose until the
+        // estimator is usable. `Setpoint::hover` marks itself terminal;
+        // clear that so the hold does not leak into terminal metrics.
+        let mut hold_setpoint = Setpoint::hover(scenario.initial_position);
+        hold_setpoint.terminal = false;
+
+        // The plant resets with its rotors already at hover speed, so the
+        // first IMU sample reads [0, 0, g] — what a real accelerometer
+        // shows with the vehicle about to take off. Zero would look like
+        // free fall to INDI's takeoff detector.
 
         // Spin up the in-sim ESKF if a GPS model is attached. The
         // `EskfGpsGuard` is the same one driving the firmware GPS task,
         // so failsafe behaviour (jump cascade, RTK debounce, staleness)
         // is exercised here too. Initialise the underlying filter from
-        // plant truth — the sim's `PerfectGps` reports an essentially
-        // truthy first fix, so this matches what the firmware does
-        // after its origin-anchor wait.
+        // plant truth: the vehicle really is there, and the firmware
+        // likewise initialises from a fix taken while sitting still on
+        // the ground. (Seeding from the first *noisy* fix instead was
+        // tried and is strictly worse — it hands the controller that
+        // fix's full error to chase from tick zero.)
         let mut eskf_state: Option<InSimEskf> = scenario.gps_model.as_ref().map(|gps| {
             let mut eskf = Eskf::new(sim_eskf_config());
             eskf.init(
@@ -245,16 +291,23 @@ impl MissionRunner {
             }
         });
 
+        // Mission clock. With no estimator in the loop the mission starts
+        // immediately, which keeps every truth-state scenario (and its
+        // snapshot rows) bit-identical. With an ESKF attached the mission
+        // waits for `EskfGpsGuard::is_ready()`, mirroring the firmware,
+        // which will not hand an unconverged estimate to the controller.
+        let mut mission_start_s: Option<f32> = if eskf_state.is_some() {
+            None
+        } else {
+            Some(0.0)
+        };
+        let mut estimator_ready_s: Option<f32> = None;
+
         for tick_idx in 0..max_ticks {
             let t = plant.time_s();
-            horizon.clear();
-            for k in 0..horizon_len {
-                let tk = t + k as f32 * horizon_stride_s;
-                horizon.push(scenario.setpoints.sample(tk));
-            }
-            let sp0 = horizon[0];
 
-            let imu = scenario.imu_model.sample(plant, &u_last);
+            let imu = scenario.imu_model.sample(plant);
+            let rotor = scenario.rotor_model.sample(plant);
 
             // Decide the state vector the controller sees. Two branches:
             //   - GPS attached: run the ESKF in-loop, feed it IMU and GPS
@@ -263,6 +316,7 @@ impl MissionRunner {
             //   - Otherwise: plant ground truth (unchanged code path, so
             //     existing snapshot rows remain bit-stable).
             let owned_state: SVector<f32, NX>;
+            let truth_state: SVector<f32, NX>;
             let controller_state: &SVector<f32, NX> = if let Some(es) = eskf_state.as_mut() {
                 // ESKF predict — decimated to ~1 kHz (PREDICT_DECIMATION=8
                 // matches the firmware decimation from 8 kHz IMU).
@@ -294,11 +348,50 @@ impl MissionRunner {
                 owned_state = build_state_from_eskf(&es.eskf, &imu);
                 &owned_state
             } else {
-                plant.raw_state()
+                truth_state = plant.control_state();
+                &truth_state
             };
 
-            let u = controller.step(controller_state, &imu, &horizon);
-            let motor_forces = [u[0], u[1], u[2], u[3]];
+            // Release the mission once the guard reports ready, or once the
+            // wait cap expires — the cap keeps a scenario that deliberately
+            // degrades GPS (outage / fault injection) from never flying.
+            if mission_start_s.is_none() {
+                let ready = eskf_state
+                    .as_ref()
+                    .map(|es| es.guard.is_ready())
+                    .unwrap_or(true);
+                if ready {
+                    estimator_ready_s = Some(t);
+                    mission_start_s = Some(t);
+                } else if t >= MAX_ESTIMATOR_WAIT_S {
+                    mission_start_s = Some(t);
+                }
+            }
+            let mission_t = mission_start_s.map(|t0| t - t0);
+
+            horizon.clear();
+            match mission_t {
+                Some(mt) => {
+                    for k in 0..horizon_len {
+                        horizon.push(scenario.setpoints.sample(mt + k as f32 * horizon_stride_s));
+                    }
+                }
+                None => horizon.resize(horizon_len, hold_setpoint),
+            }
+            let sp0 = horizon[0];
+
+            let u = controller.step(controller_state, &imu, &rotor, &horizon);
+            let motor_commands = [u[0], u[1], u[2], u[3]];
+            let thrusts = plant.motor_thrusts();
+            let motor_forces = [thrusts[0], thrusts[1], thrusts[2], thrusts[3]];
+            let omega = plant.rotor_omega();
+            let rotor_omega = [omega[0], omega[1], omega[2], omega[3]];
+            // Saturation is measured on the *command*: `d = 1` is where
+            // the actuator clips, and it is the quantity the allocator
+            // has to live within. Rotor-speed fraction lags it and never
+            // reaches 1 during a transient, which would under-report a
+            // real clip.
+            let tick_saturation = u.iter().fold(0.0f32, |a, &b| a.max(b)).clamp(0.0, 1.0);
 
             if (tick_idx as u32) % history_stride == 0 {
                 let (estimator, estimator_position) = match eskf_state.as_ref() {
@@ -313,7 +406,10 @@ impl MissionRunner {
                     body_rate: plant.body_rate(),
                     tilt_rad: plant.tilt_rad(),
                     setpoint: sp0,
+                    motor_commands,
                     motor_forces,
+                    rotor_omega,
+                    in_mission: mission_t.is_some(),
                     estimator,
                     estimator_position,
                 });
@@ -322,7 +418,9 @@ impl MissionRunner {
             for _ in 0..substeps {
                 plant.step(&u);
             }
-            u_last = u;
+            if tick_saturation > peak_saturation {
+                peak_saturation = tick_saturation;
+            }
 
             let pos = plant.position();
             if violates_geofence(
@@ -344,7 +442,8 @@ impl MissionRunner {
                 early_exit = Some(format!("non-finite state at t={:.2}s", plant.time_s()));
                 break;
             }
-            if plant.time_s() >= sim_deadline_s {
+            let elapsed_mission_s = mission_start_s.map(|t0| plant.time_s() - t0);
+            if elapsed_mission_s.is_some_and(|m| m >= sim_deadline_s) {
                 break;
             }
         }
@@ -355,7 +454,8 @@ impl MissionRunner {
             plant.time_s(),
             geofence_violation,
             early_exit.clone(),
-            per_motor_max,
+            peak_saturation,
+            estimator_ready_s,
         );
         let (verdict, failure_reasons) = evaluate(&summary, &scenario.pass_criteria);
         RunOutput {
@@ -414,16 +514,29 @@ fn summarize(
     total_s: f32,
     geofence_violation: bool,
     early_exit_reason: Option<String>,
-    per_motor_max_n: f32,
+    peak_saturation: f32,
+    estimator_ready_s: Option<f32>,
 ) -> SummaryMetrics {
     let mut sum_sq = 0.0f32;
     let mut peak_err = 0.0f32;
     let mut peak_tilt = 0.0f32;
-    let mut peak_sat = 0.0f32;
     let mut terminal_err = 0.0f32;
     let mut terminal_count: u32 = 0;
+    let mut scored: u32 = 0;
+    let mut pre_mission_peak_tilt = 0.0f32;
 
     for rec in history {
+        // The pre-mission hold is not a flight: the firmware keeps the
+        // vehicle disarmed on the ground until `EskfGpsGuard::is_ready()`,
+        // so an excursion there is not something the controller would ever
+        // be asked to survive. Record it, do not score it.
+        if !rec.in_mission {
+            if rec.tilt_rad > pre_mission_peak_tilt {
+                pre_mission_peak_tilt = rec.tilt_rad;
+            }
+            continue;
+        }
+        scored += 1;
         let err = (rec.position - rec.setpoint.position).norm();
         sum_sq += err * err;
         if err > peak_err {
@@ -432,21 +545,15 @@ fn summarize(
         if rec.tilt_rad > peak_tilt {
             peak_tilt = rec.tilt_rad;
         }
-        for f in rec.motor_forces {
-            let sat = (f / per_motor_max_n).clamp(0.0, 1.0);
-            if sat > peak_sat {
-                peak_sat = sat;
-            }
-        }
         if rec.setpoint.terminal {
             terminal_err += err;
             terminal_count += 1;
         }
     }
-    let rms_pos_err_m = if history.is_empty() {
+    let rms_pos_err_m = if scored == 0 {
         0.0
     } else {
-        (sum_sq / history.len() as f32).sqrt()
+        (sum_sq / scored as f32).sqrt()
     };
     let terminal_pos_err_m = if terminal_count > 0 {
         terminal_err / terminal_count as f32
@@ -459,11 +566,13 @@ fn summarize(
         terminal_pos_err_m,
         peak_tilt_rad: peak_tilt,
         peak_pos_err_m: peak_err,
-        peak_motor_saturation_pct: peak_sat * 100.0,
+        peak_motor_saturation_pct: peak_saturation * 100.0,
         geofence_violation,
         total_sim_time_s: total_s,
         trajectory_duration_s: trajectory_s,
         early_exit_reason,
+        estimator_ready_s,
+        pre_mission_peak_tilt_rad: pre_mission_peak_tilt,
     }
 }
 

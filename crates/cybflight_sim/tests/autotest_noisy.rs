@@ -51,7 +51,7 @@ fn noisy_mpc_indi_mission() -> (Scenario, MpcIndiController) {
 #[test]
 fn mpc_indi_tracks_through_noisy_imu() {
     let (mut scenario, mut controller) = noisy_mpc_indi_mission();
-    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), 1.0 / 8000.0);
+    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), &scenario.sim_params, 1.0 / 8000.0);
     let runner = MissionRunner::new(Default::default());
     let out = runner.run(&mut scenario, &mut plant, &mut controller);
 

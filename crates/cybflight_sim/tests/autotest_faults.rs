@@ -32,21 +32,34 @@ fn fresh_eskf() -> Eskf {
 #[test]
 fn outlier_position_rain_increments_counter_without_corrupting_state() {
     // Simulate a flapping mocap source: every other frame is a 100 m
-    // outlier, interleaved with reasonable updates. After many cycles the
-    // gate counter should be high but the filter should still be tracking
-    // truth (since the gate rejects the bad ones).
-    let mut e = fresh_eskf();
+    // outlier, interleaved with reasonable updates. Each outlier must be
+    // jump-rejected (reported via the returned `UpdateOutcome` since the
+    // failsafe rework — the `gate_rejects_pos` counter now tracks only
+    // NIS/inflation-cap rejections) and the filter must keep tracking
+    // truth.
+    // Init at truth: the jump gate (max_pos_jump_m = 1.0 by default) also
+    // guards the *good* updates, so an origin-initialized filter would
+    // reject a 3.7 m-away truth too. Real consumers init at first fix.
     let truth = Vector3::new(1.0, 2.0, 3.0);
+    let mut e = Eskf::new(EskfConfig::default());
+    e.init(
+        truth,
+        UnitQuaternion::identity(),
+        Vector3::zeros(),
+        Vector3::zeros(),
+    );
+    let mut jump_rejects: u32 = 0;
     for _ in 0..200 {
         e.update_pos(truth, 0.05);
-        e.update_pos(Vector3::new(100.0, 0.0, 0.0), 0.05);
+        if e.update_pos(Vector3::new(100.0, 0.0, 0.0), 0.05).is_jump() {
+            jump_rejects += 1;
+        }
     }
-    let h = e.health();
     assert!(
-        h.gate_rejects_pos > 100,
-        "expected ≥100 rejections, got {}",
-        h.gate_rejects_pos
+        jump_rejects > 100,
+        "expected ≥100 jump rejections, got {jump_rejects}"
     );
+    let h = e.health();
     let pos = e.position();
     assert!(
         (pos - truth).norm() < 0.5,
@@ -54,8 +67,8 @@ fn outlier_position_rain_increments_counter_without_corrupting_state() {
     );
     assert_eq!(h.nan_resets, 0);
     println!(
-        "outlier rain: rejects={} final_pos=[{:.3},{:.3},{:.3}]",
-        h.gate_rejects_pos, pos.x, pos.y, pos.z
+        "outlier rain: jump_rejects={} final_pos=[{:.3},{:.3},{:.3}]",
+        jump_rejects, pos.x, pos.y, pos.z
     );
 }
 
@@ -110,17 +123,6 @@ fn saturating_noise_imu_does_not_explode_covariance() {
     println!(
         "saturating-noise IMU: pos_cov_trace={pos_trace:.2} vel_cov_trace={vel_trace:.2}"
     );
-}
-
-#[test]
-fn velocity_outliers_count_separately_from_position() {
-    // Two channels — make sure pos and vel counters don't share state.
-    let mut e = fresh_eskf();
-    e.update_vel(Vector3::new(500.0, 0.0, 0.0), 0.1);
-    e.update_pos(Vector3::new(0.01, 0.0, 0.0), 0.5); // inlier — no count.
-    let h = e.health();
-    assert_eq!(h.gate_rejects_vel, 1);
-    assert_eq!(h.gate_rejects_pos, 0);
 }
 
 #[test]

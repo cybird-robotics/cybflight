@@ -31,10 +31,28 @@
 //!
 //! The wrapper makes this decision: it translates the failsafe's
 //! `Disarmed(JumpCascade)` action into `MocapGuardOutcome::
-//! DisarmedJumpCascade` without calling `note_reinit`. If a future
-//! mocap variant wants a re-init policy (e.g. heavy-duty multi-body
-//! tracking with corruption modes), add a config knob and branch
-//! here mirroring `EskfGpsGuard::reinit_min_carr_soln`.
+//! DisarmedJumpCascade` without calling `note_reinit`.
+//!
+//! # The escape hatch
+//!
+//! Riding out IMU is only safe because it is *bounded*. Left alone the
+//! cascade never heals: `consecutive_jumps` clears only on a non-jump
+//! outcome, and no pose can produce one while it sits outside the jump
+//! gate — so a filter whose position has separated from truth by more
+//! than `max_pos_jump_m` rejects every pose forever and the vehicle
+//! stays unarmable until a power cycle. That is reachable from an
+//! entirely routine sequence: uplink drops while disarmed, operator
+//! carries the airframe to the pad, uplink returns.
+//!
+//! `on_pose` therefore takes `armed`. **Disarmed**, once wedged, the
+//! guard re-anchors at a pose stream that agrees with itself across
+//! `reanchor_frames` within `reanchor_radius_m` — a stationary
+//! airframe satisfies this, a re-associated (generally moving) body
+//! does not. **Armed**, the policy is unchanged and absolute: no
+//! re-anchor, ride out IMU, escalate through staleness and the fault
+//! path. This is the mocap analog of `EskfGpsGuard::
+//! reinit_min_carr_soln`, using self-consistency where GPS uses the
+//! RTK quality flag.
 
 use nalgebra::{UnitQuaternion, Vector3};
 
@@ -63,7 +81,20 @@ pub struct MocapGuardConfig {
     pub gyro_bias_cov_trace_thresh: f32,
     pub mocap_pos_std: f32,
     pub mocap_att_std: f32,
+    /// Mutual-agreement radius for the disarmed re-anchor escape hatch
+    /// (m). See [`Self::reanchor_frames`] and the module-level policy note.
+    pub reanchor_radius_m: f32,
+    /// Successive mutually-agreeing poses the re-anchor requires. The
+    /// other half of the radius above; see [`DEFAULT_REANCHOR_FRAMES`].
+    pub reanchor_frames: u32,
 }
+
+/// Successive mutually-agreeing poses required before the disarmed
+/// re-anchor fires. At 100–360 Hz this is 14–50 ms of a stationary,
+/// self-consistent pose stream — long enough that a re-associated body
+/// flickering between two rigid bodies cannot satisfy it, short enough
+/// that an operator who has set the airframe down is not left waiting.
+pub const DEFAULT_REANCHOR_FRAMES: usize = 5;
 
 impl Default for MocapGuardConfig {
     fn default() -> Self {
@@ -80,6 +111,13 @@ impl Default for MocapGuardConfig {
             gyro_bias_cov_trace_thresh: 0.003,
             mocap_pos_std: 0.01,
             mocap_att_std: 0.03,
+            // 10 cm: an order of magnitude above the 1 cm pose σ (so
+            // a genuinely stationary airframe clears it comfortably)
+            // and an order of magnitude below the 1 m jump gate (so
+            // it cannot be satisfied by the drifting, ambiguous
+            // stream a re-association produces).
+            reanchor_radius_m: 0.10,
+            reanchor_frames: DEFAULT_REANCHOR_FRAMES as u32,
         }
     }
 }
@@ -93,6 +131,7 @@ impl MocapGuardConfig {
         gyro_bias_cov_trace_thresh: f32,
         mocap_pos_std: f32,
         mocap_att_std: f32,
+        reanchor_radius_m: f32,
     ) -> Self {
         Self {
             max_consecutive_jumps,
@@ -101,6 +140,8 @@ impl MocapGuardConfig {
             gyro_bias_cov_trace_thresh,
             mocap_pos_std,
             mocap_att_std,
+            reanchor_radius_m,
+            reanchor_frames: DEFAULT_REANCHOR_FRAMES as u32,
         }
     }
 }
@@ -137,8 +178,16 @@ pub enum MocapGuardOutcome {
 
 /// Per-tick outcome from `on_predict_tick`. Same shape as
 /// `super::gps_guard::TickOutcome` — the wrapper publishes
-/// `is_ready` to the arming-gate atomic and uses `is_stale` to skip
-/// odometry publishing.
+/// `is_ready` to the arming-gate atomic and uses `is_stale` purely
+/// for annunciation.
+///
+/// `is_stale` must **not** be used to withhold odometry: the
+/// module-level policy is to ride the gap out on IMU dead-reckoning,
+/// and a caller that stops publishing instead starves the outer
+/// loop's own (much tighter) odometry-freshness gate, which
+/// cascades all the way to the DShot watchdog cutting thrust. A
+/// sustained outage is escalated by the fault path
+/// (`eskf_fault_pos_timeout_s`), not by this flag.
 #[derive(Clone, Copy, Debug)]
 pub struct TickOutcome {
     pub is_ready: bool,
@@ -161,6 +210,12 @@ pub struct MocapGuardSnapshot {
 pub struct EskfMocapGuard {
     cfg: MocapGuardConfig,
     failsafe: EskfFailsafe,
+    /// Candidate anchor for the disarmed re-anchor hatch: the position
+    /// of the first pose in the current agreeing run, plus how many
+    /// poses have agreed with it so far. `None` whenever the guard is
+    /// not in the wedged-and-disarmed state.
+    reanchor_ref: Option<Vector3<f32>>,
+    reanchor_count: u32,
 }
 
 impl EskfMocapGuard {
@@ -179,6 +234,8 @@ impl EskfMocapGuard {
         Self {
             cfg,
             failsafe: EskfFailsafe::new(failsafe_cfg, anchor_ms),
+            reanchor_ref: None,
+            reanchor_count: 0,
         }
     }
 
@@ -208,7 +265,18 @@ impl EskfMocapGuard {
     /// Drive the guard with one incoming mocap pose. Mirrors the
     /// `EskfGpsGuard::on_pvt` shape but for the joint pose-update
     /// flow.
-    pub fn on_pose(&mut self, eskf: &mut Eskf, pose: &MocapPose) -> MocapGuardOutcome {
+    ///
+    /// `armed` gates the re-anchor escape hatch: the ride-out-IMU
+    /// policy above is only safe because it is bounded. In flight it is
+    /// absolute — a re-associated body must never capture the filter.
+    /// On the ground it must not be, or the cascade is a permanent
+    /// wedge (see `reanchor_radius_m`).
+    pub fn on_pose(
+        &mut self,
+        eskf: &mut Eskf,
+        pose: &MocapPose,
+        armed: bool,
+    ) -> MocapGuardOutcome {
         // Non-finite-pose gate. Cheap to do here so a corrupted
         // transport frame (ESP bridge / COBS decode) never reaches
         // `update_pose`.
@@ -277,7 +345,55 @@ impl EskfMocapGuard {
             }
         }
 
+        // --- Bounded re-anchor escape hatch (disarmed only) ---
+        //
+        // Riding out IMU is the right policy *while the cascade can
+        // still heal*. It cannot heal on its own: `consecutive_jumps`
+        // only clears on a non-jump outcome, and no pose can produce
+        // one while it sits outside the jump gate. So once the filter's
+        // position and the true position have separated by more than
+        // `max_pos_jump_m`, every subsequent pose is rejected forever
+        // and the vehicle is unarmable until a power cycle.
+        //
+        // The dominant real case is mundane: the uplink drops while
+        // disarmed, the operator carries the airframe to the pad, the
+        // uplink returns. Requiring the stream to agree with *itself*
+        // across `reanchor_frames` before re-seeding distinguishes that
+        // (a stationary airframe, poses clustered within centimetres)
+        // from the re-association this guard exists to reject (poses
+        // tracking a different, generally moving body). Gating on
+        // `!armed` keeps the in-flight policy exactly as it was.
+        let wedged =
+            self.failsafe.snapshot().consecutive_jumps >= self.cfg.max_consecutive_jumps;
+        if !armed && wedged {
+            let agrees = self
+                .reanchor_ref
+                .is_some_and(|r| (pose.position - r).norm() <= self.cfg.reanchor_radius_m);
+            if agrees {
+                self.reanchor_count = self.reanchor_count.saturating_add(1);
+            } else {
+                self.reanchor_ref = Some(pose.position);
+                self.reanchor_count = 1;
+            }
+            if self.reanchor_count >= self.cfg.reanchor_frames {
+                self.reinit_filter(eskf, pose);
+                self.clear_reanchor();
+                return MocapGuardOutcome::Reinitialised {
+                    at_pos: pose.position,
+                    at_orient: pose.orientation,
+                    cause: ReinitCause::JumpCascade,
+                };
+            }
+        } else {
+            self.clear_reanchor();
+        }
+
         returned
+    }
+
+    fn clear_reanchor(&mut self) {
+        self.reanchor_ref = None;
+        self.reanchor_count = 0;
     }
 
     /// Drive the guard at the IMU/predict cadence. Convergence and
@@ -338,28 +454,55 @@ mod tests {
         }
     }
 
-    /// Mocap policy: jump cascade at the limit DOES NOT re-init the
-    /// filter. The wrapper translates the failsafe's
-    /// `Disarmed{JumpCascade}` directly into
-    /// `DisarmedJumpCascade` and the IMU-integrated estimate is
-    /// preserved.
+    /// Drive a clean 100 Hz pose stream until the guard reports
+    /// converged, returning the timestamp of the last accepted pose.
+    /// Convergence is driven by the gyro-bias covariance trace falling
+    /// below the threshold, which only re-evaluates on `on_predict_tick`
+    /// — so ticks are interleaved at the pose rate.
+    fn converge(g: &mut EskfMocapGuard, e: &mut Eskf) -> u64 {
+        // Level hover: specific force is +g in body z, no rotation. The
+        // gyro-bias covariance only shrinks through predict/update
+        // coupling, so the IMU has to actually run.
+        let accel = Vector3::new(0.0, 0.0, 9.81);
+        let gyro = Vector3::zeros();
+        let mut t = 0u64;
+        for _ in 0..5_000 {
+            for _ in 0..10 {
+                e.predict(accel, gyro, 0.001);
+            }
+            t += 10;
+            let _ = g.on_pose(e, &good_pose(t, Vector3::zeros()), false);
+            let _ = g.on_predict_tick(e, t);
+            if g.is_ready() {
+                return t;
+            }
+        }
+        panic!(
+            "guard never converged on a clean stream (trace={})",
+            e.gyro_bias_cov_trace()
+        );
+    }
+
+    /// Mocap policy **in flight**: jump cascade at the limit DOES NOT
+    /// re-init the filter. The wrapper translates the failsafe's
+    /// `Disarmed{JumpCascade}` directly into `DisarmedJumpCascade` and
+    /// the IMU-integrated estimate is preserved.
+    ///
+    /// Note the jump-cascade disarm is *not* gated on `converged` (only
+    /// the reject cascade is — `failsafe.rs`), so no warmup is needed
+    /// here; the counter alone drives it.
     #[test]
     fn jump_cascade_disarms_without_reinit() {
         let cfg = MocapGuardConfig::default();
         let mut g = EskfMocapGuard::new(cfg, 0);
         let mut e = make_eskf();
-        // Hand-set converged so the cascade gate fires (the
-        // EskfFailsafe gate is gated on converged for the cascade
-        // disarm; without it we'd just see RejectedJump per-frame).
-        // Drive frames at 0.5 m past origin — just above the 1.0 m
-        // mocap jump gate and well below the 5 m GPS gate, but
-        // EskfConfig::default() jump gate is 1.0 m so this trips.
-        // Pre-flight artificially: insert a directly-converged
-        // failsafe via a synthetic warmup.
-        // Walk through cascade limit (3): four jumpy frames.
-        for k in 0..4 {
+        // Frames 2 m past the origin — above the 1.0 m jump gate in
+        // EskfConfig::default(), so every one is JumpRejected. Armed,
+        // so the re-anchor hatch is closed no matter how long the
+        // stream agrees with itself.
+        for k in 0..8 {
             let t = (k as u64) * 10;
-            let _ = g.on_pose(&mut e, &good_pose(t, Vector3::new(2.0, 0.0, 0.0)));
+            let _ = g.on_pose(&mut e, &good_pose(t, Vector3::new(2.0, 0.0, 0.0)), true);
         }
         // Filter should NOT have snapped to (2,0,0) — re-init on
         // jump cascade is the GPS-only policy. The mocap path
@@ -386,7 +529,7 @@ mod tests {
         assert!(!e_uninit.is_initialized());
 
         let pose = good_pose(100, Vector3::new(1.0, 2.0, 3.0));
-        let outcome = g.on_pose(&mut e_uninit, &pose);
+        let outcome = g.on_pose(&mut e_uninit, &pose, false);
         assert!(
             matches!(
                 outcome,
@@ -416,7 +559,7 @@ mod tests {
             orientation: UnitQuaternion::identity(),
             timestamp_ms: 100,
         };
-        let outcome = g.on_pose(&mut e, &pose);
+        let outcome = g.on_pose(&mut e, &pose, false);
         assert!(
             matches!(outcome, MocapGuardOutcome::NonFinitePose),
             "expected NonFinitePose, got {outcome:?}"
@@ -429,7 +572,7 @@ mod tests {
         let mut g = EskfMocapGuard::new(cfg, 0);
         let mut e = make_eskf();
         // Tiny pos delta — well below the 1.0 m jump gate.
-        let _ = g.on_pose(&mut e, &good_pose(10, Vector3::new(0.001, 0.0, 0.0)));
+        let _ = g.on_pose(&mut e, &good_pose(10, Vector3::new(0.001, 0.0, 0.0)), false);
         let s = g.snapshot();
         // Inflated counters depend on whether the residual triggered
         // R-inflation — for a 1 mm offset against MOCAP_POS_STD=0.01
@@ -441,4 +584,130 @@ mod tests {
         // last_pose_accept_ms refreshed.
         assert_eq!(s.last_pose_accept_ms, 10);
     }
+
+    /// The escape hatch: disarmed, a wedged filter re-anchors once the
+    /// pose stream has agreed with itself for `reanchor_frames`. Without
+    /// this the jump cascade is unrecoverable short of a power cycle.
+    #[test]
+    fn disarmed_jump_cascade_reanchors_on_agreeing_stream() {
+        let cfg = MocapGuardConfig::default();
+        let mut g = EskfMocapGuard::new(cfg, 0);
+        let mut e = make_eskf();
+        let far = Vector3::new(3.0, 0.0, 0.0);
+
+        // Wedge it: 3 jumpy frames trip the cascade (max_consecutive_jumps).
+        for k in 0..3 {
+            let o = g.on_pose(&mut e, &good_pose((k as u64) * 10, far), false);
+            assert!(
+                !matches!(o, MocapGuardOutcome::Reinitialised { .. }),
+                "re-anchored before the agreement run completed: {o:?}"
+            );
+        }
+        assert!(g.snapshot().consecutive_jumps >= cfg.max_consecutive_jumps);
+
+        // Now the stream agrees with itself. The run needs
+        // reanchor_frames poses: the first seeds the reference, so the
+        // hatch fires on the reanchor_frames'th agreeing frame.
+        let mut reanchored = false;
+        for k in 3..(3 + DEFAULT_REANCHOR_FRAMES + 2) {
+            let o = g.on_pose(&mut e, &good_pose((k as u64) * 10, far), false);
+            if matches!(
+                o,
+                MocapGuardOutcome::Reinitialised {
+                    cause: ReinitCause::JumpCascade,
+                    ..
+                }
+            ) {
+                reanchored = true;
+                break;
+            }
+        }
+        assert!(reanchored, "disarmed wedge never re-anchored");
+        // Filter re-seeded at the pose, cascade counters cleared.
+        assert!((e.position() - far).norm() < 1e-5);
+        assert_eq!(g.snapshot().consecutive_jumps, 0);
+        assert!(!g.is_ready(), "a freshly re-anchored filter is not converged");
+    }
+
+    /// The hatch is disarmed-only. Armed, the same agreeing stream must
+    /// never capture the filter — that is the re-association case the
+    /// ride-out-IMU policy exists to reject.
+    #[test]
+    fn armed_jump_cascade_never_reanchors() {
+        let cfg = MocapGuardConfig::default();
+        let mut g = EskfMocapGuard::new(cfg, 0);
+        let mut e = make_eskf();
+        let far = Vector3::new(3.0, 0.0, 0.0);
+        for k in 0..(DEFAULT_REANCHOR_FRAMES * 4) {
+            let o = g.on_pose(&mut e, &good_pose((k as u64) * 10, far), true);
+            assert!(
+                !matches!(o, MocapGuardOutcome::Reinitialised { .. }),
+                "armed re-anchor at frame {k}: {o:?}"
+            );
+        }
+        assert!(
+            (e.position() - Vector3::zeros()).norm() < 0.5,
+            "armed filter must keep the IMU estimate; pos={:?}",
+            e.position()
+        );
+    }
+
+    /// A stream that does *not* agree with itself — the moving,
+    /// misidentified rigid body — never satisfies the hatch even
+    /// disarmed.
+    #[test]
+    fn disarmed_reanchor_requires_self_agreement() {
+        let cfg = MocapGuardConfig::default();
+        let mut g = EskfMocapGuard::new(cfg, 0);
+        let mut e = make_eskf();
+        for k in 0..(DEFAULT_REANCHOR_FRAMES * 4) {
+            // Each frame steps well beyond reanchor_radius_m from the
+            // last, so the agreement run resets every time.
+            let pos = Vector3::new(3.0 + (k as f32) * 0.5, 0.0, 0.0);
+            let o = g.on_pose(&mut e, &good_pose((k as u64) * 10, pos), false);
+            assert!(
+                !matches!(o, MocapGuardOutcome::Reinitialised { .. }),
+                "re-anchored on a disagreeing stream at frame {k}: {o:?}"
+            );
+        }
+    }
+
+    /// Mocap twin of `gps_guard::staleness_drops_ready`. This is the
+    /// arming-gate half of the staleness contract; the *publishing* half
+    /// (odometry keeps flowing while stale) lives in the firmware task.
+    #[test]
+    fn mocap_staleness_drops_ready() {
+        let cfg = MocapGuardConfig::default();
+        let mut g = EskfMocapGuard::new(cfg, 0);
+        let mut e = make_eskf();
+        converge(&mut g, &mut e);
+
+        let stale_t = g.snapshot().last_pose_accept_ms + cfg.mocap_stale_ms + 10;
+        let tick = g.on_predict_tick(&e, stale_t);
+        assert!(tick.is_stale);
+        assert!(!tick.is_ready);
+    }
+
+    /// Mocap twin of `gps_guard::staleness_clears_on_fresh_accept` —
+    /// staleness must be recoverable, not a latch.
+    #[test]
+    fn mocap_staleness_clears_on_fresh_accept() {
+        let cfg = MocapGuardConfig::default();
+        let mut g = EskfMocapGuard::new(cfg, 0);
+        let mut e = make_eskf();
+        converge(&mut g, &mut e);
+
+        let stale_t = g.snapshot().last_pose_accept_ms + cfg.mocap_stale_ms + 10;
+        assert!(g.on_predict_tick(&e, stale_t).is_stale);
+
+        // A fresh accepted pose re-arms the staleness clock.
+        let _ = g.on_pose(&mut e, &good_pose(stale_t, Vector3::zeros()), false);
+        assert!(!g.on_predict_tick(&e, stale_t + 1).is_stale);
+    }
+
+    // Reject-cascade coverage lives in `failsafe.rs`, which can hand
+    // `record_pos_outcome` a synthetic `UpdateOutcome`. Reaching it
+    // through this wrapper would need a contrived singular update, and
+    // the only mocap-specific part is the outcome mapping to
+    // `DisarmedRejectCascade`.
 }

@@ -1,0 +1,25 @@
+\begin{table}[t]
+  \centering
+  \caption{Tracking performance of SQP-NMPC and TinyMPC on the indoor missions (simulation). $v_\mathrm{max}$: maximum speed of the reference; $e_\mathrm{RMS}$: RMS distance to the reference path; $e_\mathrm{max}$: peak path deviation. `--': the vehicle crashed before completing the mission. Best value per row in bold.}
+  \label{tab:tinympc}
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{l|c|cc|cc}
+    \toprule
+    & & \multicolumn{2}{c|}{Ours} & \multicolumn{2}{c}{TinyMPC~\cite{nguyen2024tinympc}} \\
+    map & $v_\mathrm{max}$ [m/s] & $e_\mathrm{RMS}$ & $e_\mathrm{max}$ & $e_\mathrm{RMS}$ & $e_\mathrm{max}$ \\
+    \midrule
+    circle slow & 5.80 & \textbf{0.066 m} & \textbf{0.128 m} & 0.112 m & 0.190 m \\
+    circle mid & 7.78 & \textbf{0.086 m} & \textbf{0.171 m} & 0.206 m & 0.320 m \\
+    circle high & 13.65 & \textbf{0.111 m} & \textbf{0.218 m} & -- & -- \\
+    eight slow & 5.72 & \textbf{0.049 m} & \textbf{0.110 m} & 0.082 m & 0.160 m \\
+    eight mid & 7.70 & \textbf{0.066 m} & \textbf{0.128 m} & 0.168 m & 0.277 m \\
+    eight high & 12.81 & \textbf{0.107 m} & \textbf{0.220 m} & -- & -- \\
+    slalom slow & 4.81 & \textbf{0.039 m} & \textbf{0.086 m} & 0.067 m & 0.138 m \\
+    slalom mid & 6.42 & \textbf{0.049 m} & \textbf{0.115 m} & 0.140 m & 0.266 m \\
+    slalom high & 11.05 & \textbf{0.082 m} & \textbf{0.219 m} & -- & -- \\
+    race slow & 5.53 & \textbf{0.056 m} & \textbf{0.128 m} & 0.085 m & 0.175 m \\
+    race mid & 7.22 & \textbf{0.072 m} & \textbf{0.147 m} & 0.164 m & 0.276 m \\
+    race high & 13.23 & \textbf{0.120 m} & \textbf{0.257 m} & -- & -- \\
+    \bottomrule
+  \end{tabular}
+\end{table}

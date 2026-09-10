@@ -6,7 +6,7 @@
 use core::cell::Cell;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use cybflight_drivers::gps::Ublox;
+use cybflight_drivers::gps::{GpsDriver, GpsEvent};
 use cybflight_drivers::gps::ublox::Error as UbxError;
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_time::Instant;
@@ -91,6 +91,12 @@ pub static GPS_HEALTH: Mutex<CriticalSectionRawMutex, Cell<GpsHealth>> =
 /// diffs the unique values — no firmware-side jitter computation is
 /// needed, the raw arrival time is the source-of-truth.
 pub static LATEST_NAV_PVT: Mutex<CriticalSectionRawMutex, Cell<Option<GpsNavPvt>>> =
+    Mutex::new(Cell::new(None));
+
+/// Latest dual-antenna heading snapshot (UM982 only; `None` on u-blox builds
+/// and before the first `UNIHEADING`). Mirrors [`LATEST_NAV_PVT`] so the shell
+/// can read it synchronously (the `gpsrtk` print/stream).
+pub static LATEST_GPS_HEADING: Mutex<CriticalSectionRawMutex, Cell<Option<GpsHeading>>> =
     Mutex::new(Cell::new(None));
 
 /// Sliding-window count for the GPS jitter health metric. At 2 Hz this
@@ -218,8 +224,26 @@ pub struct GpsNavPvt {
     pub carr_soln: u8,
 }
 
+/// Dual-antenna heading sample (UM982 only). Published to `super::GPS_HEADING`;
+/// consumed by the ESKF GPS task as a yaw-aiding vector/direction measurement.
+#[derive(Clone, Copy)]
+pub struct GpsHeading {
+    pub timestamp: Instant,
+    /// Baseline (ANT1→ANT2) azimuth, clockwise from True North [rad].
+    pub heading_rad: f32,
+    /// Baseline elevation [rad].
+    pub pitch_rad: f32,
+    /// Heading (azimuth) 1-σ [rad].
+    pub heading_sigma_rad: f32,
+    /// Pitch (elevation) 1-σ [rad].
+    pub pitch_sigma_rad: f32,
+    /// Moving-baseline carrier solution: 0 none, 1 float, 2 integer-FIXED.
+    /// The ESKF fuses heading on `>= 1` (float or fixed); skips only 0 (none).
+    pub carr_soln: u8,
+}
+
 pub struct GpsRunner {
-    gps: Ublox<GpsUart>,
+    gps: GpsDriver<GpsUart>,
     /// Ring of the most recent NAV-PVT arrival timestamps in
     /// microseconds since boot. `0` marks an empty slot. Used to
     /// compute the [`NAV_PVT_MAX_INTERVAL_RECENT_US`] sliding-window
@@ -234,7 +258,7 @@ pub struct GpsRunner {
 }
 
 impl GpsRunner {
-    pub fn new(gps: Ublox<GpsUart>) -> Self {
+    pub fn new(gps: GpsDriver<GpsUart>) -> Self {
         Self {
             gps,
             arrivals_us: [0; NAV_PVT_JITTER_WINDOW],
@@ -288,8 +312,8 @@ impl GpsRunner {
         let publisher = super::GPS_FIX.immediate_publisher();
         defmt::info!("GPS task running — waiting for NAV-PVT frames");
         loop {
-            match self.gps.read_fix().await {
-                Ok(pvt) => {
+            match self.gps.read_event().await {
+                Ok(GpsEvent::Fix(pvt)) => {
                     let now = Instant::now();
                     self.update_jitter_window(now.as_micros());
                     let lat_deg = pvt.lat_1e7 as f64 * 1e-7;
@@ -344,6 +368,19 @@ impl GpsRunner {
                     super::GPS_NAV_PVT.signal(nav_pvt);
                     LATEST_NAV_PVT.lock(|c| c.set(Some(nav_pvt)));
                 }
+                Ok(GpsEvent::Heading(h)) => {
+                    let heading = GpsHeading {
+                        timestamp: Instant::now(),
+                        heading_rad: h.heading_rad,
+                        pitch_rad: h.pitch_rad,
+                        heading_sigma_rad: h.heading_sigma_rad,
+                        pitch_sigma_rad: h.pitch_sigma_rad,
+                        carr_soln: h.carr_soln,
+                    };
+                    super::GPS_HEADING.signal(heading);
+                    LATEST_GPS_HEADING.lock(|c| c.set(Some(heading)));
+                }
+                Ok(GpsEvent::Other) => {}
                 Err(e) => {
                     GPS_HEALTH.lock(|c| c.set(GpsHealth::ReadError(err_kind(&e))));
                     defmt::warn!("GPS read error: {}", e);
@@ -354,6 +391,6 @@ impl GpsRunner {
 }
 
 #[embassy_executor::task]
-pub async fn ublox_gps_task(mut runner: GpsRunner) {
+pub async fn gps_task(mut runner: GpsRunner) {
     runner.run().await;
 }

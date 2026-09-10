@@ -29,6 +29,19 @@ pub struct SolverResult {
     pub cost: f32,
     pub iters: usize,
     pub converged: bool,
+    /// A non-finite value entered the Riccati recursion (NaN/Inf in the
+    /// terminal cost, `H_uu`, gains, or cost-to-go). The offending
+    /// iteration's step was **rejected**: `u_bar` still holds the last
+    /// valid iterate and `converged` is false. Callers should treat the
+    /// solve as failed and reset their warm start — the corruption cause
+    /// (bad initial state, cost overflow) usually persists across ticks.
+    pub diverged: bool,
+}
+
+/// True iff every element of the matrix/vector is finite.
+#[inline]
+fn all_finite<const R: usize, const C: usize>(m: &SMatrix<f32, R, C>) -> bool {
+    m.iter().all(|v| v.is_finite())
 }
 
 // ── 4x4 Cholesky inverse ────────────────────────────────────────────────
@@ -122,10 +135,18 @@ fn cholesky_inv_4x4<const NU: usize>(m: &SMatrix<f32, NU, NU>) -> SMatrix<f32, N
         }
     }
 
-    // Fallback: scaled identity
+    // Fallback: scaled identity. The fold skips non-finite diagonals:
+    // `f32::max` already ignores NaN (the 1.0 seed survives), but an Inf
+    // diagonal would drive the scale to 0 and return the all-zeros
+    // matrix — zero gains, zero KKT norm, a false "converged". The
+    // backward sweep additionally bails on a non-finite `H_uu` before
+    // ever calling this; the guard keeps the function safe standalone.
     let mut diag_max = 1.0f32;
     for i in 0..4 {
-        diag_max = diag_max.max(m[(i, i)].abs());
+        let v = m[(i, i)].abs();
+        if v.is_finite() {
+            diag_max = diag_max.max(v);
+        }
     }
     let s = 1.0 / diag_max;
     let mut r = SMatrix::<f32, NU, NU>::zeros();
@@ -178,7 +199,19 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
     /// associated constants — after monomorphisation they fold to literal
     /// integers and the loop bounds match what a model-specific hardcoded
     /// solver would produce.
-    fn backward_sweep<M>(&mut self)
+    ///
+    /// Returns `false` (bailing at the offending stage) if a non-finite
+    /// value is detected in the recursion — terminal cost, `H_uu`, the
+    /// gains, or the cost-to-go. The caller must then treat the whole
+    /// step as diverged and NOT run the forward sweep. Detecting this
+    /// here rather than only at the KKT norm is load-bearing:
+    /// `cholesky_inv_4x4` answers a non-finite `H_uu` with its
+    /// scaled-identity fallback, laundering the divergence into finite
+    /// (garbage) gains that no downstream NaN check can see. The checks
+    /// cost O(NX²) per stage against the sweep's O(NX³) products, on
+    /// data still warm in cache.
+    /// `n` is the active horizon (`≤ N`, the workspace capacity).
+    fn backward_sweep<M>(&mut self, n: usize) -> bool
     where
         M: QuadDynamicsModel<NX, NU>,
     {
@@ -191,10 +224,16 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
         // identity — the inner products below collapse to direct copies.
         let jx_cs: usize = M::JAC_X_NZ_COL_START;
 
-        self.pp[N] = self.qm[N];
-        self.pv[N] = self.q[N];
+        self.pp[n] = self.qm[n];
+        self.pv[n] = self.q[n];
+        // Terminal cost is the recursion seed — a NaN here (e.g. from a
+        // non-finite x_refs[N] or a NaN-propagated x_bar[N]) corrupts
+        // every stage below.
+        if !all_finite(&self.pp[n]) || !all_finite(&self.pv[n]) {
+            return false;
+        }
 
-        for k in (0..N).rev() {
+        for k in (0..n).rev() {
             let psi = &self.pp[k + 1];
             let pv = &self.pv[k + 1];
 
@@ -289,6 +328,14 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
                 }
             }
 
+            // Pre-cholesky bail: this is the one place a non-finite value
+            // can be ALIASED rather than propagated — the inverse's
+            // scaled-identity fallback is finite for any input, so a NaN
+            // or Inf H_uu must be caught before it disappears into
+            // plausible-looking gains.
+            if !all_finite(&h_uu) {
+                return false;
+            }
             let h_uu_inv = cholesky_inv_4x4::<NU>(&h_uu);
 
             // gain_k[k] = -(h_uu_inv @ h_xu^T)  → (NU x NX)
@@ -354,7 +401,22 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
                 }
                 self.pv[k][i] = s;
             }
+
+            // Stage-output finiteness: gains feed the forward sweep's
+            // Newton step; pp/pv seed stage k−1. Checking all four each
+            // stage makes the diverged verdict sound — a NaN confined to
+            // pp columns outside the sparse-B block would otherwise ride
+            // the recursion for stages before surfacing anywhere the
+            // KKT norm or the caller's u0 guard can see it.
+            if !all_finite(&self.gain_k[k])
+                || !all_finite(&self.gain_kk[k])
+                || !all_finite(&self.pp[k])
+                || !all_finite(&self.pv[k])
+            {
+                return false;
+            }
         }
+        true
     }
 
     /// Forward sweep: Newton step + update.
@@ -363,6 +425,7 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
         x_init: &SVector<f32, NX>,
         alpha: f32,
         problem: &MpcProblem<M, NX, NU>,
+        n: usize,
     ) where
         M: QuadDynamicsModel<NX, NU>,
     {
@@ -371,7 +434,7 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize>
             dx[i] = x_init[i] - self.x_bar[0][i];
         }
 
-        for k in 0..N {
+        for k in 0..n {
             // du = gain_k[k] @ dx + alpha * gain_kk[k]
             let mut du = SVector::<f32, NU>::zeros();
             for i in 0..NU {
@@ -449,6 +512,10 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize> SqpSolv
         M: QuadDynamicsModel<NX, NU>,
     {
         self.qp.u_bar = *u_init;
+        // Active horizon: `problem.n` stages, clamped to the workspace
+        // capacity `N`. Stages `n..N` of the workspace are left untouched.
+        let n = problem.n.min(N);
+        debug_assert!(n >= 1, "SqpSolver::solve: horizon must be at least one stage");
 
         let mut hess_xx = SMatrix::<f32, NX, NX>::zeros();
         let mut r_diag = SVector::<f32, NU>::zeros();
@@ -456,6 +523,7 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize> SqpSolv
         let mut grad_u = SVector::<f32, NU>::zeros();
 
         let mut converged = false;
+        let mut diverged = false;
         let mut sqp_iter = 0usize;
         let mut final_cost = 0.0;
 
@@ -465,7 +533,7 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize> SqpSolv
         // automatically normalized inside problem.propagate().
         self.qp.x_bar[0] = *x0;
         M::normalize_quat(&mut self.qp.x_bar[0]);
-        for k in 0..N {
+        for k in 0..n {
             self.qp.x_bar[k + 1] = problem.propagate(&self.qp.x_bar[k], &self.qp.u_bar[k]);
         }
 
@@ -475,7 +543,7 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize> SqpSolv
             // x_bar is already up-to-date (from init or end of previous iteration)
 
             // Step 1: Linearize
-            for k in 0..N {
+            for k in 0..n {
                 let (fx, fu) = problem.linearize(&self.qp.x_bar[k], &self.qp.u_bar[k]);
                 self.qp.a[k] = fx;
                 self.qp.b[k] = fu;
@@ -483,7 +551,7 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize> SqpSolv
 
             // Step 2: Stage costs (accumulate total cost to avoid separate eval_cost pass)
             final_cost = 0.0;
-            for k in 0..N {
+            for k in 0..n {
                 final_cost += problem.stage_cost_hess_grad(
                     &self.qp.x_bar[k],
                     &self.qp.u_bar[k],
@@ -502,32 +570,51 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize> SqpSolv
 
             // Terminal cost
             final_cost += problem.terminal_cost_hess_grad(
-                &self.qp.x_bar[N],
-                &x_refs[N],
+                &self.qp.x_bar[n],
+                &x_refs[n],
                 &mut grad_x,
                 &mut hess_xx,
             );
-            self.qp.qm[N] = hess_xx;
-            self.qp.q[N] = grad_x;
+            self.qp.qm[n] = hess_xx;
+            self.qp.q[n] = grad_x;
 
-            // Step 3: Backward Riccati sweep
-            self.qp.backward_sweep::<M>();
+            // Step 3: Backward Riccati sweep. A `false` return means a
+            // non-finite value entered the recursion: the QP subproblem
+            // is corrupt and stepping on its gains would move `u_bar` by
+            // garbage. Reject the step — `u_bar` keeps the last valid
+            // iterate (the warm start on iteration 0), `converged` stays
+            // false, and the caller sees `diverged`.
+            if !self.qp.backward_sweep::<M>(n) {
+                diverged = true;
+                break;
+            }
 
             // Step 4: Convergence check (computed before the forward sweep
             // and re-propagation so we can elide the re-propagation when
             // no next iteration will consume it). `kkt_norm` depends only
             // on `gain_kk` from `backward_sweep`, which `forward_sweep`
             // does not modify, so the check is invariant to ordering.
+            //
+            // NaN-robust accumulation: `f32::max` ignores NaN
+            // (`0.0.max(NaN) == 0.0`), which once let an all-NaN
+            // `gain_kk` report `kkt_norm = 0` → "converged". The sweep
+            // now guarantees finite gains, so the else-branch is defense
+            // in depth against any future relaxation of those checks.
             let mut kkt_norm = 0.0f32;
-            for k in 0..N {
+            for k in 0..n {
                 for i in 0..NU {
-                    kkt_norm = kkt_norm.max(self.qp.gain_kk[k][i].abs());
+                    let v = self.qp.gain_kk[k][i].abs();
+                    if v.is_finite() {
+                        kkt_norm = kkt_norm.max(v);
+                    } else {
+                        kkt_norm = f32::INFINITY;
+                    }
                 }
             }
             let last_iter = iteration + 1 == max_iters || kkt_norm < kkt_tol;
 
             // Step 5: Forward sweep (full Newton, alpha=1)
-            self.qp.forward_sweep::<M>(x0, 1.0, problem);
+            self.qp.forward_sweep::<M>(x0, 1.0, problem, n);
 
             // Re-propagate x_bar with updated u_bar — only when another
             // SQP iteration will run and consume it. After the loop exits
@@ -538,7 +625,7 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize> SqpSolv
             if !last_iter {
                 self.qp.x_bar[0] = *x0;
                 M::normalize_quat(&mut self.qp.x_bar[0]);
-                for k in 0..N {
+                for k in 0..n {
                     self.qp.x_bar[k + 1] = problem.propagate(&self.qp.x_bar[k], &self.qp.u_bar[k]);
                 }
             }
@@ -553,7 +640,127 @@ impl<const NX: usize, const NU: usize, const N: usize, const NP1: usize> SqpSolv
             cost: final_cost,
             iters: sqp_iter,
             converged,
+            diverged,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mpc::mpc_problem::SimpleQuadProblem;
+    use crate::mpc::quad_model::{PosCostMode, QuadModel, N, NU, NX};
+
+    const NP1: usize = N + 1;
+
+    /// Pinned struct literal (same values as `control_convergence.rs`'s
+    /// baseline) — `QuadModel::default()` was deliberately deleted so
+    /// tests stay independent of any vehicle definition.
+    fn test_model() -> QuadModel {
+        let mass = 0.58;
+        QuadModel {
+            mass,
+            grav: 9.81,
+            dt: 0.05,
+            u_bounds: [[0.0, 48.0], [-10.0, 10.0], [-10.0, 10.0], [-6.0, 6.0]],
+            mass_inv: 1.0 / mass,
+            w_pos: [200.0, 200.0, 200.0],
+            w_vel: [10.0, 10.0, 10.0],
+            w_att: [5.0, 5.0, 200.0],
+            w_pos_n: [200.0, 200.0, 200.0],
+            w_vel_n: [10.0, 10.0, 10.0],
+            w_att_n: [5.0, 5.0, 200.0],
+            w_input: nalgebra::Vector4::new(1.0, 20.0, 20.0, 20.0),
+            rho: 1e4,
+            pos_cost_mode: PosCostMode::Quadratic,
+            tilt_cos_max: 0.5,
+            tilt_barrier_tau: 0.0,
+            tilt_barrier_delta: 0.05,
+            drag_coeff: [0.0; 3],
+            thrust_coeff: 0.0,
+            body_drag_coeff: [0.0; 3],
+        }
+    }
+
+    fn hover_u(model: &QuadModel) -> SVector<f32, NU> {
+        SVector::<f32, NU>::from_row_slice(&[model.mass * model.grav, 0.0, 0.0, 0.0])
+    }
+
+    fn identity_refs() -> [SVector<f32, NX>; NP1] {
+        let mut x = SVector::<f32, NX>::zeros();
+        x[6] = 1.0; // qw (scalar-last)
+        [x; NP1]
+    }
+
+    /// Healthy hover solve: finite inputs must never report `diverged`,
+    /// and the hover fixed point converges.
+    #[test]
+    fn finite_solve_does_not_report_diverged() {
+        let model = test_model();
+        let hover = hover_u(&model);
+        let problem = SimpleQuadProblem::with_rk4(model, N);
+        let mut solver = SimpleSqpSolver::new();
+        let mut x0 = SVector::<f32, NX>::zeros();
+        x0[6] = 1.0;
+        let res = solver.solve(
+            &problem,
+            &x0,
+            &identity_refs(),
+            &[hover; N],
+            &[hover; N],
+            10,
+            1e-3,
+        );
+        assert!(!res.diverged);
+        assert!(res.converged, "hover from hover should converge");
+        assert!(solver.u_bar().iter().all(|u| u.iter().all(|v| v.is_finite())));
+    }
+
+    /// Regression for the KKT NaN hole: a NaN initial state NaNs the
+    /// linearization and cost, which under the old `f32::max` KKT
+    /// accumulation reported `kkt_norm = 0` → `converged: true`. The
+    /// sweep must now bail and report `diverged`, leaving `u_bar` at the
+    /// (finite) warm start.
+    #[test]
+    fn nan_x0_reports_diverged_not_converged() {
+        let model = test_model();
+        let hover = hover_u(&model);
+        let problem = SimpleQuadProblem::with_rk4(model, N);
+        let mut solver = SimpleSqpSolver::new();
+        let mut x0 = SVector::<f32, NX>::zeros();
+        x0[0] = f32::NAN;
+        x0[6] = 1.0;
+        let res = solver.solve(
+            &problem,
+            &x0,
+            &identity_refs(),
+            &[hover; N],
+            &[hover; N],
+            5,
+            1e-3,
+        );
+        assert!(res.diverged, "NaN x0 must be reported as divergence");
+        assert!(!res.converged, "a diverged solve must not report converged");
+        // Step rejected: the warm start survives untouched and finite.
+        assert!(solver.u_bar().iter().all(|u| u.iter().all(|v| v.is_finite())));
+    }
+
+    /// Same contract for a NaN landing in the reference trajectory (the
+    /// path the firmware once hit via a NaN reference quaternion).
+    #[test]
+    fn nan_x_ref_reports_diverged_not_converged() {
+        let model = test_model();
+        let hover = hover_u(&model);
+        let problem = SimpleQuadProblem::with_rk4(model, N);
+        let mut solver = SimpleSqpSolver::new();
+        let mut x0 = SVector::<f32, NX>::zeros();
+        x0[6] = 1.0;
+        let mut x_refs = identity_refs();
+        x_refs[N / 2][1] = f32::NAN;
+        let res = solver.solve(&problem, &x0, &x_refs, &[hover; N], &[hover; N], 5, 1e-3);
+        assert!(res.diverged);
+        assert!(!res.converged);
+        assert!(solver.u_bar().iter().all(|u| u.iter().all(|v| v.is_finite())));
     }
 }
 

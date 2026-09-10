@@ -1,8 +1,10 @@
 pub mod dps310;
 pub mod icp20100;
+pub mod spl06;
 
 pub use dps310::Dps310;
 pub use icp20100::Icp20100;
+pub use spl06::Spl06;
 
 /// A single barometer reading in physical units.
 pub struct BaroReading {

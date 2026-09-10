@@ -29,11 +29,27 @@ compile_error!("at most one of outer_rate, outer_geometric, outer_mpc may be sel
 #[cfg(all(feature = "est_pos_mocap", feature = "est_pos_gps"))]
 compile_error!("est_pos_mocap and est_pos_gps are mutually exclusive");
 
+// Both position-consuming outer loops need a position source. Without
+// one, `main.rs` spawns no estimation task, so the loop blocks forever on
+// a `VEHICLE_ODOMETRY` nothing publishes — while `health.rs` takes its
+// `not(any(est_pos_*))` branch and reports `estimator_ready = true` as a
+// sentinel, so the arm gate does not block either. That combination used
+// to compile clean for `outer_geometric`.
 #[cfg(all(
-    feature = "outer_mpc",
+    any(feature = "outer_mpc", feature = "outer_geometric"),
     not(any(feature = "est_pos_mocap", feature = "est_pos_gps"))
 ))]
-compile_error!("outer_mpc requires one of est_pos_mocap (indoor) or est_pos_gps (outdoor)");
+compile_error!(
+    "outer_mpc / outer_geometric require one of est_pos_mocap (indoor) or est_pos_gps (outdoor)"
+);
+
+// NOTE: dual-antenna heading fusion is decided by two `build:` knobs,
+// both const in `estimation::eskf_imu_gps`: `GPS_HAS_HEADING`
+// (`gps_model: unicore` — the u-blox driver never emits a heading event,
+// so the fusion sites are unreachable there) AND `GPS_DUAL_ANTENNA`
+// (`gps_dual_antenna: yes` — ANT2 actually fitted). The old compile_error
+// here is unnecessary: `BuildYaml::validate` rejects the inconsistent
+// pairing at the YAML bake, with a message naming both knobs.
 
 #[cfg(feature = "outer_geometric")]
 pub mod cascade_task;
@@ -51,9 +67,6 @@ pub use msgs::{
     TrackingError, TRACKING_ERROR_SOURCE_CASCADE, TRACKING_ERROR_SOURCE_INDI,
     TRACKING_ERROR_SOURCE_MPC,
 };
-
-#[cfg(feature = "est_eskf")]
-pub mod flight_mode;
 
 use cybflight_msgs as msgs;
 
@@ -74,6 +87,12 @@ pub static OCP_SOLVER_OUTPUT: PubSubChannel<
     4,
     1,
 > = PubSubChannel::new();
+
+/// Learned cost-adaptation trace (`/mpc_cost` blackbox topic). The
+/// outer loop publishes one message per tick while `mpc_learned_cost`
+/// is enabled; silent otherwise.
+pub static MPC_COST_ADAPT: PubSubChannel<CriticalSectionRawMutex, msgs::MpcCostAdapt, 4, 2, 1> =
+    PubSubChannel::new();
 
 pub static NMPC_SETPOINT: PubSubChannel<CriticalSectionRawMutex, msgs::NmpcSetpoint, 2, 2, 1> =
     PubSubChannel::new();
@@ -156,11 +175,35 @@ pub static MISSION_ABORT_REQUESTED: core::sync::atomic::AtomicBool =
 #[cfg(feature = "outer_mpc")]
 pub static PLAN_REQUEST: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+/// How the desired yaw evolves over the mission trajectory. Selected
+/// per mission by the YAML `headings` / `lookahead` keys; see
+/// `offline_mission::MissionProfile`.
+#[cfg(feature = "outer_mpc")]
+pub enum MissionYawMode {
+    /// Hold the yaw setpoint latched at mission entry (no `headings`
+    /// in the YAML — the pre-existing behavior).
+    Constant(f32),
+    /// Track the min-acceleration yaw spline solved through the
+    /// mission's `headings` (head = entry yaw, boundary rates zero).
+    Schedule(cybflight_core::trajectory_planning::minco_acc::YawTrajectory),
+    /// Point from the reference position at τ toward the reference
+    /// position at τ + `dt_s` (the mission's `yaw_lookahead_dt_s`),
+    /// followed at no more than `max_rate_rad_s` (the mission's
+    /// `yaw_lookahead_max_rate_rad_s`) starting from the entry yaw — see
+    /// `cybflight_core::trajectory_planning::lookahead_yaw`.
+    Lookahead { dt_s: f32, max_rate_rad_s: f32 },
+}
+
 #[cfg(feature = "outer_mpc")]
 pub struct MissionTrajectory {
     pub traj: cybflight_core::trajectory_planning::piecewise_polynomial::PiecewisePolynomial,
     pub t_start: Instant,
     pub total_duration_s: f32,
+    /// Desired-yaw source for this mission (see [`MissionYawMode`]).
+    pub yaw: MissionYawMode,
+    /// Flatness-map convention for reference attitude + body-rate
+    /// feedforward (see [`offline_mission::FlatnessMap`]).
+    pub flatness_map: offline_mission::FlatnessMap,
     /// Solve diagnostics from the planner, propagated verbatim into every
     /// Executing-state `MissionStatus` heartbeat so the ground station can
     /// inspect the last solve at any point during the mission.
@@ -186,33 +229,11 @@ pub static POSITION_CONTROL_SETPOINT: PubSubChannel<
     2,
 > = PubSubChannel::new();
 
-/// In-flight learning toggle.
-pub static LEARNING_ENABLED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Learner prearm switch.
-pub static LEARNER_PREARM: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Throttle µs threshold the stick must hold ABOVE for
-/// `LAUNCH_CONFIRM_FRAMES` consecutive RC frames before [`LAUNCHED`]
-/// latches. Above the mid-stick THROTTLE_DEADBAND (1440–1560 µs) so
-/// launch is an unambiguous push, not a centering gesture.
-#[cfg(any(feature = "outer_mpc", feature = "outer_geometric"))]
-pub const LAUNCH_US: u16 = 1600;
-
-/// Frame-count debounce on the launch threshold. ~50–150 Hz CRSF →
-/// 5 frames ≈ 30–100 ms. Rejects single-frame RC glitches without
-/// feeling laggy. Counter resets on any frame below threshold.
-#[cfg(any(feature = "outer_mpc", feature = "outer_geometric"))]
-pub const LAUNCH_CONFIRM_FRAMES: u8 = 5;
-
-/// Per-motor normalized throttle written to all four motors during
-/// the pre-launch idle bypass. ~Betaflight `motor_idle` default of
-/// 5.5%. Promote to a vehicle param later if airframe-specific
-/// tuning warrants it.
-#[cfg(any(feature = "outer_mpc", feature = "outer_geometric"))]
-pub const IDLE_NORMALIZED: f32 = 0.055;
+// The launch threshold / debounce and the pre-launch idle throttle are
+// now the `rc_launch_us`, `rc_launch_confirm_frames` and
+// `indi_idle_norm` parameters (see `RcParams` / `IndiControllerParams`).
+// `rc_interpreter` reads the first two from its cached `StickConfig`;
+// `indi_task` reads the third with its other INDI params.
 
 /// Sticky "drone has crossed the launch threshold this arm session"
 /// latch. Set by `rc_interpreter` after `LAUNCH_CONFIRM_FRAMES`
@@ -235,18 +256,19 @@ pub static LAST_CONTROLLER_PUBLISH: blocking_mutex::Mutex<
 /// Motor command telemetry: published by INDI task, subscribed by ESP
 /// bridge + blackbox recorder.
 ///
-/// CAP=4 / SUBS=4. CAP=4 ≈ 40 ms of drain-stall tolerance at the
-/// 100 Hz publish rate — comfortably absorbs the SD-card
-/// garbage-collection stalls (typically 50–100 ms on consumer
-/// cards) that briefly pause the recorder's drain loop. CAP=2 was
-/// the original sizing and dropped samples during exactly the
-/// high-activity periods that drive SD write rate up. SUBS=4
-/// covers ESP bridge + recorder + 2 spare for future shell-stream
-/// or sysid telemetry consumers.
+/// CAP=16 / SUBS=4. Sized for the **sysid** tier, where this mirror
+/// publishes at ≥500 Hz: 16 slots ≈ 32 ms of drain-stall tolerance
+/// there. CAP is `rates::INDI_TELEM_PUBSUB_CAP` (48 = 97 ms at the
+/// sysid tier's 500 Hz, 480 ms at the 100 Hz default). It has been
+/// raised twice by measurement: CAP=4 lost ~8 % of sysid samples to
+/// the recorder's 10–18 ms CMD25 flush stalls, and CAP=16 lost 33 %
+/// once `mpc_rate_hz` 100 cut the recorder to ~2.7 ms slices. SUBS=4 covers ESP
+/// bridge + recorder + 2 spare for future shell-stream or sysid
+/// telemetry consumers.
 pub static ACTUATOR_MOTORS_TELEM: PubSubChannel<
     CriticalSectionRawMutex,
     msgs::ActuatorMotors,
-    4,
+    { crate::rates::INDI_TELEM_PUBSUB_CAP },
     4,
     1,
 > = PubSubChannel::new();
@@ -278,13 +300,13 @@ pub static CONTROL_SETPOINT_TELEM: PubSubChannel<
 /// publishers regardless of which feature combination is enabled —
 /// extra `pub` slots cost nothing on inactive paths.
 ///
-/// CAP=4 mirrors `OCP_SOLVER_OUTPUT` since the consumer mix is
-/// similar (blackbox recorder + ground-station telemetry); SUBS=3
-/// leaves a free slot for a future shell-stream consumer.
+/// CAP=16 — same sysid-tier sizing as `ACTUATOR_MOTORS_TELEM` (this
+/// mirror runs at ≥500 Hz there too); SUBS=3 leaves a free slot for a
+/// future shell-stream consumer.
 pub static TRACKING_ERROR: PubSubChannel<
     CriticalSectionRawMutex,
     TrackingError,
-    4,
+    16,
     3,
     3,
 > = PubSubChannel::new();
@@ -298,15 +320,86 @@ pub static PROCESSED_DSHOT_TELEM: PubSubChannel<
     1,
 > = PubSubChannel::new();
 
+/// Per-motor DShot telemetry health, cumulative since boot.
+///
+/// Every frame the inner loop observes lands in exactly one bucket, so for
+/// each motor `passed + slew_reject + range_reject + no_fresh + no_reply +
+/// edt == frames`. `nis_reject` is a *subset* of `passed` (the estimator
+/// only runs while armed), not a seventh bucket. Counters are monotonic and
+/// never reset — difference two samples for a rate over any window.
+///
+/// This exists because five very different conditions used to collapse into
+/// "no measurement": a normal low-RPM gap, a wiring fault, and three
+/// distinct filter rejections. The distinctions that matter:
+///
+/// * `no_fresh` — the reply decoded cleanly but carried period 0, which
+///   this ESC firmware sends to mean "no new commutation since my last
+///   reply". **Normal**, and its rate scales inversely with RPM: roughly
+///   half of all frames at idle, dozens consecutively during spin-up.
+///   Not an error, and not a reason to trip a staleness failsafe.
+/// * `no_reply` — nothing decodable came back at all (GCR or checksum
+///   failure, or a reply that missed the receive window). This *is* an
+///   error rate; healthy wiring should keep it low single-digit percent.
+/// * `edt` — an extended-telemetry frame. Should be identically zero:
+///   the decoder is called as `interpret(raw, false)`, so if EDT ever gets
+///   enabled on an ESC those frames would otherwise be read as eRPM.
+///
+/// Counters do not accrue during the pre-launch idle bypass, which
+/// `continue`s before the telemetry block runs.
+#[derive(Clone, Copy, Default, defmt::Format)]
+pub struct DshotMotorHealth {
+    /// Survived decode, the range gate and the slew filter, and was offered
+    /// to the RPM estimator.
+    pub passed: u32,
+    /// Of `passed`, how many the estimator's NIS gate then rejected.
+    /// Only accrues while armed — the estimator idles when disarmed.
+    pub nis_reject: u32,
+    /// Rejected by the slew outlier filter.
+    pub slew_reject: u32,
+    /// Rejected by the hard range gate (negative, or above 1.5·ω_max).
+    pub range_reject: u32,
+    /// ESC reported "no new commutation since my last reply". Expected.
+    pub no_fresh: u32,
+    /// No decodable reply — GCR/checksum failure, late reply, or wiring.
+    pub no_reply: u32,
+    /// Extended-telemetry frame. Should always be 0.
+    pub edt: u32,
+}
+
+/// Snapshot of [`DshotMotorHealth`] for all motors plus the frame count
+/// they are measured against.
+#[derive(Clone, Copy, defmt::Format)]
+pub struct DshotHealth {
+    pub timestamp: Instant,
+    /// DShot telemetry frames the inner loop has consumed. Shared
+    /// denominator for every per-motor bucket.
+    pub frames: u32,
+    pub motors: [DshotMotorHealth; 4],
+}
+
+/// Cumulative DShot telemetry health, published at the same 100 Hz
+/// decimation as the rest of the inner-loop telemetry.
+///
+/// CAP=2 is deliberate and sufficient despite the drain-stall rationale
+/// used elsewhere: the payload is cumulative, so a dropped sample loses
+/// no information — the next one carries the same totals. SUBS=3 covers
+/// the ESP bridge, the recorder, and one spare.
+///
+/// Defined here rather than in `cybflight-msgs` because nothing off-board
+/// consumes it yet; promote it there (and `impl Message`) when it should
+/// go on the wire.
+pub static DSHOT_HEALTH: PubSubChannel<CriticalSectionRawMutex, DshotHealth, 2, 3, 1> =
+    PubSubChannel::new();
+
 /// Processed motor state telemetry (filtered omega + omega_dot + raw).
 ///
-/// CAP=4 / SUBS=4 — same drain-stall tolerance rationale as
-/// `ACTUATOR_MOTORS_TELEM` (40 ms vs 20 ms at the original CAP=2),
-/// SUBS covers ESP bridge + recorder + 2 spare.
+/// CAP=`rates::INDI_TELEM_PUBSUB_CAP` / SUBS=4 — same sysid-tier
+/// drain-stall sizing as `ACTUATOR_MOTORS_TELEM`; SUBS covers ESP
+/// bridge + recorder + 2 spare.
 pub static PROCESSED_MOTOR_STATE: PubSubChannel<
     CriticalSectionRawMutex,
     msgs::MotorStateTelemetry,
-    4,
+    { crate::rates::INDI_TELEM_PUBSUB_CAP },
     4,
     1,
 > = PubSubChannel::new();

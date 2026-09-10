@@ -1,0 +1,132 @@
+# FROZEN host-simulation baseline (regression-snapshot contract).
+#
+# This is the sim's vehicle + tuning, loaded by
+# `cybflight_sim::plant::VehicleParamsBuilder` through the same
+# vehicle-yaml loader the firmware bake uses. It deliberately LAGS the
+# flight tune: the committed regression snapshot
+# (crates/cybflight_sim/tests/regression_snapshot.json) is pinned against
+# these values, so firmware retunes must not shift the sim baseline
+# implicitly. Divergence from the flying configuration is visible as
+#   diff vehicles/sakura_bench.yaml vehicles/sim_baseline.yaml
+# To intentionally adopt a new tune: edit this file and regenerate the
+# snapshot (`just sim-snapshot`) IN THE SAME COMMIT. See CLAUDE.md
+# "Sim regression snapshot".
+
+airframe:
+  mass_kg: 0.55
+  inertia_kg_m2: [0.0021, 0.0, 0.0, 0.0, 0.0018, 0.0, 0.0, 0.0, 0.003]
+  max_rate_rad_s: [10.0, 10.0, 6.0]
+  motors:
+    # torque_coeff_m 0.022 → 0.02362: derived from the identified yaw
+    # coefficient rather than assumed. See the note below.
+    - { pos_m: [-0.075, -0.1], spin: cw,  max_thrust_n: 8.5, torque_coeff_m: 0.02362 }
+    - { pos_m: [ 0.075, -0.1], spin: ccw, max_thrust_n: 8.5, torque_coeff_m: 0.02362 }
+    - { pos_m: [-0.075,  0.1], spin: ccw, max_thrust_n: 8.5, torque_coeff_m: 0.02362 }
+    - { pos_m: [ 0.075,  0.1], spin: cw,  max_thrust_n: 8.5, torque_coeff_m: 0.02362 }
+
+# ── Plant-only physics (the sim's, not the controller's) ────────────────
+#
+# The controller is never told any of this. Together with the rotor lag
+# pinned under `tuning:` below, this is the entire plant/model mismatch
+# budget — the reason a metric here is not just the MPC grading its own
+# prediction model.
+sim:
+  # Rotor drag, body FLU, N·s²/(m·rad). From an identified specific-force
+  # fit a = −k·v_b·Σω with k_x = 4.85e-5, k_y = 7.28e-5 rad⁻¹; multiplied
+  # by mass to reach force. Anisotropic because the frame is not square.
+  # z is 0.0: vertical drag was never identified, and inventing a number
+  # is worse than admitting the gap.
+  aero_drag: [2.6675e-5, 4.004e-5, 0.0]
+  # ESC idle floor. 238.49 rad/s was identified at ω_max = 3295.5; scaled
+  # to this vehicle's ω_max (below) by the same ratio. Non-zero idle is
+  # what bends the true command→thrust curve away from the analytic form
+  # the controller inverts.
+  rotor_omega_min_rad_s: 180.29
+  # Rotor + prop polar inertia. J_r = I_zz · k_rd with k_rd = 1.97e-3 the
+  # identified yaw spin-up coefficient. Cross-checks against a 5×4.3 prop
+  # as a slender rod (≈6.0e-6 kg·m²).
+  rotor_inertia_kg_m2: 5.91e-6
+  # True throttle curvature. The controller inverts the best analytic fit
+  # to this curve (m*_nonlin = 0.8 below); the residual is the ESC
+  # idle offset, which no single-parameter analytic form can absorb.
+  rotor_throttle_curve_k: 0.95
+
+tuning:
+  # Keys here are flat registry names, and the heading above each block
+  # names the schema group they belong to (`param list`, docs/parameters.md).
+  # Group is not the same axis as section: every key below arrives through
+  # `tuning:` whatever its group, because the `airframe:` block above carries
+  # only the required identity that has no default.
+
+  # ── airframe.motors — identified rotor dynamics ──
+  # Previously sim-local literals in controller.rs (0.015 s, 40 000 RPM,
+  # g2 = 0). They are registry parameters the firmware INDI task already
+  # reads, so pinning them here makes the sim and the flight stack agree
+  # by construction instead of by coincidence.
+  #
+  # ω_max = √(max_thrust_n / c_T) with c_T = m·k_w = 1.3695e-6 N·s²/rad².
+  # Deriving it (rather than importing the identified 3295.5 rad/s) keeps
+  # T_max = c_T·ω_max² true, which is what every G1 in the stack assumes.
+  m0_omega_max: 2491.31
+  m1_omega_max: 2491.31
+  m2_omega_max: 2491.31
+  m3_omega_max: 2491.31
+  # Identified first-order rotor lag.
+  m0_tau: 0.04
+  m1_tau: 0.04
+  m2_tau: 0.04
+  m3_tau: 0.04
+  # G2 yaw = ±J_r/I_zz = ±k_rd. Sign follows the G1 yaw row (positive for
+  # CW in FLU); motor order here is [cw, ccw, ccw, cw]. The rotor
+  # spin-up reaction shares the sign of the steady-state prop drag
+  # torque, which is why both terms carry the same pattern.
+  m0_g2_ry:  0.00197
+  m1_g2_ry: -0.00197
+  m2_g2_ry: -0.00197
+  m3_g2_ry:  0.00197
+  # Controller-side throttle-curve inverse. The plant's true law is
+  # k = 0.95 with a 7.2% ESC idle offset; that composite best-fits the
+  # analytic Quadratic form at k ≈ 0.80 (residual under 1% over
+  # d ∈ [0.15, 0.95]), so that is what the controller inverts. This used
+  # to read 0.7 only because the registry ceiling was 0.7 — see
+  # ThrustLinearization::new, where the bound is now the physical 1.0.
+  m0_nonlin: 0.8
+  m1_nonlin: 0.8
+  m2_nonlin: 0.8
+  m3_nonlin: 0.8
+
+  # ── cascade — position + attitude gains ──
+  # Cascade baseline gains (diagnostic controller).
+  pos_kp_x: 4.0
+  pos_kp_y: 4.0
+  pos_kp_z: 8.0
+  pos_kd_x: 4.0
+  pos_kd_y: 4.0
+  pos_kd_z: 6.0
+  att_k_r: 3.0
+  att_k_p: 3.0
+  att_k_y: 1.0
+
+  # ── mpc — cost weights ──
+  # Pre-MPCTC MPC tuning: isotropic position weights, Quadratic cost.
+  mpc_w_pos_z: 500.0
+  mpc_pos_cost_mode: 0
+  # No tilt fence — same as the flying vehicles (sakura_bench_leader_1khz:
+  # mpc_tilt_max_deg 178, mpc_tilt_barrier_tau 0). tau = 0 disables the
+  # barrier regardless of the angle; pinned so the sim cannot silently
+  # inherit a fence the real vehicle does not fly with.
+  mpc_tilt_max_deg: 178.0
+  mpc_tilt_barrier_tau: 0.0
+  mpc_tilt_barrier_delta: 0.05
+  mpc_horizon_n: 20
+
+  # ── system — device/UX toggles ──
+  # Host sim has no LED strip or blackbox; scaffold defaults are on/3.
+  arm_led: 0   # NB: `system` group, not a safety gate
+  blackbox_tier: 0
+
+  # ── site — local gravity ──
+  # Now read by the plant AND by both MPC models and the planner
+  # config, so it is pinned here rather than inherited: the frozen sim
+  # baseline must not move if the schema default ever changes.
+  gravity_m_s2: 9.81

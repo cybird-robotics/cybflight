@@ -11,7 +11,7 @@
 //! Run: `cargo test -p cybflight-core --target x86_64-unknown-linux-gnu \
 //!       --test planner_convergence`
 
-use cybflight_core::params::{PlannerParams, VehicleParams};
+use cybflight_core::params::{FirmwareConfig, PlannerParams};
 use cybflight_core::trajectory_planning::planner::{
     PlannerInput, PlannerResult, SolverStatus, plan,
 };
@@ -68,18 +68,18 @@ fn max_along<F: Fn(f32) -> f32>(total_dur: f32, n_samples: usize, f: F) -> (f32,
 fn test_config() -> QuadPlanningConfig {
     // Start from a sensible VehicleParams and override planner bounds for tests.
     let mut vp = test_vehicle_params();
-    vp.planner.max_vel_m_s = 4.0;
-    vp.planner.max_tilt_rad = 60_f32.to_radians();
+    vp.trajectory.planner.max_vel_m_s = 4.0;
+    vp.trajectory.planner.max_tilt_rad = 60_f32.to_radians();
     // Use strong constraint weights to make penalties effective.
-    vp.planner.weight_vel = 50.0;
-    vp.planner.weight_tilt = 50.0;
-    vp.planner.weight_body_rate = 50.0;
-    vp.planner.weight_thrust = 10.0;
-    vp.planner.weight_energy = 0.1;
-    vp.planner.weight_time = 1.0;
-    vp.planner.smoothing_eps = 0.01;
-    vp.planner.num_check_per_piece = 8;
-    vp.planner.bfgs_trust.max_iterations = 200;
+    vp.trajectory.planner.weight_vel = 50.0;
+    vp.trajectory.planner.weight_tilt = 50.0;
+    vp.trajectory.planner.weight_body_rate = 50.0;
+    vp.trajectory.planner.weight_thrust = 10.0;
+    vp.trajectory.planner.weight_energy = 0.1;
+    vp.trajectory.planner.weight_time = 1.0;
+    vp.trajectory.planner.smoothing_eps = 0.01;
+    vp.trajectory.planner.num_check_per_piece = 8;
+    vp.trajectory.planner.bfgs_trust.max_iterations = 200;
     QuadPlanningConfig::from_vehicle_params(&vp)
 }
 
@@ -93,19 +93,19 @@ fn test_config() -> QuadPlanningConfig {
 /// intended path and constraints can genuinely become binding.
 fn test_config_for_activation(max_vel_m_s: f32, max_tilt_deg: f32) -> QuadPlanningConfig {
     let mut vp = test_vehicle_params();
-    vp.planner.max_vel_m_s = max_vel_m_s;
-    vp.planner.max_tilt_rad = max_tilt_deg.to_radians();
+    vp.trajectory.planner.max_vel_m_s = max_vel_m_s;
+    vp.trajectory.planner.max_tilt_rad = max_tilt_deg.to_radians();
     // Keep all four dynamic penalties active.
-    vp.planner.weight_vel = 50.0;
-    vp.planner.weight_tilt = 50.0;
-    vp.planner.weight_body_rate = 50.0;
-    vp.planner.weight_thrust = 10.0;
+    vp.trajectory.planner.weight_vel = 50.0;
+    vp.trajectory.planner.weight_tilt = 50.0;
+    vp.trajectory.planner.weight_body_rate = 50.0;
+    vp.trajectory.planner.weight_thrust = 10.0;
     // Zero energy → no waypoint collapse.
-    vp.planner.weight_energy = 0.0;
-    vp.planner.weight_time = 1.0;
-    vp.planner.smoothing_eps = 0.01;
-    vp.planner.num_check_per_piece = 8;
-    vp.planner.bfgs_trust.max_iterations = 500;
+    vp.trajectory.planner.weight_energy = 0.0;
+    vp.trajectory.planner.weight_time = 1.0;
+    vp.trajectory.planner.smoothing_eps = 0.01;
+    vp.trajectory.planner.num_check_per_piece = 8;
+    vp.trajectory.planner.bfgs_trust.max_iterations = 500;
     QuadPlanningConfig::from_vehicle_params(&vp)
 }
 
@@ -114,27 +114,29 @@ fn test_config_for_activation(max_vel_m_s: f32, max_tilt_deg: f32) -> QuadPlanni
 /// resulting trajectory is still physically admissible.
 fn test_config_with_time_energy(weight_time: f32, weight_energy: f32) -> QuadPlanningConfig {
     let mut vp = test_vehicle_params();
-    vp.planner.max_vel_m_s = 4.0;
-    vp.planner.max_tilt_rad = 60_f32.to_radians();
-    vp.planner.weight_vel = 50.0;
-    vp.planner.weight_tilt = 50.0;
-    vp.planner.weight_body_rate = 50.0;
-    vp.planner.weight_thrust = 10.0;
-    vp.planner.weight_time = weight_time;
-    vp.planner.weight_energy = weight_energy;
-    vp.planner.smoothing_eps = 0.01;
-    vp.planner.num_check_per_piece = 8;
-    vp.planner.bfgs_trust.max_iterations = 200;
+    vp.trajectory.planner.max_vel_m_s = 4.0;
+    vp.trajectory.planner.max_tilt_rad = 60_f32.to_radians();
+    vp.trajectory.planner.weight_vel = 50.0;
+    vp.trajectory.planner.weight_tilt = 50.0;
+    vp.trajectory.planner.weight_body_rate = 50.0;
+    vp.trajectory.planner.weight_thrust = 10.0;
+    vp.trajectory.planner.weight_time = weight_time;
+    vp.trajectory.planner.weight_energy = weight_energy;
+    vp.trajectory.planner.smoothing_eps = 0.01;
+    vp.trajectory.planner.num_check_per_piece = 8;
+    vp.trajectory.planner.bfgs_trust.max_iterations = 200;
     QuadPlanningConfig::from_vehicle_params(&vp)
 }
 
-fn test_vehicle_params() -> VehicleParams {
+fn test_vehicle_params() -> FirmwareConfig {
     use cybflight_core::mixer::{MotorParams, RigidBodyParams, SpinDir};
     use cybflight_core::params::{
-        ControlGains, IndiControllerParams, IndiEffectivenessParams, LearnerParams, MpcParams,
+        CascadeParams, IndiControllerParams, IndiEffectivenessParams, MpcParams,
     };
 
-    VehicleParams {
+    FirmwareConfig {
+        mahony: cybflight_core::params::MahonyParams::default(),
+        airframe: cybflight_core::params::AirframeParams {
         body: RigidBodyParams {
             mass_kg: 0.55,
             inertia_kg_m2: [0.0025, 0.0, 0.0, 0.0, 0.0021, 0.0, 0.0, 0.0, 0.0043],
@@ -146,38 +148,68 @@ fn test_vehicle_params() -> VehicleParams {
                 spin_dir: SpinDir::Cw,
                 max_thrust_n: 8.5,
                 torque_coeff_m: 0.022,
+                ..MotorParams::STOCK_DYNAMICS
             },
             MotorParams {
                 position_m: [0.075, -0.1],
                 spin_dir: SpinDir::Ccw,
                 max_thrust_n: 8.5,
                 torque_coeff_m: 0.022,
+                ..MotorParams::STOCK_DYNAMICS
             },
             MotorParams {
                 position_m: [-0.075, 0.1],
                 spin_dir: SpinDir::Ccw,
                 max_thrust_n: 8.5,
                 torque_coeff_m: 0.022,
+                ..MotorParams::STOCK_DYNAMICS
             },
             MotorParams {
                 position_m: [0.075, 0.1],
                 spin_dir: SpinDir::Cw,
                 max_thrust_n: 8.5,
                 torque_coeff_m: 0.022,
+                ..MotorParams::STOCK_DYNAMICS
             },
         ],
-        control: ControlGains {
+        install: cybflight_core::params::InstallParams::default(),
+        motor_pole_count: 14,
+        },
+        sensors: cybflight_core::params::SensorParams::default(),
+        eskf: cybflight_core::params::EskfParams::default(),
+        rc: cybflight_core::params::RcParams::default(),
+        site: cybflight_core::params::SiteParams::default(),
+        safety: cybflight_core::params::SafetyParams::default(),
+        battery: cybflight_core::params::BatteryParams::default(),
+        rpm_notch: cybflight_core::params::RpmNotchParams::default(),
+        cascade: CascadeParams {
+            att_k_torque: [1.0, 1.0, 0.2],
             pos_kp: [4.0, 4.0, 5.0],
             pos_kd: [4.0, 4.0, 4.0],
             att_k_rate: [3.0, 3.0, 1.0],
+            rate_hz: 100,
+            pos_err_max: [1.0; 3],
+            vel_err_max: [1.0; 3],
+            odom_stale_s: 0.1,
         },
-        indi_effectiveness: IndiEffectivenessParams::default(),
-        indi_controller: IndiControllerParams::default(),
-        learner: LearnerParams::default(),
+        indi: cybflight_core::params::IndiParams {
+            effectiveness: IndiEffectivenessParams::default(),
+            controller: IndiControllerParams::default(),
+            rpm_estimator: cybflight_core::params::RpmEstimatorParams::default(),
+        },
         mpc: MpcParams::default(),
-        planner: PlannerParams::default(),
-        sampler: cybflight_core::params::SamplerParams::default(),
-        mission_profile: 0,
+        trajectory: cybflight_core::params::TrajectoryParams {
+            planner: PlannerParams::default(),
+            sampler: cybflight_core::params::SamplerParams::default(),
+            mission_profile: 0,
+        },
+        system: cybflight_core::params::SystemSettings {
+            arm_led_enabled: false,
+            blackbox_record_set: 0,
+            blackbox_rate_div: 1,
+            blackbox_mute_mask: 0,
+            peer_pose_enable: false,
+        },
     }
 }
 
@@ -710,15 +742,15 @@ fn bench_runtime_across_tasks() {
     fn make_bench_config() -> QuadPlanningConfig {
         // Use PlannerParams::default() to verify the new defaults work.
         let mut vp = test_vehicle_params();
-        vp.planner.max_vel_m_s = 4.0;
-        vp.planner.max_tilt_rad = 60_f32.to_radians();
-        vp.planner.weight_vel = 50.0;
-        vp.planner.weight_tilt = 50.0;
-        vp.planner.weight_body_rate = 50.0;
-        vp.planner.weight_thrust = 10.0;
+        vp.trajectory.planner.max_vel_m_s = 4.0;
+        vp.trajectory.planner.max_tilt_rad = 60_f32.to_radians();
+        vp.trajectory.planner.weight_vel = 50.0;
+        vp.trajectory.planner.weight_tilt = 50.0;
+        vp.trajectory.planner.weight_body_rate = 50.0;
+        vp.trajectory.planner.weight_thrust = 10.0;
         // weight_energy = 0.01 and BFGS defaults come from PlannerParams::default()
         // via VehicleParams default. Only override max_iterations for headroom.
-        vp.planner.bfgs_trust.max_iterations = 2000;
+        vp.trajectory.planner.bfgs_trust.max_iterations = 2000;
         QuadPlanningConfig::from_vehicle_params(&vp)
     }
 
@@ -890,18 +922,18 @@ fn bench_runtime_vs_weight_energy() {
 
     fn make_bench_config(weight_energy: f32) -> QuadPlanningConfig {
         let mut vp = test_vehicle_params();
-        vp.planner.max_vel_m_s = 4.0;
-        vp.planner.max_tilt_rad = 60_f32.to_radians();
-        vp.planner.weight_vel = 50.0;
-        vp.planner.weight_tilt = 50.0;
-        vp.planner.weight_body_rate = 50.0;
-        vp.planner.weight_thrust = 10.0;
-        vp.planner.weight_energy = weight_energy;
-        vp.planner.weight_time = 1.0;
-        vp.planner.smoothing_eps = 0.01;
-        vp.planner.num_check_per_piece = 8;
+        vp.trajectory.planner.max_vel_m_s = 4.0;
+        vp.trajectory.planner.max_tilt_rad = 60_f32.to_radians();
+        vp.trajectory.planner.weight_vel = 50.0;
+        vp.trajectory.planner.weight_tilt = 50.0;
+        vp.trajectory.planner.weight_body_rate = 50.0;
+        vp.trajectory.planner.weight_thrust = 10.0;
+        vp.trajectory.planner.weight_energy = weight_energy;
+        vp.trajectory.planner.weight_time = 1.0;
+        vp.trajectory.planner.smoothing_eps = 0.01;
+        vp.trajectory.planner.num_check_per_piece = 8;
         // Large budget so every case can fully converge (or hit the ceiling).
-        vp.planner.bfgs_trust.max_iterations = 2000;
+        vp.trajectory.planner.bfgs_trust.max_iterations = 2000;
         QuadPlanningConfig::from_vehicle_params(&vp)
     }
 
@@ -1015,17 +1047,17 @@ fn bench_planner_scaling_by_piece_count() {
 
     fn make_bench_config() -> QuadPlanningConfig {
         let mut vp = test_vehicle_params();
-        vp.planner.max_vel_m_s = 4.0;
-        vp.planner.max_tilt_rad = 60_f32.to_radians();
-        vp.planner.weight_vel = 50.0;
-        vp.planner.weight_tilt = 50.0;
-        vp.planner.weight_body_rate = 50.0;
-        vp.planner.weight_thrust = 10.0;
-        vp.planner.weight_energy = 0.1;
-        vp.planner.weight_time = 1.0;
-        vp.planner.smoothing_eps = 0.01;
-        vp.planner.num_check_per_piece = 8;
-        vp.planner.bfgs_trust.max_iterations = 2000;
+        vp.trajectory.planner.max_vel_m_s = 4.0;
+        vp.trajectory.planner.max_tilt_rad = 60_f32.to_radians();
+        vp.trajectory.planner.weight_vel = 50.0;
+        vp.trajectory.planner.weight_tilt = 50.0;
+        vp.trajectory.planner.weight_body_rate = 50.0;
+        vp.trajectory.planner.weight_thrust = 10.0;
+        vp.trajectory.planner.weight_energy = 0.1;
+        vp.trajectory.planner.weight_time = 1.0;
+        vp.trajectory.planner.smoothing_eps = 0.01;
+        vp.trajectory.planner.num_check_per_piece = 8;
+        vp.trajectory.planner.bfgs_trust.max_iterations = 2000;
         QuadPlanningConfig::from_vehicle_params(&vp)
     }
 
@@ -1120,17 +1152,17 @@ fn bench_circular_planner_runtime() {
     fn time_one_budget(max_iters: usize, n_samples: usize) -> (f64, f64, f64, usize) {
         // Build a config with the given iteration cap.
         let mut vp = test_vehicle_params();
-        vp.planner.max_vel_m_s = 4.0;
-        vp.planner.max_tilt_rad = 60_f32.to_radians();
-        vp.planner.weight_vel = 50.0;
-        vp.planner.weight_tilt = 50.0;
-        vp.planner.weight_body_rate = 50.0;
-        vp.planner.weight_thrust = 10.0;
-        vp.planner.weight_energy = 0.1;
-        vp.planner.weight_time = 1.0;
-        vp.planner.smoothing_eps = 0.01;
-        vp.planner.num_check_per_piece = 8;
-        vp.planner.bfgs_trust.max_iterations = max_iters;
+        vp.trajectory.planner.max_vel_m_s = 4.0;
+        vp.trajectory.planner.max_tilt_rad = 60_f32.to_radians();
+        vp.trajectory.planner.weight_vel = 50.0;
+        vp.trajectory.planner.weight_tilt = 50.0;
+        vp.trajectory.planner.weight_body_rate = 50.0;
+        vp.trajectory.planner.weight_thrust = 10.0;
+        vp.trajectory.planner.weight_energy = 0.1;
+        vp.trajectory.planner.weight_time = 1.0;
+        vp.trajectory.planner.smoothing_eps = 0.01;
+        vp.trajectory.planner.num_check_per_piece = 8;
+        vp.trajectory.planner.bfgs_trust.max_iterations = max_iters;
         let config = QuadPlanningConfig::from_vehicle_params(&vp);
 
         // Warm-up.
@@ -1165,16 +1197,21 @@ fn bench_circular_planner_runtime() {
             "  {:>5}    {:>5}        {:>7.2}   {:>7.2}   {:>7.2}   {:>5.1}",
             budget, mean_iters, mean, p50, p99, us_per_iter
         );
-        // Only sample per-iter from budgets that actually hit the cap
-        // (so the total time accurately reflects the cap).
-        if mean_iters == budget {
-            per_iter_ms_samples.push(p50 / mean_iters as f64);
-        }
+        // Sample per-iteration cost from every budget. (This used to sample
+        // only budgets that hit the cap, but the solve converges well
+        // before every cap in the sweep, so the vector stayed empty and the
+        // headline number below printed as NaN while the test still passed.)
+        per_iter_ms_samples.push(p50 / mean_iters.max(1) as f64);
     }
 
-    // Derive per-iteration cost from the capped runs.
+    // Derive per-iteration cost.
+    assert!(
+        !per_iter_ms_samples.is_empty(),
+        "no per-iteration samples collected"
+    );
     let per_iter_ms: f64 =
         per_iter_ms_samples.iter().sum::<f64>() / per_iter_ms_samples.len() as f64;
+    assert!(per_iter_ms.is_finite(), "per-iteration cost is not finite");
 
     println!(
         "\nderived per-BFGS-iteration cost: {:.3} ms ({:.1} μs)",
@@ -1296,18 +1333,17 @@ fn save_circular_energy_heavy_trajectory_csv() {
 /// Keep in sync with the production defaults.
 fn production_regime_config() -> QuadPlanningConfig {
     let mut vp = test_vehicle_params();
-    vp.planner.max_vel_m_s = 5.0;
-    vp.planner.max_tilt_rad = core::f32::consts::FRAC_PI_3;
-    vp.planner.weight_time = 1.0;
-    vp.planner.weight_energy = 0.0;
-    vp.planner.weight_pos = 0.0;
-    vp.planner.weight_vel = 1.0;
-    vp.planner.weight_tilt = 1.0;
-    vp.planner.weight_body_rate = 10.0;
-    vp.planner.weight_thrust = 10.0;
-    vp.planner.smoothing_eps = 0.01;
-    vp.planner.num_check_per_piece = 8;
-    vp.planner.bfgs_trust.max_iterations = 500;
+    vp.trajectory.planner.max_vel_m_s = 5.0;
+    vp.trajectory.planner.max_tilt_rad = core::f32::consts::FRAC_PI_3;
+    vp.trajectory.planner.weight_time = 1.0;
+    vp.trajectory.planner.weight_energy = 0.0;
+    vp.trajectory.planner.weight_vel = 1.0;
+    vp.trajectory.planner.weight_tilt = 1.0;
+    vp.trajectory.planner.weight_body_rate = 10.0;
+    vp.trajectory.planner.weight_thrust = 10.0;
+    vp.trajectory.planner.smoothing_eps = 0.01;
+    vp.trajectory.planner.num_check_per_piece = 8;
+    vp.trajectory.planner.bfgs_trust.max_iterations = 500;
     QuadPlanningConfig::from_vehicle_params(&vp)
 }
 
@@ -1518,7 +1554,7 @@ fn production_regime_piece_count_sweep() {
 fn production_regime_repeatability() {
     let config = production_regime_config();
     println!("\n=== Production-regime repeatability (20 runs, same inputs) ===");
-    let mut statuses = [0usize; 5]; // Convergence, Stop, MaxIterations, InvalidValue, TimeExceeded
+    let mut statuses = [0usize; 6]; // Convergence, Stop, MaxIterations, InvalidValue, TimeExceeded, TrustRegionCollapsed
     for run in 0..20 {
         let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, &PRODUCTION_WAYPOINTS);
         let result = plan(&input, &config);
@@ -1528,6 +1564,7 @@ fn production_regime_repeatability() {
             SolverStatus::MaxIterations => 2,
             SolverStatus::InvalidValue => 3,
             SolverStatus::TimeExceeded => 4,
+            SolverStatus::TrustRegionCollapsed => 5,
         };
         statuses[idx] += 1;
         let n = result.num_pieces;
@@ -1545,8 +1582,8 @@ fn production_regime_repeatability() {
         );
     }
     println!(
-        "  tallies: Convergence={} Stop={} MaxIter={} Invalid={} Timeout={}",
-        statuses[0], statuses[1], statuses[2], statuses[3], statuses[4],
+        "  tallies: Convergence={} Stop={} MaxIter={} Invalid={} Timeout={} Collapsed={}",
+        statuses[0], statuses[1], statuses[2], statuses[3], statuses[4], statuses[5],
     );
 }
 
@@ -1618,17 +1655,17 @@ fn production_regime_with_weight_vel_sweep() {
     println!("\n=== Production-regime + weight_vel sweep (full 15 wp) ===");
     for &wv in &[0.0_f32, 1.0, 10.0, 50.0, 100.0] {
         let mut vp = test_vehicle_params();
-        vp.planner.max_vel_m_s = 5.0;
-        vp.planner.max_tilt_rad = core::f32::consts::FRAC_PI_3;
-        vp.planner.weight_time = 1.0;
-        vp.planner.weight_energy = 0.0;
-        vp.planner.weight_vel = wv;
-        vp.planner.weight_tilt = 0.0;
-        vp.planner.weight_body_rate = 10.0;
-        vp.planner.weight_thrust = 10.0;
-        vp.planner.smoothing_eps = 0.01;
-        vp.planner.num_check_per_piece = 8;
-        vp.planner.bfgs_trust.max_iterations = 500;
+        vp.trajectory.planner.max_vel_m_s = 5.0;
+        vp.trajectory.planner.max_tilt_rad = core::f32::consts::FRAC_PI_3;
+        vp.trajectory.planner.weight_time = 1.0;
+        vp.trajectory.planner.weight_energy = 0.0;
+        vp.trajectory.planner.weight_vel = wv;
+        vp.trajectory.planner.weight_tilt = 0.0;
+        vp.trajectory.planner.weight_body_rate = 10.0;
+        vp.trajectory.planner.weight_thrust = 10.0;
+        vp.trajectory.planner.smoothing_eps = 0.01;
+        vp.trajectory.planner.num_check_per_piece = 8;
+        vp.trajectory.planner.bfgs_trust.max_iterations = 500;
         let config = QuadPlanningConfig::from_vehicle_params(&vp);
         let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, &PRODUCTION_WAYPOINTS);
         let result = plan(&input, &config);
@@ -1646,17 +1683,17 @@ fn production_regime_max_iterations_sweep() {
     println!("\n=== Production-regime + max_iterations sweep (wv=0, wtilt=0, we=0) ===");
     for &max_iters in &[0_usize, 1, 2, 5, 10, 25, 50, 100, 150, 172, 500, 2000] {
         let mut vp = test_vehicle_params();
-        vp.planner.max_vel_m_s = 5.0;
-        vp.planner.max_tilt_rad = core::f32::consts::FRAC_PI_3;
-        vp.planner.weight_time = 1.0;
-        vp.planner.weight_energy = 0.0;
-        vp.planner.weight_vel = 0.0;
-        vp.planner.weight_tilt = 0.0;
-        vp.planner.weight_body_rate = 10.0;
-        vp.planner.weight_thrust = 10.0;
-        vp.planner.smoothing_eps = 0.01;
-        vp.planner.num_check_per_piece = 8;
-        vp.planner.bfgs_trust.max_iterations = max_iters;
+        vp.trajectory.planner.max_vel_m_s = 5.0;
+        vp.trajectory.planner.max_tilt_rad = core::f32::consts::FRAC_PI_3;
+        vp.trajectory.planner.weight_time = 1.0;
+        vp.trajectory.planner.weight_energy = 0.0;
+        vp.trajectory.planner.weight_vel = 0.0;
+        vp.trajectory.planner.weight_tilt = 0.0;
+        vp.trajectory.planner.weight_body_rate = 10.0;
+        vp.trajectory.planner.weight_thrust = 10.0;
+        vp.trajectory.planner.smoothing_eps = 0.01;
+        vp.trajectory.planner.num_check_per_piece = 8;
+        vp.trajectory.planner.bfgs_trust.max_iterations = max_iters;
         let config = QuadPlanningConfig::from_vehicle_params(&vp);
         let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, &PRODUCTION_WAYPOINTS);
         let result = plan(&input, &config);
@@ -1675,17 +1712,17 @@ fn production_regime_with_weight_energy_sweep() {
     println!("\n=== Production-regime + weight_energy sweep (wv=0, wtilt=0) ===");
     for &we in &[0.0_f32, 0.001, 0.003, 0.01, 0.03, 0.1] {
         let mut vp = test_vehicle_params();
-        vp.planner.max_vel_m_s = 5.0;
-        vp.planner.max_tilt_rad = core::f32::consts::FRAC_PI_3;
-        vp.planner.weight_time = 1.0;
-        vp.planner.weight_energy = we;
-        vp.planner.weight_vel = 0.0;
-        vp.planner.weight_tilt = 0.0;
-        vp.planner.weight_body_rate = 10.0;
-        vp.planner.weight_thrust = 10.0;
-        vp.planner.smoothing_eps = 0.01;
-        vp.planner.num_check_per_piece = 8;
-        vp.planner.bfgs_trust.max_iterations = 500;
+        vp.trajectory.planner.max_vel_m_s = 5.0;
+        vp.trajectory.planner.max_tilt_rad = core::f32::consts::FRAC_PI_3;
+        vp.trajectory.planner.weight_time = 1.0;
+        vp.trajectory.planner.weight_energy = we;
+        vp.trajectory.planner.weight_vel = 0.0;
+        vp.trajectory.planner.weight_tilt = 0.0;
+        vp.trajectory.planner.weight_body_rate = 10.0;
+        vp.trajectory.planner.weight_thrust = 10.0;
+        vp.trajectory.planner.smoothing_eps = 0.01;
+        vp.trajectory.planner.num_check_per_piece = 8;
+        vp.trajectory.planner.bfgs_trust.max_iterations = 500;
         let config = QuadPlanningConfig::from_vehicle_params(&vp);
         let input = PlannerInput::waypoints(PRODUCTION_START, ZERO3, &PRODUCTION_WAYPOINTS);
         let result = plan(&input, &config);

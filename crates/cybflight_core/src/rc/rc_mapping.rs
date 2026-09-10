@@ -27,32 +27,108 @@ pub struct ChannelCalibration {
     pub invert: bool,
 }
 
+/// Stick travel endpoints, in microseconds, as reported by the
+/// transmitter at rest and at full deflection.
+///
+/// These are a property of the radio, not of the airframe, which is why
+/// the firmware carries them as the `rc_min_us` / `rc_mid_us` /
+/// `rc_max_us` parameters rather than as source constants. The
+/// [`Self::DEFAULT`] values are the near-universal OpenTX/EdgeTX travel
+/// and stay the schema default; a radio with different servo travel
+/// overrides them per vehicle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StickEndpoints {
+    pub min_us: i16,
+    pub mid_us: i16,
+    pub max_us: i16,
+}
+
+impl StickEndpoints {
+    /// Standard OpenTX/EdgeTX travel. Mirrors the `rc_min_us` /
+    /// `rc_mid_us` / `rc_max_us` schema defaults; the parity is asserted
+    /// in the parameter tests so the two cannot drift.
+    pub const DEFAULT: Self = Self {
+        min_us: 988,
+        mid_us: 1500,
+        max_us: 2012,
+    };
+
+    /// Reject an endpoint set that would make [`ChannelCalibration::normalize`]
+    /// degenerate or invert an axis: the travel must be strictly ordered
+    /// and the centre strictly inside it.
+    ///
+    /// A throttle calibration deliberately sets `center == min`, but that
+    /// is constructed from a *valid* triple by [`ChannelCalibration::throttle_with`],
+    /// never by passing a degenerate one here.
+    pub fn is_usable(&self) -> bool {
+        self.min_us < self.mid_us && self.mid_us < self.max_us
+    }
+
+    /// The endpoints if they are usable, else [`Self::DEFAULT`].
+    ///
+    /// Range validation already runs at every parameter entry point, but
+    /// the three keys are independent scalars: each can be in range while
+    /// the triple is still unordered (`mid` below `min`, say). Degrading
+    /// to the standard travel keeps a bad triple from inverting a stick,
+    /// per the "degrade, never panic" rule in `docs/safety_protocol.md`.
+    pub fn or_default(self) -> Self {
+        if self.is_usable() { self } else { Self::DEFAULT }
+    }
+}
+
+impl Default for StickEndpoints {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 impl ChannelCalibration {
+    /// Centred stick on [`StickEndpoints::DEFAULT`] travel.
     pub fn centered(index: usize) -> Self {
+        Self::centered_with(index, StickEndpoints::DEFAULT)
+    }
+
+    /// Centred stick on the transmitter's own travel.
+    pub fn centered_with(index: usize, ep: StickEndpoints) -> Self {
+        let ep = ep.or_default();
         Self {
             index,
-            min: 988,
-            max: 2012,
-            center: 1500,
+            min: ep.min_us,
+            max: ep.max_us,
+            center: ep.mid_us,
             invert: false,
         }
     }
+
+    /// Inverted centred stick on [`StickEndpoints::DEFAULT`] travel.
     pub fn centered_inverted(index: usize) -> Self {
-        Self {
-            index,
-            min: 988,
-            max: 2012,
-            center: 1500,
-            invert: true,
-        }
+        Self::centered_inverted_with(index, StickEndpoints::DEFAULT)
     }
 
+    /// Inverted centred stick on the transmitter's own travel.
+    pub fn centered_inverted_with(index: usize, ep: StickEndpoints) -> Self {
+        let mut c = Self::centered_with(index, ep);
+        c.invert = true;
+        c
+    }
+
+    /// Throttle axis on [`StickEndpoints::DEFAULT`] travel.
     pub fn throttle(index: usize) -> Self {
+        Self::throttle_with(index, StickEndpoints::DEFAULT)
+    }
+
+    /// Throttle axis on the transmitter's own travel.
+    ///
+    /// `center == min` is load-bearing, not a coincidence: it is what
+    /// selects the `[0, 1]` branch in [`Self::normalize`]. The mid-stick
+    /// endpoint is deliberately unused here.
+    pub fn throttle_with(index: usize, ep: StickEndpoints) -> Self {
+        let ep = ep.or_default();
         Self {
             index,
-            min: 988,
-            max: 2012,
-            center: 988,
+            min: ep.min_us,
+            max: ep.max_us,
+            center: ep.min_us,
             invert: false,
         }
     }

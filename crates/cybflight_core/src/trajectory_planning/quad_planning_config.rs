@@ -21,47 +21,45 @@ pub struct QuadPlanningConfig {
     pub planner: PlannerParams,
 }
 
-impl Default for QuadPlanningConfig {
-    fn default() -> Self {
-        let mass = 0.55;
-        Self {
-            mass,
-            grav: 9.81,
-            inertia_kg_m2: [0.0025, 0.0021, 0.0043],
-            mass_inv: 1.0 / mass,
-            max_collective_thrust_n: 4.0 * 8.5,
-            min_collective_thrust_n: 2.0,
-            max_rate_rad_s: [10.0, 10.0, 6.0],
-            planner: PlannerParams::default(),
-        }
-    }
-}
+// NOTE: no `Default` — the old impl carried a fourth divergent "default
+// vehicle" (mass 0.55, its own inertia set). Construct via
+// `from_vehicle_params` (production) or an explicit literal (tests).
 
 impl QuadPlanningConfig {
     /// Construct from firmware vehicle parameters.
     ///
-    /// Physical parameters (mass, inertia, thrust bounds) come from `VehicleParams`.
-    /// Planner tunables are copied directly from `vp.planner`.
-    pub fn from_vehicle_params(vp: &crate::params::VehicleParams) -> Self {
-        let mass = vp.body.mass_kg;
+    /// Physical parameters (mass, inertia, thrust bounds) come from
+    /// `vp.airframe`, local gravity from `vp.site`. Planner tunables are
+    /// copied directly from `vp.trajectory.planner`.
+    pub fn from_vehicle_params(vp: &crate::params::FirmwareConfig) -> Self {
+        let mass = vp.airframe.body.mass_kg;
+        let grav = vp.site.gravity_m_s2;
         let mut max_collective_thrust_n = 0.0_f32;
-        for m in &vp.motors {
+        for m in &vp.airframe.motors {
             max_collective_thrust_n += m.max_thrust_n;
         }
+        // Same diagonal floor as FullQuadModel::from_vehicle_params — the
+        // shared array metadata cannot bound diagonal terms separately.
+        let inertia_floor = |v: f32| if v.is_finite() && v > 1e-6 { v } else { 1e-6 };
         let inertia_kg_m2 = [
-            vp.body.inertia_kg_m2[0], // Ixx
-            vp.body.inertia_kg_m2[4], // Iyy
-            vp.body.inertia_kg_m2[8], // Izz
+            inertia_floor(vp.airframe.body.inertia_kg_m2[0]), // Ixx
+            inertia_floor(vp.airframe.body.inertia_kg_m2[4]), // Iyy
+            inertia_floor(vp.airframe.body.inertia_kg_m2[8]), // Izz
         ];
         Self {
             mass,
-            grav: 9.81,
+            grav,
             inertia_kg_m2,
             mass_inv: 1.0 / mass,
-            max_collective_thrust_n,
-            min_collective_thrust_n: 2.0,
-            max_rate_rad_s: vp.body.max_rate_rad_s,
-            planner: vp.planner.clone(),
+            // Same derate the MPC applies (`mpc_thrust_frac`) so planner and
+            // controller agree on available thrust; previously the planner
+            // assumed the full per-motor sum while the MPC used 0.75×.
+            max_collective_thrust_n: max_collective_thrust_n * vp.mpc.thrust_frac,
+            // Same 10%-of-hover floor as `QuadModel::from_vehicle_params`
+            // (previously a fixed 2.0 N that didn't scale with mass).
+            min_collective_thrust_n: mass * grav * 0.1,
+            max_rate_rad_s: vp.airframe.body.max_rate_rad_s,
+            planner: vp.trajectory.planner.clone(),
         }
     }
 }

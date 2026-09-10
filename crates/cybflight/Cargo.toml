@@ -10,6 +10,7 @@ default = ["board_foxeerh743", "rx_crsf", "defmt_uart", "outer_mpc", "est_pos_mo
 
 board_sakurah743 = ["dep:bsp-sakurah743"]
 board_foxeerh743 = ["dep:bsp-foxeerh743"]
+board_micoair743v2 = ["dep:bsp-micoair743v2"]
 rx_crsf = []
 rx_ghst = []
 # Enable UART-based defmt logging. Disable for production to eliminate all
@@ -34,9 +35,46 @@ defmt_uart = []
 est_eskf = []
 est_pos_mocap = ["est_eskf"]
 est_pos_gps = ["est_eskf"]
+# GPS receiver model — independent of est_pos_gps. u-blox is the driver
+# default; `gps_unicore` swaps in the Unicore UM982 (BESTNAV/UNIHEADING).
+# (The old `gps_ublox` marker feature had zero cfg references — deleted.)
+gps_unicore = ["cybflight-drivers/gps_unicore"]
+# A second GNSS antenna (ANT2) is populated on this install (vehicle YAML
+# `build: gps_dual_antenna: yes`). Separate from the receiver model: a
+# UM982 is heading-*capable* but can be wired single-antenna, which is how
+# sakura_bench_hunter_outdoor flies. The vehicle-yaml loader rejects `yes`
+# without `gps_model: unicore`, so this can never ask for a heading the
+# driver does not emit.
+#
+# NOTE: `gps_fuse_vel` remains a runtime param (SensorParams) — it is
+# estimator policy, works with any receiver, and gates no code. Only the
+# hardware fact is compile-time.
+gps_dual_antenna = []
 outer_rate = []
 outer_geometric = ["est_eskf"]
 outer_mpc = ["est_eskf"]
+# Full-model outer loop (`build: outer_loop: mpc_full`): 13-state
+# FullQuadModel NMPC publishing (T_d, tau_d) for the INDI alpha inner
+# loop (Sun et al. T-RO 2022; docs/mpc_full_indi_plan.md). Additive on
+# top of outer_mpc — all mission/sampler infrastructure is shared.
+outer_mpc_full = ["outer_mpc"]
+# Primary-IMU rate (vehicle YAML `build: imu_rate`). Absence = 8 kHz ODR
+# with the UI filter wide open (Betaflight-parity low latency). `imu_1khz`
+# programs ICM426xx boards to 1 kHz ODR in the datasheet's best-noise
+# configuration (227 Hz UI filter, 258 Hz gyro AAF) and runs the INDI
+# inner loop at 1 kHz — see crates/cybflight/src/rates.rs. ICM boards only.
+imu_1khz = []
+# Disable the INDI inner loop (vehicle YAML `build: indi: no`). Absence =
+# INDI on, the normal build. When set, the incremental terms of the control
+# law are dropped and the inner loop degrades to a proportional rate
+# controller: rate error x indi_rate_* -> desired angular acceleration ->
+# WLS allocation through G1 -> thrust linearization. Everything else (WLS,
+# thrust model, notches, RPM estimators, failsafes) is unchanged. Use it to
+# A/B INDI against a conventional rate loop on the same airframe, or to fly
+# a vehicle whose actuator model is not yet identified. NB: no integral
+# action in the degraded law — expect standing rate error under a steady
+# disturbance, and re-tune indi_rate_* before flying it.
+indi_off = []
 # Post-mortem logging subsystem (BKPSRAM + flash mirror + custom panic
 # handler). Default-on for release / firmware builds — captures crash
 # state across reboots and brownouts. Disable for `probe-rs run`
@@ -44,11 +82,9 @@ outer_mpc = ["est_eskf"]
 # (cargo run --no-default-features --features=...without postmortem).
 # When this feature is on, `panic_probe` is NOT linked.
 postmortem = []
-# Reference sampler selection (only meaningful with outer_mpc).
-# Default: TimeSampler (τ = (now − t_start) + k·dt). Setting this flag
-# selects the closest-point PositionSampler — see docs in
-# `cybflight_core::trajectory_planning::sampler`.
-position_sampler = []
+# NOTE: the old `position_sampler` feature is gone — sampler selection is
+# the runtime `sampler_kind` param (both variants always compiled); see
+# `cybflight_core::trajectory_planning::sampler::SamplerKind`.
 # Forward raw, ESKF-internal sensor channels (raw IMU, mag, baro, secondary
 # IMU/baro/mag) over the ESP32 telemetry link. Off by default — these
 # channels exist for offline calibration / sensor-health debugging only;
@@ -56,10 +92,34 @@ position_sampler = []
 # them at flight time. See the audit comment at the top of
 # `comm/esp_bridge.rs` for bandwidth justification.
 dev_telem = []
+# Gimbal role variants. The CHASER carries the Z-1Mini gimbal (on USART2) and a
+# UM982, and aims the camera at the LEADER; the LEADER is the unchanged airframe
+# that broadcasts its pose. Optional + mutually exclusive — absence means the
+# firmware behaves exactly as before (no gimbal). GPS model is selected
+# separately by the vehicle YAML's `build: gps_model` (chaser → gps_unicore;
+# ublox is the driver default and has no feature).
+role_leader = []
+role_chaser = []
+
+# Select the ONLINE mission-planning schema: the on-device BFGS trajectory
+# optimizer (`mission_planner::plan_online`) instead of the baked offline
+# schedule (`plan_offline`). Off by default — every vehicle flies the
+# offline schedule. This is a cargo feature rather than a `const bool`
+# because the online path owns ~55 KiB of `.bss` (`BfgsWorkspace`) and
+# another ~55 KiB of task-future state (`PlanSession` held across
+# awaits); neither is removed by const-folding a dead branch. See
+# docs/architecture.md "Compile-Time Optimization Rules" #7. The feature
+# is local to this crate — it does not propagate to cybflight-core, so
+# toggling it does not rebuild core or the BSP.
+plan_online = []
+# NOTE: the old peer_pose feature is gone — the leader→chaser pose
+# downlink is the runtime `peer_pose_en` param (SystemSettings, live),
+# checked inside the role_leader-compiled TX block.
 
 [dependencies]
 bsp-sakurah743 = { path = "../bsp/sakurah743", optional = true }
 bsp-foxeerh743 = { path = "../bsp/foxeerh743", optional = true }
+bsp-micoair743v2 = { path = "../bsp/micoair743v2", optional = true }
 bsp-types = { path = "../bsp/types" }
 cybflight-drivers = { path = "../drivers" }
 cybflight-msgs = { version = "0.1.20", registry = "utadr", features = ["embedded"] }
@@ -111,9 +171,20 @@ heapless = "0.9.2"
 # graph. `embedded-fatfs` on crates.io (0.0.0) is a placeholder.
 embedded-fatfs = { git = "https://github.com/MabezDev/embedded-fatfs", rev = "518528cc111fcf65c48abbdeb80735a38eada112", default-features = false, features = ["lfn"] }
 block-device-adapters = { git = "https://github.com/MabezDev/embedded-fatfs", rev = "518528cc111fcf65c48abbdeb80735a38eada112" }
+# The `BlockDevice<512>` trait itself, for the CMD25 write combiner in
+# blackbox/sdmmc_block.rs. Registry version so the workspace
+# [patch.crates-io] unifies it with embassy-stm32's copy.
+block-device-driver = "0.2"
 # Most SD cards ship with an MBR + FAT32 partition (not a "superfloppy"
 # FAT BPB at LBA 0). embedded-fatfs alone reads sector 0 expecting a
 # BPB, so we route through embedded-partitions to find the FAT
 # partition's LBA and slice the stream into it before mounting.
 embedded-partitions = { git = "https://github.com/MabezDev/embedded-fatfs", rev = "518528cc111fcf65c48abbdeb80735a38eada112" }
 aligned = "0.4"
+
+[build-dependencies]
+# The YAML vehicle bake constructs a real FirmwareConfig on the host (via
+# the shared vehicle-yaml loader) so identity presence and tuning keys are
+# validated against the actual registry at build time.
+cybflight-core = { path = "../cybflight_core" }
+vehicle-yaml = { path = "../vehicle_yaml" }

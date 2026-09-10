@@ -1,4 +1,12 @@
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::hal::pac;
+
+/// Whether [`init`] has started the IWDG. The param-store recovery path
+/// can erase flash from `board_init`, *before* `init` runs; extending a
+/// never-started watchdog would spin on the PVU flag with LSI possibly
+/// off (only IWDG START forces LSI on), hanging boot forever.
+static STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Initialize and start the Independent Watchdog (IWDG1).
 ///
@@ -31,6 +39,7 @@ pub fn init() {
     // Feed to load the new reload value into the down-counter
     feed();
 
+    STARTED.store(true, Ordering::Release);
     defmt::info!("IWDG started (~500 ms timeout)");
 }
 
@@ -50,6 +59,11 @@ pub fn feed() {
 /// The IWDG prescaler and reload registers can be modified while running by
 /// first writing the unlock key (0x5555) to KR.
 pub fn extend_timeout() {
+    // No-op before `init`: there is no running watchdog to outlast the
+    // erase, and the PVU spin below requires LSI (started by IWDG START).
+    if !STARTED.load(Ordering::Acquire) {
+        return;
+    }
     let iwdg = pac::IWDG1;
     // Unlock PR/RLR
     iwdg.kr().write(|w| w.set_key(pac::iwdg::vals::Key::ENABLE));
@@ -62,6 +76,9 @@ pub fn extend_timeout() {
 
 /// Restore the IWDG timeout to the normal ~500 ms and feed immediately.
 pub fn restore_timeout() {
+    if !STARTED.load(Ordering::Acquire) {
+        return;
+    }
     let iwdg = pac::IWDG1;
     // Unlock PR/RLR
     iwdg.kr().write(|w| w.set_key(pac::iwdg::vals::Key::ENABLE));

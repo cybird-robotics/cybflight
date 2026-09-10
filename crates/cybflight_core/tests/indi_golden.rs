@@ -27,6 +27,10 @@ const NU: usize = 4;
 const NV: usize = 6;
 const NC: usize = NU + NV;
 const LOOP_HZ: f32 = 8000.0;
+/// Voltage fed to the voltage-aware INDI API. The golden fixtures use
+/// `ThrustModel::Quadratic`, which ignores voltage entirely, so any
+/// finite value preserves equivalence with the indiflight reference.
+const NOMINAL_VOLTAGE_V: f32 = 16.0;
 const GRAVITY: f32 = 9.80665;
 const SYNC_LPF_HZ: f32 = 15.0;
 
@@ -131,7 +135,7 @@ impl IndiTestState {
             rate_dot_filter: core::array::from_fn(|_| make_biquad()),
             spf_filter: core::array::from_fn(|_| make_biquad()),
             u_state_filter: core::array::from_fn(|_| make_biquad()),
-            linearization: [ThrustLinearization::new(0.5, ThrustModel::Quadratic); NU],
+            linearization: [ThrustLinearization::new(0.5, ThrustModel::Quadratic, 12.0); NU],
             prev_rate: SVector::zeros(),
             u_state: SVector::zeros(),
             u_state_fs: SVector::zeros(),
@@ -278,13 +282,13 @@ impl IndiTestState {
 
         for i in 0..NU {
             self.u[i] = (do_f * self.u_state_fs[i] + du[i]).clamp(0.0, self.act_limit[i]);
-            self.d[i] = self.linearization[i].linearize(self.u[i]);
+            self.d[i] = self.linearization[i].linearize(self.u[i], NOMINAL_VOLTAGE_V);
             // Track du for omegaDot fallback (u[i] - uState[i] = actual du)
             self.prev_du[i] = self.u[i] - self.u_state[i];
         }
 
         for i in 0..NU {
-            let u_from_d = self.linearization[i].output_curve(self.d[i]);
+            let u_from_d = self.linearization[i].output_curve(self.d[i], NOMINAL_VOLTAGE_V);
             self.u_state[i] += self.pt1_alpha * (u_from_d - self.u_state[i]);
         }
 
@@ -704,24 +708,28 @@ fn golden_flu_frame_convention() {
             spin_dir: SpinDir::Cw,
             max_thrust_n: 8.5,
             torque_coeff_m: 0.022,
+            ..MotorParams::STOCK_DYNAMICS
         },
         MotorParams {
             position_m: [0.075, -0.1],
             spin_dir: SpinDir::Ccw,
             max_thrust_n: 8.5,
             torque_coeff_m: 0.022,
+            ..MotorParams::STOCK_DYNAMICS
         },
         MotorParams {
             position_m: [-0.075, 0.1],
             spin_dir: SpinDir::Ccw,
             max_thrust_n: 8.5,
             torque_coeff_m: 0.022,
+            ..MotorParams::STOCK_DYNAMICS
         },
         MotorParams {
             position_m: [0.075, 0.1],
             spin_dir: SpinDir::Cw,
             max_thrust_n: 8.5,
             torque_coeff_m: 0.022,
+            ..MotorParams::STOCK_DYNAMICS
         },
     ];
     let body = RigidBodyParams {
@@ -798,24 +806,28 @@ fn golden_ned_flu_transform() {
             spin_dir: SpinDir::Cw,
             max_thrust_n: 8.5,
             torque_coeff_m: 0.022,
+            ..MotorParams::STOCK_DYNAMICS
         },
         MotorParams {
             position_m: [0.075, -0.1],
             spin_dir: SpinDir::Ccw,
             max_thrust_n: 8.5,
             torque_coeff_m: 0.022,
+            ..MotorParams::STOCK_DYNAMICS
         },
         MotorParams {
             position_m: [-0.075, 0.1],
             spin_dir: SpinDir::Ccw,
             max_thrust_n: 8.5,
             torque_coeff_m: 0.022,
+            ..MotorParams::STOCK_DYNAMICS
         },
         MotorParams {
             position_m: [0.075, 0.1],
             spin_dir: SpinDir::Cw,
             max_thrust_n: 8.5,
             torque_coeff_m: 0.022,
+            ..MotorParams::STOCK_DYNAMICS
         },
     ];
     let body = RigidBodyParams {
@@ -934,32 +946,39 @@ fn flu_controller_config() -> IndiConfig {
             spin_dir: SpinDir::Cw,
             max_thrust_n: 8.5,
             torque_coeff_m: 0.022,
+            ..MotorParams::STOCK_DYNAMICS
         },
         MotorParams {
             position_m: [0.075, -0.1],
             spin_dir: SpinDir::Ccw,
             max_thrust_n: 8.5,
             torque_coeff_m: 0.022,
+            ..MotorParams::STOCK_DYNAMICS
         },
         MotorParams {
             position_m: [-0.075, 0.1],
             spin_dir: SpinDir::Ccw,
             max_thrust_n: 8.5,
             torque_coeff_m: 0.022,
+            ..MotorParams::STOCK_DYNAMICS
         },
         MotorParams {
             position_m: [0.075, 0.1],
             spin_dir: SpinDir::Cw,
             max_thrust_n: 8.5,
             torque_coeff_m: 0.022,
+            ..MotorParams::STOCK_DYNAMICS
         },
     ];
     IndiConfig {
+        indi_enabled: true,
+        ground_gyro_rad_s: 100.0_f32 * core::f32::consts::PI / 180.0,
+        ground_accel_m_s2: 0.8 * 9.81,
+        ground_thrust_sp_m_s2: 3.0,
         rate_gains: nalgebra::Vector3::new(20.0, 20.0, 20.0),
         sync_filter_hz: 15.0,
         rate_dot_sg_window_size: 7,
         rate_dot_sg_order: 2,
-        rate_dot_sg_target_rate_hz: 1000.0,
         motors,
         body: RigidBodyParams {
             mass_kg: 0.55,
@@ -980,6 +999,7 @@ fn flu_controller_config() -> IndiConfig {
         wls_theta: 1e-4,
         wls_imax: 1,
         nan_limit: 20,
+        nan_rampdown: 0.95,
         rpm_invalid_limit: 50,
         rpm_all_invalid_limit: 50,
         rpm_recovery_count: 10,
@@ -1024,6 +1044,7 @@ fn run_controller_scenario(
             armed,
             &g2_valid,
             MotorState::Internal,
+            NOMINAL_VOLTAGE_V,
         );
         outputs.push(out.motor_commands);
 
@@ -1317,6 +1338,7 @@ fn controller_matches_test_state_flu() {
                 armed,
                 &g2_valid,
                 MotorState::Internal,
+                NOMINAL_VOLTAGE_V,
             );
 
             // Compare linearized motor commands (d, not u).
@@ -1352,6 +1374,10 @@ fn controller_matches_test_state_flu_with_g2() {
 
     // Config with G2 active (FLU signs)
     let config = IndiConfig {
+        indi_enabled: true,
+        ground_gyro_rad_s: 100.0_f32 * core::f32::consts::PI / 180.0,
+        ground_accel_m_s2: 0.8 * 9.81,
+        ground_thrust_sp_m_s2: 3.0,
         indi_motors: [
             IndiMotorParams {
                 time_const_s: 0.025,
@@ -1423,6 +1449,7 @@ fn controller_matches_test_state_flu_with_g2() {
             true,
             &g2_valid,
             MotorState::Internal,
+            NOMINAL_VOLTAGE_V,
         );
     }
 
@@ -1440,6 +1467,7 @@ fn controller_matches_test_state_flu_with_g2() {
             true,
             &g2_valid,
             MotorState::Internal,
+            NOMINAL_VOLTAGE_V,
         );
 
         let diff = ref_out

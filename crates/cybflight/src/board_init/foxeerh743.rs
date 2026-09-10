@@ -1,9 +1,9 @@
 use cybflight_drivers::baro::dps310::Dps310;
 #[cfg(feature = "est_pos_gps")]
-use cybflight_drivers::gps::Ublox;
+use cybflight_drivers::gps::GpsDriver;
 use cybflight_drivers::imu::icm426xx::Icm426xx;
 use cybflight_drivers::imu::mpu6x00::Mpu6x00;
-use cybflight_drivers::imu::{probe_imu_raw, DetectedImu};
+use cybflight_drivers::imu::{probe_imu_raw, DetectedImu, ReadImu};
 use cybflight_drivers::led::Led;
 use cybflight_drivers::mag::Qmc5883l;
 use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
@@ -82,7 +82,9 @@ pub async fn init(
     Timer::after_millis(100).await;
 
     let mut spi_config = spi::Config::default();
-    spi_config.frequency = Hertz(1_000_000);
+    // 8 MHz: 17 B/sample ≈ 17 µs vs the 125 µs 8 kHz period. At 1 MHz the
+    // bus time (136 µs) exceeded the period and the reader ran ~2.5 kHz.
+    spi_config.frequency = Hertz(8_000_000);
     spi_config.mode = spi::MODE_3;
 
     // --- IMU1 on SPI2 (PB13/14/15, CS=PB12, DRDY=PD0) ---
@@ -106,8 +108,16 @@ pub async fn init(
     let dev2 = SpiDevice::new(spi2_bus, cs);
 
     let mut delay = embassy_time::Delay;
-    const ACCEL_CUTOFF_HZ: f32 = 20.0;
-    const GYRO_CUTOFF_HZ: f32 = 150.0;
+    // Sensor topology params — from the vehicle YAML bake plus any flash
+    // overrides. NOTE: this board historically used 20/150 Hz cutoffs vs
+    // the schema default 80/200; FOXEERH743 builds must select a vehicle
+    // YAML that sets `imu_accel_lpf_hz`/`imu_gyro_lpf_hz` accordingly
+    // (see vehicles/foxeer_bench.yaml).
+    let sensor_params = crate::params::get().sensors;
+    let accel_cutoff_hz = sensor_params.imu_accel_lpf_hz;
+    let gyro_cutoff_hz = sensor_params.imu_gyro_lpf_hz;
+    let mag_hard_iron =
+        nalgebra::Vector3::from(crate::params::get().airframe.install.mag_hard_iron);
 
     match detected {
         Ok(DetectedImu::Icm42605)
@@ -115,9 +125,20 @@ pub async fn init(
         | Ok(DetectedImu::Icm42688P)
         | Ok(DetectedImu::Iim42652)
         | Ok(DetectedImu::Iim42653) => {
-            match Icm426xx::new(dev2, board.sensors.gyro1_drdy, &mut delay).await {
+            match Icm426xx::new(
+                dev2,
+                board.sensors.gyro1_drdy,
+                &mut delay,
+                crate::rates::ICM_ODR,
+            )
+            .await
+            {
                 Ok(imu1) => {
                     defmt::info!("IMU1 init OK (ICM)");
+                    defmt::assert!(
+                        imu1.sample_rate_hz() == crate::rates::IMU_ODR_HZ,
+                        "IMU1 ODR does not match rates::IMU_ODR_HZ"
+                    );
                     // IMU reader → control executor so fresh samples
                     // preempt thread work (e.g. planner BFGS solve).
                     ctrl_spawner
@@ -125,8 +146,8 @@ pub async fn init(
                             ImuReader::new(
                                 imu1,
                                 board.sensors.gyro1_align,
-                                ACCEL_CUTOFF_HZ,
-                                GYRO_CUTOFF_HZ,
+                                accel_cutoff_hz,
+                                gyro_cutoff_hz,
                             ),
                             &crate::sensors::IMU_1,
                             Some(&crate::sensors::IMU_1_RAW),
@@ -137,24 +158,34 @@ pub async fn init(
             }
         }
         Ok(DetectedImu::Mpu6000) | Ok(DetectedImu::Mpu6500) => {
-            match Mpu6x00::new(dev2, board.sensors.gyro1_drdy, &mut delay).await {
-                Ok(imu1) => {
-                    defmt::info!("IMU1 init OK (MPU)");
-                    // IMU reader → control executor (see ICM branch).
-                    ctrl_spawner
-                        .spawn(mpu_reader_task(
-                            ImuReader::new(
-                                imu1,
-                                board.sensors.gyro1_align,
-                                ACCEL_CUTOFF_HZ,
-                                GYRO_CUTOFF_HZ,
-                            ),
-                            &crate::sensors::IMU_1,
-                            Some(&crate::sensors::IMU_1_RAW),
-                        ))
-                        .unwrap();
+            // The MPU6x00 driver is hardcoded to 8 kHz; there is no 1 kHz
+            // low-noise path for it. Fail loud rather than run the inner
+            // loop at a rate the build was not tuned for — no IMU_1 means
+            // the vehicle cannot arm.
+            if crate::rates::IMU_ODR_HZ != 8000.0 {
+                defmt::error!(
+                    "imu_1khz build but detected MPU6x00 (8 kHz only) — IMU1 reader not spawned"
+                );
+            } else {
+                match Mpu6x00::new(dev2, board.sensors.gyro1_drdy, &mut delay).await {
+                    Ok(imu1) => {
+                        defmt::info!("IMU1 init OK (MPU)");
+                        // IMU reader → control executor (see ICM branch).
+                        ctrl_spawner
+                            .spawn(mpu_reader_task(
+                                ImuReader::new(
+                                    imu1,
+                                    board.sensors.gyro1_align,
+                                    accel_cutoff_hz,
+                                    gyro_cutoff_hz,
+                                ),
+                                &crate::sensors::IMU_1,
+                                Some(&crate::sensors::IMU_1_RAW),
+                            ))
+                            .unwrap();
+                    }
+                    Err(e) => defmt::error!("IMU1 MPU init failed: {}", e),
                 }
-                Err(e) => defmt::error!("IMU1 MPU init failed: {}", e),
             }
         }
         Err(id) => {
@@ -294,13 +325,13 @@ pub async fn init(
                 Ok(uart) => {
                     defmt::info!("GPS: UART4 OK, sending CFG-VALSET...");
                     let mut delay = embassy_time::Delay;
-                    match with_timeout(Duration::from_secs(3), Ublox::new(uart, &mut delay))
+                    match with_timeout(Duration::from_secs(3), GpsDriver::new(uart, &mut delay))
                         .await
                     {
                         Ok(Ok(gps)) => {
                             defmt::info!("GPS u-blox init OK");
                             spawner
-                                .spawn(crate::sensors::gps::ublox_gps_task(GpsRunner::new(gps)))
+                                .spawn(crate::sensors::gps::gps_task(GpsRunner::new(gps)))
                                 .unwrap_or_else(|e| {
                                     defmt::error!("Failed to spawn GPS task: {}", e)
                                 });
@@ -346,8 +377,8 @@ pub async fn init(
                     spawner
                         .spawn(crate::sensors::mag::qmc5883l_mag_task(MagReader::new(
                             mag,
-                            bsp_types::SensorAlign::Cw180Deg,
-                            nalgebra::Vector3::zeros(),
+                            board.sensors.mag_align,
+                            mag_hard_iron,
                         )))
                         .unwrap_or_else(|e| defmt::error!("Failed to spawn QMC5883L task: {}", e));
                 }
@@ -495,10 +526,19 @@ pub async fn init(
 
     // --- Power monitoring (ADC3) ---
     // Placed after DShot so motor control starts even if ADC init has issues.
+    // FOXEERH743: VBAT=PC3 (ADC3_INP1), CURR=PC2 (ADC3_INP0).
     let power_mon = PowerMonitor::new(
         board.adc.adc3,
         board.adc.vbat,
         board.adc.curr,
+        crate::sensors::power::AdcInput {
+            gpioc_pin: 3,
+            channel: 1,
+        },
+        crate::sensors::power::AdcInput {
+            gpioc_pin: 2,
+            channel: 0,
+        },
         bsp::POWER_CAL,
     );
     spawner

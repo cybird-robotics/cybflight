@@ -27,8 +27,11 @@ publisher tasks ──► PubSubChannel ──► msg_stream_task ──► SHEL
 
 1. Add a help line to `HELP_TEXT` in `usb_serial.rs`
 2. Add a match arm in `dispatch()` in `usb_serial.rs`
-3. *(If the command prints a `msgs::*` type)* Add a `ShellMsg` impl in `shell/format.rs`
-4. *(If the command needs a new streaming topic)* Also:
+3. Add the command to `COMMANDS` in `shell/complete.rs` so Tab completes it
+   (a `<param>` / `<mission>` placeholder completes a dynamic argument)
+4. *(If the command prints a `msgs::*` type)* Add a `ShellMsg` impl in `shell/format.rs`
+5. *(If the command needs a new streaming topic)* Also:
+   - Add the topic to `STREAM_TOPICS` in `shell/complete.rs`
    - Add a `pub static STREAM_FOO: AtomicBool` in `usb_serial.rs`
    - Add a concrete task wrapper calling `msg_stream_task`
    - Spawn it from `main.rs`
@@ -203,6 +206,11 @@ STREAM_ODOM.store(false, Ordering::Relaxed);
 "stream odom on"  => { STREAM_ODOM.store(true,  Ordering::Relaxed); write_all(class, b"odometry stream on\r\n").await?; }
 "stream odom off" => { STREAM_ODOM.store(false, Ordering::Relaxed); write_all(class, b"odometry stream off\r\n").await?; }
 ```
+
+### Step 7 — Tab completion (`shell/complete.rs`)
+
+Add `"odom"` to `STREAM_TOPICS`; the `stream <topic> on|off` templates in
+`COMMANDS` pick it up.
 
 ---
 

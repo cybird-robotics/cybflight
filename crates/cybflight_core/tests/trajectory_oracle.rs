@@ -24,7 +24,25 @@ use std::fs;
 use std::path::PathBuf;
 
 use cybflight_core::trajectory_planning::planner::{PlannerInput, PlannerResult, plan};
+use cybflight_core::params::PlannerParams;
 use cybflight_core::trajectory_planning::quad_planning_config::QuadPlanningConfig;
+
+/// Legacy oracle baseline — the values of the deleted
+/// `QuadPlanningConfig::default()`. The committed fixture was generated
+/// with these numbers; changing them requires regenerating the fixture
+/// (REGEN_TRAJECTORY_ORACLE=1).
+fn oracle_config() -> QuadPlanningConfig {
+    QuadPlanningConfig {
+    mass: 0.55,
+    grav: 9.81,
+    inertia_kg_m2: [0.0025, 0.0021, 0.0043],
+    mass_inv: 1.0 / 0.55,
+    max_collective_thrust_n: 4.0 * 8.5,
+    min_collective_thrust_n: 2.0,
+    max_rate_rad_s: [10.0, 10.0, 6.0],
+    planner: PlannerParams::default(),
+}
+}
 
 const EPS_REL: f32 = 1e-4;
 const EPS_ABS: f32 = 1e-4;
@@ -132,7 +150,7 @@ fn regenerate_fixture() {
         eprintln!("Skipping fixture regen — set REGEN_TRAJECTORY_ORACLE=1 to enable.");
         return;
     }
-    let config = QuadPlanningConfig::default();
+    let config = oracle_config();
     let mut buf = Vec::new();
     let scs = scenarios();
     buf.extend_from_slice(&(scs.len() as u32).to_le_bytes());
@@ -163,7 +181,7 @@ fn regenerate_fixture() {
 //         u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
 //     cursor += 4;
 
-//     let config = QuadPlanningConfig::default();
+//     let config = oracle_config();
 //     let scs = scenarios();
 //     assert_eq!(
 //         n_scenarios,

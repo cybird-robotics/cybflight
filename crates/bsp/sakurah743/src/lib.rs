@@ -42,6 +42,12 @@ pub const HAS_BLACKBOX_STORAGE: bool = HAS_SDCARD;
 pub const HAS_BACKUP_SRAM: bool = true;
 pub const LED_COUNT: usize = 3;
 
+/// Primary gyro *native* output data rate (Hz). ICM42688P/IIM42652 run at
+/// 8 kHz. The effective loop rate for a build is `cybflight::rates::IMU_ODR_HZ`
+/// — the `imu_1khz` build knob may program the chip down to 1 kHz low-noise
+/// mode, and control logic must consume that const, not this one.
+pub const PRIMARY_GYRO_ODR_HZ: f32 = 8000.0;
+
 // =====================================================================
 // PORT MAPPING TABLE — single source of truth for UART role assignments.
 // Changing a const here is the only BSP edit needed to move that role.
@@ -69,6 +75,8 @@ pub const POWER_CAL: PowerCalibration = PowerCalibration {
 pub const PORT_SERIAL_RX: SerialPortId = SerialPortId::Uart4;
 pub const PORT_GPS: SerialPortId = SerialPortId::Usart3;
 pub const PORT_ESP_BRIDGE: SerialPortId = SerialPortId::Usart1;
+/// Gimbal (Z-1Mini GCU control) — chaser only. PD5 TX / PD6 RX, board "UART2".
+pub const PORT_GIMBAL: SerialPortId = SerialPortId::Usart2;
 
 /// Sensor identities from Betaflight header (no WHOAMI constants here).
 pub mod sensors {
@@ -255,6 +263,11 @@ pub struct SerialPins {
     pub usart1_tx: hal::Peri<'static, hal::peripherals::PA9>,
     pub usart1_rx: hal::Peri<'static, hal::peripherals::PA10>,
 
+    // Gimbal control (chaser) — board "UART2" header.
+    pub usart2: hal::Peri<'static, hal::peripherals::USART2>,
+    pub usart2_tx: hal::Peri<'static, hal::peripherals::PD5>,
+    pub usart2_rx: hal::Peri<'static, hal::peripherals::PD6>,
+
     pub usart3: hal::Peri<'static, hal::peripherals::USART3>,
     pub usart3_tx: hal::Peri<'static, hal::peripherals::PD8>,
     pub usart3_rx: hal::Peri<'static, hal::peripherals::PD9>,
@@ -394,6 +407,29 @@ bind_interrupts!(pub struct UsbIrqs {
     OTG_FS => hal::usb::InterruptHandler<hal::peripherals::USB_OTG_FS>;
 });
 
+// ---- Clock declarations -------------------------------------------------
+//
+// These mirror `board_config()` below and exist so drivers that compute
+// timings from a clock (DShot bit periods, WS2812 pulse widths, the
+// DWT cycle-to-microsecond conversion) can assert against the board they
+// are actually built for instead of assuming one. `verify_clocks()` in
+// `crate::clocks` re-checks them against the running RCC configuration
+// at boot, which is what catches an edit to `board_config` that forgets
+// to move these.
+
+/// SYSCLK, in Hz. PLL1_P from the configuration below.
+pub const SYSCLK_HZ: u32 = 480_000_000;
+
+/// Kernel clock of the APB2 timers (TIM1/8/15/16/17), in Hz.
+///
+/// APB2 = AHB/2 = 120 MHz, and the H7 doubles the timer clock whenever
+/// the APB prescaler is not 1, so timers see 240 MHz.
+pub const APB2_TIMER_HZ: u32 = 240_000_000;
+
+/// Kernel clock of the APB1 timers (TIM2-7/12-14), in Hz. Same doubling
+/// rule and the same prescaler, so it matches APB2.
+pub const APB1_TIMER_HZ: u32 = 240_000_000;
+
 /// Board clock/power configuration.
 ///
 /// PLL1: HSI (64 MHz) / M=4 * N=60 / P=2 = 480 MHz SYSCLK (VOS0).
@@ -522,6 +558,10 @@ pub fn init() -> (Board, hal::usart::UartTx<'static, hal::mode::Blocking>) {
         usart1: p.USART1,
         usart1_tx: p.PA9,
         usart1_rx: p.PA10,
+
+        usart2: p.USART2,
+        usart2_tx: p.PD5,
+        usart2_rx: p.PD6,
 
         usart3: p.USART3,
         usart3_tx: p.PD8,

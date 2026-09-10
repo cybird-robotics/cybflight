@@ -1,12 +1,51 @@
 use nalgebra::Vector3;
 
-/// Maximum banded storage size.
+/// Band storage (in floats) for a MINCO system of order `s` over `pieces`
+/// polynomial pieces.
 ///
-/// Sized for the most demanding consumer:
-///   - MINCO min-jerk: system size = 6·N, half-bandwidth 6 → 6·N·13 floats.
-///   - MINCO min-snap: system size = 8·N, half-bandwidth 8 → 8·N·17 floats.
-/// MincoSnap dominates, so we allocate `8 · MAX_PIECES · 17` floats.
-const MAX_STORAGE: usize = 8 * super::MAX_PIECES * (8 + 8 + 1);
+/// A MINCO of order `s` (s=2 acc, s=3 jerk, s=4 snap) has `2s` coefficients
+/// per piece, so the linear system is `2s·N` square. Each row couples a
+/// piece's coefficients to its neighbour's, giving half-bandwidth `2s` on
+/// both sides; compact band storage therefore needs `2·(2s)+1 = 4s+1`
+/// floats per row. The `9`, `13` and `17` that used to be written inline
+/// are exactly `4s+1` for s = 2, 3, 4.
+pub const fn minco_storage(s: usize, pieces: usize) -> usize {
+    (2 * s) * pieces * (4 * s + 1)
+}
+/// Storage for the min-acceleration (s=2) `4N × 4N` system at `pieces`.
+pub const fn acc_storage(pieces: usize) -> usize {
+    minco_storage(2, pieces)
+}
+/// Storage for the min-jerk (s=3) `6N × 6N` system at `pieces`.
+pub const fn jerk_storage(pieces: usize) -> usize {
+    minco_storage(3, pieces)
+}
+/// Storage for the min-snap (s=4) `8N × 8N` system at `pieces`.
+pub const fn snap_storage(pieces: usize) -> usize {
+    minco_storage(4, pieces)
+}
+
+/// Largest system any solver builds at the global piece cap: min-snap at
+/// [`super::MAX_PIECES`]. The default `S` for [`BandedSystem`]; solvers
+/// sized for a smaller bound should pass their own `S`.
+pub const MAX_STORAGE: usize = snap_storage(super::MAX_PIECES);
+/// Min-acceleration storage at the global piece cap.
+pub const ACC_STORAGE: usize = acc_storage(super::MAX_PIECES);
+/// Min-jerk storage at the global piece cap.
+pub const JERK_STORAGE: usize = jerk_storage(super::MAX_PIECES);
+
+/// Smallest magnitude a U-diagonal entry is allowed to take.
+const PIVOT_FLOOR: f32 = 1e-6;
+
+/// Push a pivot away from zero, preserving sign (non-finite → +floor).
+#[inline]
+fn clamp_pivot(raw: f32) -> f32 {
+    if !raw.is_finite() || raw.abs() < PIVOT_FLOOR {
+        if raw < 0.0 { -PIVOT_FLOOR } else { PIVOT_FLOOR }
+    } else {
+        raw
+    }
+}
 
 /// A banded matrix with compact band storage (Golub & Van Loan convention).
 ///
@@ -14,28 +53,33 @@ const MAX_STORAGE: usize = 8 * super::MAX_PIECES * (8 + 8 + 1);
 ///
 /// Element (i,j) is stored at `data[(i - j + q) * N + j]`
 /// where q = upper bandwidth.
-pub struct BandedSystem {
+pub struct BandedSystem<const S: usize = MAX_STORAGE> {
     n: usize,
     lower_bw: usize,
     upper_bw: usize,
-    data: [f32; MAX_STORAGE],
+    data: [f32; S],
 }
 
-impl BandedSystem {
+impl<const S: usize> BandedSystem<S> {
     /// Create an N×N banded system with lower bandwidth `p` and upper bandwidth `q`.
-    /// Panics if the required storage exceeds MAX_STORAGE.
+    ///
+    /// Panics if the required storage exceeds `S`. This is a real assertion,
+    /// not a `debug_assert`: [`get`](Self::get)/[`set`](Self::set) index the
+    /// storage unchecked for speed, so this once-per-solve check is what
+    /// keeps an oversized `n` from writing past the array in release builds.
     pub fn new(n: usize, p: usize, q: usize) -> Self {
-        debug_assert!(
-            n * (p + q + 1) <= MAX_STORAGE,
-            "BandedSystem: required storage {} exceeds MAX_STORAGE {}",
+        assert!(
+            n >= 1 && n * (p + q + 1) <= S,
+            "BandedSystem: n={} needs {} floats of storage, have {}",
+            n,
             n * (p + q + 1),
-            MAX_STORAGE
+            S
         );
         Self {
             n,
             lower_bw: p,
             upper_bw: q,
-            data: [0.0; MAX_STORAGE],
+            data: [0.0; S],
         }
     }
 
@@ -54,11 +98,13 @@ impl BandedSystem {
     /// next use, which `MincoSnap::solve()` does unconditionally.
     #[inline]
     pub fn set_dimension(&mut self, n: usize) {
-        debug_assert!(
-            n * (self.lower_bw + self.upper_bw + 1) <= MAX_STORAGE,
-            "BandedSystem::set_dimension: required storage {} exceeds MAX_STORAGE {}",
+        // Same real check as `new()` — see the note there.
+        assert!(
+            n >= 1 && n * (self.lower_bw + self.upper_bw + 1) <= S,
+            "BandedSystem::set_dimension: n={} needs {} floats of storage, have {}",
+            n,
             n * (self.lower_bw + self.upper_bw + 1),
-            MAX_STORAGE
+            S
         );
         self.n = n;
     }
@@ -89,22 +135,18 @@ impl BandedSystem {
 
     /// In-place banded LU factorization without pivoting.
     ///
-    /// Tiny pivots are clamped to ±1e-6 to prevent NaN/Inf propagation
-    /// from near-singular systems.
+    /// Tiny pivots are clamped to ±[`PIVOT_FLOOR`] and **written back** into
+    /// the U diagonal, so the substitution passes divide by the same clamped
+    /// value the multipliers were built from. The last diagonal, which the
+    /// elimination loop never visits, is clamped after the loop. Without
+    /// both, a singular system factorized fine but `solve3` divided by the
+    /// raw zero and produced inf/NaN.
     pub fn factorize_lu(&mut self) {
         let n = self.n;
         for k in 0..n - 1 {
             let i_max = (k + self.lower_bw).min(n - 1);
-            let raw_pivot = self.get(k, k);
-            let pivot = if raw_pivot.abs() < 1e-6 {
-                if raw_pivot >= 0.0 {
-                    1e-6
-                } else {
-                    -1e-6
-                }
-            } else {
-                raw_pivot
-            };
+            let pivot = clamp_pivot(self.get(k, k));
+            self.set(k, k, pivot);
             let inv_pivot = 1.0 / pivot;
             for i in (k + 1)..=i_max {
                 *self.get_mut_ref(i, k) *= inv_pivot;
@@ -118,10 +160,39 @@ impl BandedSystem {
                 }
             }
         }
+        let last = clamp_pivot(self.get(n - 1, n - 1));
+        self.set(n - 1, n - 1, last);
     }
 
     /// Solve Ax = b in-place where b has 3 columns (x/y/z).
     pub fn solve3(&self, b: &mut [Vector3<f32>]) {
+        let n = self.n;
+        // Forward substitution (L).
+        for j in 0..n {
+            let i_max = (j + self.lower_bw).min(n - 1);
+            for i in (j + 1)..=i_max {
+                let lij = self.get(i, j);
+                let bj = b[j];
+                b[i] -= bj * lij;
+            }
+        }
+        // Backward substitution (U).
+        for j in (0..n).rev() {
+            let inv_diag = 1.0 / self.get(j, j);
+            b[j] *= inv_diag;
+            let i_min = j.saturating_sub(self.upper_bw);
+            for i in i_min..j {
+                let uij = self.get(i, j);
+                let bj = b[j];
+                b[i] -= bj * uij;
+            }
+        }
+    }
+
+    /// Solve Ax = b in-place where b is a single scalar column.
+    /// Same substitution as [`solve3`](Self::solve3) with `f32` rows;
+    /// used by the 1D (yaw) MINCO solver.
+    pub fn solve1(&self, b: &mut [f32]) {
         let n = self.n;
         // Forward substitution (L).
         for j in 0..n {
@@ -175,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_simple_tridiagonal() {
-        let mut a = BandedSystem::new(3, 1, 1);
+        let mut a = BandedSystem::<MAX_STORAGE>::new(3, 1, 1);
         a.set(0, 0, 2.0);
         a.set(0, 1, 1.0);
         a.set(1, 0, 1.0);
@@ -206,5 +277,35 @@ mod tests {
             }
             assert!((sum - rhs[i]).abs() < 1e-5, "Row {i}: {sum} != {}", rhs[i]);
         }
+    }
+
+    /// The pivot floor must reach the substitution passes: an exactly
+    /// singular system used to factorize "fine" and then divide by the
+    /// raw zero diagonal in `solve3`.
+    #[test]
+    fn singular_system_stays_finite() {
+        let mut a = BandedSystem::<MAX_STORAGE>::new(3, 1, 1);
+        a.set(0, 0, 1.0);
+        a.set(1, 1, 0.0); // zero pivot in the middle
+        a.set(2, 2, 0.0); // ... and on the never-eliminated last diagonal
+        a.factorize_lu();
+        let mut b = [Vector3::new(1.0, 2.0, 3.0); 3];
+        a.solve3(&mut b);
+        let mut b1 = [1.0f32, 2.0, 3.0];
+        a.solve1(&mut b1);
+        let mut badj = [Vector3::new(1.0, 2.0, 3.0); 3];
+        a.solve3_adj(&mut badj);
+        for i in 0..3 {
+            assert!(b[i].iter().all(|v| v.is_finite()), "solve3 row {i}: {:?}", b[i]);
+            assert!(b1[i].is_finite(), "solve1 row {i}: {}", b1[i]);
+            assert!(badj[i].iter().all(|v| v.is_finite()), "solve3_adj row {i}: {:?}", badj[i]);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "BandedSystem: n=")]
+    fn oversized_system_is_rejected_in_release_too() {
+        // 4 floats of storage cannot hold a 2×2 tridiagonal (2·3 = 6).
+        let _ = BandedSystem::<4>::new(2, 1, 1);
     }
 }

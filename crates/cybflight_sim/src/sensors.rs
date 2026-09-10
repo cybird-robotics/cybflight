@@ -31,12 +31,16 @@ pub struct ImuMeasurement {
     pub accel: Vector3<f32>,
 }
 
-/// Produce an IMU measurement from the current plant state. The runner
-/// provides the most recently applied motor command vector so the sensor
-/// model can derive specific force — for a drag-free quadrotor plant,
-/// body-frame specific force is always `[0, 0, Σu / m]`.
+/// Produce an IMU measurement from the current plant state.
+///
+/// Specific force is read off the plant's actual force balance
+/// ([`QuadPlant::specific_force_body`]) rather than reconstructed from the
+/// commanded thrust. The old closed form `[0, 0, Σu/m]` was only valid for
+/// a drag-free plant whose motors responded instantly; with rotor lag and
+/// aerodynamic drag in the model it would hand the ESKF — and INDI — an
+/// accelerometer that disagrees with the vehicle it is bolted to.
 pub trait ImuModel: Send {
-    fn sample(&mut self, plant: &QuadPlant, u_last: &SVector<f32, NU>) -> ImuMeasurement;
+    fn sample(&mut self, plant: &QuadPlant) -> ImuMeasurement;
 }
 
 /// Ground-truth IMU (no noise, no bias). Sets the numerical baseline for
@@ -45,12 +49,104 @@ pub trait ImuModel: Send {
 pub struct PerfectImu;
 
 impl ImuModel for PerfectImu {
-    fn sample(&mut self, plant: &QuadPlant, u_last: &SVector<f32, NU>) -> ImuMeasurement {
-        let mass = plant.params.body.mass_kg;
-        let total_thrust_n: f32 = u_last.iter().sum();
+    fn sample(&mut self, plant: &QuadPlant) -> ImuMeasurement {
         ImuMeasurement {
             gyro: plant.body_rate(),
-            accel: Vector3::new(0.0, 0.0, total_thrust_n / mass),
+            accel: plant.specific_force_body(),
+        }
+    }
+}
+
+// ── Rotor telemetry ─────────────────────────────────────────────────────────
+
+/// One rotor-speed telemetry frame, per motor. `valid[i]` false models a
+/// dropped/corrupt DShot telemetry frame — INDI zeroes that motor's G2
+/// column after `rpm_invalid_limit` consecutive misses.
+#[derive(Clone, Copy, Debug)]
+pub struct RotorTelemetry {
+    pub omega_rad_s: SVector<f32, NU>,
+    pub valid: [bool; NU],
+}
+
+impl RotorTelemetry {
+    /// All-invalid frame — what a stack with no ESC telemetry reports.
+    pub fn none() -> Self {
+        Self {
+            omega_rad_s: SVector::zeros(),
+            valid: [false; NU],
+        }
+    }
+}
+
+/// Synthesize ESC rotor-speed telemetry from plant state.
+pub trait RotorModel: Send {
+    fn sample(&mut self, plant: &QuadPlant) -> RotorTelemetry;
+}
+
+/// No ESC telemetry — the pre-rotor-state behaviour. INDI runs on G1
+/// alone.
+#[derive(Default)]
+pub struct NoRotorTelemetry;
+
+impl RotorModel for NoRotorTelemetry {
+    fn sample(&mut self, _plant: &QuadPlant) -> RotorTelemetry {
+        RotorTelemetry::none()
+    }
+}
+
+/// Truth rotor telemetry: exact speeds, always valid.
+#[derive(Default)]
+pub struct PerfectRotorTelemetry;
+
+impl RotorModel for PerfectRotorTelemetry {
+    fn sample(&mut self, plant: &QuadPlant) -> RotorTelemetry {
+        RotorTelemetry {
+            omega_rad_s: plant.rotor_omega(),
+            valid: [true; NU],
+        }
+    }
+}
+
+/// DShot-like rotor telemetry: eRPM quantization plus a per-motor frame
+/// dropout probability, deterministic for a given seed.
+///
+/// Quantization is the real one — DShot telemetry reports eRPM in units of
+/// 100, so mechanical RPM resolution is `100 / (poles/2)`.
+pub struct NoisyRotorTelemetry {
+    rng: ChaCha8Rng,
+    /// Mechanical-RPM quantum implied by the eRPM encoding.
+    rpm_quantum: f32,
+    /// Per-motor, per-frame probability that the telemetry frame is lost.
+    pub dropout_prob: f32,
+}
+
+impl NoisyRotorTelemetry {
+    pub fn new(seed: u64, motor_pole_count: u8, dropout_prob: f32) -> Self {
+        let pole_pairs = (motor_pole_count.max(2) as f32) / 2.0;
+        Self {
+            rng: ChaCha8Rng::seed_from_u64(seed),
+            rpm_quantum: 100.0 / pole_pairs,
+            dropout_prob: dropout_prob.clamp(0.0, 1.0),
+        }
+    }
+}
+
+impl RotorModel for NoisyRotorTelemetry {
+    fn sample(&mut self, plant: &QuadPlant) -> RotorTelemetry {
+        let truth = plant.rotor_omega();
+        let mut omega_rad_s = SVector::<f32, NU>::zeros();
+        let mut valid = [true; NU];
+        for i in 0..NU {
+            let rpm = truth[i] * 60.0 / core::f32::consts::TAU;
+            let quantized = (rpm / self.rpm_quantum).round() * self.rpm_quantum;
+            omega_rad_s[i] = quantized * core::f32::consts::TAU / 60.0;
+            if self.dropout_prob > 0.0 && self.rng.random::<f32>() < self.dropout_prob {
+                valid[i] = false;
+            }
+        }
+        RotorTelemetry {
+            omega_rad_s,
+            valid,
         }
     }
 }
@@ -113,8 +209,8 @@ impl NoisyImu {
 }
 
 impl ImuModel for NoisyImu {
-    fn sample(&mut self, plant: &QuadPlant, u_last: &SVector<f32, NU>) -> ImuMeasurement {
-        let truth = self.truth.sample(plant, u_last);
+    fn sample(&mut self, plant: &QuadPlant) -> ImuMeasurement {
+        let truth = self.truth.sample(plant);
         let gyro_noise = self.noise(&self.gyro_sigma_rad_s.clone());
         let accel_noise = self.noise(&self.accel_sigma_m_s2.clone());
         ImuMeasurement {

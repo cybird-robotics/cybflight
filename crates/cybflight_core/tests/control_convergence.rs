@@ -13,7 +13,7 @@ extern crate alloc;
 
 use cybflight_core::mixer::{MotorEffectiveness, MotorParams, SpinDir};
 use cybflight_core::mpc::{FullQuadModel, FullQuadProblem, FullSqpSolver, N, NU, NX};
-use nalgebra::{SVector, UnitQuaternion, Vector3, Vector4};
+use nalgebra::{Matrix3, SVector, UnitQuaternion, Vector3, Vector4};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Vehicle parameters — single source of truth, matching vehicle.rs
@@ -24,6 +24,36 @@ const GRAV: f32 = 9.81;
 const INERTIA: [f32; 3] = [0.0025, 0.0021, 0.0043];
 const MAX_THRUST_N: f32 = 8.5;
 
+
+/// Legacy baseline — the values of the deleted `QuadModel::default()`,
+/// pinned so these convergence cases are independent of any vehicle
+/// definition.
+fn base_quad_model() -> cybflight_core::mpc::QuadModel {
+    let mass = 0.58;
+    cybflight_core::mpc::QuadModel {
+        mass,
+        grav: 9.81,
+        dt: 0.05,
+        u_bounds: [[0.0, 4.0 * 12.0], [-10.0, 10.0], [-10.0, 10.0], [-6.0, 6.0]],
+        mass_inv: 1.0 / mass,
+        w_pos: [200.0, 200.0, 200.0],
+        w_vel: [10.0, 10.0, 10.0],
+        w_att: [5.0, 5.0, 200.0],
+        w_pos_n: [200.0, 200.0, 200.0],
+        w_vel_n: [10.0, 10.0, 10.0],
+        w_att_n: [5.0, 5.0, 200.0],
+        w_input: nalgebra::Vector4::new(1.0, 20.0, 20.0, 20.0),
+        rho: 1e4,
+        pos_cost_mode: cybflight_core::mpc::quad_model::PosCostMode::Quadratic,
+        tilt_cos_max: 0.5,
+        tilt_barrier_tau: 0.0,
+        tilt_barrier_delta: 0.05,
+        drag_coeff: [0.0; 3],
+        thrust_coeff: 0.0,
+        body_drag_coeff: [0.0; 3],
+    }
+}
+
 fn test_motors() -> [MotorParams; 4] {
     [
         MotorParams {
@@ -31,34 +61,40 @@ fn test_motors() -> [MotorParams; 4] {
             spin_dir: SpinDir::Cw,
             max_thrust_n: MAX_THRUST_N,
             torque_coeff_m: 0.022,
+            ..MotorParams::STOCK_DYNAMICS
         },
         MotorParams {
             position_m: [0.075, -0.1],
             spin_dir: SpinDir::Ccw,
             max_thrust_n: MAX_THRUST_N,
             torque_coeff_m: 0.022,
+            ..MotorParams::STOCK_DYNAMICS
         },
         MotorParams {
             position_m: [-0.075, 0.1],
             spin_dir: SpinDir::Ccw,
             max_thrust_n: MAX_THRUST_N,
             torque_coeff_m: 0.022,
+            ..MotorParams::STOCK_DYNAMICS
         },
         MotorParams {
             position_m: [0.075, 0.1],
             spin_dir: SpinDir::Cw,
             max_thrust_n: MAX_THRUST_N,
             torque_coeff_m: 0.022,
+            ..MotorParams::STOCK_DYNAMICS
         },
     ]
 }
 
 fn test_quad_model(dt: f32) -> FullQuadModel {
+    let inertia = Matrix3::from_diagonal(&Vector3::from(INERTIA));
     FullQuadModel {
         mass: MASS,
         grav: GRAV,
         dt,
-        inertia: INERTIA.into(),
+        inertia,
+        inertia_inv: Matrix3::from_diagonal(&Vector3::from(INERTIA.map(|v| 1.0 / v))),
         ..Default::default()
     }
 }
@@ -478,7 +514,7 @@ fn bench_solve_runtime() {
     // ── QuadModel (NX=10, NU=4) ────────────────────────────────────────────
     let simple_model = QuadModel {
         dt: 0.05,
-        ..Default::default()
+        ..base_quad_model()
     };
     let simple_problem = SimpleQuadProblem::with_rk4(simple_model, SIMPLE_N);
     let mut simple_solver = alloc::boxed::Box::new(SimpleSqpSolver::new());
@@ -670,7 +706,7 @@ fn bench_solve_runtime_varied() {
     // ── Build simple-model solver/problem/refs ────────────────────────────
     let simple_model = QuadModel {
         dt: 0.05,
-        ..Default::default()
+        ..base_quad_model()
     };
     let simple_problem = SimpleQuadProblem::with_rk4(simple_model, SIMPLE_N);
     let mut simple_solver = alloc::boxed::Box::new(SimpleSqpSolver::new());
@@ -980,7 +1016,7 @@ impl SimpleDyn {
         Self {
             model: cybflight_core::mpc::QuadModel {
                 dt,
-                ..Default::default()
+                ..base_quad_model()
             },
         }
     }
@@ -1013,7 +1049,7 @@ impl SimpleCtrl {
         const MPC_SOLVE_DT: f32 = 0.01;
         let model = cybflight_core::mpc::QuadModel {
             dt: MPC_DT,
-            ..Default::default()
+            ..base_quad_model()
         };
         let problem = cybflight_core::mpc::SimpleQuadProblem::with_rk4(model, SN);
         let u_ref = SVector::<f32, { cybflight_core::mpc::quad_model::NU }>::from_row_slice(&[
@@ -1081,13 +1117,14 @@ mod simple_quad {
 
     use super::{generate_initial_orientations, GRAV, MASS, NUM_ORIENTATIONS, POS_TOL, SIM_DT};
 
-    /// Build a default `QuadModel` and override its dt for the prediction
-    /// horizon (50 ms — same as the FullQuadModel test). All other fields
-    /// (mass, weights, bounds) come from `Default::default()`.
+    /// Build the legacy-baseline `QuadModel` and override its dt for the
+    /// prediction horizon (50 ms — same as the FullQuadModel test). All
+    /// other fields (mass, weights, bounds) come from the pinned
+    /// `base_quad_model()` fixture.
     fn make_simple_model(dt: f32) -> QuadModel {
         QuadModel {
             dt,
-            ..Default::default()
+            ..crate::base_quad_model()
         }
     }
 

@@ -1,7 +1,8 @@
 use cybflight_drivers::baro::dps310::Dps310;
 use cybflight_drivers::baro::icp20100::Icp20100;
 #[cfg(feature = "est_pos_gps")]
-use cybflight_drivers::gps::Ublox;
+use cybflight_drivers::gps::GpsDriver;
+use cybflight_drivers::imu::ReadImu;
 use cybflight_drivers::imu::icm426xx::Icm426xx;
 use cybflight_drivers::led::Led;
 use cybflight_drivers::mag::{Ist8310, Qmc5883l};
@@ -12,7 +13,7 @@ use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::Timer;
 #[cfg(feature = "est_pos_gps")]
-use embassy_time::{with_timeout, Duration};
+use embassy_time::{Duration, with_timeout};
 use static_cell::StaticCell;
 
 use crate::bsp;
@@ -20,8 +21,8 @@ use crate::hal;
 use crate::motors::{DshotQuadConfig, MotorTimerConfig};
 use crate::sensors::baro::BaroReader;
 #[cfg(feature = "est_pos_gps")]
-use crate::sensors::gps::{err_kind, GpsHealth, GpsRunner, GPS_HEALTH};
-use crate::sensors::imu::{icm_reader_task, ImuReader, SpiBusMtx};
+use crate::sensors::gps::{GPS_HEALTH, GpsHealth, GpsRunner, err_kind};
+use crate::sensors::imu::{ImuReader, SpiBusMtx, icm_reader_task};
 use crate::sensors::mag::{I2cBusMtx, MagReader};
 use crate::sensors::power::{PowerMonitor, power_task};
 use crate::status;
@@ -31,6 +32,25 @@ use hal::spi::{self, Spi};
 use hal::time::Hertz;
 use hal::timer::low_level::Timer as LLTimer;
 
+// ── Optional-sensor policy ──────────────────────────────────────────────
+// What this build *brings up*, as opposed to what the board *has*
+// (`bsp::HAS_*`). All off by default: none of these feed the control
+// path (ESKF/INDI read `IMU_1`; the shell one-shots, ESP-bridge mirrors
+// and `/health` tolerate a silent channel), and each costs a bus init, an
+// IRQ binding and a polling task. When every device on a bus is off the
+// bus itself is not created. Flip per need — plain `if` on a const, so
+// the dead arm is eliminated and the code keeps compiling either way.
+/// IIM42652 secondary IMU on SPI1 (8 kHz reader on the control executor).
+const ENABLE_IMU2: bool = false;
+/// ICP20100 barometer on I2C1.
+const ENABLE_BARO1: bool = false;
+/// DPS310 barometer on SPI1.
+const ENABLE_BARO2: bool = false;
+/// IST8310 internal compass on I2C1.
+const ENABLE_MAG_INT: bool = false;
+/// QMC5883L external compass on I2C2.
+const ENABLE_MAG_EXT: bool = false;
+
 // Single interrupt struct covering all buffered serial UARTs used as role
 // candidates. board_init dispatches based on the bsp::PORT_* constants
 // defined in the BSP port mapping table; LLVM eliminates dead match arms
@@ -38,6 +58,7 @@ use hal::timer::low_level::Timer as LLTimer;
 hal::bind_interrupts!(struct SerialIrqs {
     UART4 => hal::usart::BufferedInterruptHandler<hal::peripherals::UART4>;
     USART3 => hal::usart::BufferedInterruptHandler<hal::peripherals::USART3>;
+    USART2 => hal::usart::BufferedInterruptHandler<hal::peripherals::USART2>;
     UART7 => hal::usart::BufferedInterruptHandler<hal::peripherals::UART7>;
 });
 
@@ -87,6 +108,15 @@ pub async fn init(
     // --- Load vehicle parameters from flash (or defaults) ---
     crate::params::init_from_flash(board.internal_flash);
 
+    // Sensor topology params (IMU LPF cutoffs, mag hard-iron) — from the
+    // vehicle YAML bake plus any flash overrides. Captured once at init;
+    // changes need a reboot.
+    let sensor_params = crate::params::get().sensors;
+    let accel_cutoff_hz = sensor_params.imu_accel_lpf_hz;
+    let gyro_cutoff_hz = sensor_params.imu_gyro_lpf_hz;
+    let mag_hard_iron =
+        nalgebra::Vector3::from(crate::params::get().airframe.install.mag_hard_iron);
+
     // --- LEDs: turn off led1 & led2, use led0 for status ---
     let mut led1 = Led::new(board.leds.led1, false);
     let mut led2 = Led::new(board.leds.led2, false);
@@ -100,13 +130,23 @@ pub async fn init(
     // The strip stays off until the operator runs `led on` AND the vehicle
     // arms — see `arm_led::compose_frame`.
     crate::arm_led::ARM_LED_ENABLED.store(
-        crate::params::get().arm_led_enabled,
+        crate::params::get().system.arm_led_enabled,
         core::sync::atomic::Ordering::Relaxed,
     );
+    // LED strip is on TIM1_CH1 (PA8/AF1). TIM1 is an advanced-control timer:
+    // enable its RCC clock, set BDTR.MOE (required for the output stage), and
+    // keep the clock alive (forget) before handing the GP16 regs to the driver.
+    let led_timer = LLTimer::new(board.motors.tim1);
+    let led_tim_regs = led_timer.regs_gp16();
+    led_timer.regs_advanced().bdtr().modify(|w| w.set_moe(true));
+    core::mem::forget(led_timer);
     let arm_led_strip = crate::arm_led::ws2812::Ws2812::new(
-        board.motors.tim1,
+        led_tim_regs,
         board.motors.led_strip,
+        1, // AF1 = TIM1_CH1
+        0, // CH1
         board.motors.dma1_ch7,
+        11, // DMAMUX request: TIM1_CH1
     );
     spawner
         .spawn(crate::arm_led::task(arm_led_strip))
@@ -154,9 +194,24 @@ pub async fn init(
     // Wait for power to stabilize before touching SPI devices.
     Timer::after_millis(100).await;
 
+    // SPI4 carries IMU1 alone, 24 MHz (ICM-42688-P datasheet max). The
+    // 15-byte TEMP/ACCEL/GYRO burst is ~5 µs of bus time against the
+    // 125 µs 8 kHz period. History: at the original 1 MHz (with a second
+    // INT_STATUS transaction per sample) it was 136 µs — longer than the
+    // period — so the reader silently ran at ~2.5 kHz on every build
+    // (`imurate`). 24 MHz boot-looped (IWDG) on 2026-08-24 with that
+    // two-transaction driver; it was re-benched and kept after the
+    // driver moved to a single burst + latched DRDY (docs/imu_fifo.md).
+    // If it ever boot-loops again, 8 MHz (foxeer/micoair) is the known-
+    // good fallback. embassy picks the nearest prescaler <= 24 MHz.
     let mut spi_config = spi::Config::default();
-    spi_config.frequency = Hertz(1_000_000);
+    spi_config.frequency = Hertz(24_000_000);
     spi_config.mode = spi::MODE_3;
+    // SPI1 is the shared bus (DPS310 + IIM42652); its own config so IMU1's
+    // clock never leaks onto it. Unchanged at 1 MHz.
+    let mut spi1_config = spi::Config::default();
+    spi1_config.frequency = Hertz(1_000_000);
+    spi1_config.mode = spi::MODE_3;
 
     // --- IMU1: ICM42688P on SPI4 (PE12/13/14, CS=PE11, DRDY=PB2) ---
     static SPI4_BUS: StaticCell<SpiBusMtx> = StaticCell::new();
@@ -173,15 +228,31 @@ pub async fn init(
     let dev4 = SpiDevice::new(spi4_bus, board.sensors.gyro1_cs);
 
     let mut delay = embassy_time::Delay;
-    match Icm426xx::new(dev4, board.sensors.gyro1_drdy, &mut delay).await {
+    match Icm426xx::new(
+        dev4,
+        board.sensors.gyro1_drdy,
+        &mut delay,
+        crate::rates::ICM_ODR,
+    )
+    .await
+    {
         Ok(imu1) => {
             defmt::info!("IMU1 init OK");
+            defmt::assert!(
+                imu1.sample_rate_hz() == crate::rates::IMU_ODR_HZ,
+                "IMU1 ODR does not match rates::IMU_ODR_HZ"
+            );
             // IMU reader → control executor (P10). Fresh gyro/accel
             // samples preempt any thread-executor work, including the
             // trajectory planner's BFGS solve.
             ctrl_spawner
                 .spawn(icm_reader_task(
-                    ImuReader::new(imu1, board.sensors.gyro1_align, 80.0, 200.0),
+                    ImuReader::new(
+                        imu1,
+                        board.sensors.gyro1_align,
+                        accel_cutoff_hz,
+                        gyro_cutoff_hz,
+                    ),
                     &crate::sensors::IMU_1,
                     Some(&crate::sensors::IMU_1_RAW),
                 ))
@@ -268,7 +339,12 @@ pub async fn init(
     // reports `GpsHealth::NotConfigured`.
     #[cfg(feature = "est_pos_gps")]
     {
+        // u-blox runs at 230_400 on this board; the UM982 is configured for
+        // 115_200 on its COM1 (the port wired to USART3).
+        #[cfg(not(feature = "gps_unicore"))]
         const GPS_BAUD: u32 = 230_400;
+        #[cfg(feature = "gps_unicore")]
+        const GPS_BAUD: u32 = 115_200;
         GPS_HEALTH.lock(|c| c.set(GpsHealth::Initializing));
         match bsp::PORT_GPS {
             bsp::SerialPortId::Usart3 => {
@@ -291,15 +367,16 @@ pub async fn init(
                     Ok(uart) => {
                         defmt::info!("GPS: USART3 OK, sending CFG-MSG...");
                         let mut delay = embassy_time::Delay;
-                        match with_timeout(Duration::from_secs(30), Ublox::new(uart, &mut delay))
-                            .await
+                        match with_timeout(
+                            Duration::from_secs(30),
+                            GpsDriver::new(uart, &mut delay),
+                        )
+                        .await
                         {
                             Ok(Ok(gps)) => {
                                 defmt::info!("GPS u-blox init OK");
                                 spawner
-                                    .spawn(crate::sensors::gps::ublox_gps_task(GpsRunner::new(
-                                        gps,
-                                    )))
+                                    .spawn(crate::sensors::gps::gps_task(GpsRunner::new(gps)))
                                     .unwrap_or_else(|e| {
                                         defmt::error!("Failed to spawn GPS task: {}", e)
                                     });
@@ -328,8 +405,10 @@ pub async fn init(
     }
 
     // --- I2C2 shared bus (PB10 SCL, PB11 SDA) for external QMC5883L ---
-    defmt::info!("I2C2: starting init");
-    {
+    if !ENABLE_MAG_EXT {
+        defmt::info!("I2C2 / QMC5883L mag ext: disabled (ENABLE_MAG_EXT)");
+    } else {
+        defmt::info!("I2C2: starting init");
         static I2C2_BUS: StaticCell<I2cBusMtx> = StaticCell::new();
         let mut i2c_config = hal::i2c::Config::default();
         i2c_config.frequency = Hertz(400_000);
@@ -358,8 +437,8 @@ pub async fn init(
                     spawner
                         .spawn(crate::sensors::mag::qmc5883l_mag_task(MagReader::new(
                             mag,
-                            bsp_types::SensorAlign::Cw180Deg,
-                            nalgebra::Vector3::zeros(),
+                            board.sensors.mag_align,
+                            mag_hard_iron,
                         )))
                         .unwrap_or_else(|e| defmt::error!("Failed to spawn QMC5883L task: {}", e));
                 }
@@ -371,8 +450,12 @@ pub async fn init(
     }
 
     // --- I2C1 shared bus (PB6 SCL, PB7 SDA) for ICP20100 baro1 + IST8310 mag ---
-    defmt::info!("I2C1: starting init for ICP20100 + IST8310");
-    {
+    if !(ENABLE_BARO1 || ENABLE_MAG_INT) {
+        defmt::info!(
+            "I2C1 / ICP20100 baro1 + IST8310 mag int: disabled (ENABLE_BARO1, ENABLE_MAG_INT)"
+        );
+    } else {
+        defmt::info!("I2C1: starting init for ICP20100 + IST8310");
         static I2C1_BUS: StaticCell<I2cBusMtx> = StaticCell::new();
         let mut i2c_config = hal::i2c::Config::default();
         i2c_config.frequency = Hertz(400_000);
@@ -404,11 +487,13 @@ pub async fn init(
         let mut mag_int_driver = None;
 
         // ICP20100 barometer (addr 0x63) — init directly, no separate probe
-        defmt::info!(
-            "I2C1: initializing ICP20100 at {:#x}...",
-            bsp::sensors::BARO_1_I2C_ADDR
-        );
-        {
+        if !ENABLE_BARO1 {
+            defmt::info!("ICP20100 baro1: disabled (ENABLE_BARO1)");
+        } else {
+            defmt::info!(
+                "I2C1: initializing ICP20100 at {:#x}...",
+                bsp::sensors::BARO_1_I2C_ADDR
+            );
             let dev = I2cDevice::new(i2c1_bus);
             let mut delay = embassy_time::Delay;
             match Icp20100::new(dev, bsp::sensors::BARO_1_I2C_ADDR, &mut delay).await {
@@ -421,11 +506,13 @@ pub async fn init(
         }
 
         // IST8310 internal magnetometer (addr 0x0E)
-        defmt::info!(
-            "I2C1: probing IST8310 at {:#x}...",
-            bsp::sensors::MAG_I2C_ADDR
-        );
-        {
+        if !ENABLE_MAG_INT {
+            defmt::info!("IST8310 mag int: disabled (ENABLE_MAG_INT)");
+        } else {
+            defmt::info!(
+                "I2C1: probing IST8310 at {:#x}...",
+                bsp::sensors::MAG_I2C_ADDR
+            );
             let mut probe_dev = I2cDevice::new(i2c1_bus);
             let mut delay = embassy_time::Delay;
             if Ist8310::probe(&mut probe_dev, bsp::sensors::MAG_I2C_ADDR, &mut delay).await {
@@ -462,16 +549,18 @@ pub async fn init(
             spawner
                 .spawn(crate::sensors::mag::ist8310_mag_task(MagReader::new(
                     mag,
-                    bsp_types::SensorAlign::Cw180Deg,
-                    nalgebra::Vector3::zeros(),
+                    board.sensors.mag_align,
+                    mag_hard_iron,
                 )))
                 .unwrap_or_else(|e| defmt::error!("Failed to spawn IST8310 task: {}", e));
         }
     }
 
     // --- SPI1 shared bus (PA5/6/7) for BARO_2 (DPS310, CS=PC5) + IMU2 (IIM42652, CS=PA4) ---
-    defmt::info!("SPI1: starting init for DPS310 baro2 + IIM42652 IMU2");
-    {
+    if !(ENABLE_BARO2 || ENABLE_IMU2) {
+        defmt::info!("SPI1 / DPS310 baro2 + IIM42652 IMU2: disabled (ENABLE_BARO2, ENABLE_IMU2)");
+    } else {
+        defmt::info!("SPI1: starting init for DPS310 baro2 + IIM42652 IMU2");
         use crate::sensors::imu::SpiBusMtx;
         static SPI1_BUS: StaticCell<SpiBusMtx> = StaticCell::new();
         let spi1 = Spi::new(
@@ -481,13 +570,15 @@ pub async fn init(
             board.spi.spi1_miso,
             board.spi.spi1_tx_dma,
             board.spi.spi1_rx_dma,
-            spi_config,
+            spi1_config,
         );
         let spi1_bus = SPI1_BUS.init(Mutex::new(spi1));
 
         // DPS310 barometer (CS=PC5)
         let mut probe_dev = SpiDevice::new(spi1_bus, board.sensors.baro2_cs);
-        if Dps310::probe_spi(&mut probe_dev).await {
+        if !ENABLE_BARO2 {
+            defmt::info!("DPS310 baro2: disabled (ENABLE_BARO2)");
+        } else if Dps310::probe_spi(&mut probe_dev).await {
             defmt::info!("SPI1: DPS310 found, initializing...");
             let mut delay = embassy_time::Delay;
             match Dps310::new_spi(probe_dev, &mut delay).await {
@@ -508,22 +599,41 @@ pub async fn init(
             defmt::warn!("DPS310 not detected on SPI1");
         }
 
-        // IMU2: IIM42652 (CS=PA4, DRDY=PC4) — same Icm426xx driver as IMU1
+        // IMU2: IIM42652 (CS=PA4, DRDY=PC4) — same Icm426xx driver as IMU1,
+        // same ODR so IMU_2 consumers see coherent timing
         let dev_imu2 = SpiDevice::new(spi1_bus, board.sensors.gyro2_cs);
         let mut delay = embassy_time::Delay;
-        match Icm426xx::new(dev_imu2, board.sensors.gyro2_drdy, &mut delay).await {
-            Ok(imu2) => {
-                defmt::info!("IMU2 (IIM42652) init OK");
-                // IMU2 reader → control executor (see IMU1 rationale).
-                ctrl_spawner
-                    .spawn(icm_reader_task(
-                        ImuReader::new(imu2, board.sensors.gyro2_align, 80.0, 200.0),
-                        &crate::sensors::IMU_2,
-                        None,
-                    ))
-                    .unwrap_or_else(|e| defmt::error!("Failed to spawn IMU2 reader task: {}", e));
+        if !ENABLE_IMU2 {
+            defmt::info!("IMU2 (IIM42652): disabled (ENABLE_IMU2)");
+        } else {
+            match Icm426xx::new(
+                dev_imu2,
+                board.sensors.gyro2_drdy,
+                &mut delay,
+                crate::rates::ICM_ODR,
+            )
+            .await
+            {
+                Ok(imu2) => {
+                    defmt::info!("IMU2 (IIM42652) init OK");
+                    // IMU2 reader → control executor (see IMU1 rationale).
+                    ctrl_spawner
+                        .spawn(icm_reader_task(
+                            ImuReader::new(
+                                imu2,
+                                board.sensors.gyro2_align,
+                                accel_cutoff_hz,
+                                gyro_cutoff_hz,
+                            ),
+                            &crate::sensors::IMU_2,
+                            None,
+                        ))
+                        .unwrap_or_else(|e| {
+                            defmt::error!("Failed to spawn IMU2 reader task: {}", e)
+                        });
+                }
+                Err(e) => defmt::warn!("IMU2 (IIM42652) init failed: {}", e),
             }
-            Err(e) => defmt::warn!("IMU2 (IIM42652) init failed: {}", e),
         }
     }
 
@@ -556,6 +666,45 @@ pub async fn init(
             }
         }
         _ => defmt::warn!("ESP bridge: PORT_ESP_BRIDGE is not a supported port on this board"),
+    }
+
+    // --- Gimbal (chaser only): bsp::PORT_GIMBAL selects the UART (USART2). ---
+    #[cfg(feature = "role_chaser")]
+    {
+        match bsp::PORT_GIMBAL {
+            bsp::SerialPortId::Usart2 => {
+                static GIMBAL_TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+                static GIMBAL_RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+                let tx_buf = &mut GIMBAL_TX_BUF.init([0u8; 256])[..];
+                let rx_buf = &mut GIMBAL_RX_BUF.init([0u8; 256])[..];
+                let mut uart_config = hal::usart::Config::default();
+                // Z-1Mini UART baud is auto-adaptive among 115200/250000/500000/
+                // 1000000; 115200 is the confirmed-reliable rate on this wiring.
+                // (Higher rates failed to auto-lock here — revisit if needed.)
+                uart_config.baudrate = 115_200;
+                match hal::usart::BufferedUart::new(
+                    board.serial.usart2,
+                    board.serial.usart2_rx,
+                    board.serial.usart2_tx,
+                    tx_buf,
+                    rx_buf,
+                    SerialIrqs,
+                    uart_config,
+                ) {
+                    Ok(uart) => {
+                        let (tx, rx) = uart.split();
+                        defmt::info!("Gimbal USART2 init OK (BufferedUart)");
+                        spawner
+                            .spawn(crate::gimbal::gimbal_task(tx, rx))
+                            .unwrap_or_else(|e| {
+                                defmt::error!("Failed to spawn gimbal task: {}", e)
+                            });
+                    }
+                    Err(e) => defmt::error!("Gimbal USART2 init failed: {}", e),
+                }
+            }
+            _ => defmt::warn!("Gimbal: PORT_GIMBAL is not a supported port on this board"),
+        }
     }
 
     // --- DShot motor output ---
@@ -634,10 +783,19 @@ pub async fn init(
 
     // --- Power monitoring (ADC3) ---
     // Placed after DShot so motor control starts even if ADC init has issues.
+    // SAKURAH743: VBAT=PC3 (ADC3_INP1), CURR=PC2 (ADC3_INP0).
     let power_mon = PowerMonitor::new(
         board.adc.adc3,
         board.adc.vbat,
         board.adc.curr,
+        crate::sensors::power::AdcInput {
+            gpioc_pin: 3,
+            channel: 1,
+        },
+        crate::sensors::power::AdcInput {
+            gpioc_pin: 2,
+            channel: 0,
+        },
         bsp::POWER_CAL,
     );
     spawner

@@ -20,6 +20,13 @@ pub struct Setpoint {
     pub position: Vector3<f32>,
     pub velocity: Vector3<f32>,
     pub acceleration: Vector3<f32>,
+    /// Third derivative of the reference position. Zero for hover and
+    /// past-end samples; consumed by the flatness `u_ref` feedforward.
+    pub jerk: Vector3<f32>,
+    /// Fourth derivative of the reference position (zero for hover and
+    /// past-end samples); consumed by the geometric controller's
+    /// angular-acceleration feedforward.
+    pub snap: Vector3<f32>,
     pub yaw: f32,
     /// Flagged true on the tick at which the trajectory completes. The runner
     /// uses this for early-exit / terminal-metric windows.
@@ -32,6 +39,8 @@ impl Setpoint {
             position,
             velocity: Vector3::zeros(),
             acceleration: Vector3::zeros(),
+            jerk: Vector3::zeros(),
+            snap: Vector3::zeros(),
             yaw: 0.0,
             terminal: true,
         }
@@ -78,6 +87,12 @@ pub struct MissionSetpoints {
 }
 
 impl MissionSetpoints {
+    /// The underlying trajectory (e.g. to hand a copy to a controller-side
+    /// position sampler).
+    pub fn trajectory(&self) -> &PiecewisePolynomial {
+        &self.traj
+    }
+
     pub fn from_trajectory(traj: PiecewisePolynomial) -> Self {
         let duration_s = traj.total_duration();
         let p = traj.get_pos(duration_s);
@@ -118,6 +133,8 @@ impl SetpointSource for MissionSetpoints {
                 position: self.terminal_pos,
                 velocity: Vector3::zeros(),
                 acceleration: Vector3::zeros(),
+                jerk: Vector3::zeros(),
+                snap: Vector3::zeros(),
                 yaw: 0.0,
                 terminal: true,
             };
@@ -125,10 +142,14 @@ impl SetpointSource for MissionSetpoints {
         let p = self.traj.get_pos(t);
         let v = self.traj.get_vel(t);
         let a = self.traj.get_acc(t);
+        let j = self.traj.get_jerk(t);
+        let sn = self.traj.get_snap(t);
         Setpoint {
             position: Vector3::new(p[0], p[1], p[2]),
             velocity: Vector3::new(v[0], v[1], v[2]),
             acceleration: Vector3::new(a[0], a[1], a[2]),
+            jerk: Vector3::new(j[0], j[1], j[2]),
+            snap: Vector3::new(sn[0], sn[1], sn[2]),
             yaw: 0.0,
             terminal: false,
         }

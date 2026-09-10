@@ -11,6 +11,7 @@ use nalgebra::Vector3;
 
 pub mod eskf_imu_mocap;
 pub mod eskf_imu_gps;
+pub mod mahony_task;
 pub mod rpm_estimator;
 
 
@@ -151,20 +152,67 @@ pub mod att_health {
     pub const ALL_OK: u8 = ACCEL_OK | GYRO_OK | NO_RECENT_NAN;
 }
 
-pub const POS_TIMEOUT_S: f32 = 2.0;
-pub const POS_COV_BLOWUP_M2: f32 = 25.0;
-pub const NAN_RESET_HOLD_S: f32 = 3.0;
-/// How long a guard-cascade event keeps its fault bit asserted.
-/// Cascades are momentary: the wrapper records a single timestamp
-/// when the gate fires; the bit then auto-clears after this window
-/// so a healthy filter doesn't carry stale fault state forever.
-/// Match `NAN_RESET_HOLD_S` so all "recently bad" hold-downs share
-/// one operator-visible duration.
-pub const CASCADE_HOLD_S: f32 = 3.0;
+/// Bias-telemetry publish decimation relative to the ESKF predict rate
+/// (1 kHz / 100 = 10 Hz). Shared by both estimation tasks — biases drift
+/// slowly, so the channel runs well below the predict rate.
+pub const BIAS_TELEM_DECIMATION: u32 = 100;
+
+/// Upper bound on a single ESKF predict step [s]. A gap larger than this
+/// means the IMU stream hiccuped (task starvation, driver recovery); the
+/// linearization is only valid over a short interval, so the step is
+/// skipped rather than propagated over a stale dt. Shared by both
+/// estimation tasks so the GPS and mocap paths cannot drift apart.
+pub const MAX_PREDICT_DT_S_FALLBACK: f32 = 0.05;
+
+/// The configured longest IMU gap the estimator will integrate across
+/// (`eskf_max_predict_dt_s`), degrading to [`MAX_PREDICT_DT_S_FALLBACK`]
+/// if the value is not usable.
+///
+/// Read once at task start, never per predict step: `params::get()`
+/// clones the whole config inside a critical section and the predict
+/// path runs at ~1 kHz.
+pub fn max_predict_dt_s(p: &cybflight_core::params::FirmwareConfig) -> f32 {
+    let v = p.eskf.filter.max_predict_dt_s;
+    if v.is_finite() && v > 0.0 {
+        v
+    } else {
+        defmt::warn!("estimation: eskf_max_predict_dt_s unusable — using default");
+        MAX_PREDICT_DT_S_FALLBACK
+    }
+}
+
+/// Fault-annunciation windows from the `eskf.faults` param group.
+///
+/// `eskf.faults` is reboot-flagged, so this is a one-shot read: callers
+/// snapshot it at task start and pass it in. It used to be read inside
+/// `evaluate_faults` on the claim that the evaluator "runs at the
+/// telemetry cadence" — it does not. `ODOM_DECIMATION` is 1, so it runs
+/// at the full predict rate, and `params::get()` clones the whole
+/// `FirmwareConfig` inside a critical section, which disables the DShot
+/// and INDI interrupts.
+pub fn fault_params() -> cybflight_core::params::EskfFaultParams {
+    crate::params::get().eskf.faults
+}
 
 pub static ESKF_FAULTS: AtomicU32 = AtomicU32::new(0);
 pub static ESKF_DEGRADED: AtomicBool = AtomicBool::new(false);
-/// Severe in-flight faults — polled by `failsafe_task` to force disarm.
+/// Severe estimator faults, as classified by `evaluate_faults`.
+///
+/// Consumed by the **arm gate** (`health::first_blocker` →
+/// `BlockReason::EskfSevereFault`) and by telemetry (`health`,
+/// `health_wire`, the `/health` blackbox topic).
+///
+/// `severe` is by construction `armed && <untrusted-pos/vel bits>`, so
+/// this can only ever be true *in flight*. That makes it useless to the
+/// arm gate — pre-arm it is always false, and `ESKF_DEGRADED`
+/// (`flags != 0 && !severe`) already carries every asserted bit there.
+///
+/// It is currently telemetry-only. It is deliberately NOT wired to
+/// `failsafe_task`: an estimator fault mid-flight leaves attitude
+/// control intact and usable, and on a mocap vehicle there is no
+/// secondary position source to fall back to, so cutting the motors is
+/// not obviously safer than letting the pilot take over. Wiring an
+/// auto-disarm here is a policy decision, not a bug fix.
 pub static ESKF_SEVERE_FAULT: AtomicBool = AtomicBool::new(false);
 pub static ATTITUDE_HEALTH: AtomicU8 = AtomicU8::new(0);
 pub static ESKF_HEALTH: Mutex<CriticalSectionRawMutex, Cell<EskfHealth>> =
@@ -203,8 +251,6 @@ pub static ESKF_LAST_REJECT_CASCADE: Mutex<CriticalSectionRawMutex, Cell<Option<
 /// thresholds are deliberately generous — the goal is to catch a
 /// vehicle that's tumbling or falling, not a vehicle that's lifting
 /// off cleanly. Used by `attitude_health_bits`.
-pub const ACCEL_ARM_TOL_M_S2: f32 = 1.5;
-pub const GYRO_ARM_LIMIT_RAD_S: f32 = 0.5;
 
 /// Compute the `ATTITUDE_HEALTH` bitfield from the latest IMU sample
 /// + the most recent NaN-reset timestamp. Called every IMU sample by
@@ -218,18 +264,19 @@ pub fn attitude_health_bits(
     gyro_rad_s: &Vector3<f32>,
     last_nan_reset: Option<Instant>,
     now: Instant,
+    p: &AttitudeHealthParams,
 ) -> u8 {
     let mut bits = 0u8;
-    if (accel_m_s2.norm() - 9.81).abs() < ACCEL_ARM_TOL_M_S2 {
+    if (accel_m_s2.norm() - p.gravity_m_s2).abs() < p.arm_accel_tol_m_s2 {
         bits |= att_health::ACCEL_OK;
     }
-    if gyro_rad_s.iter().all(|v| v.abs() < GYRO_ARM_LIMIT_RAD_S) {
+    if gyro_rad_s.iter().all(|v| v.abs() < p.arm_gyro_limit_rad_s) {
         bits |= att_health::GYRO_OK;
     }
     let recent_nan = match last_nan_reset {
         Some(t) => now
             .checked_duration_since(t)
-            .is_some_and(|d| d.as_secs_f32() < NAN_RESET_HOLD_S),
+            .is_some_and(|d| d.as_secs_f32() < p.nan_reset_hold_s),
         None => false,
     };
     if !recent_nan {
@@ -238,7 +285,43 @@ pub fn attitude_health_bits(
     bits
 }
 
+/// The four scalars `attitude_health_bits` needs, lifted out of
+/// `FirmwareConfig`.
+///
+/// This runs on **every IMU sample** — 8 kHz on an `imu_rate: 8khz`
+/// vehicle. It used to call `params::get()` inline, which clones the
+/// entire ~260-field `FirmwareConfig` inside a `critical_section`, i.e.
+/// with the P6 DShot and P10 INDI interrupts masked, 8000 times a
+/// second. All three source groups (`site`, `safety`, `eskf`) are
+/// reboot-flagged, so snapshotting once at task start is exactly the
+/// documented contract.
+#[derive(Clone, Copy, Debug)]
+pub struct AttitudeHealthParams {
+    pub gravity_m_s2: f32,
+    pub arm_accel_tol_m_s2: f32,
+    pub arm_gyro_limit_rad_s: f32,
+    pub nan_reset_hold_s: f32,
+}
+
+impl AttitudeHealthParams {
+    /// Snapshot from the live config. Call once, at task start.
+    pub fn snapshot() -> Self {
+        let p = crate::params::get();
+        Self {
+            gravity_m_s2: p.site.gravity_m_s2,
+            arm_accel_tol_m_s2: p.safety.arm_accel_tol_m_s2,
+            arm_gyro_limit_rad_s: p.safety.arm_gyro_limit_rad_s,
+            nan_reset_hold_s: p.eskf.faults.nan_reset_hold_s,
+        }
+    }
+}
+
 pub struct FaultEvalInputs {
+    /// Fault-annunciation windows, snapshotted at task start —
+    /// `eskf` is reboot-flagged. Passed in rather than read inside
+    /// `evaluate_faults` for the same reason as
+    /// [`AttitudeHealthParams`]: this runs at the full predict rate.
+    pub fault_params: cybflight_core::params::EskfFaultParams,
     pub now: Instant,
     pub last_pos_update: Option<Instant>,
     pub last_vel_update: Option<Instant>,
@@ -252,13 +335,14 @@ pub struct FaultEvalInputs {
 
 /// Returns `(flags, severe)`. `severe` only goes true while armed.
 pub fn evaluate_faults(inputs: &FaultEvalInputs) -> (u32, bool) {
+    let fp = inputs.fault_params;
     let mut flags = 0u32;
 
     let stale = |t: Option<Instant>| match t {
         Some(t) => inputs
             .now
             .checked_duration_since(t)
-            .is_some_and(|d| d.as_secs_f32() > POS_TIMEOUT_S),
+            .is_some_and(|d| d.as_secs_f32() > fp.pos_timeout_s),
         None => false,
     };
     if stale(inputs.last_pos_update) {
@@ -278,17 +362,17 @@ pub fn evaluate_faults(inputs: &FaultEvalInputs) -> (u32, bool) {
             .is_some_and(|d| d.as_secs_f32() < hold_s),
         None => false,
     };
-    if recent(inputs.last_nan_reset, NAN_RESET_HOLD_S) {
+    if recent(inputs.last_nan_reset, fp.nan_reset_hold_s) {
         flags |= fault::NAN_RESET;
     }
-    if recent(inputs.last_jump_cascade, CASCADE_HOLD_S) {
+    if recent(inputs.last_jump_cascade, fp.cascade_hold_s) {
         flags |= fault::GUARD_JUMP_CASCADE;
     }
-    if recent(inputs.last_reject_cascade, CASCADE_HOLD_S) {
+    if recent(inputs.last_reject_cascade, fp.cascade_hold_s) {
         flags |= fault::GUARD_REJECT_CASCADE;
     }
 
-    if inputs.pos_cov_trace > POS_COV_BLOWUP_M2 {
+    if inputs.pos_cov_trace > fp.cov_blowup_m2 {
         flags |= fault::COV_TRACE_BLOWUP;
     }
 

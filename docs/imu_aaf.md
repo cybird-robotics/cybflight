@@ -35,21 +35,37 @@ ADC.
 
 Three decisions are made in `icm426xx.rs`:
 
-### 1. Target frequencies
+### 1. Target frequencies (per ODR mode)
 
-- **Gyro ~1 kHz** — passes all flight-relevant dynamics while rejecting high
-  motor harmonics
-- **Accel ~250 Hz** — sufficient for attitude/gravity correction; narrower
-  bandwidth reduces vibration noise in the gravity estimate
+The driver takes an `OutputDataRate` argument (selected by the `imu_1khz`
+build knob, see `crates/cybflight/src/rates.rs`):
+
+- **8 kHz mode** (default): gyro ~1 kHz — passes all flight-relevant
+  dynamics while rejecting high motor harmonics
+- **1 kHz low-noise mode**: gyro ~258 Hz — Nyquist drops to 500 Hz, so the
+  8 kHz-mode ~1 kHz gyro AAF would sit *above* Nyquist and stop doing its
+  job; the narrower pole restores real anti-aliasing
+- **Accel ~250 Hz in both modes** — sufficient for attitude/gravity
+  correction and already below either Nyquist; narrower bandwidth reduces
+  vibration noise in the gravity estimate
+
+In 1 kHz mode the gyro simply reuses the accel triplet — same LUT row.
+
+Related but separate: in 1 kHz mode the driver also programs the *digital*
+UI filter (section 5.5) to BW code 1 = ODR/4 ≈ 227 Hz, 2nd order. The
+selectable UI bandwidths only take effect at ODR ≤ 1 kHz — at 8 kHz the
+hardware pins the UI filter wide open (~2 kHz, "low latency"), which is
+why the 8 kHz mode writes `GYRO_ACCEL_CONFIG0 = 0xFF` and the datasheet
+calls 1 kHz the best-noise operating point.
 
 ### 2. Per-family register values
 
 The AAF pole frequency scales linearly with the chip's internal AAF clock:
 
-| Family                          | Internal clock | Gyro target | DELT | Accel target | DELT |
-|---------------------------------|---------------|-------------|------|--------------|------|
-| ICM-42688P / ICM-42622P         | 32 MHz        | ~997 Hz     | 21   | ~258 Hz      | 6    |
-| ICM-42605 / IIM-42652 / IIM-42653 | 8 MHz       | ~995 Hz     | 63   | ~249 Hz      | 21   |
+| Family                          | Internal clock | Gyro 8 kHz mode | DELT | Gyro 1 kHz mode / Accel | DELT |
+|---------------------------------|---------------|-----------------|------|--------------------------|------|
+| ICM-42688P / ICM-42622P         | 32 MHz        | ~997 Hz         | 21   | ~258 Hz                  | 6    |
+| ICM-42605 / IIM-42652 / IIM-42653 | 8 MHz       | ~995 Hz         | 63   | ~249 Hz                  | 21   |
 
 The 8 MHz family runs 4× slower, so it needs 4× larger DELT values to hit the
 same real-world cutoff. The table entry for delt=63 at 32 MHz is 3979 Hz;

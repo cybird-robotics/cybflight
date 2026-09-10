@@ -31,11 +31,37 @@ pub struct IndiEffectiveness<const N: usize> {
     /// For standard quads, only the yaw row is non-zero.
     pub g2: SMatrix<f32, 3, N>,
 
+    /// The geometry-derived G1 captured at construction. `g1` can later be
+    /// replaced by a configured matrix from params; this copy lets the
+    /// controller *restore* the geometric solution when the configured
+    /// block is zeroed or fails validation — degrading is only safe if the
+    /// pre-override matrix is still around to degrade to.
+    pub g1_geometric: SMatrix<f32, 6, N>,
+
     /// Pre-computed G2 scaler per motor: ω_max² / (2 · τ_motor).
     pub g2_scaler: SVector<f32, N>,
 
     /// Maximum motor angular speed (rad/s) per motor.
     pub max_omega: SVector<f32, N>,
+}
+
+/// Fraction of a motor's `max_omega` below which `1/ω` is replaced by
+/// `1/(frac·ω_max)`. Guards the `ω̇ = 2·ω·ω̇_thrust` inversion against a
+/// stopped or barely-spinning motor without introducing a discontinuity.
+/// Single definition so the controller's du-fallback path and
+/// `combined_g1g2` cannot drift apart.
+pub const INV_OMEGA_THRESH_FRAC: f32 = 0.1;
+
+/// `1/ω` with the [`INV_OMEGA_THRESH_FRAC`] floor applied against
+/// `max_omega`.
+#[inline]
+pub fn omega_inv_guarded(omega: f32, max_omega: f32) -> f32 {
+    let thresh = INV_OMEGA_THRESH_FRAC * max_omega;
+    if num_traits::Float::abs(omega) > thresh {
+        1.0 / omega
+    } else {
+        1.0 / thresh
+    }
 }
 
 /// Per-motor INDI parameters not in the base MotorParams.
@@ -111,6 +137,7 @@ impl<const N: usize> IndiEffectiveness<N> {
         Self {
             g1,
             g2,
+            g1_geometric: g1,
             g2_scaler,
             max_omega,
         }
@@ -134,13 +161,7 @@ impl<const N: usize> IndiEffectiveness<N> {
                 continue;
             }
 
-            // omega_inv with threshold at 10% of max to avoid division by zero
-            let inv_thresh = 0.1 * self.max_omega[i];
-            let omega_inv = if num_traits::Float::abs(omega_fs[i]) > inv_thresh {
-                1.0 / omega_fs[i]
-            } else {
-                1.0 / inv_thresh
-            };
+            let omega_inv = omega_inv_guarded(omega_fs[i], self.max_omega[i]);
 
             // Add G2 contribution to torque rows (3, 4, 5)
             for j in 0..3 {
@@ -149,53 +170,6 @@ impl<const N: usize> IndiEffectiveness<N> {
         }
 
         g1g2
-    }
-
-    /// Replace G1, G2, and motor parameters from learned values.
-    ///
-    /// Validates all values before applying. Returns `true` if the update was
-    /// applied, `false` if validation failed (effectiveness unchanged).
-    ///
-    /// Validation checks:
-    /// - All G1/G2 values must be finite and |value| ≤ 1e4
-    /// - max_omega must be in (0, 20000] rad/s
-    /// - time_const_s must be in [0.005, 0.5]
-    pub fn update_from_learned(
-        &mut self,
-        g1: &SMatrix<f32, 6, N>,
-        g2: &SMatrix<f32, 3, N>,
-        max_omega: &SVector<f32, N>,
-        time_const_s: &SVector<f32, N>,
-    ) -> bool {
-        // Magnitude bound: ~30× the largest geometric G1 entry for a typical
-        // micro-quad. Anything beyond this is a diverged RLS, not a real vehicle.
-        const G_MAG_MAX: f32 = 1e4;
-        // Max plausible motor speed: ~191k RPM mechanical.
-        const OMEGA_MAX: f32 = 20_000.0;
-
-        let g_valid = |&v: &f32| v.is_finite() && v.abs() <= G_MAG_MAX;
-        if !g1.iter().all(g_valid) || !g2.iter().all(g_valid) {
-            return false;
-        }
-        for i in 0..N {
-            if !max_omega[i].is_finite() || max_omega[i] <= 0.0 || max_omega[i] > OMEGA_MAX {
-                return false;
-            }
-            if !time_const_s[i].is_finite() || time_const_s[i] < 0.005 || time_const_s[i] > 0.5 {
-                return false;
-            }
-        }
-
-        // Apply
-        self.g1 = *g1;
-        self.g2 = *g2;
-        for i in 0..N {
-            self.max_omega[i] = max_omega[i];
-            // Recompute G2 scaler: ω_max² / (2 · τ)
-            self.g2_scaler[i] = 0.5 * max_omega[i] * max_omega[i] / time_const_s[i];
-        }
-
-        true
     }
 
     /// Inertia-inverse helper: convert physical torque column to acceleration space.
@@ -227,24 +201,28 @@ mod tests {
                 spin_dir: SpinDir::Cw,
                 max_thrust_n: 8.5,
                 torque_coeff_m: 0.022,
+                ..MotorParams::STOCK_DYNAMICS
             },
             MotorParams {
                 position_m: [0.075, -0.1],
                 spin_dir: SpinDir::Ccw,
                 max_thrust_n: 8.5,
                 torque_coeff_m: 0.022,
+                ..MotorParams::STOCK_DYNAMICS
             },
             MotorParams {
                 position_m: [-0.075, 0.1],
                 spin_dir: SpinDir::Ccw,
                 max_thrust_n: 8.5,
                 torque_coeff_m: 0.022,
+                ..MotorParams::STOCK_DYNAMICS
             },
             MotorParams {
                 position_m: [0.075, 0.1],
                 spin_dir: SpinDir::Cw,
                 max_thrust_n: 8.5,
                 torque_coeff_m: 0.022,
+                ..MotorParams::STOCK_DYNAMICS
             },
         ]
     }

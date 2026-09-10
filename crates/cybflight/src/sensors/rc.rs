@@ -42,31 +42,77 @@ pub type RcUart = hal::usart::BufferedUart<'static>;
 // Arming parameters
 // ---------------------------------------------------------------------------
 
-/// RC arm channel index (0-based). Channel 6 on the transmitter (AUX2).
-pub(crate) const ARM_CHANNEL: usize = 5;
-/// PWM threshold: armed when channel value exceeds this (µs).
-pub(crate) const ARM_THRESHOLD: u16 = 1500;
-/// Throttle channel index (AETR order: index 2 = throttle).
+/// Throttle channel index (AETR order: index 2 = throttle). Protocol
+/// ordering, not a preference — stays a constant.
 pub(crate) const THROTTLE_CHANNEL: usize = 2;
-/// Throttle must be below this to arm (µs). Matches BF `rxConfig.mincheck` default.
-pub(crate) const THROTTLE_MINCHECK: u16 = 1050;
-/// Arm switch must be held for this long before arming (ms).
-/// BF does not debounce the arm switch; this is a cybflight safety addition.
-const ARM_SWITCH_HOLD_MS: u64 = 100;
 
 /// Hold time after the arm switch is flipped before we print the rejection
 /// summary if gates have not passed. Long enough that a normal-debounce arm
 /// completes silently before the deadline; short enough that a stuck attempt
-/// gets one immediate "ARM rejected" line.
+/// gets one immediate "ARM rejected" line. Log policy, not a safety gate.
 const ARM_REJECT_SUMMARY_MS: u64 = 200;
-/// Minimum link quality to allow arming [0..100].
-pub(crate) const MIN_LINK_QUALITY: u8 = 50;
-/// Link stats older than this block arming (ms). Mirrors BF `ARMING_DISABLED_RX_FAILSAFE`.
-pub(crate) const LINK_STATS_MAX_AGE_MS: u64 = 500;
-/// Tilt envelope: roll/pitch must be within this magnitude (degrees).
-pub(crate) const MAX_TILT_DEG: f32 = 30.0;
-/// ESKF/Mahony cross-check tolerance for roll & pitch (degrees).
-pub(crate) const MAX_ESKF_MAHONY_DISAGREE_DEG: f32 = 10.0;
+
+/// Arming gates and the arm-switch mapping, snapshotted from the
+/// `rc` / `safety` param groups.
+///
+/// Both groups are reboot-flagged, so this is read once at RC-task start
+/// and cached here: the per-frame gate evaluation must not take the
+/// critical section that `params::get()` needs (it clones the whole
+/// `FirmwareConfig`). `health.rs` reads the same snapshot so the shell's
+/// "why can't I arm" view and the state machine cannot disagree.
+#[derive(Clone, Copy)]
+pub(crate) struct ArmConfig {
+    pub arm_channel: usize,
+    pub arm_threshold_us: u16,
+    pub throttle_mincheck_us: u16,
+    pub arm_switch_hold_ms: u64,
+    pub min_link_quality: u8,
+    pub link_stats_max_age_ms: u64,
+    pub max_tilt_deg: f32,
+    pub max_eskf_mahony_disagree_deg: f32,
+}
+
+impl ArmConfig {
+    /// Pre-param defaults. Used until [`init_arm_config`] runs, so a
+    /// frame that lands before the snapshot is taken is gated exactly as
+    /// it was before these became parameters.
+    pub(crate) const FALLBACK: Self = Self {
+        arm_channel: 5,
+        arm_threshold_us: 1500,
+        throttle_mincheck_us: 1050,
+        arm_switch_hold_ms: 100,
+        min_link_quality: 50,
+        link_stats_max_age_ms: 500,
+        max_tilt_deg: 30.0,
+        max_eskf_mahony_disagree_deg: 10.0,
+    };
+}
+
+static ARM_CONFIG: BlockingMutex<CriticalSectionRawMutex, Cell<ArmConfig>> =
+    BlockingMutex::new(Cell::new(ArmConfig::FALLBACK));
+
+/// Snapshot the arming params. Call once, after `params::init`.
+pub fn init_arm_config() {
+    let p = crate::params::get();
+    ARM_CONFIG.lock(|c| {
+        c.set(ArmConfig {
+            arm_channel: p.rc.arm_channel as usize,
+            arm_threshold_us: p.rc.arm_threshold_us,
+            throttle_mincheck_us: p.rc.throttle_mincheck_us,
+            arm_switch_hold_ms: (p.safety.arm_switch_hold_s * 1000.0) as u64,
+            min_link_quality: p.safety.arm_min_link_quality,
+            link_stats_max_age_ms: (p.safety.arm_link_stats_max_age_s * 1000.0) as u64,
+            max_tilt_deg: p.safety.arm_max_tilt_deg,
+            max_eskf_mahony_disagree_deg: p.safety.arm_eskf_mahony_tol_deg,
+        })
+    });
+}
+
+/// Cheap read of the cached arming configuration.
+#[inline]
+pub(crate) fn arm_config() -> ArmConfig {
+    ARM_CONFIG.lock(|c| c.get())
+}
 
 // ---------------------------------------------------------------------------
 // Arming state machine
@@ -169,12 +215,13 @@ impl ArmStateMachine {
 
     /// Evaluate arm/disarm on each RC channel frame.
     fn update_channels(&mut self, channels: &[u16; 16], channel_count: u8) {
-        if (channel_count as usize) <= ARM_CHANNEL {
+        let cfg = arm_config();
+        if (channel_count as usize) <= cfg.arm_channel {
             return;
         }
 
         let now = Instant::now();
-        let switch_armed = channels[ARM_CHANNEL] > ARM_THRESHOLD;
+        let switch_armed = channels[cfg.arm_channel] > cfg.arm_threshold_us;
 
         // --- Disarm: always immediate, no gates ---
         if !switch_armed {
@@ -187,8 +234,8 @@ impl ArmStateMachine {
                 self.armed = false;
                 defmt::info!(
                     "DISARMED (ch{}={})",
-                    ARM_CHANNEL + 1,
-                    channels[ARM_CHANNEL]
+                    cfg.arm_channel + 1,
+                    channels[cfg.arm_channel]
                 );
                 ARM_STATE.signal(msgs::ArmDisarm {
                     timestamp: now,
@@ -217,12 +264,12 @@ impl ArmStateMachine {
         }
 
         // Gate 2: throttle at minimum (BF: ARMING_DISABLED_THROTTLE)
-        if channels[THROTTLE_CHANNEL] > THROTTLE_MINCHECK {
+        if channels[THROTTLE_CHANNEL] > cfg.throttle_mincheck_us {
             self.note_block(
                 now,
                 BlockReason::ThrottleNotMin {
                     value: channels[THROTTLE_CHANNEL],
-                    max: THROTTLE_MINCHECK,
+                    max: cfg.throttle_mincheck_us,
                 },
             );
             return;
@@ -234,16 +281,16 @@ impl ArmStateMachine {
             return;
         }
         let link_age_ms = now.duration_since(self.link_stats_time).as_millis() as u64;
-        if link_age_ms > LINK_STATS_MAX_AGE_MS {
+        if link_age_ms > cfg.link_stats_max_age_ms {
             self.note_block(now, BlockReason::LinkStale { age_ms: link_age_ms });
             return;
         }
-        if self.link_quality < MIN_LINK_QUALITY {
+        if self.link_quality < cfg.min_link_quality {
             self.note_block(
                 now,
                 BlockReason::LinkLowQuality {
                     quality: self.link_quality,
-                    min: MIN_LINK_QUALITY,
+                    min: cfg.min_link_quality,
                 },
             );
             return;
@@ -258,7 +305,7 @@ impl ArmStateMachine {
 
         // Gate 5: switch hold duration (debounce)
         let start = *self.switch_arm_start.get_or_insert(now);
-        if now.duration_since(start).as_millis() < ARM_SWITCH_HOLD_MS {
+        if now.duration_since(start).as_millis() < cfg.arm_switch_hold_ms {
             return;
         }
 
@@ -270,8 +317,8 @@ impl ArmStateMachine {
         LATEST_BLOCK_REASON.lock(|c| c.set(None));
         defmt::info!(
             "ARMED (ch{}={}, throttle={}, lq={}%)",
-            ARM_CHANNEL + 1,
-            channels[ARM_CHANNEL],
+            cfg.arm_channel + 1,
+            channels[cfg.arm_channel],
             channels[THROTTLE_CHANNEL],
             self.link_quality,
         );

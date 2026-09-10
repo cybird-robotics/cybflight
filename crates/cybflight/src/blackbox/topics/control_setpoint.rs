@@ -21,7 +21,7 @@ use crate::msgs;
 
 /// MCAP channel id for `/control_setpoint`. Stable across all
 /// record-set profiles.
-pub const CHANNEL_ID: u16 = 11;
+pub const CHANNEL_ID: u16 = 14;
 pub const TOPIC: &str = "/control_setpoint";
 pub const SCHEMA_NAME: &str = "AttitudeControlSetpoint";
 pub const SCHEMA: &[u8] = br#"{

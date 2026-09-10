@@ -4,9 +4,15 @@
 //! Mirrors the firmware's offline-planning workflow on the host:
 //!   1. Recover per-segment durations from the absolute-time YAML schedule.
 //!   2. Feed the n−1 intermediate waypoints + tail = wp[n−1] into a
-//!      `MincoJerk` solver of size n.
+//!      `MincoSnap` solver of size n with zero-PVAJ boundaries — the same
+//!      solver + boundary conditions `plan_offline` uses (`OFFLINE_MINCO`).
+//!      Min-jerk (s=3) is NOT equivalent here: it leaves the head/tail
+//!      jerk free, and on dense schedules the solution front-loads jerk
+//!      at t=0, spiking the flatness body rate ∝ ‖j‖/‖α‖ at the very
+//!      first sample.
 //!   3. Sample the resulting trajectory at 10 ms and compute peak collective
-//!      thrust + peak body rates from differential flatness.
+//!      thrust + peak body rates via `flatness_to_thrust_omega` — the same
+//!      pole-safe map the outer loop uses for the `u_refs` feedforward.
 //!   4. Assert the peaks stay within the planner's published limits
 //!      (small overshoots tolerated; gross violations fail the test).
 //!
@@ -18,7 +24,8 @@
 //! Run: `cargo test -p cybflight-core --target x86_64-unknown-linux-gnu \
 //!       --test offline_minco`
 
-use cybflight_core::trajectory_planning::minco_jerk::MincoJerk;
+use cybflight_core::trajectory_planning::flatness::flatness_to_thrust_omega;
+use cybflight_core::trajectory_planning::minco_snap::MincoSnap;
 use cybflight_core::trajectory_planning::piecewise_polynomial::PiecewisePolynomial;
 use cybflight_core::trajectory_planning::types::{Vec3, ZERO3};
 
@@ -47,8 +54,9 @@ const SAMPLE_DT_S: f32 = 0.010;
 const CONSTRAINT_SLACK: f32 = 1.30;
 
 /// Expected continuity tolerance at internal piece boundaries.
-/// MINCO degree-5 polynomials are C² by construction (position, velocity,
-/// acceleration agree across boundaries); we double-check empirically.
+/// MINCO-snap degree-7 polynomials are C⁴ by construction (continuity
+/// through snap across boundaries); we double-check pos/vel/acc
+/// empirically.
 const CONTINUITY_TOL_POS: f32 = 1e-3;
 const CONTINUITY_TOL_VEL: f32 = 1e-2;
 const CONTINUITY_TOL_ACC: f32 = 1e-1;
@@ -227,29 +235,32 @@ const TO_FIXTURE: Fixture = Fixture {
 
 // ─── helpers ───────────────────────────────────────────────────────────
 
-/// Body rates from differential flatness at ψ=0 (yaw angle = 0).
-/// Returns `(omega_xy_norm, |omega_z|)` in rad/s. Returns zeros for
-/// near-inverted samples where the flatness map degenerates.
+/// Body rates from the pole-safe flatness map at ψ=0 — the same
+/// `flatness_to_thrust_omega` the outer loop feeds `u_refs` with.
+/// Returns `(omega_xy_norm, |omega_z|)` in rad/s; zeros for the
+/// near-free-fall samples the map refuses (should not occur on these
+/// schedules).
+///
+/// Note on `omega_z`: the map returns the *min-norm* body rate
+/// `ω_world = z_b × dz_b + ψ̇·ẑ`, whose component along `z_b` is
+/// identically zero when `ψ̇ = 0`. These fixtures carry no yaw
+/// schedule, so `omega_z ≡ 0` and its envelope assertion below is a
+/// finiteness/regression guard rather than a live constraint — it
+/// becomes load-bearing the moment a fixture gains a yaw schedule
+/// (`headings` / `lookahead`). The previous hand-rolled body rate
+/// reported a nonzero `ω_z` here, but that term is the spin required
+/// to hold the *intrinsic tilt-yaw Euler angle* constant, not a
+/// physical requirement of flying the path.
 fn body_rates_flatness(traj: &PiecewisePolynomial, t: f32) -> (f32, f32) {
     let a = traj.get_acc(t);
     let j = traj.get_jerk(t);
-    let alpha = a + Vec3::new(0.0, 0.0, GRAVITY_M_S2);
-    let na = alpha.norm().max(1e-8);
-    let zb = alpha / na;
-    if zb[2] <= -0.9 {
-        return (0.0, 0.0);
+    match flatness_to_thrust_omega(a, j, 0.0, 0.0, GRAVITY_M_S2) {
+        Ok((_tpm, _q, omega)) => {
+            let omega_xy = (omega[0] * omega[0] + omega[1] * omega[1]).sqrt();
+            (omega_xy, omega[2].abs())
+        }
+        Err(_) => (0.0, 0.0),
     }
-    let dot_zj = zb.dot(&j);
-    let dzb = (j - zb * dot_zj) / na;
-    let s_inv = 1.0 / (1.0 + zb[2]).max(0.01);
-    let omega = Vec3::new(
-        -dzb[1] + s_inv * zb[1] * dzb[2],
-        dzb[0] - s_inv * zb[0] * dzb[2],
-        s_inv * (zb[1] * dzb[0] - zb[0] * dzb[1]),
-    );
-    let omega_xy = (omega[0] * omega[0] + omega[1] * omega[1]).sqrt();
-    let omega_z = omega[2].abs();
-    (omega_xy, omega_z)
 }
 
 /// Build the offline trajectory exactly the way `plan_offline` does
@@ -291,10 +302,13 @@ fn build_trajectory(fix: &Fixture) -> (PiecewisePolynomial, Vec<f32>) {
     let tail_pos = Vec3::from(fix.waypoints[n_pieces - 1]);
     let head_pos = Vec3::from(fix.start_pos);
 
-    let head: [Vec3; 3] = [head_pos, ZERO3, ZERO3];
-    let tail: [Vec3; 3] = [tail_pos, ZERO3, ZERO3];
+    // PVAJ boundaries with zero v/a/j — identical to `plan_offline`.
+    let head: [Vec3; 4] = [head_pos, ZERO3, ZERO3, ZERO3];
+    let tail: [Vec3; 4] = [tail_pos, ZERO3, ZERO3, ZERO3];
 
-    let mut minco = MincoJerk::new(&head, &tail, n_pieces);
+    // Host test: the ~42 KB MincoSnap lives on the (8 MB) test stack;
+    // only firmware callers need the StaticCell treatment.
+    let mut minco = MincoSnap::new(&head, &tail, n_pieces);
     minco.set_boundary(&head, &tail);
     minco.solve(&intermediate, &durations);
 

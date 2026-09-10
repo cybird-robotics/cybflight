@@ -7,3 +7,8 @@ pub use sakurah743::init;
 mod foxeerh743;
 #[cfg(feature = "board_foxeerh743")]
 pub use foxeerh743::init;
+
+#[cfg(feature = "board_micoair743v2")]
+mod micoair743v2;
+#[cfg(feature = "board_micoair743v2")]
+pub use micoair743v2::init;

@@ -1,0 +1,489 @@
+# Vehicle definition: SAKURAH743 bench quad (the values that lived in
+# `vehicle.rs` as QUADROTOR_BODY / QUADROTOR_MOTORS before the YAML bake).
+#
+# Selected at build time via `VEHICLE=sakura_bench` (see `.env` /
+# Justfile). The `airframe` section is REQUIRED — physical identity has no
+# defaults; a missing field fails the build. Everything under `tuning` is
+# optional: keys are registry parameter names (see `param list`), values
+# override the schema defaults at bake time. Runtime `param set` + `save`
+# overrides layer on top of everything here (per-key, flash-persisted).
+#
+# Body frame FLU (x fwd, y left, z up); Betaflight QuadX motor order:
+#   m0 REAR_RIGHT (CW), m1 FRONT_RIGHT (CCW), m2 REAR_LEFT (CCW),
+#   m3 FRONT_LEFT (CW).
+
+# Compile-time build selections — per-vehicle hardware facts. Consumed by
+# tools/vehicle_features.py (feature list) and cross-checked by build.rs.
+# Env vars (BOARD, RC_PROTOCOL, OUTER_LOOP, POS_SOURCE, GPS_MODEL, ROLE,
+# IMU_RATE) still override for dev experiments; the script warns on divergence.
+build:
+  board: sakurah743
+  rc_protocol: crsf
+  outer_loop: mpc          # mpc | mpc_full | cascade | rate
+                           #   mpc_full: 13-state NMPC -> (T_d, tau_d) -> INDI
+                           #   alpha inner loop, no rate gains (docs/mpc_full_indi_plan.md)
+  pos_source: mocap          # gps | mocap
+  gps_model: unicore         # ublox | unicore (UM982 dual-antenna)
+  gps_dual_antenna: yes    # yes | no — is ANT2 fitted? `yes` requires
+                          #   gps_model: unicore (build error otherwise)
+  role: chaser             # leader | chaser; omit for none
+  imu_rate: 1khz           # 8khz | 1khz (ICM low-noise mode, 1 kHz inner loop)
+  indi: yes                # yes | no — `no` degrades the inner loop to a plain rate
+                           #   controller (under mpc_full: to static inversion — bench only)
+
+# Default offline mission (missions/<name>.yaml file stem), applied at
+# boot until `mission set` + `param save` persists another. Name is
+# resolved and env-checked against build.pos_source at bake time.
+default_mission: indoor_splits_slow
+
+airframe:
+  name: hunter_01
+
+  # Thrust-to-command model (REQUIRED, hardware identity like mass):
+  # bench-measured (thrust, voltage) → command table baked from
+  # crates/cybflight/data/thrust_tables/a2rl_0114.csv. Analytic
+  # alternatives: { type: quadratic, k: … } / { type: sqrt_squared, k: … }
+  # (A2RL 6S map fits: k = 0.518 / 0.458 respectively).
+  thrust_model: { type: table, table: a2rl_0114 }
+  mass_kg: 0.6
+  # Row-major inertia tensor [Ixx Ixy Ixz Iyx Iyy Iyz Izx Izy Izz], kg·m².
+  # Calibrate from a bifilar pendulum test or CAD model.
+  inertia_kg_m2: [0.0021, 0.0, 0.0, 0.0, 0.0018, 0.0, 0.0, 0.0, 0.003]
+  max_rate_rad_s: [10.0, 10.0, 6.0]
+  motors:
+    # hunter_01 measured geometry — must match the hunter_indoor/outdoor
+    # YAMLs byte-for-byte (airframe.name identifies one physical drone;
+    # enforced by vehicle-yaml's airframe_identity test).
+    - { pos_m: [-0.09, -0.086], spin: cw,  max_thrust_n: 12.0, torque_coeff_m: 0.022 }
+    - { pos_m: [ 0.054, -0.086], spin: ccw, max_thrust_n: 12.0, torque_coeff_m: 0.022 }
+    - { pos_m: [-0.09,  0.086], spin: ccw, max_thrust_n: 12.0, torque_coeff_m: 0.022 }
+    - { pos_m: [ 0.054,  0.086], spin: cw,  max_thrust_n: 12.0, torque_coeff_m: 0.022 }
+
+# Fixed geodetic anchor for the ENU frame (optional).
+#
+# When present, ENU (0,0,0) is this point on every flight, so a mission's
+# waypoints — which are expressed in ENU — always describe the same
+# physical place. When absent (the default, as here), the frame is
+# anchored at the first RTK-fixed PVT instead, which means the same
+# mission flies somewhere slightly different each session.
+#
+# Either way the estimator still waits for an RTK-fixed PVT before it
+# initialises: with a fixed origin that fix seeds *where the vehicle is*
+# inside the frame, and a biased stand-alone seed would start the
+# estimate metres off.
+#
+# lat/lon are f64 (this is deliberately NOT a `tuning:` key — that map is
+# f32, which quantises latitude to ~0.6 m and would throw away the very
+# accuracy the RTK anchor provides). `alt_msl_m` matches the receiver's
+# `alt_msl`, not ellipsoidal height.
+#
+# origin:
+#   lat_deg: 47.3977419
+#   lon_deg: 8.5455938
+#   alt_msl_m: 488.5
+
+tuning:
+  # Keys here are flat registry names, and the heading above each block
+  # names the schema group they belong to (`param list`, docs/parameters.md).
+  # Group is not the same axis as section: every key below arrives through
+  # `tuning:` whatever its group, because the `airframe:` block above carries
+  # only the required identity that has no default.
+
+  # ── airframe.install — GPS antenna extrinsics ──
+  # Body/FLU, IMU at origin — per-install facts, previously the
+  # GPS_ANTENNA_EXTRINSICS const in vehicle.rs.
+  gps_ant_x: -0.03
+  gps_ant_y: 0.0
+  gps_ant_z: 0.0
+  gps_base_x: 0.0
+  gps_base_y: -1.0
+  gps_base_z: 0.0
+  # ── cascade — position + attitude gains ──
+  # Previously DEFAULT_CONTROL_GAINS in vehicle.rs; the schema default for
+  # cascade gains is zero.
+  pos_kp_x: 4.0
+  pos_kp_y: 4.0
+  pos_kp_z: 8.0
+  pos_kd_x: 4.0
+  pos_kd_y: 4.0
+  pos_kd_z: 6.0
+  att_k_r: 3.0
+  att_k_p: 3.0
+  att_k_y: 1.0
+
+  # ── airframe.motors + battery + sensors — hardware-coupled, pin per vehicle ──
+  # Pin-what-you-fly policy: these values are physically determined by
+  # THIS airframe's motors/props/battery/install, so they are written out
+  # explicitly even where they equal today's schema defaults — a future
+  # default retune must never silently change a flying vehicle, and a new
+  # airframe copies this checklist instead of inheriting invisible
+  # numbers. The bake warns when any of these keys is left unset.
+  #
+  # Motor dynamics (FOPDT): time constant + max mechanical speed
+  # (4188.79 rad/s = 40 000 RPM). Identify per motor on the bench.
+  m0_tau: 0.02
+  m1_tau: 0.02
+  m2_tau: 0.02
+  m3_tau: 0.02
+  m0_omega_max: 3600
+  m1_omega_max: 3600
+  m2_omega_max: 3600
+  m3_omega_max: 3600
+  # G2 yaw effectiveness (reaction torque from motor spin-up). Sign
+  # follows spin direction: CW +, CCW −. Motor order m0 RR(CW),
+  # m1 FR(CCW), m2 RL(CCW), m3 FL(CW).
+  m0_g2_ry: 0.001
+  m1_g2_ry: -0.001
+  m2_g2_ry: -0.001
+  m3_g2_ry: 0.001
+  # Battery (6S): bootstrap voltage for the thrust table before the first
+  # ADC frame, and the ADC plausibility window.
+  batt_nominal_v: 23.0
+  batt_min_v: 12.0
+  batt_max_v: 30.0
+  # IMU software LPF cutoffs (board install / vibration environment).
+  #
+  # This is the one `imu_rate: 1khz` vehicle, so the hardware chain in
+  # front of these biquads is NOT the 8 kHz one: the ICM runs a 258 Hz
+  # gyro AAF plus a 2nd-order 227 Hz digital UI filter (docs/imu_aaf.md),
+  # which alone lands at ENBW 186 Hz / 1.6 ms group delay — near enough
+  # to what an 8 kHz build gets *after* its 200 Hz software filter
+  # (215 Hz / 1.3 ms). Stacking a 200 Hz biquad on top of that bought
+  # 19 % ENBW for 60 % more delay (151 Hz / 2.6 ms) in the one INDI path
+  # that has no other band-limiting — `rate_err = rate_sp − gyro`, gain
+  # `indi_rate_*`, straight to WLS.
+  #
+  # 380 Hz is therefore near-passthrough (183 Hz / 1.9 ms): it leaves the
+  # gyro to the hardware while keeping a software backstop, and sits just
+  # under the 0.4·fs = 400 Hz clamp in `ImuReader` so it is the cutoff
+  # actually applied rather than a clamped one. Accel keeps 80 Hz — its
+  # 4.4 ms is invisible behind the 12 Hz `indi_sync_hz` filter on `spf_fs`
+  # and it is the ESKF that benefits.
+  imu_accel_lpf_hz: 80.0
+  imu_gyro_lpf_hz: 380.0
+
+  # ── eskf.filter — process/measurement noise + jump gates ──
+  # Full EskfConfig surface — noise model AND the outlier gates. No
+  # estimator threshold is a hidden code constant.
+  eskf_acc_noise: 0.01           # accel noise density [m/s^2/sqrt(Hz)]
+  eskf_gyro_noise: 0.0001        # gyro noise density [rad/s/sqrt(Hz)]
+  eskf_acc_bias_rw: 0.001        # accel bias random walk
+  eskf_gyro_bias_rw: 0.00001     # gyro bias random walk
+  eskf_baro_std: 0.5             # baro 1-sigma [m]
+  eskf_mag_std: 0.05             # magnetometer 1-sigma
+  eskf_gate_sigma: 5.0          # Mahalanobis gate [sigma/dim]; lower = stricter
+  # Absolute position-jump reject gate. POSITION-SOURCE COUPLED: 3 m for
+  # GPS because the legitimate inter-frame residual at 10 m/s over a
+  # 5-10 Hz NAV-PVT is ~1 m by itself. Still catches RTK ambiguity loss
+  # and multipath, which jump tens of metres.
+  eskf_max_pos_jump_m: 3.0
+  eskf_max_att_jump_rad: 0.7     # inert on GPS-only (no attitude measurement)
+
+  # ── eskf.gps_guard — GNSS acceptance + sigma schedule ──
+  # Failsafe cascade limits. These decide when a faulted PVT stream stops
+  # driving the filter — raising them widens the window in which bad
+  # fixes keep steering the estimate. Safety-relevant, not nuisance
+  # suppression.
+  eskf_gps_max_jumps: 5          # consecutive jump-gated PVTs -> disarm/re-init
+  eskf_gps_max_rejects: 15       # consecutive filter-rejected PVTs -> disarm
+  # Timing (receiver-rate coupled; u-blox NAV-PVT at 5-10 Hz).
+  eskf_gps_stale_s: 2.0
+  eskf_gps_rtk_fix_debounce_s: 2.0
+  eskf_gps_rtk_loss_debounce_s: 1.0
+  # Convergence gate (arming) and initial yaw covariance. GPS-only cannot
+  # observe yaw, so init_yaw_cov starts deliberately large.
+  eskf_gps_bias_cov_thresh: 0.002
+  eskf_gps_init_yaw_cov: 10.0
+  # PVT usability gate (site/receiver coupled: open field vs urban canyon).
+  eskf_gps_min_sv: 6
+  eskf_gps_h_acc_max_m: 50.0
+  # Position/velocity measurement sigma floors by carrier solution
+  # (baseline length to base station, antenna quality, site multipath).
+  eskf_gps_pos_sigma_fix_m: 0.05     # carr_soln=2, RTK-fixed
+  eskf_gps_pos_sigma_float_m: 0.30   # carr_soln=1, RTK-float
+  eskf_gps_pos_sigma_none_m: 2.0     # carr_soln=0, stand-alone
+  eskf_gps_vel_sigma_m_s: 0.10
+  # Minimum carrier solution for a jump-cascade re-init. 2 = RTK-fixed
+  # only. A NON-RTK receiver MUST set this to 0, else the cascade can
+  # never re-init and the guard only ever disarms.
+  eskf_gps_reinit_min_carr_soln: 2
+  # Dual-antenna heading sigma floor (baseline-length coupled). Only read
+  # on gps_unicore builds; inert here (ublox, single antenna).
+  eskf_gps_heading_sigma_floor_rad: 0.025
+
+  # ── eskf.mocap_guard — mocap acceptance (INACTIVE on this build) ──
+  # pos_source is gps, so the mocap guard is never constructed here.
+  # Stated anyway, for the same reason the cascade gains above are stated
+  # under outer_loop: mpc — POS_SOURCE=mocap is a supported dev override
+  # (tools/vehicle_features.py), and such a build must not silently
+  # inherit invisible schema defaults. Values are the reviewed defaults;
+  # re-tune against the actual volume before flying mocap on this frame.
+  eskf_mocap_max_jumps: 3
+  eskf_mocap_max_rejects: 8
+  eskf_mocap_stale_s: 0.1          # couple to the mocap stream rate
+  eskf_mocap_bias_cov_thresh: 0.003
+  eskf_mocap_pos_std: 0.01         # install-specific: volume/camera count
+  eskf_mocap_att_std: 0.03         # install-specific: marker spread
+  # Disarmed re-anchor radius; without it the jump cascade wedges the
+  # filter permanently. Keep >> eskf_mocap_pos_std and << the jump gate.
+  eskf_mocap_reanchor_m: 0.10
+
+  # ══ Pinned schema defaults ═════════════════════════════════════════
+  # Written out explicitly so no flight-relevant value is inherited
+  # invisibly. These are the values this vehicle already flies — pinning
+  # them changes nothing today, but a future schema retune can no longer
+  # move them silently underneath a flying airframe.
+  #
+  # Deliberately NOT pinned: the 24 g1_* and 4 m*_nonlin keys are
+  # all-zero sentinels meaning "derive geometrically from the airframe",
+  # so literal zeros there would read as measured data. Mission selection
+  # is expressed once as `default_mission:` above.
+
+  # ── airframe.install + sensors — install calibration + fusion policy ──
+  mag_hi_x: 0
+  mag_hi_y: 0
+  mag_hi_z: 0
+  gps_fuse_vel: 1   # 0/1
+
+  # ── eskf.filter — initial covariance P0 ──
+  eskf_init_pos_var: 1
+  eskf_init_vel_var: 1
+  eskf_init_acc_bias_var: 0.01
+  eskf_init_gyro_bias_var: 0.01
+  eskf_init_att_var_rp: 0.1
+
+  # ── eskf.faults — fault annunciation windows ──
+  eskf_fault_pos_timeout_s: 2
+  eskf_fault_cov_blowup_m2: 25
+  eskf_fault_nan_hold_s: 3
+  eskf_fault_cascade_hold_s: 3
+
+  # ── battery — cell detection ──
+  batt_cell_detect_v: 4.3
+  # Cell-count ceiling for the auto-detector. Pack-coupled: a
+  # larger pack would be silently clamped to this rather than
+  # reported, so it is stated per vehicle.
+  batt_max_cells: 8
+  batt_no_battery_v: 3
+
+  # ── rc — transmitter / stick configuration ──
+  rc_min_us: 988
+  rc_mid_us: 1500
+  rc_max_us: 2012
+  rc_arm_channel: 5
+  rc_arm_threshold_us: 1500
+  rc_throttle_mincheck_us: 1050
+  rc_mission_channel: 4
+  rc_mission_high_us: 1700
+  rc_mission_low_us: 1300
+  rc_throttle_land_us: 1100
+  rc_launch_us: 1600
+  rc_launch_confirm_frames: 5
+  rc_xy_deadband: 0.05
+  rc_throttle_deadband: 0.12
+  rc_rate_deadband: 0.05
+  rc_xy_rate_m_s: 1
+  rc_z_rate_m_s: 0.5
+  rc_land_rate_m_s: 0.4
+  rc_max_rate_rp: 8
+  rc_max_rate_yaw: 4
+
+  # ── site — gravity and stick-integrator envelope ──
+  # Local g. Read by both MPC models, the planner, the cascade, the
+  # arming accel gate and the INDI ground-contact test — pin the value
+  # for your latitude rather than inheriting the 9.81 default.
+  gravity_m_s2: 9.81
+  fence_enable: 1   # 0 = off, 1 = on
+  fence_x_m: 2.5
+  fence_y_m: 3.5
+  fence_z_max_m: 1.5
+  fence_z_min_m: 0
+
+  # ── safety — arming gates ──
+  arm_max_tilt_deg: 30
+  arm_min_link_quality: 50
+  arm_eskf_mahony_tol_deg: 10
+  arm_accel_tol_m_s2: 1.5
+  arm_gyro_limit_rad_s: 0.5
+  arm_switch_hold_s: 0.1
+  arm_link_stats_max_age_s: 0.5
+  arm_led: 0   # 0/1 — NB: `system` group, not a safety gate
+
+  # ── safety — RC-loss failsafe timing ──
+  fs_rxloss_trigger_s: 0.15
+  fs_guard_period_s: 1.5
+  fs_recovery_period_s: 0.5
+  fs_ctrl_timeout_s: 0.5
+
+  # ── airframe.motors — G2 roll/pitch effectiveness ──
+  m0_g2_rr: 0
+  m0_g2_rp: 0
+  m1_g2_rr: 0
+  m1_g2_rp: 0
+  m2_g2_rr: 0
+  m2_g2_rp: 0
+  m3_g2_rr: 0
+  m3_g2_rp: 0
+
+  # ── indi.controller — rate gains, sync filter, WLS weights ──
+  indi_rate_r: 20
+  indi_rate_p: 20
+  indi_rate_y: 20
+  indi_sync_hz: 40
+  indi_ctrl_div: 1             # 1 kHz IMU, INDI at IMU rate (reboot)
+  wls_wv_fx: 1
+  wls_wv_fy: 1
+  wls_wv_fz: 50
+  wls_wv_rr: 50
+  wls_wv_rp: 50
+  wls_wv_ry: 5
+  wls_wu_m0: 1
+  wls_wu_m1: 1
+  wls_wu_m2: 1
+  wls_wu_m3: 1
+
+  # ── indi.controller — idle throttle + ground detection ──
+  indi_idle_norm: 0.055
+  indi_ground_gyro_dps: 100
+  indi_ground_accel_g: 0.8
+  indi_ground_thrust_sp: 3
+
+  # ── indi.controller — RPM feedback source + liveness ──
+  # indi_omega_kf: which ω/ω̇ reaches the incremental law. 0 = the dshot
+  # value held through dropouts (what this vehicle has flown); 1 = the
+  # RPM Kalman filter's estimate through the same low-pass. Both share
+  # the biquad, so indi_sync_hz means the same thing either way and the
+  # two are directly comparable in an A/B flight.
+  #
+  # Pinned 0 until m*_omega_max and m*_tau above are *identified* rather
+  # than inherited defaults: the KF bridges telemetry gaps with the motor
+  # model, so a wrong model yields a confidently wrong ω, where the hold
+  # merely yields a stale one. Flip to 1 once they are measured.
+  indi_omega_kf: 1   # 0/1
+  # Missed *expected* telemetry intervals before a motor's ω is stale
+  # (G2 off for that motor; all four ⇒ ω̇ from the motor model). The
+  # expected interval is derived from ω, so one number holds across the
+  # RPM range. Size it above the longest consecutive `no_reply` run this
+  # ESC link produces — see DshotMotorHealth. 10 suits a ≤1% error rate.
+  indi_rpm_stale_gaps: 10
+
+  # ── indi.rpm_estimator — per-motor FOPDT Kalman filter ──
+  # Measurement variance on ω, i.e. sigma^2. 400 = sigma 20 rad/s ~ 1%
+  # commutation asymmetry at omega ~ 2000 rad/s. This ESC firmware sends a
+  # single *unaveraged* 60 deg electrical step, so asymmetry dominates and
+  # the true value scales with omega — sized at high thrust rather than
+  # hover because R is constant while the noise is not, and a too-tight
+  # gate during maneuvers is the costly direction. Provisional: measure the
+  # spread of `raw` in MotorStateTelemetry at steady throttle, and read
+  # nis_reject/passed in DshotHealth (should match the chi-squared rate for
+  # rpm_est_nis_gate — 0.27% at 9.0 — when R is right for that omega).
+  rpm_est_omega_var: 400
+  # Throttle-error intensity (spectral density in seconds — not a per-step
+  # variance, so it means the same at 8 kHz and 1 kHz). This is the knob
+  # that buys down *model* error: simulated-optimal at ~25% m*_tau error,
+  # which is the honest assumption while m*_tau is still a default. Drop
+  # toward 1.25e-8 once the time constants are identified — that is worth
+  # ~3x better omega than the ZOH path, versus ~25% today.
+  rpm_est_thr_psd: 1.25e-6
+  # How fast the estimated full-throttle speed c_m may follow pack sag.
+  # c_m is the throttle->omega gain, so it tracks pack voltage: a 6S pack
+  # sagging 25.2 -> 21.0 V over a 3 min flight moves it ~17%. At 0.1 the
+  # filter cannot follow that (48 rad/s of standing lag); 100 leaves 2.5.
+  # Broad optimum, and it does not loosen the NIS gate.
+  rpm_est_cm_psd: 100
+  # NIS gate (χ², 1 DOF): 9.0 ≈ 3σ. Watch `nis_reject` after changing it.
+  rpm_est_nis_gate: 9
+  # Throttle → ω transport delay. 0 = use the newest command.
+  rpm_est_tau_d: 0
+
+  # ── rpm_notch — gyro/accel notch bank ──
+  rpm_notch_en: 1   # 0/1
+  rpm_notch_q: 8
+  rpm_notch_min_hz: 150
+  rpm_notch_fade_hz: 50
+  rpm_notch_lpf_hz: 150
+
+  # ── cascade — geometric cascade (inactive under outer_loop: mpc) ──
+  att_kt_r: 0
+  att_kt_p: 0
+  att_kt_y: 0
+  cascade_rate_hz: 100
+
+  # ── mpc — cost weights and solve cadence ──
+  mpc_w_pos_x: 500
+  mpc_w_pos_y: 500
+  mpc_w_pos_z: 100
+  mpc_w_vel_x: 10
+  mpc_w_vel_y: 10
+  mpc_w_vel_z: 10
+  mpc_w_att_r: 5
+  mpc_w_att_p: 5
+  mpc_w_att_y: 200
+  mpc_w_rate_r: 10
+  mpc_w_rate_p: 10
+  mpc_w_rate_y: 20
+  mpc_w_thrust: 1
+  mpc_dt: 0.05
+  mpc_rho: 10000
+  mpc_thrust_frac: 0.75
+  mpc_pos_cost_mode: 1   # 0 = Quadratic, 1 = Contouring
+  mpc_rate_hz: 100
+  # ── mpc — SQP solver knobs ──
+  # max_iters = 1 is RTI (one warm-started Newton step per tick, the
+  # flight configuration); kkt_tol only labels convergence at 1 iter.
+  mpc_max_iters: 1
+  # Active SQP horizon in stages (mpc_dt apart); 20 = the full solver
+  # workspace. Shortening only — lowers solve time ~linearly.
+  mpc_horizon_n: 20
+  mpc_kkt_tol: 0.001
+  # Body-rate state-constraint barrier (FullQuadModel only; the reduced
+  # outer-loop model bounds rates as inputs). tau = 0 disables. 0.5/0.5
+  # validated by the closed-loop stress suite
+  # (docs/mpc_runtime_comparison.md).
+  mpc_rate_barrier_tau: 0.5
+  mpc_rate_barrier_delta: 0.5
+  # Maximum-tilt state constraint (both MPC models) — an envelope fence
+  # keeping the predicted trajectory away from deep tilt, where the local
+  # SQP has a free-fall stationary point (~100°; all motors corner at
+  # zero). tau = 0 disables. Fence semantics only: it bounds what the
+  # controller *chooses*, not what disturbances impose. delta is in cos
+  # units (0.05 = 3.3 deg margin at a 60 deg limit). Raise
+  # mpc_tilt_max_deg before flying maneuvers that legitimately need more
+  # tilt (60 deg caps horizontal accel at ~1.7 g).
+  mpc_tilt_max_deg: 80.0
+  mpc_tilt_barrier_tau: 0.5
+  mpc_tilt_barrier_delta: 0.05
+
+  # ── trajectory.planner — online BFGS planner (inactive: USE_OFFLINE_PLAN) ──
+  plan_max_vel: 100
+  plan_max_tilt: 1.0471976
+  plan_w_time: 1
+  plan_w_energy: 0.01
+  plan_w_vel: 0
+  plan_w_tilt: 0
+  plan_w_body_rate: 10
+  plan_w_thrust: 10
+  plan_smooth_eps: 0.01
+  plan_num_check: 8
+  plan_bfgs_delta_init: 1
+  plan_bfgs_delta_max: 100
+  plan_bfgs_eta: 0.1
+  plan_bfgs_g_eps: 1e-07
+  plan_bfgs_max_iter: 500
+  plan_bfgs_past: 3
+  plan_bfgs_delta_conv: 1e-08
+
+  # ── trajectory.sampler — reference sampler ──
+  sampler_kind: 1   # 0 = Time, 1 = Position
+  sampler_max_lag_s: 0.1
+  sampler_axis_weights_sqrt_x: 1
+  sampler_axis_weights_sqrt_y: 1
+  sampler_axis_weights_sqrt_z: 1
+  sampler_search_dt: 0.01
+  sampler_max_search_steps: 100
+  sampler_radius_of_acceptance: 0.15
+  sampler_max_lead_s: 0.1
+
+  # ── system — device/UX toggles ──
+  blackbox_tier: 3   # record-set tier
+  peer_pose_en: 0   # 0/1

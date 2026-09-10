@@ -3,6 +3,7 @@
 
 use cybflight_drivers::baro::dps310::{Dps310, I2cBusWrapper, SpiBusWrapper};
 use cybflight_drivers::baro::icp20100::Icp20100;
+use cybflight_drivers::baro::spl06::{I2cBusWrapper as Spl06I2cBusWrapper, Spl06};
 use cybflight_drivers::baro::ReadBaro;
 use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
@@ -25,6 +26,8 @@ pub type Dps310SpiDev = Dps310<
 >;
 pub type Dps310I2cDev =
     Dps310<I2cBusWrapper<I2cDevice<'static, NoopRawMutex, I2cBus>>>;
+pub type Spl06I2cDev =
+    Spl06<Spl06I2cBusWrapper<I2cDevice<'static, NoopRawMutex, I2cBus>>>;
 pub type Icp20100Dev = Icp20100<I2cDevice<'static, NoopRawMutex, I2cBus>>;
 
 pub struct BaroReader<D: ReadBaro> {
@@ -87,6 +90,14 @@ pub async fn dps310_i2c_baro_task(
 #[embassy_executor::task]
 pub async fn icp20100_baro_task(
     mut reader: BaroReader<Icp20100Dev>,
+    channel: &'static PubSubChannel<CriticalSectionRawMutex, msgs::BaroSample, 2, 4, 1>,
+) {
+    reader.run(channel).await;
+}
+
+#[embassy_executor::task]
+pub async fn spl06_i2c_baro_task(
+    mut reader: BaroReader<Spl06I2cDev>,
     channel: &'static PubSubChannel<CriticalSectionRawMutex, msgs::BaroSample, 2, 4, 1>,
 ) {
     reader.run(channel).await;

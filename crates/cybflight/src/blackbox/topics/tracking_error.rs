@@ -9,7 +9,7 @@
 //!   cost uses (`model_utils::attitude_error`);
 //! - the **cascade outer loop** (100 Hz) — pos / vel error against
 //!   the live position setpoint, raw (unclamped);
-//! - the **INDI inner loop** (100 Hz, decimated from 8 kHz) —
+//! - the **INDI inner loop** (100 Hz, decimated from the IMU rate) —
 //!   body-rate error `rate_ref - gyro_corrected`.
 //!
 //! Each publish carries a `source` byte

@@ -20,8 +20,8 @@ pub const SCHEMA: &[u8] = br#"{
   "properties": {
     "timestamp_ns": { "type": "integer" },
     "kind":         { "type": "integer",
-                      "description": "Kind enum: 1=ARM, 2=DISARM, 3=FAILSAFE, 4=FAILSAFE_CLEAR, 5=ESTIMATOR_DOWN, 6=ESTIMATOR_UP, 7=RC_LOSS, 8=RC_RECOVERED, 9=MISSION_PLANNING, 10=MISSION_EXECUTING, 11=MISSION_IDLE, 16=LOG_END, 32=PANIC, 33=HARDFAULT, 34=BROWNOUT, 35=IWDG_RESET, 36=BOOT_POSTMORTEM" },
-    "data":         { "type": "integer", "description": "kind-specific: KIND_FAILSAFE -> FailsafeReason (1=ControllerTimeout, 2=RcLoss); KIND_MISSION_IDLE -> previous MissionState (1=Planning, 2=Executing); KIND_BOOT_POSTMORTEM -> packed (reset_cause<<8 | fatal_kind) when entering, 0 when leaving the prior-boot bracket; 0 otherwise" }
+                      "description": "Kind enum: 1=ARM, 2=DISARM, 3=FAILSAFE, 4=FAILSAFE_CLEAR, 5=ESTIMATOR_DOWN, 6=ESTIMATOR_UP, 7=RC_LOSS, 8=RC_RECOVERED, 9=MISSION_PLANNING, 10=MISSION_EXECUTING, 11=MISSION_IDLE, 12=INNER_SILENT, 13=POWER_STALE, 14=POWER_OK, 15=RECORDER_OVERRUN, 16=LOG_END, 32=PANIC, 33=HARDFAULT, 34=BROWNOUT, 35=IWDG_RESET, 36=BOOT_POSTMORTEM" },
+    "data":         { "type": "integer", "description": "kind-specific: KIND_DISARM -> cause, same codes as KIND_FAILSAFE (0=commanded by pilot, 1=ControllerTimeout, 2=RcLoss); KIND_FAILSAFE -> FailsafeReason (1=ControllerTimeout, 2=RcLoss); KIND_MISSION_IDLE -> previous MissionState (1=Planning, 2=Executing); KIND_INNER_SILENT -> cause (1=voltage stale, 2=WLS NaN); KIND_POWER_STALE -> episode index since boot; KIND_POWER_OK -> episode duration in ms; KIND_RECORDER_OVERRUN -> cumulative records dropped this session; KIND_BOOT_POSTMORTEM -> packed (reset_cause<<8 | fatal_kind) when entering, 0 when leaving the prior-boot bracket; 0 otherwise" }
   }
 }"#;
 
@@ -36,7 +36,22 @@ pub const DEF: TopicDef = TopicDef {
 // codes only with values that don't conflict; existing tooling
 // must keep working unchanged when it sees an unknown code.
 pub const KIND_ARM: u8 = 0x01;
+/// Disarm edge. `data` carries **why**, using the same codes as
+/// [`KIND_FAILSAFE`]: [`DISARM_CAUSE_COMMANDED`] when the disarm came
+/// from the pilot (or anything else that is not a failsafe), otherwise
+/// the live `FailsafeReason`.
+///
+/// Without this a post-flight reader cannot tell a normal landing from
+/// a watchdog disarm without joining against the preceding
+/// `KIND_FAILSAFE` record and reasoning about timing — and
+/// `msgs::ArmDisarm` carries only `armed`, so the cause is not
+/// available anywhere else in the file.
 pub const KIND_DISARM: u8 = 0x02;
+
+/// `KIND_DISARM` `data`: no failsafe was active at the disarm edge, so
+/// the disarm was commanded (RC switch, shell, mission end). Shares the
+/// numbering of `FailsafeReason::None`.
+pub const DISARM_CAUSE_COMMANDED: u32 = 0;
 /// Failsafe ENTERED — controller silent >500 ms or RC loss
 /// >1500 ms. The recorder watches `control::failsafe::FAILSAFE_ACTIVE`
 /// inside the capture loop and emits this on the false→true edge.
@@ -86,6 +101,58 @@ pub const KIND_MISSION_EXECUTING: u8 = 0x0A;
 /// "rejected during plan" from "trajectory finished" without
 /// cross-referencing solver diagnostics.
 pub const KIND_MISSION_IDLE: u8 = 0x0B;
+/// The INDI inner loop stopped publishing motor commands **on
+/// purpose** — a trip that leaves the controller watchdog to disarm
+/// `fs_ctrl_timeout_s` later. `data` is the cause:
+/// [`SILENT_CAUSE_VOLTAGE_STALE`] or [`SILENT_CAUSE_WLS_NAN`].
+///
+/// Exists because the disarm these trips produce arrives as
+/// `KIND_FAILSAFE(data = ControllerTimeout)`, which points at the
+/// controller when the real cause was power telemetry or a NaN in the
+/// WLS solve. Emitted on the 0 -> non-zero edge of
+/// `control::indi_task::INNER_SILENT_CAUSE`; that atomic is latched for
+/// the rest of the boot, so at most one of these appears per boot.
+pub const KIND_INNER_SILENT: u8 = 0x0C;
+/// `KIND_INNER_SILENT` `data`: `POWER_STATUS` stale past
+/// `VOLTAGE_FAILSAFE_TIMEOUT` (2 s) while armed, on a `Table` thrust
+/// model — the linearization voltage can no longer be trusted.
+pub const SILENT_CAUSE_VOLTAGE_STALE: u32 = 1;
+/// `KIND_INNER_SILENT` `data`: WLS output stayed non-finite past
+/// `nan_limit` while armed.
+pub const SILENT_CAUSE_WLS_NAN: u32 = 2;
+
+/// Battery telemetry went stale past `VOLTAGE_STALE_TIMEOUT` (500 ms):
+/// INDI is holding the last reading to linearize the thrust table.
+/// `data` is the episode index since boot
+/// (`control::indi_task::VOLTAGE_STALE_EPISODES`).
+///
+/// The index is what makes poll aliasing visible: the recorder samples
+/// this atomic once per capture-loop iteration, so two episodes inside
+/// one iteration collapse to one record — a jump in the index says so
+/// rather than hiding it.
+pub const KIND_POWER_STALE: u8 = 0x0D;
+/// Battery telemetry resumed. `data` is the episode's duration in ms as
+/// measured by `indi_task` (not by the recorder's poll, which would add
+/// its own iteration latency).
+pub const KIND_POWER_OK: u8 = 0x0E;
+
+/// The recorder is losing records: a channel reported `Lagged` and the
+/// session's cumulative drop count moved. `data` is that count.
+///
+/// Self-reporting matters because the alternative is forensics — the
+/// `Sysid` tier over-subscribed the card for weeks and the ~50 % loss
+/// was only visible by reconstructing sequence holes from the file
+/// afterwards (see `record_set::estimated_bytes_per_s`). With this a
+/// reader can tell a gap that is a dropped record from a gap that is a
+/// stalled publisher.
+///
+/// **Rate-limited to [`crate::blackbox::recorder::DROP_EVENT_INTERVAL`]**
+/// after the first edge. This is the one event whose emission rate
+/// correlates with the failure it reports — it fires exactly when the
+/// recorder is already behind on writes — so it must never be free to
+/// spin.
+pub const KIND_RECORDER_OVERRUN: u8 = 0x0F;
+
 pub const KIND_LOG_END: u8 = 0x10;
 
 // ── Post-mortem fault events (0x20+) ────────────────────────────────────

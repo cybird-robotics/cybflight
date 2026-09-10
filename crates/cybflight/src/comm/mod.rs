@@ -52,10 +52,26 @@ impl FrameAccumulator {
     }
 }
 
-/// Build a raw frame `[msg_id, seq, payload...]`, COBS-encode into `dest`,
-/// and append 0x00 delimiter. Returns the total number of bytes written.
+/// Build a raw frame `[msg_id, seq, payload...]`, COBS-encode it into
+/// `dest`, and append the 0x00 delimiter.
+///
+/// Returns the number of bytes written, or `0` if the frame does not
+/// fit. A caller batches many frames into one buffer and cannot know in
+/// advance which one will overrun it. Both the COBS encode and the
+/// delimiter write used to index `dest` unchecked, so an oversubscribed
+/// batch buffer panicked in the middle of a telemetry tick rather than
+/// dropping a frame — the one outcome a downlink should never have.
+/// Refusing up front lets the caller drop and count it instead.
 pub fn encode_frame(msg_id: u8, seq: u8, payload: &[u8], dest: &mut [u8]) -> usize {
     let raw_len = wire::FRAME_HEADER_SIZE + payload.len();
+    // The scratch frame is fixed-size, and the destination must hold the
+    // encoding plus its delimiter. COBS output length depends on where
+    // the zero bytes fall, so this tests the worst case: conservative by
+    // a byte or two per 254, which costs nothing here and keeps the
+    // check independent of the payload's content.
+    if raw_len > MAX_RAW_FRAME || cobs::max_encoding_length(raw_len) + 1 > dest.len() {
+        return 0;
+    }
     let mut raw = [0u8; MAX_RAW_FRAME];
     raw[0] = msg_id;
     raw[1] = seq;

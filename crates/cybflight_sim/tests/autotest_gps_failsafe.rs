@@ -80,7 +80,7 @@ fn jump_cascade_recovers_after_sustained_gps_excursion() {
     scenario.pass_criteria.geofence_max = Vector3::new(50.0, 50.0, 50.0);
 
     let mut controller = MpcIndiController::from_params(&scenario.vehicle_params);
-    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), 1.0 / 8000.0);
+    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), &scenario.sim_params, 1.0 / 8000.0);
     let runner = MissionRunner::new(Default::default());
     let out = runner.run(&mut scenario, &mut plant, &mut controller);
 
@@ -237,7 +237,7 @@ fn gps_outage_recovers_via_jump_cascade_reinit() {
     scenario.pass_criteria.geofence_max = Vector3::new(50.0, 50.0, 50.0);
 
     let mut controller = MpcIndiController::from_params(&scenario.vehicle_params);
-    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), 1.0 / 8000.0);
+    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), &scenario.sim_params, 1.0 / 8000.0);
     let runner = MissionRunner::new(Default::default());
     let out = runner.run(&mut scenario, &mut plant, &mut controller);
 
@@ -343,7 +343,7 @@ fn gps_outage_clean_recovery_no_cascade_needed() {
     scenario.pass_criteria.peak_tilt_rad = 80.0_f32.to_radians();
 
     let mut controller = MpcIndiController::from_params(&scenario.vehicle_params);
-    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), 1.0 / 8000.0);
+    let mut plant = QuadPlant::new(scenario.vehicle_params.clone(), &scenario.sim_params, 1.0 / 8000.0);
     let runner = MissionRunner::new(Default::default());
     let out = runner.run(&mut scenario, &mut plant, &mut controller);
 

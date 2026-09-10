@@ -38,6 +38,15 @@
 //     biquad still runs at w=0 so its delay line stays warm — avoids
 //     transients when the notch re-engages on motor spin-up.
 //
+//     The fade is symmetric: it also runs *down* as a harmonic approaches
+//     `max_hz` (0.48·sample rate), reaching passthrough at and above it.
+//     Fading only at the bottom edge and clamping at the top left a
+//     full-authority notch parked on `max_hz` whenever a harmonic ran off
+//     the end of the band — attenuating a frequency where no motor tone
+//     exists. At 8 kHz `max_hz` is 3840 Hz and no harmonic ever reaches it,
+//     so this is invisible there; at 1 kHz (`imu_1khz`) it is 480 Hz, which
+//     a hovering quad's 2nd harmonic already exceeds.
+//
 //   * **Safety**: non-finite motor frequency is treated as "motor at idle"
 //     (clamped to `min_hz`, weight=0 → passthrough). The bank never
 //     introduces NaN into the signal and never panics.
@@ -135,11 +144,20 @@ impl<const NU: usize, const NH: usize> RpmNotchBank<NU, NH> {
             } else {
                 self.min_hz
             };
-            let margin = f_clamped - self.min_hz;
-            let weight = if margin < self.fade_range_hz {
-                (margin / self.fade_range_hz).clamp(0.0, 1.0)
+            // Symmetric crossfade. The lower edge fades in over
+            // `[min_hz, min_hz + fade]`; the upper edge fades back out over
+            // `[max_hz - fade, max_hz]` and is fully passthrough at or above
+            // `max_hz`. The upper term reads the UNCLAMPED harmonic, so a
+            // tone that has run past the band gets weight 0 instead of a
+            // full-authority notch pinned to `max_hz`. `min` of the two
+            // keeps the weight sane even if the fade bands overlap on a
+            // narrow band (low sample rate, wide `fade_range_hz`).
+            let weight = if f_h.is_finite() {
+                let up = (f_h - self.min_hz) / self.fade_range_hz;
+                let down = (self.max_hz - f_h) / self.fade_range_hz;
+                up.min(down).clamp(0.0, 1.0)
             } else {
-                1.0
+                0.0
             };
             self.weights[self.motor_idx][self.harm_idx] = weight;
             for axis in 0..N_AXES {
@@ -301,6 +319,38 @@ mod tests {
             on_response < 0.3 * off_response,
             "expected ≥3× attenuation on-target; got on={on_response} off={off_response}"
         );
+    }
+
+    /// Upper edge of the crossfade, at the 1 kHz (`imu_1khz`) sample rate
+    /// where it actually binds: `max_hz` = 0.48·1000 = 480 Hz. A harmonic
+    /// that runs past the band must fade to passthrough, not sit at full
+    /// weight on a notch pinned to 480 Hz.
+    #[test]
+    fn weights_fade_to_zero_above_max_hz() {
+        const FS: f32 = 1000.0;
+        const MAX_HZ: f32 = 0.48 * FS; // 480
+        let cases: &[(f32, f32)] = &[
+            (300.0, 1.0),             // mid-band, full notch
+            (MAX_HZ - FADE_HZ, 1.0),  // 430: bottom of the upper fade band
+            (MAX_HZ - FADE_HZ / 2.0, 0.5), // 455: halfway back down
+            (MAX_HZ, 0.0),            // 480: passthrough
+            (666.0, 0.0),             // 40k-RPM fundamental — off the end
+            (5000.0, 0.0),            // absurd, still passthrough
+        ];
+        for (f, expected_weight) in cases {
+            let mut bank = RpmNotchBank::<4, 1>::new(FS, Q, MIN_HZ, FADE_HZ);
+            let freqs = [*f; 4];
+            for _ in 0..(4 * 4) {
+                bank.update(&freqs);
+            }
+            for motor in 0..4 {
+                let w = bank.weight(motor, 0);
+                assert!(
+                    libm::fabsf(w - expected_weight) < 1e-4,
+                    "freq={f} motor={motor}: expected weight {expected_weight}, got {w}"
+                );
+            }
+        }
     }
 
     #[test]

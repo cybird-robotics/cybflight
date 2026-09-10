@@ -20,8 +20,9 @@
 //!
 //! ## Stack-size warning
 //!
-//! `MincoSnap` carries ~42 KB of inline storage (banded buffer +
-//! coefficient rows + seven time tables sized at [`MAX_PIECES`]).
+//! [`MincoSnap`] (the instance at [`MAX_PIECES`]) carries ~84 KiB of
+//! inline storage (banded buffer + coefficient rows + seven time
+//! tables); size a [`MincoSnapN`] to the pieces you actually need.
 //! `MincoSnap::new` returns by value with no NRVO guarantee, so a
 //! stack-allocated `let mut s = MincoSnap::new(...)` may briefly
 //! materialize the full struct on the caller's stack. On Embassy
@@ -30,59 +31,76 @@
 //! `OFFLINE_MINCO` does in `cybflight::control::mission_planner`.
 //! Host-side use (tests, sim, planning utilities) is unaffected.
 
-use nalgebra::{UnitQuaternion, Vector3};
+use nalgebra::Vector3;
 
-use super::banded_system::BandedSystem;
+use super::banded_system::{snap_storage, BandedSystem};
 use super::piecewise_polynomial::PiecewisePolynomial;
 use super::polynomial::Polynomial;
 use super::types::{Vec3, ZERO3, PVAJ3D};
 use super::MAX_PIECES;
-use crate::rotation::quaternion_from_zb_and_yaw;
 
-/// MINCO min-snap solver (polynomial degree 7, smoothness s=4).
+/// MINCO min-snap solver (polynomial degree 7, smoothness s=4), sized
+/// for at most `P` pieces.
 ///
-/// Zero heap allocations — all buffers are inline fixed-size arrays
-/// sized at [`MAX_PIECES`]. The active piece count is tracked in
-/// `self.n`; only the leading `8·n` entries of every buffer are live
-/// per solve.
-pub struct MincoSnap {
+/// Zero heap allocations — all buffers are inline fixed-size arrays.
+/// The active piece count is tracked in `self.n`; only the leading
+/// `8·n` entries of every buffer are live per solve.
+///
+/// `C` must equal `8 * P` and `S` must be at least [`snap_storage`]`(P)`
+/// — see [`super::minco_jerk::MincoJerkN`] for why the bound is spelled
+/// three times. Use a type alias for each concrete instance; [`MincoSnap`]
+/// is the one at the global cap.
+pub struct MincoSnapN<const P: usize, const C: usize, const S: usize> {
     n: usize,
     head_pvaj: PVAJ3D,
     tail_pvaj: PVAJ3D,
-    banded: BandedSystem,
+    banded: BandedSystem<S>,
     /// Coefficient matrix: 8N rows × 3 cols (one Vec3 per row).
-    b: [Vector3<f32>; 8 * MAX_PIECES],
-    t1: [f32; MAX_PIECES],
-    t2: [f32; MAX_PIECES],
-    t3: [f32; MAX_PIECES],
-    t4: [f32; MAX_PIECES],
-    t5: [f32; MAX_PIECES],
-    t6: [f32; MAX_PIECES],
-    t7: [f32; MAX_PIECES],
+    b: [Vector3<f32>; C],
+    t1: [f32; P],
+    t2: [f32; P],
+    t3: [f32; P],
+    t4: [f32; P],
+    t5: [f32; P],
+    t6: [f32; P],
+    t7: [f32; P],
 }
 
-impl MincoSnap {
+/// [`MincoSnapN`] at the global trajectory cap [`MAX_PIECES`] (~84 KiB).
+pub type MincoSnap = MincoSnapN<MAX_PIECES, { 8 * MAX_PIECES }, { snap_storage(MAX_PIECES) }>;
+
+impl<const P: usize, const C: usize, const S: usize> MincoSnapN<P, C, S> {
+    /// Compile-time check that `C` and `S` match `P`; evaluated by `new`.
+    const LAYOUT_OK: () = assert!(
+        P >= 1 && P <= MAX_PIECES && C == 8 * P && S >= snap_storage(P),
+        "MincoSnapN<P, C, S>: C must be 8*P and S >= snap_storage(P)"
+    );
+
     /// Initialize the solver with placeholder boundary states. Reuse
-    /// across solves with [`set_boundary`] — constructing a fresh
-    /// `MincoSnap` zero-initializes ~35 KB of inline storage (the
-    /// banded buffer alone is `8·MAX_PIECES·17` floats), so holding
+    /// across solves with [`set_boundary`](Self::set_boundary) —
+    /// constructing a fresh solver zero-initializes all of its inline
+    /// storage (the banded buffer alone is `8·P·17` floats), so holding
     /// one in a `StaticCell` is significantly cheaper than building a
-    /// new one per call.
+    /// new one per call. Panics if `piece_num` exceeds `P`.
     pub fn new(head_state: &PVAJ3D, tail_state: &PVAJ3D, piece_num: usize) -> Self {
-        debug_assert!(piece_num >= 1 && piece_num <= MAX_PIECES);
+        let () = Self::LAYOUT_OK;
+        assert!(
+            piece_num >= 1 && piece_num <= P,
+            "MincoSnapN: {piece_num} pieces exceeds the type's bound of {P}"
+        );
         Self {
             n: piece_num,
             head_pvaj: *head_state,
             tail_pvaj: *tail_state,
             banded: BandedSystem::new(8 * piece_num, 8, 8),
-            b: [Vector3::zeros(); 8 * MAX_PIECES],
-            t1: [0.0; MAX_PIECES],
-            t2: [0.0; MAX_PIECES],
-            t3: [0.0; MAX_PIECES],
-            t4: [0.0; MAX_PIECES],
-            t5: [0.0; MAX_PIECES],
-            t6: [0.0; MAX_PIECES],
-            t7: [0.0; MAX_PIECES],
+            b: [Vector3::zeros(); C],
+            t1: [0.0; P],
+            t2: [0.0; P],
+            t3: [0.0; P],
+            t4: [0.0; P],
+            t5: [0.0; P],
+            t6: [0.0; P],
+            t7: [0.0; P],
         }
     }
 
@@ -94,12 +112,15 @@ impl MincoSnap {
     }
 
     /// Reconfigure the active piece count in place. All inline buffers
-    /// are sized to [`MAX_PIECES`] regardless, so this only updates the
-    /// active extent and the underlying banded system's dimension.
-    /// `solve()` must be called before any subsequent read; this leaves
-    /// the buffers in an unspecified state.
+    /// are sized to `P` regardless, so this only updates the active
+    /// extent and the underlying banded system's dimension. `solve()`
+    /// must be called before any subsequent read; this leaves the
+    /// buffers in an unspecified state. Panics if `piece_num` exceeds `P`.
     pub fn set_piece_count(&mut self, piece_num: usize) {
-        debug_assert!(piece_num >= 1 && piece_num <= MAX_PIECES);
+        assert!(
+            piece_num >= 1 && piece_num <= P,
+            "MincoSnapN: {piece_num} pieces exceeds the type's bound of {P}"
+        );
         self.n = piece_num;
         self.banded.set_dimension(8 * piece_num);
     }
@@ -294,7 +315,7 @@ impl MincoSnap {
             degree: 0,
             duration: 0.0,
             coeffs: [ZERO3; super::polynomial::MAX_COEFFS],
-        }; MAX_PIECES];
+        }; P];
 
         for i in 0..self.n {
             let base = 8 * i;
@@ -435,7 +456,7 @@ impl MincoSnap {
         }
 
         // Solve A^T · adj_grad = partial_grad_c.
-        let mut adj_grad = [Vector3::<f32>::zeros(); 8 * MAX_PIECES];
+        let mut adj_grad = [Vector3::<f32>::zeros(); C];
         adj_grad[..sys_size].copy_from_slice(&partial_grad_c[..sys_size]);
         self.banded.solve3_adj(&mut adj_grad[..sys_size]);
 
@@ -575,320 +596,6 @@ impl MincoSnap {
     }
 }
 
-// ── Quadrotor flatness map (port of `toStateWithTiltYaw`) ────────────
-//
-// Mirrors `drolib::QuadManifold::toStateWithTiltYaw` from
-// `tmp/planner/src/system/quadrotor_manifold.cpp` (line 1695). Maps a
-// (a, j, s) flat-output triple plus a yaw triple (ψ, ψ̇, ψ̈) and
-// gravity into a quadrotor setpoint: collective thrust per unit mass,
-// attitude quaternion, body rate, body angular acceleration. Position
-// and velocity are kinematic flat outputs but unused by this map, so
-// they are not part of the signature; callers multiply by mass to get
-// thrust force.
-//
-// Yaw triple is `[ψ, ψ̇, ψ̈]` in rad / rad·s⁻¹ / rad·s⁻².
-
-/// Output of [`flatness_to_state_tilt_yaw`].
-///
-/// All fields are world-frame except `omega` and `omega_dot`, which
-/// are body-frame (the convention every quadrotor controller in this
-/// codebase uses).
-#[derive(Copy, Clone, Debug)]
-pub struct FlatState {
-    pub thrust_per_mass: f32,
-    pub attitude: UnitQuaternion<f32>,
-    pub omega: Vec3,
-    pub omega_dot: Vec3,
-}
-
-/// Hard floor on `‖α‖²` (m²/s⁴). Below this we treat the input as
-/// near-free-fall and bail; the closed-form inversion divides by
-/// `‖α‖³` and `‖α‖⁵`, both of which would overflow `f32::MAX ≈ 3.4·10³⁸`
-/// well before `‖α‖` reaches zero. The threshold is `(0.1·g)² ≈ 1`,
-/// so any flight regime where the vehicle is still net-accelerating
-/// upward stays well above the floor.
-const ALPHA_NORM_SQR_FLOOR: f32 = 1.0;
-
-/// Tilt singularity threshold on `zB.z + 1`. Below this the tilt-yaw
-/// parameterization breaks down (`omg_den → 0`, the `dzb2²/omg_den²`
-/// term in `ω̇` blows up). We refuse to evaluate rather than silently
-/// emit garbage. ~5.7° below "fully inverted" — far enough from any
-/// practical flight regime that hitting it indicates a planning bug
-/// upstream, close enough that no legitimate maneuver hits it.
-const TILT_DEN_FLOOR: f32 = 5e-3;
-
-/// Did the flatness map evaluate cleanly, or did it hit a singularity?
-///
-/// `Singular` is returned by [`flatness_to_state_tilt_yaw`] without
-/// consulting the offending input — caller is expected to short-circuit
-/// (hold last setpoint, trip a fault, etc.). The MINCO trajectories
-/// produced by this codebase should never hit it; if they do, the
-/// trajectory is unflyable and the controller cannot rescue it from
-/// downstream NaN.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum FlatnessFault {
-    /// `‖a + g·ẑ‖²` was below [`ALPHA_NORM_SQR_FLOOR`].
-    NearFreeFall,
-    /// `zB.z + 1` was below [`TILT_DEN_FLOOR`] (vehicle inverted or
-    /// past the tilt-yaw parameterization's singularity).
-    InvertedTilt,
-}
-
-/// Flat-output → state map (yaw-as-input convention).
-///
-/// Direct port of `toStateWithTiltYaw`. Returns `FlatState` whose
-/// `thrust_per_mass = ‖a + g·ẑ‖` (collective thrust per unit mass),
-/// `attitude` = tilt-then-yaw composition with `psi` as the yaw, and
-/// `omega` / `omega_dot` from the closed-form differential-flatness
-/// inversion.
-///
-/// `gravity` is the gravitational acceleration magnitude in m/s²
-/// (positive). Pass `QuadPlanningConfig::grav` (default 9.81).
-///
-/// Returns `Err(FlatnessFault::*)` for the two singularities the
-/// parameterization cannot represent: near-free-fall (`‖α‖ → 0`) and
-/// inversion (`zB.z → -1`). Both should be unreachable on a valid
-/// MINCO trajectory; if they fire, the upstream planner produced an
-/// unflyable schedule and the caller must drop the sample.
-///
-/// ## Numerical layout (f32 / Cortex-M7 FPU)
-///
-/// The Cortex-M7 single-precision FPU pipelines `VMUL/VFMA` at one
-/// per cycle but `VDIV/VSQRT` are 14-cycle blocking ops. The body
-/// hoists every reciprocal once and reuses it via multiplies; only
-/// **two** divisions and **one** sqrt are issued total.
-pub fn flatness_to_state_tilt_yaw(
-    acc: Vec3,
-    jer: Vec3,
-    sna: Vec3,
-    yaw_triple: [f32; 3],
-    gravity: f32,
-) -> Result<FlatState, FlatnessFault> {
-    let psi = yaw_triple[0];
-    let dpsi = yaw_triple[1];
-    let ddpsi = yaw_triple[2];
-
-    // Single sin/cos pair via libm — no half-angle pair here; the
-    // quaternion construction in `quaternion_from_zb_and_yaw`
-    // computes its own ψ/2 sin/cos once internally.
-    let c_psi = libm::cosf(psi);
-    let s_psi = libm::sinf(psi);
-
-    // α = a + g·ẑ_w.
-    let alpha = Vec3::new(acc[0], acc[1], acc[2] + gravity);
-    let alpha_norm_2 = alpha.norm_squared();
-    if alpha_norm_2 < ALPHA_NORM_SQR_FLOOR {
-        return Err(FlatnessFault::NearFreeFall);
-    }
-    // Single sqrt for the whole function — every other power of ‖α‖
-    // is derived by multiplication via `inv_alpha_norm_*` below.
-    let alpha_norm_1 = libm::sqrtf(alpha_norm_2);
-
-    let alpha_dot_j = alpha.dot(&jer);
-    let alpha_dot_j_sqr = alpha_dot_j * alpha_dot_j;
-    let j_norm_2 = jer.norm_squared();
-
-    // Hoisted reciprocals: one VDIV produces inv_alpha_norm_1, the
-    // rest of the powers come from multiplies (free on Cortex-M7).
-    let inv_alpha_norm_1 = 1.0 / alpha_norm_1;
-    let inv_alpha_norm_2 = inv_alpha_norm_1 * inv_alpha_norm_1;
-    let inv_a3 = inv_alpha_norm_2 * inv_alpha_norm_1;
-    // inv_a5 derived via multiply, *not* `1.0 / alpha_norm_5` — saves
-    // a 14-cycle VDIV.
-    let inv_a5 = inv_a3 * inv_alpha_norm_2;
-
-    // zB = α / ‖α‖
-    let z_b = alpha * inv_alpha_norm_1;
-    let zb0 = z_b[0];
-    let zb1 = z_b[1];
-    let zb2 = z_b[2];
-
-    // Singularity guard: refuse rather than clamp. C++ clamps to
-    // `±1e-6` and propagates the (now meaningless) result; we exit
-    // cleanly so the controller cannot consume garbage. See
-    // `FlatnessFault::InvertedTilt`.
-    let zb2_1 = zb2 + 1.0;
-    if zb2_1 < TILT_DEN_FLOOR {
-        return Err(FlatnessFault::InvertedTilt);
-    }
-
-    // Collective thrust per unit mass = ‖α‖ (already computed). Avoids
-    // 5 extra FLOPs and ~3 ulp of f32 accumulation that the longhand
-    // `zB · α` would carry.
-    let thrust_per_mass = alpha_norm_1;
-
-    // dzB = N(α) · j = (j − α·(α·j)/‖α‖²) / ‖α‖.
-    // Cleaner *and* better-conditioned than expanding the symmetric
-    // `ng**` matrix by hand: when α is nearly axis-aligned, the
-    // longhand form has `α_sqr_i + α_sqr_j` cancellations that this
-    // form sidesteps. 3 mul + 3 sub + 3 mul = 9 FLOPs vs 9+6=15 in
-    // the longhand `ng**` formulation.
-    let proj_j = alpha_dot_j * inv_alpha_norm_2;
-    let dzb0 = (jer[0] - alpha[0] * proj_j) * inv_alpha_norm_1;
-    let dzb1 = (jer[1] - alpha[1] * proj_j) * inv_alpha_norm_1;
-    let dzb2 = (jer[2] - alpha[2] * proj_j) * inv_alpha_norm_1;
-
-    // N(α)·s by the same projection identity.
-    let alpha_dot_s = alpha.dot(&sna);
-    let proj_s = alpha_dot_s * inv_alpha_norm_2;
-    let dn_alpha_s_0 = (sna[0] - alpha[0] * proj_s) * inv_alpha_norm_1;
-    let dn_alpha_s_1 = (sna[1] - alpha[1] * proj_s) * inv_alpha_norm_1;
-    let dn_alpha_s_2 = (sna[2] - alpha[2] * proj_s) * inv_alpha_norm_1;
-
-    // ddzB = -2·(α·j)/‖α‖³ · j  +  α · (3·(α·j)² − ‖α‖²·‖j‖²)/‖α‖⁵
-    //        +  N(α) · s
-    //
-    // The `common` term `(3·(α·j)² − ‖α‖²·‖j‖²) · inv_a5` folds a
-    // catastrophic-cancellation-prone difference of two same-magnitude
-    // terms into a single subtraction the optimizer can fuse. C++
-    // (double) is unaffected; in f32 the original form measurably
-    // increased the body-rate divergence vs the f64 reference.
-    let common = (3.0 * alpha_dot_j_sqr - alpha_norm_2 * j_norm_2) * inv_a5;
-    let neg_two_aj_inv_a3 = -2.0 * alpha_dot_j * inv_a3;
-    let ddzb0 = neg_two_aj_inv_a3 * jer[0] + alpha[0] * common + dn_alpha_s_0;
-    let ddzb1 = neg_two_aj_inv_a3 * jer[1] + alpha[1] * common + dn_alpha_s_1;
-    let ddzb2 = neg_two_aj_inv_a3 * jer[2] + alpha[2] * common + dn_alpha_s_2;
-
-    // Attitude: tilt(zB) ∘ yaw(ψ). `quaternion_from_zb_and_yaw` with
-    // `use_tilt = true` is the same closed form as the C++ source's
-    // tilt0/tilt1/tilt2 construction (see rotation.rs:268..283).
-    let attitude = quaternion_from_zb_and_yaw(&z_b, psi, true);
-
-    // Body rate. Hoist `1/omg_den` (one VDIV) and reuse it via
-    // multiplies for both ω and ω̇.
-    let inv_omg_den = 1.0 / zb2_1;
-    let inv_omg_den_2 = inv_omg_den * inv_omg_den;
-
-    let omg_term = dzb2 * inv_omg_den;
-    let tmp_omg_1 = zb0 * s_psi - zb1 * c_psi;
-    let tmp_omg_2 = zb0 * c_psi + zb1 * s_psi;
-    let tmp_omg_3 = zb1 * dzb0 - zb0 * dzb1;
-    // Hoisted: appear in both ω.x/.y *and* (as `tmp_omg_4/5` in C++)
-    // in the ω̇.x/.y correction. Saves 4 mul + 2 sub.
-    let dz_psi_a = dzb0 * s_psi - dzb1 * c_psi;
-    let dz_psi_b = dzb0 * c_psi + dzb1 * s_psi;
-    let omega = Vec3::new(
-        dz_psi_a - tmp_omg_1 * omg_term,
-        dz_psi_b - tmp_omg_2 * omg_term,
-        tmp_omg_3 * inv_omg_den + dpsi,
-    );
-
-    // Body angular acceleration. Reuses dz_psi_{a,b} from above.
-    let tmp_omg_6 = zb1 * ddzb0 - zb0 * ddzb1;
-    let dzb2_sqr = dzb2 * dzb2;
-
-    let omega_dot = Vec3::new(
-        ddzb0 * s_psi - ddzb1 * c_psi - ddzb2 * tmp_omg_1 * inv_omg_den
-            - dzb2 * dz_psi_a * inv_omg_den
-            + dzb2_sqr * tmp_omg_1 * inv_omg_den_2,
-        ddzb0 * c_psi + ddzb1 * s_psi - ddzb2 * tmp_omg_2 * inv_omg_den
-            - dzb2 * dz_psi_b * inv_omg_den
-            + dzb2_sqr * tmp_omg_2 * inv_omg_den_2,
-        tmp_omg_6 * inv_omg_den - tmp_omg_3 * dzb2 * inv_omg_den_2 + ddpsi,
-    );
-
-    Ok(FlatState {
-        thrust_per_mass,
-        attitude,
-        omega,
-        omega_dot,
-    })
-}
-
-/// Pole-safe flat-output → (thrust, attitude, body-rate) map for the MPC
-/// outer-loop feedforward.
-///
-/// Companion to [`flatness_to_state_tilt_yaw`] tailored to a 4-channel
-/// MPC whose control vector is `[T, ω_x, ω_y, ω_z]`. Returns:
-///
-/// - `thrust_per_mass = ‖a + g·ẑ‖`. Parameterization-independent —
-///   has no dependence on the tilt-yaw decomposition, so it stays
-///   well-defined arbitrarily close to the inverted pole.
-/// - `attitude` from [`quaternion_from_zb_and_yaw`] with `use_tilt = true`.
-///   The unique singularity at `z_b = -ẑ` is handled by a substituted
-///   180° flip inside that function.
-/// - `omega` in body frame, computed from the *minimum-norm* world
-///   angular velocity
-///
-///       ω_world  =  z_b × dz_b  +  ψ̇ · ẑ_world
-///
-///   then rotated into body frame via the (pole-safe) attitude
-///   quaternion. This is the parameterization-independent angular
-///   velocity that produces the smooth attitude trajectory through
-///   the pole; it is finite and bounded everywhere `‖a + g·ẑ‖` is
-///   above the free-fall floor.
-///
-/// ## Why min-norm body rate (and not the C++ tilt-yaw closed form)
-///
-/// [`flatness_to_state_tilt_yaw`] computes ω in the *intrinsic-Euler
-/// tilt-then-yaw* convention. That ω contains a `(zb1·dzb0 − zb0·dzb1)
-/// / (zb.z + 1)` body-z term that *diverges* as `z_b.z → −1` — it is
-/// the rate the body must spin around its z-axis to keep the intrinsic
-/// Euler "yaw" angle constant while tilting through the pole. A real
-/// drone cannot supply unbounded ω, so feeding this quantity into the
-/// MPC's `u_ref` would push the input cost off a cliff near the pole.
-///
-/// The min-norm form picks instead the body rate that:
-///
-/// 1. Correctly evolves `z_b(t)` along the trajectory (the perpendicular
-///    component is `z_b × dz_b`, identical to the limit of the closed
-///    form).
-/// 2. Adds yaw rate as a **world-z** rate (`ψ̇ · ẑ_world`) rather than as
-///    an intrinsic-Euler rate. For our MINCO trajectories `ψ̇ = 0`, so
-///    this distinction is invisible to the MPC.
-///
-/// At the pole the min-norm body rate matches the body-rate limit of the
-/// substituted attitude in [`quaternion_from_zb_and_yaw`] — the pair is
-/// kinematically consistent.
-///
-/// `omega_dot` is intentionally not returned: the firmware MPC's input
-/// is `[T, ω_x, ω_y, ω_z]` (no `ω̇` channel), and the closed-form ω̇
-/// formula contains `1/(zb.z + 1)²` which diverges quadratically faster
-/// than ω. Skipping it removes the worst pole singularity from the
-/// integration path entirely.
-pub fn flatness_to_thrust_omega(
-    acc: Vec3,
-    jer: Vec3,
-    yaw: f32,
-    yaw_rate: f32,
-    gravity: f32,
-) -> Result<(f32, UnitQuaternion<f32>, Vec3), FlatnessFault> {
-    let alpha = Vec3::new(acc[0], acc[1], acc[2] + gravity);
-    let alpha_norm_2 = alpha.norm_squared();
-    if alpha_norm_2 < ALPHA_NORM_SQR_FLOOR {
-        return Err(FlatnessFault::NearFreeFall);
-    }
-    let alpha_norm_1 = libm::sqrtf(alpha_norm_2);
-    let inv_alpha_norm_1 = 1.0 / alpha_norm_1;
-    let inv_alpha_norm_2 = inv_alpha_norm_1 * inv_alpha_norm_1;
-
-    // z_b = α / ‖α‖
-    let z_b = alpha * inv_alpha_norm_1;
-
-    // dz_b = N(α)·j = (j − α·(α·j)/‖α‖²) / ‖α‖. No division by `zb.z + 1`,
-    // so this stays bounded across the pole.
-    let proj_j = alpha.dot(&jer) * inv_alpha_norm_2;
-    let dz_b = Vec3::new(
-        (jer[0] - alpha[0] * proj_j) * inv_alpha_norm_1,
-        (jer[1] - alpha[1] * proj_j) * inv_alpha_norm_1,
-        (jer[2] - alpha[2] * proj_j) * inv_alpha_norm_1,
-    );
-
-    // World-frame angular velocity: perpendicular component rotates
-    // z_b along the trajectory; world-z component carries the yaw rate.
-    let perp = z_b.cross(&dz_b);
-    let omega_world = Vec3::new(perp[0], perp[1], perp[2] + yaw_rate);
-
-    // Attitude is pole-safe (substituted 180° flip at z_b = -ẑ).
-    let attitude = quaternion_from_zb_and_yaw(&z_b, yaw, true);
-
-    // ω_body = R^T · ω_world. UnitQuaternion's inverse_transform_vector
-    // is `q^{-1} · v · q` — the standard body-from-world rotation.
-    let omega_body = attitude.inverse_transform_vector(&omega_world);
-
-    Ok((alpha_norm_1, attitude, omega_body))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -938,188 +645,6 @@ mod tests {
         assert!(j1.norm() < 1e-2, "j1 not zero: {j1:?}");
     }
 
-    /// Hover flatness: zero a/j/s + zero yaw → identity attitude,
-    /// zero body rate, thrust = g.
-    #[test]
-    fn test_flatness_hover() {
-        let st = flatness_to_state_tilt_yaw(ZERO3, ZERO3, ZERO3, [0.0; 3], 9.81)
-            .expect("hover should be a valid flat state");
-        assert!((st.thrust_per_mass - 9.81).abs() < 1e-4);
-        let q = st.attitude;
-        assert!((q.w - 1.0).abs() < 1e-4);
-        assert!(q.i.abs() < 1e-4);
-        assert!(q.j.abs() < 1e-4);
-        assert!(q.k.abs() < 1e-4);
-        assert!(st.omega.norm() < 1e-4);
-    }
-
-    /// Free-fall: a = -g·ẑ → ‖α‖ ≈ 0; should fault, not NaN.
-    #[test]
-    fn test_flatness_free_fall_fault() {
-        let acc = Vec3::new(0.0, 0.0, -9.81);
-        let r = flatness_to_state_tilt_yaw(acc, ZERO3, ZERO3, [0.0; 3], 9.81);
-        assert_eq!(r.unwrap_err(), FlatnessFault::NearFreeFall);
-    }
-
-    /// Inverted: a chosen so zB ≈ -ẑ; should fault, not produce
-    /// blow-up ω̇.
-    #[test]
-    fn test_flatness_inverted_fault() {
-        // α = (0, 0, -|α|) → zB = (0, 0, -1), zb2_1 = 0.
-        let acc = Vec3::new(0.0, 0.0, -2.0 * 9.81);
-        let r = flatness_to_state_tilt_yaw(acc, ZERO3, ZERO3, [0.0; 3], 9.81);
-        assert_eq!(r.unwrap_err(), FlatnessFault::InvertedTilt);
-    }
-
-    // ── flatness_to_thrust_omega (pole-safe MPC u_ref feedforward) ──
-
-    /// Hover: zero a/j → identity attitude, zero body rate, thrust=g.
-    /// Same expectation as `test_flatness_hover` for the full map; this
-    /// confirms the trimmed function returns the same hover values.
-    #[test]
-    fn test_thrust_omega_hover() {
-        let (tpm, q, omega) =
-            flatness_to_thrust_omega(ZERO3, ZERO3, 0.0, 0.0, 9.81).expect("hover ok");
-        assert!((tpm - 9.81).abs() < 1e-4);
-        assert!((q.w - 1.0).abs() < 1e-4);
-        assert!(q.i.abs() < 1e-4 && q.j.abs() < 1e-4 && q.k.abs() < 1e-4);
-        assert!(omega.norm() < 1e-4, "hover omega nonzero: {omega:?}");
-    }
-
-    /// Free-fall fault parity with the full map.
-    #[test]
-    fn test_thrust_omega_free_fall_fault() {
-        let acc = Vec3::new(0.0, 0.0, -9.81);
-        let r = flatness_to_thrust_omega(acc, ZERO3, 0.0, 0.0, 9.81);
-        assert_eq!(r.unwrap_err(), FlatnessFault::NearFreeFall);
-    }
-
-    /// At the inverted pole the *full* map faults (`InvertedTilt`)
-    /// because its closed-form ω diverges. The pole-safe map must NOT
-    /// fault — that is the whole point — and the body rate it returns
-    /// must be finite.
-    #[test]
-    fn test_thrust_omega_pole_no_fault_finite_omega() {
-        // α = (0, 0, -2g) → z_b = (0, 0, -1): exact pole.
-        let acc = Vec3::new(0.0, 0.0, -2.0 * 9.81);
-        // Some nonzero jerk in xy so dz_b ≠ 0 and the perpendicular
-        // angular-velocity component is non-trivial.
-        let jer = Vec3::new(3.0, 1.5, 0.0);
-        let (tpm, _q, omega) = flatness_to_thrust_omega(acc, jer, 0.3, 0.0, 9.81)
-            .expect("pole-safe ok at z_b = -ẑ");
-        // Thrust per mass = ‖α‖ = g (positive, finite).
-        assert!((tpm - 9.81).abs() < 1e-3, "tpm wrong at pole: {tpm}");
-        // Body rate must be finite and bounded — `‖dz_b‖` here is on
-        // the order of `‖j‖/‖α‖` ≈ 3.4/9.81 ≈ 0.35 rad/s, so the body
-        // rate magnitude should be of that order, not "infinite".
-        assert!(
-            omega.iter().all(|c| c.is_finite()),
-            "non-finite omega at pole: {omega:?}"
-        );
-        assert!(
-            omega.norm() < 5.0,
-            "implausibly large omega at pole: {omega:?}"
-        );
-    }
-
-    /// Off the pole, the pole-safe map's ω agrees with the geometric
-    /// `z_b × dz_b` projected into body frame (which is its definition).
-    /// This regression-locks the formula and catches any future axis-
-    /// or sign-flipping mistake.
-    #[test]
-    fn test_thrust_omega_matches_min_norm_definition() {
-        use nalgebra::Vector3;
-        let acc = Vec3::new(2.0, -1.0, 1.5);
-        let jer = Vec3::new(0.7, 0.4, -0.2);
-        let yaw = 0.5;
-        let yaw_rate = 0.0;
-        let (tpm, q, omega_body) =
-            flatness_to_thrust_omega(acc, jer, yaw, yaw_rate, 9.81).expect("nominal ok");
-
-        // Thrust per mass = ‖a + g·ẑ‖
-        let alpha = Vec3::new(acc[0], acc[1], acc[2] + 9.81);
-        let alpha_norm = alpha.norm();
-        assert!((tpm - alpha_norm).abs() < 1e-4);
-
-        // Reconstruct ω_world from body-frame ω via the attitude.
-        let omega_world_back = q * omega_body;
-
-        // Geometric ω_world (yaw_rate = 0): z_b × dz_b
-        let z_b = alpha / alpha_norm;
-        let proj = alpha.dot(&jer) / (alpha_norm * alpha_norm);
-        let dz_b = (jer - alpha * proj) / alpha_norm;
-        let expected = z_b.cross(&dz_b);
-
-        let diff: Vector3<f32> = omega_world_back - expected;
-        assert!(
-            diff.norm() < 1e-4,
-            "omega_world reconstructed = {omega_world_back:?}, expected {expected:?}"
-        );
-    }
-
-    /// Yaw rate of `ψ̇` rad/s in world-z, identity attitude (z_b = ẑ,
-    /// yaw = 0): should produce body rate `(0, 0, ψ̇)` exactly. Confirms
-    /// the world-z yaw-rate convention.
-    #[test]
-    fn test_thrust_omega_yaw_rate_at_hover() {
-        let yaw_rate = 0.7;
-        let (_tpm, _q, omega) =
-            flatness_to_thrust_omega(ZERO3, ZERO3, 0.0, yaw_rate, 9.81).expect("ok");
-        assert!(omega.x.abs() < 1e-4);
-        assert!(omega.y.abs() < 1e-4);
-        assert!((omega.z - yaw_rate).abs() < 1e-4);
-    }
-
-    /// Sweep z_b through the inverted pole along a continuous path and
-    /// confirm thrust + body rate stay finite and bounded across the
-    /// crossing. This is the regression test for the original bug:
-    /// the full-map closed form blows up ω as `1/(zb.z + 1)`; the
-    /// pole-safe map must not.
-    #[test]
-    fn test_thrust_omega_continuous_through_pole() {
-        // Sweep φ ∈ [π/2 − δ, π/2 + δ] where the trajectory α =
-        // ‖α‖ · (sin φ, 0, −cos φ) crosses the pole exactly at φ = π/2
-        // (z_b = (1, 0, 0) → (0, 0, -1) → (-1, 0, 0)). dα/dφ supplies
-        // the jerk via α̇ ≈ (dα/dφ) · φ̇ ; we use φ̇ = 1 rad/s for
-        // simplicity, which makes ‖dz_b‖ = 1 rad/s by construction.
-        let alpha_mag = 12.0; // > free-fall floor
-        let phi_dot = 1.0;
-        let mut max_norm = 0.0f32;
-        let mut all_finite = true;
-        for i in 0..201 {
-            let phi = core::f32::consts::FRAC_PI_2 + (i as f32 - 100.0) * 1e-3;
-            let s = libm::sinf(phi);
-            let c = libm::cosf(phi);
-            let alpha = Vec3::new(alpha_mag * s, 0.0, -alpha_mag * c);
-            // d/dφ α = α_mag · (c, 0, s); jerk = α̇ − 0 = (dα/dφ)·φ̇.
-            let alpha_dot = Vec3::new(alpha_mag * c * phi_dot, 0.0, alpha_mag * s * phi_dot);
-            let acc = Vec3::new(alpha[0], alpha[1], alpha[2] - (-9.81)); // a = α − g·ẑ; here g·ẑ = (0,0,9.81), so a = α − (0,0,9.81)
-            let jer = alpha_dot;
-            let r = flatness_to_thrust_omega(acc, jer, 0.0, 0.0, 9.81);
-            match r {
-                Ok((tpm, _, omega)) => {
-                    if !tpm.is_finite() || omega.iter().any(|c| !c.is_finite()) {
-                        all_finite = false;
-                    }
-                    max_norm = max_norm.max(omega.norm());
-                }
-                Err(FlatnessFault::NearFreeFall) => {
-                    // Possible at certain φ if α magnitude dips; should not happen here.
-                    panic!("unexpected NearFreeFall at φ={phi}");
-                }
-                Err(FlatnessFault::InvertedTilt) => {
-                    panic!("pole-safe map must not return InvertedTilt at φ={phi}");
-                }
-            }
-        }
-        assert!(all_finite, "non-finite ω somewhere in the pole sweep");
-        // ‖dz_b‖ = 1 rad/s by construction, so ‖ω‖ should be ~1 rad/s
-        // across the sweep — well under any "diverging" threshold.
-        assert!(
-            max_norm < 5.0,
-            "max omega norm over pole sweep too large: {max_norm}"
-        );
-    }
 
     /// Sanity check on the closed-form energy gradient by finite
     /// difference: ∂E/∂c_4 should match the analytical value.

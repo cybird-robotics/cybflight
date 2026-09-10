@@ -28,10 +28,12 @@
 //! Byte-atomic, no erase, survives soft-reset and (with VBAT wired) full
 //! power loss. See [`bkpsram`].
 //!
-//! Fallback (Stage A, single-slot): the first 4 KiB of flash sector 6
-//! (`0x080C_0000`). Written by the PVD IRQ + on graceful shutdown so
-//! the LiPo-yank crash mode (where 3.3 V collapses with VBAT) still
-//! has a copy. See [`flash_mirror`].
+//! Fallback (Stage A, single-slot, NOT YET IMPLEMENTED — no
+//! `flash_mirror` module exists): a flash-resident copy written by the
+//! PVD IRQ + on graceful shutdown so the LiPo-yank crash mode (where
+//! 3.3 V collapses with VBAT) still has a copy. Placement must avoid
+//! both the app image (bank 1 is app flash up to 1792K, see `memory.x`)
+//! and the param KV store (bank-2 sectors 6+7).
 //!
 //! ## Surfacing
 //!
@@ -56,5 +58,10 @@ pub mod bkpsram;
 pub mod fault;
 pub mod record;
 pub mod recovery;
-pub mod reset_cause;
+// Feature-independent since the reboot-loop debugging of 2026-08-14: the
+// capture + `resetcause` shell verb must work on builds WITHOUT
+// `postmortem` (the bench mocap build compiles it out), so the module
+// lives at the crate root. Re-exported here so `postmortem::reset_cause`
+// paths (recovery, shell `postmortem show`, blackbox bracket) still work.
+pub use crate::reset_cause;
 pub mod task;

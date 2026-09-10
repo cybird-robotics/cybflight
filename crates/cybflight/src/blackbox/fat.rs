@@ -6,9 +6,11 @@
 //!     └─ embedded_fatfs::FileSystem        ── FAT directory + file ops
 //!          └─ embedded_partitions::Scheme  ── auto-detect MBR vs superfloppy,
 //!                                              slice into FAT partition
-//!               └─ block_device_adapters::BufStream  ── byte ↔ 512 B block shim
-//!                    └─ embassy_stm32::sdmmc::StorageDevice  ── BlockDevice<512>
-//!                         └─ embassy_stm32::sdmmc::Sdmmc
+//!               └─ lazy_stream::LazyBufStream       ── byte ↔ 512 B block shim,
+//!                    │                                  no read-before-write
+//!                    └─ sdmmc_block::WriteCombiner   ── CMD25 batching (32 KB)
+//!                         └─ embassy_stm32::sdmmc::StorageDevice  ── BlockDevice<512>
+//!                              └─ embassy_stm32::sdmmc::Sdmmc
 //! ```
 //!
 //! Why the partition layer is non-optional: SD cards typically ship
@@ -31,11 +33,14 @@
 //! mount/unmount path.
 
 use crate::hal::sdmmc;
-use block_device_adapters::{BufStream, BufStreamError};
+use block_device_adapters::BufStreamError;
+
+use super::lazy_stream::LazyBufStream;
+use super::sdmmc_block::{SdSession, LAST_IO_STATS};
 use embedded_fatfs::{
     DefaultTimeProvider, Error as FatError, FileSystem, FsOptions, LossyOemCpConverter,
 };
-use embedded_io_async::Write;
+use embedded_io_async::{Read as _, Seek as _, SeekFrom, Write};
 use embedded_partitions::mbr::{Error as MbrError, Mbr, Scheme};
 
 use super::sdmmc_block::SdmmcBlockStore;
@@ -89,10 +94,34 @@ pub enum OpError {
     Mount,
     /// Couldn't create the directory entry — disk full, name collision, etc.
     Create,
-    /// Body's `write` returned an I/O fault, or `flush` failed.
+    /// Body's `write` returned an I/O fault, or `flush` failed, and
+    /// nothing could be salvaged — the directory entry is still at the
+    /// zero size `truncate()` set, so no file survives.
     Write,
+    /// Body's `write` returned an I/O fault **after** some bytes had
+    /// already been committed, and the flush/close/unmount that
+    /// followed succeeded. A truncated but structurally readable log
+    /// survives on the card under this name.
+    ///
+    /// Callers must **not** recycle the sequence number: the next
+    /// session would `create_file` the same name and `truncate()` the
+    /// salvage away.
+    PartialWrite,
     /// Final unmount-time flush failed; data may not have hit the card.
     Unmount,
+    // ── Read / remove path ────────────────────────────────────────
+    /// `open_file` / `remove`: the path doesn't exist in the FAT root.
+    NotFound,
+    /// `open_file` failed for a reason other than absence.
+    Open,
+    /// `File::read` or a seek returned an I/O fault mid-stream, or
+    /// the file ended short of its directory-entry size.
+    Read,
+    /// `Dir::remove` failed for a reason other than absence.
+    Remove,
+    /// The sink refused data — shell disconnected, chunk-channel send
+    /// timed out, or the vehicle armed mid-transfer. Not a card fault.
+    Aborted,
 }
 
 /// Pluggable file payload — what to write into the just-created FAT
@@ -120,6 +149,26 @@ impl FileBody for Bytes<'_> {
     }
 }
 
+/// Sink-side abort marker for [`FileSink`]: the consumer no longer
+/// wants bytes (shell disconnected, channel send timed out, vehicle
+/// armed mid-transfer). Carries no detail — the sink owner knows why
+/// it aborted; `read_file` just maps it to [`OpError::Aborted`].
+pub struct SinkAbort;
+
+/// Pluggable read-side consumer — the mirror of [`FileBody`] for
+/// [`read_file`]. `begin` fires exactly once, after the file has been
+/// opened and the requested window clamped to its real size, so the
+/// consumer can emit a size header before the first data byte.
+/// `data` then receives the file content in sequential chunks of at
+/// most 512 bytes.
+#[allow(async_fn_in_trait)]
+pub trait FileSink {
+    /// Announce the exact byte count that will follow.
+    async fn begin(&mut self, total: u32) -> Result<(), SinkAbort>;
+    /// Consume one sequential chunk of file content.
+    async fn data(&mut self, chunk: &[u8]) -> Result<(), SinkAbort>;
+}
+
 /// Open the card, locate the FAT partition (or accept a superfloppy
 /// layout), create `path` in the root directory truncated to empty,
 /// hand it to `body.write(...)`, then flush + unmount.
@@ -136,38 +185,43 @@ pub async fn write_file<P: FileBody>(
     path: &str,
     body: &mut P,
 ) -> Result<u32, OpError> {
-    let storage = store.open_session().await.map_err(|_| {
+    let mut session = store.open_session().await.map_err(|_| {
         defmt::warn!("blackbox/fat: open_session failed");
         OpError::CardAcquire
     })?;
 
-    // BlockDevice<512> → byte-level Read/Write/Seek
-    let buf = BufStream::<_, 512>::new(storage);
+    let result = {
+        // BlockDevice<512> → byte-level Read/Write/Seek. The session is
+        // lent by `&mut` so we can flush its CMD25 batch after unmount.
+        let buf = LazyBufStream::<_, 512>::new(&mut session);
 
-    // **MBR-only.** SD cards from any modern host OS ship with an
-    // MBR; the superfloppy layout (FAT BPB at LBA 0) is 1990s legacy.
-    // Accepting both doubles every FAT-layer monomorphization
-    // (`FileSystem<StreamSlice<BufStream<_>>>` vs
-    // `FileSystem<BufStream<_>>`), inflating the binary by tens of
-    // KB. The unsupported branches return a clear error so the user
-    // knows to reformat.
-    match Scheme::open(buf).await.map_err(map_mbr_error)? {
-        Scheme::Mbr(mbr) => mount_mbr_partition(mbr, path, body).await,
-        Scheme::Superfloppy(_) => {
-            defmt::warn!(
-                "blackbox/fat: card uses superfloppy layout (FAT BPB at LBA 0); \
-                 reformat as MBR + FAT32 (the format any desktop OS uses by default)"
-            );
-            Err(OpError::NoPartitionTable)
+        // **MBR-only.** SD cards from any modern host OS ship with an
+        // MBR; the superfloppy layout (FAT BPB at LBA 0) is 1990s legacy.
+        // Accepting both doubles every FAT-layer monomorphization
+        // (`FileSystem<StreamSlice<BufStream<_>>>` vs
+        // `FileSystem<BufStream<_>>`), inflating the binary by tens of
+        // KB. The unsupported branches return a clear error so the user
+        // knows to reformat.
+        match Scheme::open(buf).await.map_err(map_mbr_error) {
+            Ok(Scheme::Mbr(mbr)) => mount_mbr_partition(mbr, path, body).await,
+            Ok(Scheme::Superfloppy(_)) => {
+                defmt::warn!(
+                    "blackbox/fat: card uses superfloppy layout (FAT BPB at LBA 0); \
+                     reformat as MBR + FAT32 (the format any desktop OS uses by default)"
+                );
+                Err(OpError::NoPartitionTable)
+            }
+            Ok(Scheme::Unknown(_)) => {
+                defmt::warn!(
+                    "blackbox/fat: sector 0 has no MBR signature and no FAT BPB \
+                     (reformat as MBR + FAT32)"
+                );
+                Err(OpError::NoPartitionTable)
+            }
+            Err(e) => Err(e),
         }
-        Scheme::Unknown(_) => {
-            defmt::warn!(
-                "blackbox/fat: sector 0 has no MBR signature and no FAT BPB \
-                 (reformat as MBR + FAT32)"
-            );
-            Err(OpError::NoPartitionTable)
-        }
-    }
+    };
+    finish_session(session, result).await
 }
 
 async fn mount_mbr_partition<IO, P>(
@@ -222,7 +276,7 @@ where
         OpError::Mount
     })?;
 
-    let bytes = {
+    let (bytes, body_failed) = {
         let root = fs.root_dir();
         let mut file = root.create_file(path).await.map_err(|e| {
             log_fat_error("create_file", &e);
@@ -232,10 +286,27 @@ where
             log_fat_error("truncate", &e);
             OpError::Write
         })?;
-        let n = body.write(&mut file).await.map_err(|e| {
-            log_fat_error("body.write", &e);
-            OpError::Write
-        })?;
+
+        // A body failure is deliberately **not** propagated with `?`.
+        // The directory entry still reads the zero size `truncate()`
+        // set, so bailing out here would discard every byte the body
+        // already streamed to the card — for a flight recorder that
+        // means losing the whole session to one transient SDMMC
+        // error near the end of it. Record the failure, commit what
+        // exists, and report it after the file is safely closed.
+        let (n, body_failed) = match body.write(&mut file).await {
+            Ok(n) => (n, false),
+            Err(e) => {
+                log_fat_error("body.write", &e);
+                // Byte count is unknown on this path — the body owns
+                // the tally and never got to return it. The seek
+                // position is the file's true length; fall back to 0
+                // if even that errors.
+                let n = file.stream_position().await.unwrap_or(0);
+                (n.min(u32::MAX as u64) as u32, true)
+            }
+        };
+
         file.flush().await.map_err(|e| {
             log_fat_error("flush", &e);
             OpError::Write
@@ -246,15 +317,39 @@ where
             log_fat_error("close", &e);
             OpError::Write
         })?;
-        n
+        (n, body_failed)
     };
 
     fs.unmount().await.map_err(|e| {
         log_fat_error("unmount", &e);
         OpError::Unmount
     })?;
+
+    if body_failed {
+        defmt::warn!(
+            "blackbox/fat: salvaged /{} ({} bytes) after a write fault",
+            path,
+            bytes
+        );
+        return Err(OpError::PartialWrite);
+    }
     defmt::info!("blackbox/fat: wrote /{} ({} bytes)", path, bytes);
     Ok(bytes)
+}
+
+/// Common epilogue for every card op: drain the CMD25 tail batch (at
+/// minimum the unmount's dirty-flag write is still in the combiner)
+/// and publish the session's I/O counters. The op's own error wins;
+/// a flush failure means the last blocks may not have hit the card.
+async fn finish_session<T>(mut session: SdSession<'_>, result: Result<T, OpError>) -> Result<T, OpError> {
+    let flushed = session.flush().await.map_err(|_| {
+        defmt::warn!("blackbox/fat: tail flush failed");
+        OpError::Unmount
+    });
+    LAST_IO_STATS.lock(|c| c.set(session.stats()));
+    let out = result?;
+    flushed?;
+    Ok(out)
 }
 
 fn map_mbr_error<E: core::fmt::Debug>(e: MbrError<E>) -> OpError {
@@ -263,6 +358,362 @@ fn map_mbr_error<E: core::fmt::Debug>(e: MbrError<E>) -> OpError {
         defmt::Debug2Format(&e)
     );
     OpError::PartitionIo
+}
+
+/// Open the card, locate the FAT volume, open `path` in the root
+/// directory and stream the byte window `[offset, offset + max_len)`
+/// (clamped to the file size; `max_len = None` means "to EOF") into
+/// `sink`. Returns the number of bytes streamed. An `offset` at or
+/// past EOF is not an error — the window clamps to zero bytes and
+/// `sink.begin(0)` still fires.
+///
+/// Error-routing subtlety: once `sink.begin` has fired the caller has
+/// typically already committed a success header to its transport, so
+/// any later `OpError` from this function must be delivered in-band
+/// by the caller (e.g. through the chunk channel), not via the
+/// header path.
+pub async fn read_file<S: FileSink>(
+    store: &mut SdmmcBlockStore,
+    path: &str,
+    offset: u32,
+    max_len: Option<u32>,
+    sink: &mut S,
+) -> Result<u32, OpError> {
+    let mut session = store.open_session().await.map_err(|_| {
+        defmt::warn!("blackbox/fat: open_session failed");
+        OpError::CardAcquire
+    })?;
+    let result = {
+        let buf = LazyBufStream::<_, 512>::new(&mut session);
+        // MBR-only — see `write_file` for rationale.
+        match Scheme::open(buf).await.map_err(map_mbr_error) {
+            Ok(Scheme::Mbr(mbr)) => read_mbr_partition(mbr, path, offset, max_len, sink).await,
+            Ok(Scheme::Superfloppy(_)) | Ok(Scheme::Unknown(_)) => {
+                defmt::warn!(
+                    "blackbox/fat: read: not an MBR-formatted card (reformat as MBR + FAT32)"
+                );
+                Err(OpError::NoPartitionTable)
+            }
+            Err(e) => Err(e),
+        }
+    };
+    finish_session(session, result).await
+}
+
+async fn read_mbr_partition<IO, S>(
+    mut mbr: Mbr<IO>,
+    path: &str,
+    offset: u32,
+    max_len: Option<u32>,
+    sink: &mut S,
+) -> Result<u32, OpError>
+where
+    IO: embedded_io_async::Read + Write + embedded_io_async::Seek,
+    S: FileSink,
+{
+    let idx = mbr
+        .iter_used()
+        .find(|(_, p)| p.is_fat())
+        .map(|(i, _)| i)
+        .ok_or_else(|| {
+            defmt::warn!("blackbox/fat: no FAT-typed partition in MBR");
+            OpError::NoFatPartition
+        })?;
+    let mut slice = mbr.open_partition(idx).await.map_err(|_| {
+        // No Debug2Format — see `mount_mbr_partition` for rationale.
+        defmt::warn!("blackbox/fat: open_partition failed");
+        OpError::PartitionIo
+    })?;
+    read_in_filesystem(&mut slice, path, offset, max_len, sink).await
+}
+
+async fn read_in_filesystem<IO, S>(
+    io: IO,
+    path: &str,
+    offset: u32,
+    max_len: Option<u32>,
+    sink: &mut S,
+) -> Result<u32, OpError>
+where
+    IO: embedded_io_async::Read + Write + embedded_io_async::Seek,
+    S: FileSink,
+{
+    let fs = FileSystem::new(io, FsOptions::new()).await.map_err(|e| {
+        log_fat_error("mount", &e);
+        OpError::Mount
+    })?;
+    let outcome: Result<u32, OpError> = async {
+        let root = fs.root_dir();
+        let mut file = root.open_file(path).await.map_err(|e| match e {
+            // Absence is an expected outcome, not an I/O fault — no
+            // defmt noise for it.
+            FatError::NotFound => OpError::NotFound,
+            _ => {
+                log_fat_error("open_file", &e);
+                OpError::Open
+            }
+        })?;
+        // No public size accessor on `File`; seek-to-end is the
+        // supported way to learn the length, then seek back to the
+        // (clamped) window start.
+        let size = file.seek(SeekFrom::End(0)).await.map_err(|e| {
+            log_fat_error("seek_end", &e);
+            OpError::Read
+        })?;
+        let start = u64::from(offset).min(size);
+        file.seek(SeekFrom::Start(start)).await.map_err(|e| {
+            log_fat_error("seek_start", &e);
+            OpError::Read
+        })?;
+        let avail = (size - start).min(u32::MAX as u64) as u32;
+        let total = avail.min(max_len.unwrap_or(u32::MAX));
+        sink.begin(total).await.map_err(|_| OpError::Aborted)?;
+
+        // 512-byte reads line up with the BufStream block size, so
+        // each iteration costs one (cached) block fetch.
+        let mut buf = [0u8; 512];
+        let mut remaining = total;
+        while remaining > 0 {
+            let want = (remaining as usize).min(buf.len());
+            let n = file.read(&mut buf[..want]).await.map_err(|e| {
+                log_fat_error("file.read", &e);
+                OpError::Read
+            })?;
+            if n == 0 {
+                // File ended short of its directory-entry size. The
+                // sink was promised `total` bytes, so a silent break
+                // would corrupt the caller's framing — fail loudly
+                // and let the caller report in-band.
+                defmt::warn!("blackbox/fat: /{} ended {} bytes early", path, remaining);
+                return Err(OpError::Read);
+            }
+            sink.data(&buf[..n]).await.map_err(|_| OpError::Aborted)?;
+            remaining -= n as u32;
+        }
+        // Read-only op — nothing is dirty — but close explicitly for
+        // symmetry with the write path.
+        file.close().await.map_err(|e| {
+            log_fat_error("close", &e);
+            OpError::Read
+        })?;
+        Ok(total)
+    }
+    .await;
+
+    // Unmount even when the stream faulted, so the dirty-flag
+    // discipline matches the write path; the stream error (if any)
+    // takes precedence in the return value.
+    let unmounted = fs.unmount().await;
+    let streamed = outcome?;
+    unmounted.map_err(|e| {
+        log_fat_error("unmount", &e);
+        OpError::Unmount
+    })?;
+    defmt::info!("blackbox/fat: read /{} ({} bytes)", path, streamed);
+    Ok(streamed)
+}
+
+/// Open the card, locate the FAT volume and delete `path` from the
+/// root directory. `OpError::NotFound` if no such file exists.
+pub async fn remove_file(store: &mut SdmmcBlockStore, path: &str) -> Result<(), OpError> {
+    let mut session = store.open_session().await.map_err(|_| {
+        defmt::warn!("blackbox/fat: open_session failed");
+        OpError::CardAcquire
+    })?;
+    let result = {
+        let buf = LazyBufStream::<_, 512>::new(&mut session);
+        // MBR-only — see `write_file` for rationale.
+        match Scheme::open(buf).await.map_err(map_mbr_error) {
+            Ok(Scheme::Mbr(mbr)) => remove_mbr_partition(mbr, path).await,
+            Ok(Scheme::Superfloppy(_)) | Ok(Scheme::Unknown(_)) => {
+                defmt::warn!(
+                    "blackbox/fat: remove: not an MBR-formatted card (reformat as MBR + FAT32)"
+                );
+                Err(OpError::NoPartitionTable)
+            }
+            Err(e) => Err(e),
+        }
+    };
+    finish_session(session, result).await
+}
+
+async fn remove_mbr_partition<IO>(mut mbr: Mbr<IO>, path: &str) -> Result<(), OpError>
+where
+    IO: embedded_io_async::Read + Write + embedded_io_async::Seek,
+{
+    let idx = mbr
+        .iter_used()
+        .find(|(_, p)| p.is_fat())
+        .map(|(i, _)| i)
+        .ok_or_else(|| {
+            defmt::warn!("blackbox/fat: no FAT-typed partition in MBR");
+            OpError::NoFatPartition
+        })?;
+    let mut slice = mbr.open_partition(idx).await.map_err(|_| {
+        // No Debug2Format — see `mount_mbr_partition` for rationale.
+        defmt::warn!("blackbox/fat: open_partition failed");
+        OpError::PartitionIo
+    })?;
+    remove_in_filesystem(&mut slice, path).await
+}
+
+async fn remove_in_filesystem<IO>(io: IO, path: &str) -> Result<(), OpError>
+where
+    IO: embedded_io_async::Read + Write + embedded_io_async::Seek,
+{
+    let fs = FileSystem::new(io, FsOptions::new()).await.map_err(|e| {
+        log_fat_error("mount", &e);
+        OpError::Mount
+    })?;
+    let outcome = {
+        let root = fs.root_dir();
+        match root.remove(path).await {
+            Ok(()) => Ok(()),
+            // Absence is an expected outcome — no defmt noise.
+            Err(FatError::NotFound) => Err(OpError::NotFound),
+            Err(e) => {
+                log_fat_error("remove", &e);
+                Err(OpError::Remove)
+            }
+        }
+    };
+    let unmounted = fs.unmount().await;
+    outcome?;
+    unmounted.map_err(|e| {
+        log_fat_error("unmount", &e);
+        OpError::Unmount
+    })?;
+    defmt::info!("blackbox/fat: removed /{}", path);
+    Ok(())
+}
+
+/// Outcome of [`remove_flight_logs`].
+#[derive(Clone, Copy, Default, defmt::Format)]
+pub struct CleanSummary {
+    /// Files deleted.
+    pub removed: u32,
+    /// True if a delete failed part-way; `removed` is still accurate.
+    pub aborted: bool,
+}
+
+/// True for the recorder's own files (`flight_NNNN.mcap`, any NNNN,
+/// case-insensitive) — the only thing `blackbox clean` touches.
+pub fn is_flight_log(name: &str) -> bool {
+    parse_seq(name, "flight_", ".mcap").is_some()
+}
+
+/// Delete every root-directory file for which `is_flight_log` holds,
+/// in a single card session / single mount. Other files on the card
+/// are never touched. Stops at the first failing delete (reported via
+/// `CleanSummary::aborted`) rather than spinning on it.
+pub async fn remove_flight_logs(store: &mut SdmmcBlockStore) -> Result<CleanSummary, OpError> {
+    let mut session = store.open_session().await.map_err(|_| {
+        defmt::warn!("blackbox/fat: open_session failed");
+        OpError::CardAcquire
+    })?;
+    let result = {
+        let buf = LazyBufStream::<_, 512>::new(&mut session);
+        // MBR-only — see `write_file` for rationale.
+        match Scheme::open(buf).await.map_err(map_mbr_error) {
+            Ok(Scheme::Mbr(mbr)) => clean_mbr_partition(mbr).await,
+            Ok(Scheme::Superfloppy(_)) | Ok(Scheme::Unknown(_)) => {
+                defmt::warn!(
+                    "blackbox/fat: clean: not an MBR-formatted card (reformat as MBR + FAT32)"
+                );
+                Err(OpError::NoPartitionTable)
+            }
+            Err(e) => Err(e),
+        }
+    };
+    finish_session(session, result).await
+}
+
+async fn clean_mbr_partition<IO>(mut mbr: Mbr<IO>) -> Result<CleanSummary, OpError>
+where
+    IO: embedded_io_async::Read + Write + embedded_io_async::Seek,
+{
+    let idx = mbr
+        .iter_used()
+        .find(|(_, p)| p.is_fat())
+        .map(|(i, _)| i)
+        .ok_or_else(|| {
+            defmt::warn!("blackbox/fat: no FAT-typed partition in MBR");
+            OpError::NoFatPartition
+        })?;
+    let mut slice = mbr.open_partition(idx).await.map_err(|_| {
+        defmt::warn!("blackbox/fat: open_partition failed");
+        OpError::PartitionIo
+    })?;
+    clean_in_filesystem(&mut slice).await
+}
+
+async fn clean_in_filesystem<IO>(io: IO) -> Result<CleanSummary, OpError>
+where
+    IO: embedded_io_async::Read + Write + embedded_io_async::Seek,
+{
+    let fs = FileSystem::new(io, FsOptions::new()).await.map_err(|e| {
+        log_fat_error("mount", &e);
+        OpError::Mount
+    })?;
+    let mut summary = CleanSummary::default();
+    let outcome = {
+        let root = fs.root_dir();
+        let mut name_buf: EntryName = heapless::String::new();
+        // Delete-while-iterating is not safe on a FAT directory
+        // iterator, so each pass finds the first matching entry,
+        // drops the iterator, deletes, and rescans. Root directories
+        // here hold tens of files, not thousands.
+        loop {
+            let found = {
+                let mut iter = root.iter();
+                let mut found = false;
+                loop {
+                    match iter.next().await {
+                        None => break,
+                        Some(Ok(entry)) => {
+                            if !entry.is_file() {
+                                continue;
+                            }
+                            name_buf.clear();
+                            fill_entry_name(&entry, &mut name_buf);
+                            if is_flight_log(name_buf.as_str()) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            log_fat_error("dir.iter", &e);
+                            summary.aborted = true;
+                            break;
+                        }
+                    }
+                }
+                found
+            };
+            if !found {
+                break;
+            }
+            match root.remove(name_buf.as_str()).await {
+                Ok(()) => summary.removed += 1,
+                Err(e) => {
+                    log_fat_error("remove", &e);
+                    summary.aborted = true;
+                    break;
+                }
+            }
+        }
+        Ok(summary)
+    };
+    fs.unmount().await.map_err(|e| {
+        log_fat_error("unmount", &e);
+        OpError::Unmount
+    })?;
+    defmt::info!(
+        "blackbox/fat: clean removed {} flight log(s){}",
+        summary.removed,
+        if summary.aborted { " (aborted)" } else { "" },
+    );
+    outcome
 }
 
 /// Open the card, locate the FAT volume, walk its **root directory**
@@ -278,19 +729,25 @@ pub async fn scan_root_files<F>(store: &mut SdmmcBlockStore, visit: &mut F) -> R
 where
     F: FnMut(&str, u32),
 {
-    let storage = store.open_session().await.map_err(|_| {
+    let mut session = store.open_session().await.map_err(|_| {
         defmt::warn!("blackbox/fat: open_session failed");
         OpError::CardAcquire
     })?;
-    let buf = BufStream::<_, 512>::new(storage);
-    // MBR-only — see `write_file` for rationale.
-    match Scheme::open(buf).await.map_err(map_mbr_error)? {
-        Scheme::Mbr(mbr) => scan_mbr_partition(mbr, visit).await,
-        Scheme::Superfloppy(_) | Scheme::Unknown(_) => {
-            defmt::warn!("blackbox/fat: scan: not an MBR-formatted card (reformat as MBR + FAT32)");
-            Err(OpError::NoPartitionTable)
+    let result = {
+        let buf = LazyBufStream::<_, 512>::new(&mut session);
+        // MBR-only — see `write_file` for rationale.
+        match Scheme::open(buf).await.map_err(map_mbr_error) {
+            Ok(Scheme::Mbr(mbr)) => scan_mbr_partition(mbr, visit).await,
+            Ok(Scheme::Superfloppy(_)) | Ok(Scheme::Unknown(_)) => {
+                defmt::warn!(
+                    "blackbox/fat: scan: not an MBR-formatted card (reformat as MBR + FAT32)"
+                );
+                Err(OpError::NoPartitionTable)
+            }
+            Err(e) => Err(e),
         }
-    }
+    };
+    finish_session(session, result).await
 }
 
 /// Scan the root for the highest existing `<prefix>NNNN<suffix>` and

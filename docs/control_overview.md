@@ -25,13 +25,37 @@ HAL/BSP  →  drivers  →  sensor reader tasks  →  CHANNELS  →  estimation 
 - `ACTUATOR_MOTORS` — final motor commands (signal to DShot task)
 - `DSHOT_TELEMETRY` — eRPM feedback from ESCs
 
-### Two compile-time control configurations
-| Feature | Estimator | Setpoint | Inner controller |
-|---|---|---|---|
-| `est_mahony` | Mahony filter (gyro+accel) | RC → tilt angle / yaw rate | cascaded **geometric attitude → rate PID → linear allocator** |
-| `est_eskf` | Error-State Kalman Filter (Vicon-aided) | RC → ENU position | **position PD-FF → geometric attitude → INDI** (replaces rate PID + allocator) |
+### Three compile-time outer loops
+Selected by the vehicle YAML's `build: outer_loop` knob; exactly one must be
+enabled or `control/mod.rs` fails the build. The estimator is not an axis:
+`est_eskf` is the only one, and `outer_geometric` / `outer_mpc` enable it
+implicitly. (A Mahony attitude filter still runs inside the ESKF path to
+supply gyro bias, but it is not a selectable configuration.)
 
-The IMU stream always drives the loop at 8 kHz; outer loops are decimated.
+| `outer_loop` | Feature | Setpoint source | Outer controller |
+|---|---|---|---|
+| `rate` | `outer_rate` | RC sticks → body-rate reference | none — sticks drive INDI directly |
+| `cascade` | `outer_geometric` | RC → ENU position | position PD-FF → geometric attitude (`cascade_task.rs`) |
+| `mpc` | `outer_mpc` | offline mission / trajectory planner | SQP MPC over the quad model (`outer_loop.rs`) |
+
+**INDI is the sole inner loop in every configuration.** The position source is
+an independent knob (`build: pos_source` → `est_pos_mocap` | `est_pos_gps`).
+
+`build: indi: no` (`indi_off`) turns the *increment* off rather than
+swapping in a different controller: the incremental terms of Module 7's
+law drop out and what remains is a proportional rate controller — rate
+error × `indi_rate_*` → desired angular acceleration → the same WLS
+allocation through G1 → the same thrust linearization. It is the
+permanent version of the `do_indi = false` branch INDI already takes on
+the ground, and it matches indiflight's `useIncrement = false`. The
+degraded law has **no integral action**, so a steady disturbance leaves a
+standing rate error for the outer loop to absorb, and `indi_rate_*`
+generally needs re-tuning (the incremental law's effective loop gain is
+not the same number).
+
+The IMU stream drives the inner loop at 8 kHz by default, or 1 kHz when
+`build: imu_rate` is `1khz` (`imu_1khz`); outer loops are decimated from it,
+and every decimation constant derives from `rates::IMU_ODR_HZ` at compile time.
 
 ---
 
@@ -43,7 +67,7 @@ Signal path with explicit input/output for each module. Notation: world-frame (E
 
 **Input:** raw RC channels `c ∈ ℕ¹⁶` (PWM µs).
 
-### Mahony branch (manual mode)
+### Manual branch (`outer_rate`)
 Maps stick deflection through linear scaling (`RcMapper::aetr` with `RcSettings`):
 $$
 \theta_\text{roll}^\text{ref} = k_r\,\bar c_0,\quad
@@ -53,7 +77,7 @@ T = \bar c_2
 $$
 with `k_r = k_p = 60°`, `k_ψ = 90°/s`. Output: `MANUAL_CONTROL` (tilt-angle commands + yaw rate + normalized thrust).
 
-### ESKF branch (position mode)
+### Position branch (`outer_geometric` / `outer_mpc`)
 Captures origin `p₀` from first converged odometry, then maps sticks to ENU position offsets:
 $$
 p^\text{ref} = p_0 + (\Delta x,\Delta y,\Delta z),\;\;
@@ -100,7 +124,7 @@ $$
 
 **Output:** `(q_des, ω_des = 0, F)`. Note feedforward body-rate is currently zero.
 
-In `est_eskf` it then divides `spf_sp_z = F/m` for INDI; otherwise `inner_loop` carries `F` forward as `collective_thrust_n`.
+It then divides `spf_sp_z = F/m` for INDI, which consumes specific force rather than collective thrust.
 
 ---
 
@@ -122,34 +146,13 @@ It also computes a torque:
 $$
 \tau = -K_R^\tau\!\odot e_R + J\,\alpha^\text{ref}_\text{body} + \omega\times(J\omega)
 $$
-but the inner_loop **discards** `τ` to avoid double-acting on the attitude correction (only `ω_ref` is consumed).
+but the caller **discards** `τ` to avoid double-acting on the attitude correction (only `ω_ref` is consumed).
 
 **Output:** `body_rate_rad_s = ω_ref`, `torque_n_m = τ` (unused downstream).
 
 ---
 
-## Module 4a — Rate PID + Linear Allocator (`est_mahony` only, `inner_loop.rs`)
-
-**Input:** body-rate feedback `ω`, body-rate reference `ω_ref`, collective thrust `F`.
-
-Three independent PID controllers (`discrete_pid` crate) at the IMU period `Δt = 125 µs`:
-$$
-\tau_i = K_{p,i}(\omega^\text{ref}_i - \omega_i) + K_{i,i}\!\!\int e\,dt + K_{d,i}\frac{de}{dt},\;\;i\in\{x,y,z\}
-$$
-The torque vector is the rate output (in `est_eskf` it is per-axis clamped, but the rate-PID path only runs in `est_mahony`).
-
-Then **linear allocation** (`mixer::LinearAllocator`):
-$$
-\begin{bmatrix}F\\\tau_x\\\tau_y\\\tau_z\end{bmatrix}
-= M\,\mathbf{u},\qquad \mathbf{u} = M^{+}\begin{bmatrix}F\\\tau\end{bmatrix}\in[0,1]^4
-$$
-where `M ∈ ℝ^{4×4}` is the geometric mixing matrix derived from `MotorParams` (arm lengths, spin direction, max thrust, drag-torque coefficient). For Mahony, throttles are linear; for ESKF (when this path is enabled) `cmd_i = √u_i` to invert the propeller `T ∝ ω²` map.
-
-**Output:** `motor_commands ∈ [0,1]^4` published on `ACTUATOR_MOTORS`.
-
----
-
-## Module 4b — INDI (`est_eskf`, `indi/controller.rs`)
+## Module 4 — INDI (the sole inner loop, `indi/controller.rs`)
 
 This **replaces** the rate PID + linear allocator with **Incremental Nonlinear Dynamic Inversion + Weighted Least Squares allocation**, running every 125 µs.
 
@@ -226,7 +229,7 @@ Then update `u_state` (PT1 actuator model with `α = Δt/(τ+Δt)`).
 ### Auxiliary loops attached to INDI
 - **RPM EKF** (`rpm_estimator.rs`): per-motor first-order-plus-dead-time observer fusing DShot eRPM and commanded throttle history. Output `Ω̂` feeds `G₁/G₂` scaling.
 - **Slew-rate limiter** on raw eRPM: rejects samples whose `|ΔΩ|` exceeds `Ω_max/τ_min · Δt`, defending against GCR decode errors.
-- **Online RLS Learner** (`indi/learner.rs`): when latched via prearm channel + learning toggle, estimates `G₁`/`G₂` from `(ω̇, f_b, Ω, u)`. Result committed to `IndiEffectivenessParams` on disarm and persisted to flash.
+- **Effectiveness config** (`IndiEffectivenessParams`): G1 derives geometrically from the airframe identity unless a full identified G1 is configured; G2/tau/omega/nonlinearity come from the params (vehicle YAML + flash overrides), applied at boot and on the disarmed param hot-reload via `apply_effectiveness_params`.
 
 ---
 
@@ -251,13 +254,12 @@ ESKF (vicon+IMU) ─► VEHICLE_ODOMETRY ───┤
         DShot eRPM ─► RpmEstimator ─► Ω̂ ─┘  (also fed back into INDI G-matrices)
 ```
 
-For `est_mahony` the chain instead is:
+For `outer_rate` the outer stages drop out entirely — RC sticks supply `ω_ref`
+straight to INDI:
 ```
-RC → tilt-angle setpoint → GeometricAttitudeController → ω_ref
-                                       │
-IMU 8kHz ──────────────────────────────┴─► RatePID (×3) → τ
-                                                          │
-                                       LinearAllocator (M⁺) → motor_commands
+RC → body-rate setpoint ──┐
+                          ├─► INDI + WLS → motor_commands
+IMU ──────────────────────┘
 ```
 
 ### Summary table — module I/O
@@ -268,10 +270,7 @@ IMU 8kHz ───────────────────────�
 | Mahony / ESKF | `IMU_1` (+Vicon) | `VEHICLE_ATTITUDE` / `VEHICLE_ODOMETRY` | 8 kHz / 100 Hz |
 | Position ctrl (Lee SE3) | `(p,v,q)`, `(p^ref,v^ref,ψ^ref)` | `(q_des, F)` | 100 Hz |
 | Geometric att ctrl | `(q,ω)`, `(q_des,ω^ref)` | `ω_ref` (and unused τ) | 100 Hz |
-| Rate PID (mahony) | `(ω, ω^ref)` | `τ` | 8 kHz |
-| Linear allocator (mahony) | `(F,τ)` | `u∈[0,1]^4` | 8 kHz |
-| INDI (eskf) | `(ω, f_b, ω^ref, f_z^{sp}, Ω̂, g2_valid, armed)` | `motor_commands∈[0,1]^4` | 8 kHz |
+| INDI (all configs) | `(ω, f_b, ω^ref, f_z^{sp}, Ω̂, g2_valid, armed)` | `motor_commands∈[0,1]^4` | IMU rate |
 | RpmEstimator | DShot eRPM, throttle history | `Ω̂_i`, covariance | per DShot frame |
-| Learner (RLS) | `(ω̇, f_b, Ω, u)` while armed+latched | `G₁`,`G₂` updates | 8 kHz |
 
-Files referenced: `crates/cybflight/src/control/{rc_interpreter.rs,inner_loop.rs,indi_task.rs,mod.rs}`, `crates/cybflight_core/src/{position_control/pd_ff_control.rs,attitude_control/geometric_controller.rs,indi/controller.rs,mixer.rs}`.
+Files referenced: `crates/cybflight/src/control/{rc_interpreter.rs,cascade_task.rs,outer_loop.rs,indi_task.rs,mod.rs}`, `crates/cybflight_core/src/{position_control/pd_ff_control.rs,attitude_control/geometric_controller.rs,indi/controller.rs,mixer.rs}`.

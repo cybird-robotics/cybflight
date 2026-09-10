@@ -162,6 +162,10 @@ pub struct GpsGuardConfig {
     pub pos_sigma_floor_float_m: f32,
     pub pos_sigma_floor_none_m: f32,
     pub vel_sigma_floor_m_s: f32,
+    /// Fuse GNSS velocity (`Eskf::update_vel`) on accepted position frames.
+    /// When false the guard is position-only and `enu_vel` / `vel_sigma_floor_m_s`
+    /// are ignored. Firmware sets this from the `gps_fuse_vel` cargo feature.
+    pub fuse_velocity: bool,
     /// Minimum `carr_soln` for a jump-cascade-triggered re-init to fire.
     /// Default 2 = RTK-fixed only — re-seeding the ENU state from a
     /// stand-alone fix would inject metre-scale absolute bias relative
@@ -173,8 +177,8 @@ pub struct GpsGuardConfig {
 impl Default for GpsGuardConfig {
     fn default() -> Self {
         Self {
-            max_consecutive_jumps: 2,
-            max_consecutive_rejects: 5,
+            max_consecutive_jumps: 5,
+            max_consecutive_rejects: 15,
             gps_stale_ms: 2_000,
             rtk_fix_debounce_ms: 2_000,
             rtk_loss_debounce_ms: 1_000,
@@ -186,6 +190,7 @@ impl Default for GpsGuardConfig {
             pos_sigma_floor_float_m: 0.30,
             pos_sigma_floor_none_m: 2.0,
             vel_sigma_floor_m_s: 0.10,
+            fuse_velocity: true,
             reinit_min_carr_soln: 2,
         }
     }
@@ -213,6 +218,7 @@ impl GpsGuardConfig {
         pos_sigma_floor_float_m: f32,
         pos_sigma_floor_none_m: f32,
         vel_sigma_floor_m_s: f32,
+        fuse_velocity: bool,
         reinit_min_carr_soln: u8,
     ) -> Self {
         Self {
@@ -229,6 +235,7 @@ impl GpsGuardConfig {
             pos_sigma_floor_float_m,
             pos_sigma_floor_none_m,
             vel_sigma_floor_m_s,
+            fuse_velocity,
             reinit_min_carr_soln,
         }
     }
@@ -368,11 +375,11 @@ impl EskfGpsGuard {
 
         let pos_outcome = eskf.update_pos_sparse(fix.enu_pos, sigma_pos);
 
-        // Velocity update — runs only when the position update was
-        // accepted (an RTK ambiguity slip biases pos+vel together;
-        // the failsafe story belongs to the pos channel). σ_vel from
+        // Velocity update — opt-in (`fuse_velocity`), and only when the
+        // position update was accepted (an RTK ambiguity slip biases pos+vel
+        // together; the failsafe story belongs to the pos channel). σ_vel from
         // u-blox `s_acc_mm_s` with the cfg-level floor.
-        if pos_outcome.is_accepted() {
+        if self.cfg.fuse_velocity && pos_outcome.is_accepted() {
             let sigma_vel =
                 ((fix.s_acc_mm_s as f32) * 1e-3).max(self.cfg.vel_sigma_floor_m_s);
             let vel_outcome = eskf.update_vel(fix.enu_vel, sigma_vel);
@@ -384,7 +391,9 @@ impl EskfGpsGuard {
         // NaN check. Returns either `None` (nothing extra to do) or
         // `Disarmed(cause)` — we translate `cause` into the
         // GPS-specific outcome enum below.
-        let action = self.failsafe.record_pos_outcome(eskf, pos_outcome, fix.timestamp_ms);
+        let action = self
+            .failsafe
+            .record_pos_outcome(eskf, pos_outcome, fix.timestamp_ms);
 
         // Headline outcome from the pos update — used when the
         // failsafe didn't disarm. `JumpRejected` carries the live
@@ -468,12 +477,18 @@ impl EskfGpsGuard {
     }
 
     fn reinit_filter(&mut self, eskf: &mut Eskf, fix: &GpsFix) {
+        // Roll/pitch seed from the filter's own `init_att_var_rp`, the
+        // same value `Eskf::init` uses at bootstrap. It was previously a
+        // literal `0.1` here, which silently ignored a vehicle that had
+        // pinned `eskf_init_att_var_rp`: the pinned value applied on the
+        // first fix and then not on any re-init after a GPS glitch.
+        let att_var_rp = eskf.config().init_att_var_rp;
         eskf.init_with_cov(
             fix.enu_pos,
             UnitQuaternion::identity(),
             Vector3::zeros(),
             Vector3::zeros(),
-            Vector3::new(0.1, 0.1, self.cfg.init_yaw_cov),
+            Vector3::new(att_var_rp, att_var_rp, self.cfg.init_yaw_cov),
         );
         self.failsafe.note_reinit(fix.timestamp_ms);
     }
@@ -519,7 +534,7 @@ mod tests {
 
     fn make_eskf() -> Eskf {
         let mut e = Eskf::new(EskfConfig {
-            max_pos_jump_m: 3.0,
+            max_pos_jump_m: 5.0,
             ..EskfConfig::default()
         });
         e.init_with_cov(
@@ -567,7 +582,14 @@ mod tests {
     /// matching fixes are accepted normally.
     #[test]
     fn jump_cascade_with_rtk_fix_triggers_reinit() {
-        let cfg = GpsGuardConfig::default();
+        // Pin the cascade limit rather than relying on the (tunable)
+        // default, and jump well past the fixture's max_pos_jump_m
+        // (5.0 m — the gate is a strict `>`, so an exactly-5.0 m
+        // innovation would be sigma-inflate-accepted, not rejected).
+        let cfg = GpsGuardConfig {
+            max_consecutive_jumps: 2,
+            ..GpsGuardConfig::default()
+        };
         let mut g = EskfGpsGuard::new(cfg, 0);
         let mut e = make_eskf();
         for k in 0..15 {
@@ -575,12 +597,12 @@ mod tests {
         }
         assert_eq!(g.snapshot().consecutive_jumps, 0);
 
-        // Two consecutive jumpy fixes 5 m east of origin. The first
+        // Two consecutive jumpy fixes 8 m east of origin. The first
         // is `JumpRejected` and bumps the counter to 1. The second
-        // hits the cascade limit (`MAX_CONSECUTIVE_JUMPS = 2`) and
+        // hits the cascade limit (max_consecutive_jumps = 2) and
         // triggers re-init.
-        let _ = g.on_pvt(&mut e, &good_fix(3000, Vector3::new(5.0, 0.0, 0.0)));
-        let outcome = g.on_pvt(&mut e, &good_fix(3200, Vector3::new(5.0, 0.0, 0.0)));
+        let _ = g.on_pvt(&mut e, &good_fix(3000, Vector3::new(8.0, 0.0, 0.0)));
+        let outcome = g.on_pvt(&mut e, &good_fix(3200, Vector3::new(8.0, 0.0, 0.0)));
         assert!(
             matches!(
                 outcome,
@@ -594,7 +616,7 @@ mod tests {
         // Filter should now be at the new GPS position.
         let pos = e.position();
         assert!(
-            (pos - Vector3::new(5.0, 0.0, 0.0)).norm() < 0.1,
+            (pos - Vector3::new(8.0, 0.0, 0.0)).norm() < 0.1,
             "filter not re-anchored: pos={pos:?}"
         );
         // Cascade counter cleared so subsequent jumps don't double-count.
@@ -607,7 +629,12 @@ mod tests {
     /// known-biased measurement source.
     #[test]
     fn jump_cascade_without_rtk_fix_disarms_only() {
-        let cfg = GpsGuardConfig::default();
+        // Same pinned cascade limit and >max_pos_jump_m offset as the
+        // RTK variant above — only the carrier solution differs.
+        let cfg = GpsGuardConfig {
+            max_consecutive_jumps: 2,
+            ..GpsGuardConfig::default()
+        };
         let mut g = EskfGpsGuard::new(cfg, 0);
         let mut e = make_eskf();
         // Use carr_soln=0 (stand-alone) fixes throughout — below the
@@ -620,8 +647,8 @@ mod tests {
         // direct mutation isn't easy in this test; instead, drive the
         // cascade with `converged=false`. The test's value is purely
         // to confirm the re-init path is *not* taken on stand-alone.
-        let _ = g.on_pvt(&mut e, &standalone(3000, Vector3::new(5.0, 0.0, 0.0)));
-        let outcome = g.on_pvt(&mut e, &standalone(3200, Vector3::new(5.0, 0.0, 0.0)));
+        let _ = g.on_pvt(&mut e, &standalone(3000, Vector3::new(8.0, 0.0, 0.0)));
+        let outcome = g.on_pvt(&mut e, &standalone(3200, Vector3::new(8.0, 0.0, 0.0)));
         // No Reinitialised — the carrier solution didn't permit it.
         assert!(
             !matches!(outcome, GpsGuardOutcome::Reinitialised { .. }),

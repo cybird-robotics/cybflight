@@ -6,6 +6,7 @@ use embassy_usb::{
     driver::{Driver, EndpointError},
 };
 
+pub mod complete;
 pub mod format;
 
 // ---------------------------------------------------------------------------

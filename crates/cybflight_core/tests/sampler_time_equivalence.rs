@@ -93,19 +93,26 @@ fn reference_fill(
     for k in 0..nodes {
         let t_k = (tau0 + k as f32 * horizon_dt).min(total_duration_s);
         let past_end = t_k >= total_duration_s;
-        let (p, v, a) = if past_end {
+        let (p, v, a, j) = if past_end {
             (
                 traj.get_pos(total_duration_s),
                 Vec3::zeros(),
                 Vec3::zeros(),
+                Vec3::zeros(),
             )
         } else {
-            (traj.get_pos(t_k), traj.get_vel(t_k), traj.get_acc(t_k))
+            (
+                traj.get_pos(t_k),
+                traj.get_vel(t_k),
+                traj.get_acc(t_k),
+                traj.get_jerk(t_k),
+            )
         };
         out.push(SamplerNode {
             pos: p,
             vel: v,
             acc: a,
+            jerk: j,
             past_end,
         });
     }

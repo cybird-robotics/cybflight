@@ -7,8 +7,12 @@ members = [
   "crates/cybflight",
   "crates/cybflight_core",
   "crates/cybflight_sim",
+  "crates/cybflight_rl",
+  "crates/params_derive",
+  "crates/vehicle_yaml",
   "crates/bsp/sakurah743",
   "crates/bsp/foxeerh743",
+  "crates/bsp/micoair743v2",
   "crates/bsp/types",
   "crates/drivers",
 ]
@@ -21,6 +25,7 @@ default-members = [
   "crates/cybflight_core",
   "crates/bsp/sakurah743",
   "crates/bsp/foxeerh743",
+  "crates/bsp/micoair743v2",
   "crates/bsp/types",
   "crates/drivers",
 ]
@@ -42,7 +47,9 @@ lto = false
 codegen-units = 16
 
 [patch.utadr]
-#cybflight-msgs = { path = "../cybflight-msgs" }
+# Unify on the local cybflight-msgs working tree (main 0.1.21 + the
+# WireFleetState swarm message). Remove once that is published to utadr.
+cybflight-msgs = { path = "../cybflight-msgs" }
 # Unify `block-device-driver` so embassy-stm32 (registry 0.2) and
 # embedded-fatfs/block-device-adapters (same version, but pulled from
 # git) talk about the *same* trait. Without this they appear as two

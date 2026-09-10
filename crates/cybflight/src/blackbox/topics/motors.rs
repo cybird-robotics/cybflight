@@ -4,8 +4,8 @@
 //! Carries the four normalized motor commands the INDI loop publishes
 //! to the DShot driver. Sourced from
 //! [`crate::control::ACTUATOR_MOTORS_TELEM`] (a 100 Hz decimated
-//! mirror of the 8 kHz `motors::ACTUATOR_MOTORS` Signal — going to the
-//! decimated PubSub keeps the recorder out of the hot 8 kHz path).
+//! mirror of the IMU-rate `motors::ACTUATOR_MOTORS` Signal — going to
+//! the decimated PubSub keeps the recorder out of the hot inner-loop path).
 //!
 //! Useful for spotting motor saturation, mixer asymmetry, or ESC
 //! desync after the fact: pair with `/odometry` (state) and `/mpc`

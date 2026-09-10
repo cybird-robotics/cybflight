@@ -76,6 +76,28 @@ async fn main(spawner: embassy_executor::Spawner) {
     let (board, defmt_uart) = cybflight::bsp::init();
     cybflight::serial_logger::init(defmt_uart);
     defmt::info!("cybflight: {} starting", cybflight::bsp::BOARD_NAME);
+    // Confirm the BSP's declared clocks match what the RCC configuration
+    // actually produced. DShot and WS2812 bit timings are computed from
+    // those constants, so a mismatch mistimes both; reported, not fatal,
+    // because a boot loop is the worse failure.
+    cybflight::clocks::verify_clocks();
+    // STM32H743 96-bit unique device ID (UID register @ 0x1FF1_E800),
+    // read via embassy-stm32's `uid` module. Logged once at boot so each
+    // board reports an identity for field bring-up and log correlation.
+    defmt::info!("device UID: {}", cybflight::hal::uid::uid_hex());
+    // Why did the previous session end? Captured from RCC.RSR in
+    // `pre_init` (before any HAL code could clear the latch). IWDG =
+    // firmware hung (panic/hardfault/starved executor); Brownout/BOR =
+    // power dipped; Pin/POR = normal power-up or NRST. Also readable
+    // later over USB via the `resetcause` shell verb.
+    {
+        let raw = cybflight::reset_cause::read();
+        defmt::info!(
+            "reset cause: {:?} (raw=0x{=u32:08x})",
+            cybflight::reset_cause::classify(raw),
+            raw,
+        );
+    }
     cybflight::status::STATUS
         .sender()
         .send(cybflight::status::SystemStatus::Booting);
@@ -121,6 +143,13 @@ async fn main(spawner: embassy_executor::Spawner) {
             .unwrap_or_else(|_| defmt::panic!("failed to spawn postmortem task"));
     }
 
+    // Snapshot the reboot-flagged safety/RC params into their task-local
+    // caches before the consumers spawn. Params are already loaded by
+    // `board_init` (`params::init_from_flash`); until these run, both
+    // caches serve their pre-parameter fallbacks.
+    cybflight::sensors::rc::init_arm_config();
+    cybflight::control::failsafe::init_fs_config();
+
     // --- IWDG: system-level safety net ---
     cybflight::watchdog::init();
     spawner
@@ -144,8 +173,11 @@ async fn main(spawner: embassy_executor::Spawner) {
     // predict (1 kHz) and ~120 μs mocap update (100 Hz) are small, but
     // co-locating it with MPC keeps the position-estimation → MPC pipeline
     // on the same tier and avoids any risk of blocking the 8 kHz INDI loop.
-    // ESKF also publishes `VEHICLE_ATTITUDE` (100 Hz) for telemetry
-    // consumers (CRSF, ESP bridge, USB stream).
+    // ESKF also publishes `VEHICLE_ATTITUDE` for telemetry consumers
+    // (CRSF, ESP bridge, USB stream, blackbox). It goes out alongside
+    // `VEHICLE_ODOMETRY` under the same `ODOM_DECIMATION`, so both are
+    // 1 kHz — in *every* build, since the predict is decimated to
+    // ~1 kHz whether the IMU runs at 1 kHz or 8 kHz.
     // Cross-executor communication (ESKF_GYRO_BIAS, ESKF_ACCEL_BIAS Signals and
     // VEHICLE_ODOMETRY PubSub) is lock-free by construction.
     #[cfg(feature = "est_pos_mocap")]
@@ -156,6 +188,14 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::estimation::eskf_imu_gps::estimation_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn estimation task"));
+
+    // Mahony attitude filter: always-on, logging/telemetry only (feeds
+    // the blackbox `/attitude` topic; on no-ESKF builds it is also the
+    // sole VEHICLE_ATTITUDE publisher). ~1 kHz update on the thread
+    // executor, negligible CPU — see estimation/mahony_task.rs.
+    spawner
+        .spawn(cybflight::estimation::mahony_task::mahony_task())
+        .unwrap_or_else(|_| defmt::panic!("failed to spawn Mahony task"));
 
     // spawner
     //     .spawn(cybflight::control::nmpc_driver::nmpc_task())
@@ -184,7 +224,8 @@ async fn main(spawner: embassy_executor::Spawner) {
     spawner
         .spawn(cybflight::control::outer_loop::control_loop_task())
         .unwrap_or_else(|_| defmt::panic!("failed to spawn MPC outer loop task"));
-    // Mission planner (BFGS trajectory solver, thread executor).
+    // Mission planner (offline MINCO schedule by default, or the BFGS
+    // trajectory solver under `plan_online`; thread executor).
     #[cfg(feature = "outer_mpc")]
     spawner
         .spawn(cybflight::control::mission_planner::mission_planner_task())

@@ -4,11 +4,86 @@ Notes for contributors. Architecture and design live in
 [architecture.md](architecture.md); this file is about the workflows you'll
 actually touch while changing code.
 
+## Parameter & vehicle-config workflow
+
+The full design is in
+[architecture.md → The Configuration Plane](architecture.md#the-configuration-plane);
+the generated per-parameter reference is [parameters.md](parameters.md).
+Day-to-day:
+
+- **Build for a vehicle**: `just vehicles` lists them; `just build <name>`
+  builds one and `just flash <name>` builds + flashes the same one. With
+  no argument both fall back to `VEHICLE=` in `.env`. Either way the
+  chosen `vehicles/<name>.yaml`'s `build:` section drives the cargo
+  feature list — `just print-features [<name>]` shows the resolution and
+  per-knob provenance, and is the dry run for a build (`just --dry-run
+  build` will not show features; it does not evaluate backticks). A name
+  with no matching YAML fails immediately with the available names. Env
+  vars (`BOARD=`, `OUTER_LOOP=`, `POS_SOURCE=`, …) remain dev overrides;
+  `build.rs` hard-fails a mismatched board↔vehicle pairing.
+- **Tune at the bench**: `param list|get|set|diff|save` over USB CDC.
+  `param list` prints the whole config tree grouped by subsystem —
+  `[eskf.mocap_guard]`, `[indi.controller]`, `[trajectory.sampler]`, … —
+  led by a `[build]` block showing the compile-time selections
+  (`board`, `pos_source`, `outer_loop`, `imu_rate`, the baked vehicle and
+  `airframe.name`). Those are cargo features, so they are read-only, but
+  they are the first thing to check when a board behaves like a vehicle
+  it isn't. Narrow with `param list <group>` or `param <group> list`;
+  a group matches its whole subtree, and `.`/`-`/`_` are
+  interchangeable (`param eskf-mocap_guard list`). An unknown group
+  prints the available ones.
+  `param set` applies on the disarmed hot-reload (reboot-flagged params
+  are marked `(reboot)` in the listing); `param save` persists to the KV
+  flash log. Then
+  `just param-sync` merges `param diff --yaml` into the vehicle file —
+  review the git diff and commit. The firmware never writes YAML.
+- **A YAML edit didn't take effect**: a saved override shadows it. Flash
+  wins per key, and re-flashing does not clear the KV sectors (`memory.x`
+  reserves them; DFU writes the app region only). `param diff` lists
+  every key whose live value differs from the bake — that list *is* the
+  answer. Fix it in whichever direction is right: `just param-sync` to
+  adopt the flash tune into the YAML, or `param reset <name>` +
+  **`param save --prune`** to adopt the YAML. Plain `param save` there
+  only papers over it — with no tombstone record it stores today's baked
+  value, so the same key is shadowed again at your next YAML edit.
+  `param reset all` + `param save --prune` is also what you want after
+  flashing a *different vehicle* onto a board: records carry no vehicle
+  identity, so the previous airframe's mass/inertia replay onto the new
+  one and pass range validation.
+- **Add a parameter**: one attributed struct field in
+  `cybflight_core/src/params.rs` + `VERSION` bump; see the checklist in
+  architecture.md. Regenerate the reference with `just params-doc` and
+  commit it.
+- **Add a mission**: drop the offline planner's output YAML into
+  `missions/<name>.yaml` (native `start`/`waypoints`/`durations` form is
+  accepted) and rebuild — validation happens at bake. Select with
+  `mission set <name>`; the vehicle YAML's `default_mission:` names the
+  boot default. Re-run `mission set` + `param save` after adding or
+  removing mission files (the persisted selection is an index into the
+  name-sorted table).
+- **Changing schema defaults**: flying vehicles pin their
+  hardware-coupled values explicitly in YAML (the bake warns about
+  unpinned keys), so a `Default` retune must not silently change them.
+  Keep it that way — pin what you fly.
+
+## The `tmp/` reference directory
+
+`tmp/` is **untracked** but load-bearing as provenance: code comments
+reference `tmp/thrust_map/` (bench thrust-stand data + `identify_indi_k.py`),
+`tmp/indi_c/` (the Indiflight C reference the INDI port mirrors),
+`tmp/planner/` (offline MINCO planner), and `tmp/planning_results/`
+(the planner outputs the committed `missions/*.yaml` were migrated from).
+A fresh clone cannot resolve those paths — if you need them, get the
+directory from the bench machine. Anything that becomes load-bearing
+(new thrust CSVs, new missions) should be **committed** into
+`crates/cybflight/data/` / `missions/` rather than referenced in `tmp/`.
+
 ## Sim regression snapshot
 
 `crates/cybflight_sim/tests/regression_snapshot.json` is a **committed**
-JSON file with the expected summary metrics for the 12-row sim comparison
-(4 scenarios × 3 controllers × 5 metrics). `cargo test` runs the sim and
+JSON file with the expected summary metrics for the sim comparison
+(16 rows: the 4 scenarios × 3 controllers grid plus contouring, GPS-in-
+the-loop, and noisy variants). `cargo test` runs the sim and
 compares the actual numbers against this file with a tight tolerance
 (~1 % relative plus a small absolute floor so hover-level's ~0 values
 don't trip). Drift fails the test.
@@ -177,13 +252,14 @@ as any tolerance-tripping environmental drift.
    large bias, latency spike, dropout).
 4. Do **not** add noisy rows to the regression snapshot; see above.
 
-A `GpsModel` / `ViconModel` follows the same pattern once ESKF-in-the-
-loop is wired — that's the next milestone and it will consume
-`PositionMeasurement` at ~10 Hz.
+`GpsModel` shipped (`PerfectGps`, `NoisyGps`, `OutageGps`, `FaultedGps`
+in `sensors.rs`, driving the `mission_square_gps` scenario /
+`autotest_gps.rs` / `just sim-run GPS=…`); a `ViconModel` would follow
+the same pattern.
 
 ## Vehicle parameters in the sim
 
-`Scenario` owns `vehicle_params: VehicleParams`. That's the **single
+`Scenario` owns `vehicle_params: FirmwareConfig`. That's the **single
 source of truth** for everything downstream:
 
 - `QuadPlant::new(scenario.vehicle_params.clone(), ...)` — simulated
@@ -202,15 +278,19 @@ different mass.
 ### Defaults + overrides
 
 `Scenario::hover`, `point_to_point`, `mission` fill
-`vehicle_params` with `default_vehicle()` (the canonical host-side
-params in `plant.rs::VEHICLE`, which mirrors the firmware's
-`QUADROTOR_BODY` / `QUADROTOR_MOTORS`).
+`vehicle_params` with `default_vehicle()` — the FROZEN sim baseline
+loaded from `vehicles/sim_baseline.yaml` through the same
+`vehicle-yaml` loader the firmware bake uses. The baseline
+deliberately lags the flight tune (`vehicles/sakura_bench.yaml`);
+compare them with a plain file diff. To adopt a new tune, edit
+`sim_baseline.yaml` and regenerate the regression snapshot in the
+same commit.
 
 For tuning sweeps or "what if" tests, the `_with_params` variants take
-an explicit `VehicleParams`:
+an explicit `FirmwareConfig`:
 
 ```rust
-let vp = tweaked_vehicle(|p| p.body.mass_kg *= 1.5);
+let vp = tweaked_vehicle(|p| p.airframe.body.mass_kg *= 1.5);
 let scenario = Scenario::mission_with_params("heavy_square", vp, start, &wps);
 let controller = MpcIndiController::from_params(&scenario.vehicle_params);
 ```
@@ -236,7 +316,8 @@ to avoid a "works sometimes" trap.
 ## Simulation runner (`just sim-compare`, `just sim-run`)
 
 `just sim-compare` runs all four sim scenarios through all three
-controllers and prints a 12-row comparison table. This is the
+controllers, plus the sensors-in-the-loop noisy and GPS variants, and
+prints a 16-row comparison table. This is the
 exploratory tool — use it when you want to *look* at how behavior
 changed, not gate a PR on it.
 
@@ -248,3 +329,41 @@ Both recipes use the `release-host` profile, which inherits from
 `release` but disables LTO and loosens `codegen-units` so incremental
 rebuilds don't pay the cross-crate LTO tax that embedded firmware
 needs. Embedded builds (`just build`, `just flash`) are unaffected.
+
+## Bench rate checks (`imurate`, `indistat`)
+
+Two shell verbs measure what the inner loop actually does, as opposed to
+what it was compiled or configured to do. Run both after any change to
+the IMU driver, the SPI/bus setup in `board_init`, the IMU reader task,
+or the INDI step — and before trusting a blackbox log for sysid.
+
+```
+> imurate
+measuring for 1000 ms (build expects 8000 Hz; INDI at /4 = 2000 Hz)...
+  imu1: 7922 samples / 1.000 s = 7921.8 Hz (-0.98 %)
+> indistat          # first call discards what accumulated since boot
+> indistat          # wait a second, then this is the number
+indi: 2001 iters, step avg 61.3 us, max 118.0 us, loop period max 512.0 us
+```
+
+- `imurate` counts publishes on `IMU_1` (`Lagged(n)` counts as `n`) over
+  one second against the MCU clock — a real ODR measurement, ±1 % is the
+  chip's oscillator tolerance. Anything well below the build's ODR means
+  the *reader* is losing samples: bus time (`bytes × 8 / f_spi` vs the
+  period), a second transaction per sample, or a task on the same
+  executor (INDI) running long enough to miss the DRDY pulse.
+- `indistat` is a DWT cycle count around one INDI iteration (after the
+  `indi_ctrl_div` gate, up to the motor publish). `step max` must stay
+  well under `1 / (IMU_ODR_HZ / indi_ctrl_div)`; `loop period max` shows
+  the worst gap between iterations.
+
+History: until 2026-08-24 every build ran the IMU at ~2.5 kHz because
+the SPI bus was 1 MHz (136 µs of bus time per sample against a 125 µs
+period), and INDI — designed for 8 kHz — silently ran at that rate too.
+Raising the clock exposed the INDI step (> 125 µs) as the next limit,
+which is why the control rate is now a separate param. When a P10 task
+saturates its executor the symptom is an IWDG reset loop (slow LED, no
+USB), indistinguishable from a panic without the `postmortem` feature.
+
+The per-sample reader is the interim design; the intended end state is
+the ICM FIFO drained at the control rate — see [imu_fifo.md](imu_fifo.md).

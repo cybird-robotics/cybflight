@@ -32,6 +32,9 @@ where
     M: QuadDynamicsModel<NX, NU>,
 {
     pub model: M,
+    /// Active horizon length (stages). The solver clamps it to its
+    /// const-generic workspace capacity `N`; `n < N` runs a shorter
+    /// horizon in the same workspace.
     pub n: usize,
     pub prop: Propagation,
 }
@@ -82,7 +85,9 @@ where
             .stage_cost_hess_grad(x, u, x_ref, u_ref, hess_xx, r_diag, grad_x, grad_u)
     }
 
-    /// Terminal cost = stage state cost (no input, no constraint penalty at N).
+    /// Terminal cost = the model's terminal state cost (no input, no
+    /// constraint penalty at N). For `QuadModel` that is the stage state
+    /// cost under the terminal weights, which default to the stage ones.
     pub fn terminal_cost_hess_grad(
         &self,
         x: &SVector<f32, NX>,
@@ -90,7 +95,7 @@ where
         grad_x: &mut SVector<f32, NX>,
         hess_xx: &mut SMatrix<f32, NX, NX>,
     ) -> f32 {
-        self.model.state_cost_hess_grad(x, x_ref, grad_x, hess_xx)
+        self.model.terminal_cost_hess_grad(x, x_ref, grad_x, hess_xx)
     }
 
     /// Sum of stage state-cost + input-cost + constraint penalty over the

@@ -71,6 +71,18 @@ pub async fn qmc5883l_mag_task(mut reader: MagReader<Qmc5883lDev>) {
     reader.run(&super::MAG_EXT).await;
 }
 
+/// QMC5883L wired as the board's **internal** compass (publishes to `MAG_INT`).
+///
+/// Note on alignment: ArduPilot bakes a universal X/Z sign negation into its
+/// QMC5883L driver (`field(-rx, ry, -rz)`), independent of board orientation —
+/// our driver returns raw axes, so callers reproduce that convention by passing
+/// `SensorAlign::Cw0DegFlip` (= `(-x, y, -z)`, a flip about Y) composed with the
+/// board's mounting rotation.
+#[embassy_executor::task]
+pub async fn qmc5883l_mag_int_task(mut reader: MagReader<Qmc5883lDev>) {
+    reader.run(&super::MAG_INT).await;
+}
+
 #[embassy_executor::task]
 pub async fn ist8310_mag_task(mut reader: MagReader<Ist8310Dev>) {
     reader.run(&super::MAG_INT).await;

@@ -1,42 +1,66 @@
 use nalgebra::Vector3;
 
-use super::banded_system::BandedSystem;
+use super::banded_system::{jerk_storage, BandedSystem};
 use super::piecewise_polynomial::PiecewisePolynomial;
 use super::polynomial::Polynomial;
 use super::types::{Vec3, ZERO3, PVA3D};
 use super::MAX_PIECES;
 
-/// MINCO min-jerk trajectory solver (polynomial degree 5, s=3).
+/// MINCO min-jerk trajectory solver (polynomial degree 5, s=3), sized
+/// for at most `P` pieces.
+///
 /// Zero heap allocations — all buffers are inline fixed-size arrays.
-pub struct MincoJerk {
+/// The three const parameters are one bound spelled three ways, because
+/// stable Rust cannot derive an array length from another parameter:
+/// - `P` — maximum piece count (sizes the time tables),
+/// - `C` — coefficient rows, must equal `6 * P`,
+/// - `S` — band storage floats, must be at least [`jerk_storage`]`(P)`.
+///
+/// Name a concrete instance once with a type alias (see [`MincoJerk`] and
+/// [`super::PlannerMinco`]) rather than spelling the triple at use sites;
+/// `new` checks the relationship at compile time.
+pub struct MincoJerkN<const P: usize, const C: usize, const S: usize> {
     n: usize,
     head_pva: PVA3D,
     tail_pva: PVA3D,
-    banded: BandedSystem,
+    banded: BandedSystem<S>,
     /// Coefficient matrix: 6N rows × 3 cols
-    b: [Vector3<f32>; 6 * MAX_PIECES],
-    t1: [f32; MAX_PIECES],
-    t2: [f32; MAX_PIECES],
-    t3: [f32; MAX_PIECES],
-    t4: [f32; MAX_PIECES],
-    t5: [f32; MAX_PIECES],
+    b: [Vector3<f32>; C],
+    t1: [f32; P],
+    t2: [f32; P],
+    t3: [f32; P],
+    t4: [f32; P],
+    t5: [f32; P],
 }
 
-impl MincoJerk {
-    /// Initialize the solver.
+/// [`MincoJerkN`] at the global trajectory cap [`MAX_PIECES`] (~52 KiB).
+pub type MincoJerk = MincoJerkN<MAX_PIECES, { 6 * MAX_PIECES }, { jerk_storage(MAX_PIECES) }>;
+
+impl<const P: usize, const C: usize, const S: usize> MincoJerkN<P, C, S> {
+    /// Compile-time check that `C` and `S` match `P`; evaluated by `new`.
+    const LAYOUT_OK: () = assert!(
+        P >= 1 && P <= MAX_PIECES && C == 6 * P && S >= jerk_storage(P),
+        "MincoJerkN<P, C, S>: C must be 6*P and S >= jerk_storage(P)"
+    );
+
+    /// Initialize the solver. Panics if `piece_num` exceeds `P`.
     pub fn new(head_state: &PVA3D, tail_state: &PVA3D, piece_num: usize) -> Self {
-        debug_assert!(piece_num >= 1 && piece_num <= MAX_PIECES);
+        let () = Self::LAYOUT_OK;
+        assert!(
+            piece_num >= 1 && piece_num <= P,
+            "MincoJerkN: {piece_num} pieces exceeds the type's bound of {P}"
+        );
         Self {
             n: piece_num,
             head_pva: *head_state,
             tail_pva: *tail_state,
             banded: BandedSystem::new(6 * piece_num, 6, 6),
-            b: [Vector3::zeros(); 6 * MAX_PIECES],
-            t1: [0.0; MAX_PIECES],
-            t2: [0.0; MAX_PIECES],
-            t3: [0.0; MAX_PIECES],
-            t4: [0.0; MAX_PIECES],
-            t5: [0.0; MAX_PIECES],
+            b: [Vector3::zeros(); C],
+            t1: [0.0; P],
+            t2: [0.0; P],
+            t3: [0.0; P],
+            t4: [0.0; P],
+            t5: [0.0; P],
         }
     }
 
@@ -171,7 +195,7 @@ impl MincoJerk {
             degree: 0,
             duration: 0.0,
             coeffs: [ZERO3; super::polynomial::MAX_COEFFS],
-        }; MAX_PIECES];
+        }; P];
 
         for i in 0..self.n {
             let base = 6 * i;
@@ -268,7 +292,7 @@ impl MincoJerk {
         for gt in grad_times.iter_mut() { *gt = 0.0; }
 
         // Solve A^T * adjGrad = partial_grad_c
-        let mut adj_grad = [Vector3::<f32>::zeros(); 6 * MAX_PIECES];
+        let mut adj_grad = [Vector3::<f32>::zeros(); C];
         adj_grad[..sys_size].copy_from_slice(&partial_grad_c[..sys_size]);
         self.banded.solve3_adj(&mut adj_grad[..sys_size]);
 

@@ -416,7 +416,32 @@ impl BaselineSolver {
 // ───────────────────────────────────────────────────────────────────────────
 
 fn make_problem() -> SimpleQuadProblem {
-    let model = QuadModel::default();
+    // Legacy test baseline — the values of the deleted
+    // `QuadModel::default()`, pinned so the SQP equivalence cases are
+    // independent of any vehicle definition.
+    let mass = 0.58;
+    let model = QuadModel {
+        mass,
+        grav: 9.81,
+        dt: 0.05,
+        u_bounds: [[0.0, 4.0 * 12.0], [-10.0, 10.0], [-10.0, 10.0], [-6.0, 6.0]],
+        mass_inv: 1.0 / mass,
+        w_pos: [200.0, 200.0, 200.0],
+        w_vel: [10.0, 10.0, 10.0],
+        w_att: [5.0, 5.0, 200.0],
+        w_pos_n: [200.0, 200.0, 200.0],
+        w_vel_n: [10.0, 10.0, 10.0],
+        w_att_n: [5.0, 5.0, 200.0],
+        w_input: nalgebra::Vector4::new(1.0, 20.0, 20.0, 20.0),
+        rho: 1e4,
+        pos_cost_mode: cybflight_core::mpc::quad_model::PosCostMode::Quadratic,
+        tilt_cos_max: 0.5,
+        tilt_barrier_tau: 0.0,
+        tilt_barrier_delta: 0.05,
+        drag_coeff: [0.0; 3],
+        thrust_coeff: 0.0,
+        body_drag_coeff: [0.0; 3],
+    };
     SimpleQuadProblem::with_rk4(model, N)
 }
 

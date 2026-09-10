@@ -148,6 +148,41 @@ pub async fn write_channel<W: Write>(
     w.write_all(&0u32.to_le_bytes()).await
 }
 
+/// Emit a Metadata record (op 0x0C): a named `Map<string, string>`.
+///
+/// The recorder writes one at session start (name `"cybflight"`)
+/// carrying the acquisition provenance a reader needs to interpret —
+/// or reconstruct — the data streams: IMU ODR, the *effective*
+/// (post-clamp) biquad LP cutoffs, filter topology, board, and the
+/// active record-set tier. Without these on disk, every analysis
+/// depends on out-of-band knowledge of that flight's tune; with
+/// them, `/imu1` is derivable from `/imu1_raw` and vice versa.
+pub async fn write_metadata<W: Write>(
+    w: &mut W,
+    name: &str,
+    pairs: &[(&str, &str)],
+) -> Result<(), W::Error> {
+    // MCAP Map<string,string> = uint32 byte-length of all entries,
+    // then (string, string)* — each string itself u32-length-prefixed.
+    let map_len: usize = pairs.iter().map(|(k, v)| 4 + k.len() + 4 + v.len()).sum();
+    let body_len = 4 + name.len() + 4 + map_len;
+    write_prelude(w, op::METADATA, body_len as u64).await?;
+    write_string(w, name).await?;
+    w.write_all(&(map_len as u32).to_le_bytes()).await?;
+    for (k, v) in pairs {
+        write_string(w, k).await?;
+        write_string(w, v).await?;
+    }
+    Ok(())
+}
+
+/// Byte length of the Metadata record [`write_metadata`] emits, for
+/// callers tracking a byte total.
+pub fn metadata_record_len(name: &str, pairs: &[(&str, &str)]) -> u32 {
+    let map_len: usize = pairs.iter().map(|(k, v)| 4 + k.len() + 4 + v.len()).sum();
+    (1 + 8 + 4 + name.len() + 4 + map_len) as u32
+}
+
 /// Emit a Message record (op 0x05). `data` is the raw payload bytes
 /// in whatever encoding was declared on the channel (CBOR, JSON, ...).
 /// Times are nanoseconds (Foxglove will use any monotonic basis; for

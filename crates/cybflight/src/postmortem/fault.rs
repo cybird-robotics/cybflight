@@ -173,6 +173,18 @@ fn PVD_AVD() {
     let exti = crate::hal::pac::EXTI;
     exti.pr(0).write(|w| w.set_line(16, true));
 
+    // Confirm the comparator still sees VDD below threshold. A real
+    // brownout stays asserted all the way down to BOR; a glitch (EMI
+    // spike, marginal supply ringing) has already recovered by the
+    // time we get here. Committing a fatal record and parking in
+    // `wfi` on a glitch turns a survivable transient into a
+    // guaranteed IWDG reset — treat it as spurious and return to the
+    // running system instead.
+    if !crate::hal::pac::PWR.csr1().read().pvdo() {
+        FAULT_DEPTH.store(0, Ordering::Release);
+        return;
+    }
+
     let summary = FatalSummary {
         kind: FatalKind::Brownout as u8,
         _pad0: [0; 3],
@@ -212,10 +224,19 @@ pub fn enable_pvd_brownout() {
     // chip-specific; PLS=0b111 selects the highest threshold,
     // giving us the longest commit window.
     pwr.cr1().modify(|w| {
-        // PLS bits [7:5] select the PVD threshold. 0b111 picks the
-        // highest threshold (~2.85 V on STM32H7), maximizing the
-        // PVD-to-BOR commit window. The H743 PAC takes the raw u8.
-        w.set_pls(0b111);
+        // PLS bits [7:5] select the PVD threshold. 0b110 = 2.85 V,
+        // the highest *internal* threshold (RM0433 §6.8.1),
+        // maximizing the PVD-to-BOR commit window.
+        //
+        // NOT 0b111: on the H7 that value does not mean "higher
+        // still" — it switches the comparator to the **external
+        // PVD_IN pin (PB7) vs VREFINT (~1.2 V)**. PB7 is I2C1 SDA on
+        // SAKURAH743, so 0b111 armed a brownout interrupt on a data
+        // line: every SDA low period past arming looked like a
+        // brownout, the handler parked in `wfi` and the IWDG reset
+        // the board ~500 ms later, forever (the 2026-08-07 mocap
+        // boot-loop). The H743 PAC takes the raw u8.
+        w.set_pls(0b110);
         w.set_pvde(true);
     });
     // EXTI16 = PVD line. Enable interrupt mask + rising-edge trigger

@@ -36,6 +36,12 @@ pub const HAS_BLACKBOX_STORAGE: bool = false;
 pub const HAS_BACKUP_SRAM: bool = true;
 pub const LED_COUNT: usize = 1;
 
+/// Primary gyro *native* output data rate (Hz). ICM426xx runs at 8 kHz. The
+/// effective loop rate for a build is `cybflight::rates::IMU_ODR_HZ` — the
+/// `imu_1khz` build knob may program the chip down to 1 kHz low-noise mode,
+/// and control logic must consume that const, not this one.
+pub const PRIMARY_GYRO_ODR_HZ: f32 = 8000.0;
+
 // =====================================================================
 // PORT MAPPING TABLE — single source of truth for UART role assignments.
 // Changing a const here is the only BSP edit needed to move that role.
@@ -302,6 +308,29 @@ pub struct Board {
     /// Internal flash peripheral for parameter storage.
     pub internal_flash: hal::Peri<'static, hal::peripherals::FLASH>,
 }
+
+// ---- Clock declarations -------------------------------------------------
+//
+// These mirror `board_config()` below and exist so drivers that compute
+// timings from a clock (DShot bit periods, WS2812 pulse widths, the
+// DWT cycle-to-microsecond conversion) can assert against the board they
+// are actually built for instead of assuming one. `verify_clocks()` in
+// `crate::clocks` re-checks them against the running RCC configuration
+// at boot, which is what catches an edit to `board_config` that forgets
+// to move these.
+
+/// SYSCLK, in Hz. PLL1_P from the configuration below.
+pub const SYSCLK_HZ: u32 = 480_000_000;
+
+/// Kernel clock of the APB2 timers (TIM1/8/15/16/17), in Hz.
+///
+/// APB2 = AHB/2 = 120 MHz, and the H7 doubles the timer clock whenever
+/// the APB prescaler is not 1, so timers see 240 MHz.
+pub const APB2_TIMER_HZ: u32 = 240_000_000;
+
+/// Kernel clock of the APB1 timers (TIM2-7/12-14), in Hz. Same doubling
+/// rule and the same prescaler, so it matches APB2.
+pub const APB1_TIMER_HZ: u32 = 240_000_000;
 
 /// Board clock/power configuration.
 ///

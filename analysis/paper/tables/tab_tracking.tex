@@ -1,0 +1,34 @@
+\begin{table}[t]
+\centering
+\caption{Trajectory-tracking accuracy over the mission-execution segment.
+Contour error is the distance from the flown state to the nearest point on
+the planned path; $\tau$ is the residual time lag against the plan after a
+monotone alignment. Peak speed and acceleration are properties of the
+\emph{plan}, given so the error can be read against the aggressiveness of
+the manoeuvre. Single flight per cell.}
+\label{tab:tracking}
+\begin{tabular}{llrrrrrrrr}
+\toprule
+& & \multicolumn{3}{c}{Planned trajectory} & \multicolumn{3}{c}{Contour error [cm]} & & \\
+\cmidrule(lr){3-5}\cmidrule(lr){6-8}
+Path & Profile & $T$ [s] & $v_{\max}$ & $a_{\max}$ & RMS & p95 & max
+     & $\tau_{\mathrm{rms}}$ [ms] & tilt$_{\max}$ [$^\circ$] \\
+\midrule
+\multirow{3}{*}{Circle} & Slow & 11.40 & 5.8 & 10.7 & 11.1 & 18.0 & 23.6 & 25 & 48 \\
+ & Mid & 8.55 & 7.8 & 19.0 & 14.8 & 24.5 & 27.8 & 27 & 63 \\
+ & Time-opt. & 5.01 & 13.6 & 48.0 & 28.1 & 48.3 & 53.1 & 33 & 117 \\
+\midrule
+\multirow{3}{*}{Figure-8} & Slow & 18.82 & 5.6 & 10.6 & 8.0 & 16.4 & 19.3 & 152 & 49 \\
+ & Mid & 14.12 & 7.5 & 18.9 & 12.3 & 24.1 & 26.1 & 144 & 65 \\
+ & Time-opt. & 8.32 & 12.8 & 48.1 & 24.4 & 41.1 & 51.7 & 63 & 105 \\
+\midrule
+\multirow{3}{*}{Slalom} & Slow & 13.76 & 4.8 & 10.3 & 7.5 & 13.4 & 16.8 & 106 & 50 \\
+ & Mid & 10.32 & 6.4 & 18.4 & 11.1 & 18.7 & 24.8 & 111 & 67 \\
+ & Time-opt. & 6.14 & 11.1 & 49.4 & 27.1 & 48.8 & 61.6 & 64 & 121 \\
+\midrule
+\multirow{3}{*}{Splits} & Slow & 21.41 & 5.5 & 9.5 & 7.9 & 14.4 & 18.2 & 128 & 50 \\
+ & Mid & 16.05 & 7.2 & 16.9 & 10.1 & 17.2 & 19.2 & 149 & 75 \\
+ & Time-opt. & 8.73 & 13.2 & 50.9 & 27.8 & 47.5 & 58.4 & 64 & 124 \\
+\bottomrule
+\end{tabular}
+\end{table}

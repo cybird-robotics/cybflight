@@ -6,7 +6,7 @@ use num_traits::Float;
 use nalgebra::Vector3;
 
 use super::flatness::{self, AlphaState, FlatnessState};
-use super::minco_jerk::MincoJerk;
+use super::PlannerMinco;
 use super::penalties::{
     back_propagate_t, eval_dynamics_derivatives, forward_t, smoothed_l1_inv, DynDerivatives,
 };
@@ -16,6 +16,10 @@ use super::MAX_PLANNED_PIECES;
 use crate::params::PlannerParams;
 
 const JERK_COEFFS: usize = 6;
+
+/// Lowest `z_b.z` at which the body-rate penalty is evaluated; see the
+/// comment at its use site in `accumulate_dynamics_penalties`.
+const BODY_RATE_ZB_Z_FLOOR: f32 = -0.9;
 
 struct ConstraintBounds {
     max_vel_sq: f32,
@@ -60,7 +64,7 @@ pub struct CostEvaluator {
     nominal_waypoints: [Vec3; MAX_PLANNED_PIECES],
     waypoint_radius: f32,
 
-    minco: MincoJerk,
+    minco: PlannerMinco,
 
     times: [f32; MAX_PLANNED_PIECES],
     waypoints: [Vec3; MAX_PLANNED_PIECES],
@@ -85,6 +89,10 @@ impl CostEvaluator {
         let thr_radi = 0.5 * (config.max_collective_thrust_n - config.min_collective_thrust_n);
         let cos_max_tilt = p.max_tilt_rad.cos();
         let mr = config.max_rate_rad_s;
+        // The penalty is on ‖ω_xy‖², a single scalar, so it can only honour
+        // one roll/pitch limit. Take the tighter of the two rather than
+        // silently discarding `max_rate_rad_s[1]`.
+        let max_rate_xy = mr[0].min(mr[1]);
 
         let mu = p.smoothing_eps;
         let bounds = ConstraintBounds {
@@ -92,7 +100,7 @@ impl CostEvaluator {
             thr_mean,
             thr_radi_sq: thr_radi * thr_radi,
             cos_max_tilt,
-            max_rate_xy_sq: mr[0] * mr[0],
+            max_rate_xy_sq: max_rate_xy * max_rate_xy,
             max_rate_z_sq: mr[2] * mr[2],
             gravity: config.grav,
             mass: config.mass,
@@ -108,8 +116,9 @@ impl CostEvaluator {
             n_waypoints: n_wp,
             dim_k: n_pieces,
             nominal_waypoints: *nominal_waypoints,
-            waypoint_radius,
-            minco: MincoJerk::new(head, tail, n_pieces),
+            // `encode_gradient` scales by s²/r; a zero radius is 0/0.
+            waypoint_radius: super::planner::sanitize_radius(waypoint_radius),
+            minco: PlannerMinco::new(head, tail, n_pieces),
             times: [0.0; MAX_PLANNED_PIECES],
             waypoints: [ZERO3; MAX_PLANNED_PIECES],
             partial_grad_c: [Vector3::zeros(); JERK_COEFFS * MAX_PLANNED_PIECES],
@@ -221,7 +230,14 @@ impl CostEvaluator {
                     if need_tilt {
                         penalty += self.tilt_penalty(&alpha, &mut grads);
                     }
-                    if need_body_rate && alpha.zb[2] > -0.9 {
+                    // The flatness map is singular when thrust points
+                    // straight down (z_b ∥ −e_z), and `extend_to_flatness`
+                    // divides by quantities that vanish there. Skip the
+                    // body-rate term once z_b.z drops below −0.9 (≈154° of
+                    // tilt). This is a hard switch in the objective, but the
+                    // tilt penalty is already enormous that far past
+                    // `max_tilt_rad`, so no accepted iterate sits near it.
+                    if need_body_rate && alpha.zb[2] > BODY_RATE_ZB_Z_FLOOR {
                         let fs = flatness::extend_to_flatness(&alpha, dd.jer);
                         penalty += self.body_rate_penalty(&fs, &mut grads);
                     }

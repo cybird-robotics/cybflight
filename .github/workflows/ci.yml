@@ -1,0 +1,30 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        vehicle: [sakura_vicon, sakura_um982, sakura_ublox_f9]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - name: Build firmware
+        env:
+          VEHICLE: ${{ matrix.vehicle }}
+        run: |
+          features=$(bash tools/vehicle_features.sh)
+          cargo build -p cybflight --release --locked --no-default-features --features "$features,postmortem"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.vehicle }}
+          path: target/thumbv7em-none-eabihf/release/cybflight
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: cargo install just --locked
+      - run: just test-all

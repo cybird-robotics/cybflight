@@ -1,4 +1,4 @@
-//! GPS sensor task — reads NAV-PVT frames from a u-blox receiver
+//! GPS sensor task — reads navigation fixes from u-blox or UM982 receivers
 //! (M8/M9/F9P) and fans them out to both `GPS_FIX` (trimmed, for
 //! telemetry) and `GPS_NAV_PVT` (full NAV-PVT signal used by the ESKF
 //! GPS path).

@@ -1,5 +1,7 @@
 # Learned adaptive cost for the NMPC — discussion, PLAN A, PLAN B
 
+Historical experiment notes; hardware support and current build instructions are in [hardware-support.md](hardware-support.md) and the repository README.
+
 Status: PLAN B implemented and trained in sim, 2026-08-29 (see §4). PLAN A is design only.
 
 This file records (1) the review of the ACMPC paper against the
@@ -438,7 +440,7 @@ vehicle actually flies.
 | training | `tools/train_cost_policy.py` (SB3 PPO, `[128,128]` tanh, log-std −1.5, γ 0.98, λ 0.95) | exports `policy.bin` (flat `nn::Mlp` layout) and `probe.json` (situation sweeps); `--blind` zeroes the observation → the constant-`z` control |
 | evaluation | `crates/cybflight_sim/tests/learned_cost_eval.rs`, `tools/learned_cost_table.py` | 13 indoor missions × {nominal, learned, blind}; geometric (closest-point) and time-indexed RMSE; `indoor_splits_timeopt` is the held-out test |
 
-Vehicle throughout: `vehicles/sakura_bench_leader_1khz.yaml` (the flight airframe and its flown tune), plant physics from `sim_baseline.yaml`, exactly as `figure8_tinympc_compare.rs`.
+Vehicle throughout: `vehicles/simulation/research_1khz.yaml` (the flight airframe and its flown tune), plant physics from `sim_baseline.yaml`, exactly as `figure8_tinympc_compare.rs`.
 
 ### Calibration facts worth keeping
 
@@ -1190,7 +1192,7 @@ rotor drag ×3 v13 still salvages 0.73 m from the nominal's 9.4 m.
 
 ### v14 — v13 + domain randomization (2026-08-30)
 
-Per user direction, training now randomizes, per episode, the **plant**
+Training randomizes, per episode, the **plant**
 (controller model stays nominal): inertia ×[0.8, 1.25] per axis, per-motor
 thrust ceiling ±15 % common ±3 % per motor, motor τ ×[0.75, 2.0]
 log-uniform (spans the τ×2 robustness condition), rotor drag ×[0.5, 3],

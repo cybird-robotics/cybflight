@@ -46,7 +46,7 @@ it never composes a feature list for a vehicle that isn't there. (Because
 named test", not "build then test".)
 
 The cargo feature list is derived from the **vehicle YAML's `build:`
-section** (`vehicles/<vehicle>.yaml`) by `tools/vehicle_features.py` —
+section** (`vehicles/<vehicle>.yaml`) by `tools/vehicle_features.sh` —
 `just print-features [vehicle]` shows the resolution and is the dry run
 for a build. Env vars (`BOARD=`, `OUTER_LOOP=`, `POS_SOURCE=`, …) remain
 dev overrides; `build.rs` cross-checks features against the YAML and

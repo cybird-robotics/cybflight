@@ -88,8 +88,6 @@ pub const POWER_CAL: PowerCalibration = PowerCalibration {
 pub const PORT_SERIAL_RX: SerialPortId = SerialPortId::Usart6;
 pub const PORT_GPS: SerialPortId = SerialPortId::Usart3;
 pub const PORT_ESP_BRIDGE: SerialPortId = SerialPortId::Usart1;
-/// Gimbal (Z-1Mini GCU control) — chaser only. USART2 PA2 TX / PA3 RX.
-pub const PORT_GIMBAL: SerialPortId = SerialPortId::Usart2;
 
 /// Sensor identities (no WHOAMI constants here).
 pub mod sensors {
@@ -151,7 +149,6 @@ pub struct SerialPins {
     pub usart1_tx: hal::Peri<'static, hal::peripherals::PA9>,
     pub usart1_rx: hal::Peri<'static, hal::peripherals::PA10>,
 
-    // USART2 (PA2 TX / PA3 RX): gimbal control on the chaser (AP uses it for
     // DisplayPort, which we don't implement, so the pins are free).
     pub usart2: hal::Peri<'static, hal::peripherals::USART2>,
     pub usart2_tx: hal::Peri<'static, hal::peripherals::PA2>,

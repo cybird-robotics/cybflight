@@ -150,23 +150,6 @@ pub static BLACKBOX_ODOMETRY: PubSubChannel<
 // blocking. Up to 4 receivers (avoidance/formation/shell + spare).
 pub static NEIGHBOR_STATES: Watch<CriticalSectionRawMutex, msgs::NeighborStates, 4> = Watch::new();
 
-// Leader pose for the chaser gimbal: decoded `WirePeerPose` from the DIRECT
-// leader→chaser ESP link (msg_id 132), published by the ESP-bridge RX task and
-// consumed by the gimbal task. `Watch` (latest-value) — read non-blockingly via
-// `receiver().try_get()`; staleness judged with `PeerPose::usable`.
-#[cfg(feature = "role_chaser")]
-pub static LEADER_POSE: Watch<CriticalSectionRawMutex, msgs::PeerPose, 2> = Watch::new();
-
-// Local ENU origin (LLH datum), anchored by the GPS ESKF at the first RTK fix
-// and published once per flight. Both roles read it (held for the flight): the
-// leader re-expresses its ESKF position as absolute LLH for the peer link; the
-// chaser reprojects the leader's LLH into its own ENU. `Signal` (latest-wins).
-// Declared unconditionally (like GPS_FIX / GPS_NAV_PVT above) so the always-
-// compiled GPS ESKF module references it cleanly under any est_pos_* config; it
-// is only ever signalled on the est_pos_gps path.
-pub static GNSS_ORIGIN: Signal<CriticalSectionRawMutex, cybflight_core::geodetic::LlhOrigin> =
-    Signal::new();
-
 // External magnetometer: CAP=4 (200 Hz), SUBS=4 (attitude + telemetry + shell + spare), PUBS=1.
 pub static MAG_EXT: PubSubChannel<CriticalSectionRawMutex, msgs::MagSample, 4, 4, 1> =
     PubSubChannel::new();

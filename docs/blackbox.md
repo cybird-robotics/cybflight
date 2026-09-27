@@ -436,10 +436,7 @@ The `[patch.crates-io]` for `block-device-driver` is **load-bearing**
 patch they're treated as different traits and `BufStream<StorageDevice>:
 ReadWriteSeek` fails to resolve.
 
-The `cybflight-msgs` `[patch.utadr]` is **currently active** for
-local development on the `EstimatorBias` type added in
-cybflight-msgs 0.1.20. Re-comment after the new revision is
-published.
+The shared message dependency is versioned through crates.io.
 
 ---
 

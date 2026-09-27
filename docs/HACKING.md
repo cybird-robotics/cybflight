@@ -4,6 +4,20 @@ Notes for contributors. Architecture and design live in
 [architecture.md](architecture.md); this file is about the workflows you'll
 actually touch while changing code.
 
+## Development tools
+
+Firmware builds and the default test suite use Rust, Bash, and `just`. Vehicle
+feature selection uses the shared Rust YAML parser. Rust still needs its normal
+host linker and platform libraries for build scripts and host executables.
+
+Python 3 is needed only for optional utilities such as `just size`,
+`just param-sync`, `just blackbox-pull`, and analysis plots; individual scripts
+list any additional Python dependencies. Flashing over DFU requires `dfu-util`.
+
+The optional Rerun visualization (`VIZ=1 just sim-run`) enables the `viz` Cargo
+feature, whose dependencies compile C code and need a C compiler. Headless
+regression tests do not enable it.
+
 ## Parameter & vehicle-config workflow
 
 The full design is in
@@ -66,17 +80,16 @@ Day-to-day:
   unpinned keys), so a `Default` retune must not silently change them.
   Keep it that way — pin what you fly.
 
-## The `tmp/` reference directory
+## Test fixtures and data
 
-`tmp/` is **untracked** but load-bearing as provenance: code comments
-reference `tmp/thrust_map/` (bench thrust-stand data + `identify_indi_k.py`),
-`tmp/indi_c/` (the Indiflight C reference the INDI port mirrors),
-`tmp/planner/` (offline MINCO planner), and `tmp/planning_results/`
-(the planner outputs the committed `missions/*.yaml` were migrated from).
-A fresh clone cannot resolve those paths — if you need them, get the
-directory from the bench machine. Anything that becomes load-bearing
-(new thrust CSVs, new missions) should be **committed** into
-`crates/cybflight/data/` / `missions/` rather than referenced in `tmp/`.
+The INDI regression tests use the committed `tests/indi_golden/golden.csv`
+fixture. Running them needs neither an external reference checkout nor a
+fixture generator. Keep these expected results independent of the Rust
+implementation under test; review numerical changes rather than regenerating
+expected values to match them.
+
+Commit new bench datasets under `crates/cybflight/data/` and mission inputs
+under `missions/`, so contributors can reproduce checks from a fresh clone.
 
 ## Sim regression snapshot
 
@@ -281,7 +294,7 @@ different mass.
 `vehicle_params` with `default_vehicle()` — the FROZEN sim baseline
 loaded from `vehicles/sim_baseline.yaml` through the same
 `vehicle-yaml` loader the firmware bake uses. The baseline
-deliberately lags the flight tune (`vehicles/sakura_bench.yaml`);
+deliberately lags the flight tune (`vehicles/sakura_vicon.yaml`);
 compare them with a plain file diff. To adopt a new tune, edit
 `sim_baseline.yaml` and regenerate the regression snapshot in the
 same commit.

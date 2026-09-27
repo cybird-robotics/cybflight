@@ -141,7 +141,7 @@ experimental.** Rationale:
 extend `AttitudeControlSetpoint` (it already carries
 `collective_thrust_n`, `body_rate_rad_s`, `torque_n_m`) with
 `body_ang_accel_rad_s2: Vector3<f32>`, or add a dedicated
-`InnerLoopSetpoint`. Version bump + publish to the utadr registry.
+`InnerLoopSetpoint`. Version and publish the shared message crate before updating consumers.
 Decision at implementation time; extending the existing message keeps the
 `RATE_COMMAND` signal reusable.
 
@@ -175,8 +175,8 @@ consecutive bad ticks. (This structure promotes solver failure from
 non-negotiable.)
 
 **Stage 4 — build plumbing** *(small)*
-`tools/vehicle_features.py`: `OUTER_FEATURE["mpc_full"] =
-"outer_mpc_full"`; `vehicle_yaml` `BuildYaml::validate`: `mpc_full` +
+`vehicle-features`: map `mpc_full` to the `outer_mpc_full` Cargo feature;
+`vehicle_yaml` `BuildYaml::validate`: `mpc_full` +
 `indi: no` allowed with a stderr warning naming it experimental;
 Cargo feature; mutual-exclusion gates in `control/mod.rs`; a `check-all`
 matrix row; docs (`architecture.md` outer-loop section, CLAUDE.md crate

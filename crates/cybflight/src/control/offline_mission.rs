@@ -132,7 +132,7 @@ impl MissionProfile {
 //
 // Selected by the position-source feature:
 // - `est_pos_mocap` → "indoor" (VICON / lab)
-// - `est_pos_gps`   → "outdoor" (u-blox M10 NAV-PVT)
+// - `est_pos_gps`   → "outdoor" (u-blox F9 NAV-PVT or UM982 BESTNAV)
 //
 // The compile_error guards in `control/mod.rs` ensure exactly one is set
 // whenever this module is compiled (`outer_mpc` requires it).

@@ -1,5 +1,7 @@
 # IMU Filtering Architecture
 
+Historical experiment notes; hardware support and current build instructions are in [hardware-support.md](hardware-support.md) and the repository README.
+
 ## The chain
 
 There is no decimation anywhere in the IMU path. `ImuReader` filters at the
@@ -58,7 +60,7 @@ The consequence: **the same cutoff is not the same decision at both rates.**
 At 8 kHz the software filter does all the shaping. At 1 kHz the hardware
 already delivers roughly what the 8 kHz build gets *after* its software
 filter, so a 200 Hz software cutoff there is mostly added delay — which is
-why `vehicles/sakura_bench.yaml` (the one `imu_rate: 1khz` vehicle) pins the
+why `vehicles/sakura_vicon.yaml` (the one `imu_rate: 1khz` vehicle) pins the
 gyro at 380 Hz instead of inheriting the default.
 
 Accel is the easier call: `spf_fs` sits behind a 12 Hz `indi_sync_hz` filter

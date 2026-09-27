@@ -416,14 +416,14 @@ mod vehicle_bake {
             // and rust-analyzer have no .env. `just` loads .env, so real
             // builds always set VEHICLE; the baked name is also logged at
             // boot and shown in the shell banner, so a wrong-vehicle
-            // flash is detectable on the bench. foxeer_bench matches the
-            // crate's default feature set (board_foxeerh743 +
+            // flash is detectable on the bench. sakura_vicon matches the
+            // crate's default feature set (board_sakurah743 +
             // est_pos_mocap), so the fallback bake is guard-consistent.
             println!(
-                "cargo:warning=VEHICLE not set — baking default vehicle 'foxeer_bench' \
+                "cargo:warning=VEHICLE not set — baking default vehicle 'sakura_vicon' \
                  (set VEHICLE in .env or the environment for real builds)"
             );
-            "foxeer_bench".into()
+            "sakura_vicon".into()
         });
         let yaml_path = Path::new("../../vehicles").join(format!("{vehicle}.yaml"));
         println!("cargo:rerun-if-changed={}", yaml_path.display());
@@ -929,7 +929,7 @@ mod vehicle_bake {
     /// - `cargo:warning` when VEHICLE was not explicitly set, when
     ///   `VEHICLE_GUARD=off` (the check-all matrix), or when the knob's
     ///   own env var (OUTER_LOOP, POS_SOURCE, …) is set — a deliberate
-    ///   dev override, already warned about by vehicle_features.py.
+    ///   dev override, already warned about by vehicle-features.
     /// - hard build error otherwise. The `board` knob NEVER downgrades
     ///   via its env var: overriding the board against the declared
     ///   vehicle is exactly the dangerous pairing; make a vehicle YAML
@@ -946,7 +946,6 @@ mod vehicle_bake {
             "OUTER_LOOP",
             "POS_SOURCE",
             "GPS_MODEL",
-            "ROLE",
             "IMU_RATE",
         ] {
             println!("cargo:rerun-if-env-changed={var}");
@@ -992,7 +991,7 @@ mod vehicle_bake {
             // matching the YAML exactly still downgraded a genuine
             // board/feature split-brain to a warning — the guard disarmed
             // itself precisely when it agreed with the file it was
-            // checking. `vehicle_features.py` has always compared values;
+            // checking. `vehicle-features` has always compared values;
             // this now matches it.
             let deliberate_override = knob != "board"
                 && env_nonempty(env_var)
@@ -1024,7 +1023,6 @@ mod vehicle_bake {
         const RX: &[&str] = &["rx_crsf", "rx_ghst"];
         const OUTER: &[&str] = &["outer_mpc", "outer_geometric", "outer_rate"];
         const POS: &[&str] = &["est_pos_mocap", "est_pos_gps"];
-        const ROLES: &[&str] = &["role_leader", "role_chaser"];
 
         report("board", "BOARD", b.board.as_ref(), b.board.as_ref().map(|v| format!("board_{v}")), BOARDS);
         report(
@@ -1058,7 +1056,7 @@ mod vehicle_bake {
             b.gps_model.as_ref(),
             b.gps_model.as_ref().map(|v| {
                 // Both GPS knobs are inert unless the GPS is the position
-                // source: `vehicle_features.py` only emits these features
+                // source: `vehicle-features` only emits these features
                 // when pos_source resolves to gps, because a mocap build
                 // has no reason to compile a GNSS driver. Keying off the
                 // ACTIVE feature rather than the YAML value keeps a
@@ -1102,7 +1100,6 @@ mod vehicle_bake {
                  these knobs have no effect on this build"
             );
         }
-        report("role", "ROLE", b.role.as_ref(), b.role.as_ref().map(|v| format!("role_{v}")), ROLES);
         report(
             "imu_rate",
             "IMU_RATE",

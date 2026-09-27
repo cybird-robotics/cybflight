@@ -1,5 +1,7 @@
 # IMU FIFO: motivation and plan
 
+Historical experiment notes; hardware support and current build instructions are in [hardware-support.md](hardware-support.md) and the repository README.
+
 Status: **proposal** (2026-08-24). Nothing here is implemented. The
 per-sample data-ready reader described in [imu_filtering.md](imu_filtering.md)
 is what flies today; this document records why the ICM FIFO is the

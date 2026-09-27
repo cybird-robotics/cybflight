@@ -56,7 +56,7 @@ const MISSIONS: [&str; 13] = [
     "indoor_splits_fast",
     "indoor_splits_timeopt",
 ];
-const VEHICLE_YAML: &str = "sakura_bench_leader_1khz";
+const VEHICLE_YAML: &str = "simulation/research_1khz";
 const INDI_RATE_HZ: f32 = 1000.0;
 const SQP_RATE_HZ: f32 = 100.0;
 const SQP_N: usize = 20;

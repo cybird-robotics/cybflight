@@ -365,7 +365,7 @@ pub async fn init(
                     uart_config,
                 ) {
                     Ok(uart) => {
-                        defmt::info!("GPS: USART3 OK, sending CFG-MSG...");
+                        defmt::info!("GPS: USART3 ready, initializing receiver...");
                         let mut delay = embassy_time::Delay;
                         match with_timeout(
                             Duration::from_secs(30),
@@ -374,7 +374,7 @@ pub async fn init(
                         .await
                         {
                             Ok(Ok(gps)) => {
-                                defmt::info!("GPS u-blox init OK");
+                                defmt::info!("GPS receiver init OK");
                                 spawner
                                     .spawn(crate::sensors::gps::gps_task(GpsRunner::new(gps)))
                                     .unwrap_or_else(|e| {
@@ -666,45 +666,6 @@ pub async fn init(
             }
         }
         _ => defmt::warn!("ESP bridge: PORT_ESP_BRIDGE is not a supported port on this board"),
-    }
-
-    // --- Gimbal (chaser only): bsp::PORT_GIMBAL selects the UART (USART2). ---
-    #[cfg(feature = "role_chaser")]
-    {
-        match bsp::PORT_GIMBAL {
-            bsp::SerialPortId::Usart2 => {
-                static GIMBAL_TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-                static GIMBAL_RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-                let tx_buf = &mut GIMBAL_TX_BUF.init([0u8; 256])[..];
-                let rx_buf = &mut GIMBAL_RX_BUF.init([0u8; 256])[..];
-                let mut uart_config = hal::usart::Config::default();
-                // Z-1Mini UART baud is auto-adaptive among 115200/250000/500000/
-                // 1000000; 115200 is the confirmed-reliable rate on this wiring.
-                // (Higher rates failed to auto-lock here — revisit if needed.)
-                uart_config.baudrate = 115_200;
-                match hal::usart::BufferedUart::new(
-                    board.serial.usart2,
-                    board.serial.usart2_rx,
-                    board.serial.usart2_tx,
-                    tx_buf,
-                    rx_buf,
-                    SerialIrqs,
-                    uart_config,
-                ) {
-                    Ok(uart) => {
-                        let (tx, rx) = uart.split();
-                        defmt::info!("Gimbal USART2 init OK (BufferedUart)");
-                        spawner
-                            .spawn(crate::gimbal::gimbal_task(tx, rx))
-                            .unwrap_or_else(|e| {
-                                defmt::error!("Failed to spawn gimbal task: {}", e)
-                            });
-                    }
-                    Err(e) => defmt::error!("Gimbal USART2 init failed: {}", e),
-                }
-            }
-            _ => defmt::warn!("Gimbal: PORT_GIMBAL is not a supported port on this board"),
-        }
     }
 
     // --- DShot motor output ---

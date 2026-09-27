@@ -2,7 +2,7 @@
 //! (`missions/indoor_{circle,figure8,slalom,splits}_*.yaml`).
 //!
 //! Both stacks share the INDI inner loop, the reference chain and the
-//! vehicle (`vehicles/sakura_bench_leader_1khz.yaml`: flight airframe and
+//! vehicle (`vehicles/simulation/research_1khz.yaml`: flight airframe and
 //! its flown MPC tune, see [`vehicle`]). The only difference is the outer
 //! solver:
 //!
@@ -106,7 +106,7 @@ fn scenario_for(name: &str, m: &Mission, vp: FirmwareConfig) -> Scenario {
     }
 }
 
-/// Vehicle under test: `vehicles/sakura_bench_leader_1khz.yaml` — the
+/// Vehicle under test: `vehicles/simulation/research_1khz.yaml` — the
 /// flight airframe (0.6 kg, 4 × 10 N, `max_rate [10, 10, 6]`) and its
 /// flown MPC tune (contouring cost, `thrust_frac 0.75`, tilt fence at
 /// 178° / τ 0.5 — effectively unconstrained, RTI). Used unchanged for the
@@ -115,7 +115,7 @@ fn scenario_for(name: &str, m: &Mission, vp: FirmwareConfig) -> Scenario {
 /// The leader YAML carries no `sim:` section (rotor drag, ESC idle
 /// floor, throttle curvature are plant-only physics the firmware never
 /// reads), so the plant takes those from `vehicles/sim_baseline.yaml`.
-const VEHICLE_YAML: &str = "sakura_bench_leader_1khz";
+const VEHICLE_YAML: &str = "simulation/research_1khz";
 /// Inner-loop (INDI) rate for both stacks.
 const INDI_RATE_HZ: f32 = 1000.0;
 /// SQP-NMPC outer solve rate (the leader's `mpc_rate_hz`; horizon spacing

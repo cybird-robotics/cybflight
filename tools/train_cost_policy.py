@@ -162,7 +162,7 @@ def probe(model: PPO, path: str):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--vehicle", default="vehicles/sakura_bench_leader_1khz.yaml")
+    ap.add_argument("--vehicle", default="vehicles/simulation/research_1khz.yaml")
     ap.add_argument("--steps", type=int, default=10_000_000)
     ap.add_argument("--envs", type=int, default=48)
     ap.add_argument("--n-steps", type=int, default=256)

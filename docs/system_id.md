@@ -132,7 +132,7 @@ python3 analysis/sysid_mcap.py f.mcap --no-crop                   # keep pre-ARM
 python3 analysis/sysid_mcap.py f.mcap --raw                       # /imu1_raw instead of /imu1
 python3 analysis/sysid_mcap.py f.mcap --yaw-signs=1,-1,-1,1       # non-QuadX spin layout
 python3 analysis/sysid_mcap.py f.mcap --cutoff 32                 # gentler ω̇-estimate LP
-python3 analysis/sysid_mcap.py f.mcap --vehicle vehicles/sakura_bench.yaml
+python3 analysis/sysid_mcap.py f.mcap --vehicle vehicles/sakura_vicon.yaml
                                                                   # + print paste-ready YAML (§4.1)
 ```
 
@@ -197,7 +197,7 @@ M3=FL/CW; FLU: +x forward, +y left, +z up):
 ### 4.1 Filling the vehicle YAML
 
 Every identified value has a home in `vehicles/<vehicle>.yaml`
-([sakura_bench.yaml](../vehicles/sakura_bench.yaml) is the reference
+([sakura_vicon.yaml](../vehicles/sakura_vicon.yaml) is the reference
 layout) — either under `airframe:` / `tuning:` (baked into the
 firmware, read by INDI / the RPM estimator / the MPC) or under `sim:`
 (read only by the host simulator's plant). **No new parameters are
@@ -232,7 +232,7 @@ output of the moments fit instead.
 | `k` | `sim.rotor_throttle_curve_k` | pooled `k` | Sim plant (kept separate from `mi_nonlin` on purpose — the plant may be more curved than the controller's clamped inverse) |
 | `k_rd` | `sim.rotor_inertia_kg_m2` | `Izz · k_rd` (the identified Izz) | Sim yaw reaction torque + rotor gyroscopic term |
 
-What the script prints for `--vehicle vehicles/sakura_bench.yaml`
+What the script prints for `--vehicle vehicles/sakura_vicon.yaml`
 (synthetic ground-truth run: `k_w = 1.9e-6`, `k = 0.6`, `τ = 0.02`,
 `w_max = 2800`, `k_rd = 1.0e-4`, and `k_p`/`k_q`/`k_r` generated from
 the file's own geometry with Ixx = 0.0021, Iyy = 0.0018, Izz = 0.003 —
@@ -380,7 +380,7 @@ inertia is still under dispute.
 1. **Fit with the vehicle file you fly:**
    ```sh
    python3 analysis/sysid_mcap.py logs/flight_NNNN.mcap \
-       --vehicle vehicles/sakura_bench_hunter_indoor.yaml --save sysid_NNNN --no-show
+       --vehicle vehicles/sakura_vicon.yaml --save sysid_NNNN --no-show
    ```
    Look at the three PNGs first (§4); only paste numbers from fits
    whose prediction tracks the data. `--fit` lets you re-run one model
@@ -391,9 +391,8 @@ inertia is still under dispute.
    `airframe.name`.** `airframe.name` identifies the physical drone,
    and `crates/vehicle_yaml/tests/airframe_identity.rs` requires the
    whole `airframe:` block (mass, inertia, thrust_model, motors) to be
-   identical across all files with that name — `hunter_01` currently
-   lives in six files (`sakura_bench*.yaml`); `grep -l "name: hunter_01"
-   vehicles/*.yaml` lists them. Edit in each:
+   identical across all files with that name. The reference airframe is
+   `sakura_01`; `rg -l "name: sakura_01" vehicles/*.yaml` lists its configurations. Edit in each:
    - `inertia_kg_m2:` → the printed line (Ixx, Iyy identified; Izz
      derived through the file's `torque_coeff_m`, §4.2).
    - `motors[i].max_thrust_n:` → the printed values. **If the file uses
@@ -735,12 +734,12 @@ directly ([motor_mixing.md](motor_mixing.md), §4.2).
 
 ```python
 python3 analysis/sysid_mcap.py analysis/datasets/indoor_exp_*/*.mcap \
-    --fit thrust --from-mission --no-show --vehicle vehicles/sakura_bench_leader_1khz.yaml
+    --fit thrust --from-mission --no-show --vehicle vehicles/simulation/research_1khz.yaml
 
-python3 analysis/sysid_mcap.py analysis/datasets/indoor_exp_*/*.mcap  --from-mission --until-idle --vehicle vehicles/sakura_bench_leader_1khz.yaml
+python3 analysis/sysid_mcap.py analysis/datasets/indoor_exp_*/*.mcap  --from-mission --until-idle --vehicle vehicles/simulation/research_1khz.yaml
 
 # for drag
-python3 analysis/sysid_mcap.py analysis/datasets/indoor_exp_*/*.mcap --fit thrust --from-mission --until-idle --vehicle vehicles/sakura_bench_leader_1khz.yaml
+python3 analysis/sysid_mcap.py analysis/datasets/indoor_exp_*/*.mcap --fit thrust --from-mission --until-idle --vehicle vehicles/simulation/research_1khz.yaml
 
 
 

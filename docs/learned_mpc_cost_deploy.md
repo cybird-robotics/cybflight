@@ -1,5 +1,7 @@
 # Deploying the drag model + v10 cost policy on the SAKURAH743 boards
 
+Historical experiment notes; hardware support and current build instructions are in [hardware-support.md](hardware-support.md) and the repository README.
+
 Status: **implemented 2026-09-08** (plan written 2026-08-29). Companion to
 [learned_mpc_cost.md](learned_mpc_cost.md) (methodology, results).
 Landed: the drag model (v51 params, `from_vehicle_params` applies it),
@@ -178,7 +180,7 @@ Add the same numbers under `tuning:` as `mpc_drag_x/y` (and `mpc_drag_z:
 applies), so one run of the script yields the paste-ready block for both
 the plant and the controller.
 
-### `vehicles/sakura_bench_leader_1khz.yaml` (and the other flying YAMLs)
+### `vehicles/simulation/research_1khz.yaml` (and the other flying YAMLs)
 
 ```yaml
 mpc_cost_policy: v10                # bake the policy (flash cost 107 KB)
@@ -215,7 +217,7 @@ tuning:
   sampler_max_lead_s: 0.1
 ```
 
-`just print-features sakura_bench_leader_1khz` is the dry run; the bake
+`just print-features simulation/research_1khz` is the dry run; the bake
 warns on any unpinned key the policy assumes.
 
 ## Workflow
@@ -226,7 +228,7 @@ noise) are exactly what steps 0 and 2 measure.
 
 **0. Identify the airframe (one flight, `blackbox set sysid`).**
 Fly the current tune on `indoor_figure8_mid`; run
-`python3 analysis/sysid_mcap.py <log> --vehicle vehicles/sakura_bench_leader_1khz.yaml`.
+`python3 analysis/sysid_mcap.py <log> --vehicle vehicles/simulation/research_1khz.yaml`.
 Take from it: `mpc_drag_x/y` (and update `sim: aero_drag` for the sim
 twin), `m*_tau`, `m*_omega_max`, `max_thrust_n` cross-check. **Decision
 point**: if τ ≤ 30 ms the whole plan applies; if τ is 40 ms or unknown,

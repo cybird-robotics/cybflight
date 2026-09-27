@@ -8,8 +8,8 @@
 //! only reads; there is no command handshake. `new` waits for the first valid
 //! frame, which confirms the link is up at the expected baud.
 //!
-//! Heading (`UNIHEADING`) is decoded by the core but dropped here; it is wired
-//! into a dedicated channel + ESKF yaw update in a later phase.
+//! `read_event` forwards UNIHEADING to the GPS heading channel. The ESKF
+//! uses it when a dual-antenna installation is configured.
 
 use embedded_io_async::Read;
 use um982::{Message, Um982};
@@ -54,7 +54,7 @@ where
         loop {
             match self.inner.read_message().await {
                 Ok((_hdr, Message::BestNav(b))) => return Ok(bestnav_to_navpvt(&b)),
-                Ok(_) => {}                       // heading / other — skipped in phase 1
+                Ok(_) => {}                       // read_fix only returns position fixes
                 Err(um982::Error::BadCrc) => {}   // drop corrupt frame, keep reading
                 Err(e) => return Err(map_err(e)), // real I/O error — surface it
             }

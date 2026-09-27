@@ -1,5 +1,7 @@
 # TinyMPC, geometric tracking and SQP-NMPC on the indoor missions
 
+Historical experiment notes; hardware support and current build instructions are in [hardware-support.md](hardware-support.md) and the repository README.
+
 Rust port of [TinyMPC](https://github.com/TinyMPC/TinyMPC) (Nguyen et al.,
 ICRA 2024 — `tmp/TinyMPC.pdf`) added as a second outer-loop solver and
 compared against the firmware's SQP-NMPC (`cybflight_core::mpc::QuadModel`
@@ -111,7 +113,7 @@ events mid-mission — and an analytic thrust model), temporal 0.5–0.7 m
 
 ## Setup
 
-**Vehicle — `vehicles/sakura_bench_leader_1khz.yaml`**, used unchanged for
+**Vehicle — `vehicles/simulation/research_1khz.yaml`**, used unchanged for
 the plant and both controllers: 0.6 kg, 4 × 10 N (40 N ceiling, `thrust_frac
 0.75` → 30 N usable), inertia `diag(2.0, 1.8, 3.8)·10⁻³`, `max_rate
 [10, 10, 6]` rad/s, motor τ = 20 ms, INDI rate gains 80 / sync 30 Hz. The

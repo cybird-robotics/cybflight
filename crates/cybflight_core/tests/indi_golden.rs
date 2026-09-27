@@ -1,6 +1,7 @@
-// Golden test: compare Rust INDI pipeline against C indiflight reference.
+// INDI regression tests against recorded C-reference results.
 //
-// Uses the same NED G1 values and inputs as tests/indi_golden/gen_golden.c.
+// The fixed inputs and expected outputs live in tests/indi_golden/golden.csv.
+// These tests run entirely in Rust; fixture generation is not part of the build.
 // Tests the core INDI math (filters, pseudo-control, WLS allocation,
 // linearization, actuator state estimation) independent of frame convention.
 //

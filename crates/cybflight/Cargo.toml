@@ -1,4 +1,6 @@
 [package]
+license = "Apache-2.0"
+repository = "https://github.com/cybird-robotics/cybflight"
 name = "cybflight"
 version = "0.1.0"
 edition = "2024"
@@ -6,7 +8,7 @@ publish = false
 
 [features]
 # Pick one board by default; enable CRSF RC and UART logging by default
-default = ["board_foxeerh743", "rx_crsf", "defmt_uart", "outer_mpc", "est_pos_mocap", "postmortem"]
+default = ["board_sakurah743", "rx_crsf", "outer_mpc", "est_pos_mocap", "postmortem"]
 
 board_sakurah743 = ["dep:bsp-sakurah743"]
 board_foxeerh743 = ["dep:bsp-foxeerh743"]
@@ -31,7 +33,7 @@ defmt_uart = []
 # is on (outer_geometric and outer_mpc default to est_pos_mocap so existing
 # bench configurations keep working unchanged):
 #   est_pos_mocap:  VICON_POSE channel (ESP32 bridge, lab / HIL).
-#   est_pos_gps:    GPS_FIX channel (u-blox M10 NAV-PVT, outdoor flight).
+#   est_pos_gps:    GPS_FIX channel (u-blox F9 NAV-PVT or UM982 BESTNAV).
 est_eskf = []
 est_pos_mocap = ["est_eskf"]
 est_pos_gps = ["est_eskf"]
@@ -42,7 +44,7 @@ gps_unicore = ["cybflight-drivers/gps_unicore"]
 # A second GNSS antenna (ANT2) is populated on this install (vehicle YAML
 # `build: gps_dual_antenna: yes`). Separate from the receiver model: a
 # UM982 is heading-*capable* but can be wired single-antenna, which is how
-# sakura_bench_hunter_outdoor flies. The vehicle-yaml loader rejects `yes`
+# sakura_um982 flies. The vehicle-yaml loader rejects `yes`
 # without `gps_model: unicore`, so this can never ask for a heading the
 # driver does not emit.
 #
@@ -92,15 +94,6 @@ postmortem = []
 # them at flight time. See the audit comment at the top of
 # `comm/esp_bridge.rs` for bandwidth justification.
 dev_telem = []
-# Gimbal role variants. The CHASER carries the Z-1Mini gimbal (on USART2) and a
-# UM982, and aims the camera at the LEADER; the LEADER is the unchanged airframe
-# that broadcasts its pose. Optional + mutually exclusive — absence means the
-# firmware behaves exactly as before (no gimbal). GPS model is selected
-# separately by the vehicle YAML's `build: gps_model` (chaser → gps_unicore;
-# ublox is the driver default and has no feature).
-role_leader = []
-role_chaser = []
-
 # Select the ONLINE mission-planning schema: the on-device BFGS trajectory
 # optimizer (`mission_planner::plan_online`) instead of the baked offline
 # schedule (`plan_offline`). Off by default — every vehicle flies the
@@ -112,9 +105,6 @@ role_chaser = []
 # is local to this crate — it does not propagate to cybflight-core, so
 # toggling it does not rebuild core or the BSP.
 plan_online = []
-# NOTE: the old peer_pose feature is gone — the leader→chaser pose
-# downlink is the runtime `peer_pose_en` param (SystemSettings, live),
-# checked inside the role_leader-compiled TX block.
 
 [dependencies]
 bsp-sakurah743 = { path = "../bsp/sakurah743", optional = true }
@@ -122,7 +112,7 @@ bsp-foxeerh743 = { path = "../bsp/foxeerh743", optional = true }
 bsp-micoair743v2 = { path = "../bsp/micoair743v2", optional = true }
 bsp-types = { path = "../bsp/types" }
 cybflight-drivers = { path = "../drivers" }
-cybflight-msgs = { version = "0.1.20", registry = "utadr", features = ["embedded"] }
+cybflight-msgs = { version = "=0.2.0", features = ["embedded"] }
 cybflight-core = { path = "../cybflight_core/" }
 
 # Embassy runtime pieces (board-agnostic)

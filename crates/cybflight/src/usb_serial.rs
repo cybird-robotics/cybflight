@@ -2042,13 +2042,6 @@ fn build_facts_iter() -> impl Iterator<Item = (&'static str, &'static str)> {
     } else {
         "yes"
     };
-    const ROLE: &str = if cfg!(feature = "role_leader") {
-        "leader"
-    } else if cfg!(feature = "role_chaser") {
-        "chaser"
-    } else {
-        "<none>"
-    };
     const GPS_MODEL: &str = if cfg!(feature = "gps_unicore") {
         "unicore (UM982)"
     } else {
@@ -2103,7 +2096,6 @@ fn build_facts_iter() -> impl Iterator<Item = (&'static str, &'static str)> {
         ("rc_protocol", RC_PROTOCOL),
         ("imu_rate", IMU_RATE),
         ("indi", INDI),
-        ("role", ROLE),
         ("gps_model", GPS_MODEL),
         ("gps_dual_antenna", GPS_DUAL_ANTENNA),
         ("postmortem", POSTMORTEM),

@@ -26,6 +26,7 @@ pub mod runner;
 pub mod scenario;
 pub mod sensors;
 pub mod trajectory;
+#[cfg(feature = "viz")]
 pub mod viz;
 
 pub use controller::{

@@ -4,7 +4,7 @@
 //! one loader; a firmware/sim divergence is a *file diff* between
 //! `vehicles/*.yaml`, never a code drift.
 //!
-//! Format (see `vehicles/sakura_bench.yaml` for a commented example):
+//! Format (see `vehicles/sakura_vicon.yaml` for a commented example):
 //! - `airframe:` — REQUIRED physical identity (mass, inertia, max rates,
 //!   exactly 4 motors). No defaults; a missing field is an error — this is
 //!   the "no default mass" rule of docs/param_redesign_plan.md.
@@ -202,7 +202,7 @@ pub struct OriginYaml {
 
 /// Optional `build:` section — compile-time selections that are per-vehicle
 /// hardware facts (which PCB, receiver wiring, GNSS unit, …). Consumed by
-/// the firmware build tooling (`tools/vehicle_features.py`, `build.rs`
+/// the firmware build tooling (`tools/vehicle_features.sh`, `build.rs`
 /// cross-check); the sim ignores it. Every knob is optional so partial
 /// declarations validate; the build tooling decides what absence means.
 #[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
@@ -227,7 +227,7 @@ pub struct BuildYaml {
     /// Is a second GNSS antenna (ANT2) populated on this install?
     /// `yes` | `no` (default). Independent of `gps_model`: a UM982 is
     /// heading-*capable*, but can still be wired with one antenna — which
-    /// is exactly how `sakura_bench_hunter_outdoor` flies.
+    /// is exactly how `sakura_um982` flies.
     ///
     /// A `build:` knob rather than a tuning param because it is an
     /// immutable fact about the airframe's wiring, and because only here
@@ -238,9 +238,6 @@ pub struct BuildYaml {
     /// `gps_model` vs `gps_ant_*`.
     #[serde(default)]
     pub gps_dual_antenna: Option<String>,
-    /// Gimbal role: `leader` | `chaser`; omit for no role.
-    #[serde(default)]
-    pub role: Option<String>,
     /// Primary-IMU output data rate / inner-loop rate: `8khz` (low-latency,
     /// the default) | `1khz` (ICM426xx low-noise mode). ICM boards only.
     #[serde(default)]
@@ -291,7 +288,6 @@ impl BuildYaml {
         check("pos_source", &self.pos_source, &["mocap", "gps"])?;
         check("gps_model", &self.gps_model, &["ublox", "unicore"])?;
         check("gps_dual_antenna", &self.gps_dual_antenna, &["yes", "no"])?;
-        check("role", &self.role, &["leader", "chaser"])?;
         check("imu_rate", &self.imu_rate, &["8khz", "1khz"])?;
         check("indi", &self.indi, &["yes", "no"])?;
         check("plan_online", &self.plan_online, &["yes", "no"])?;
@@ -667,7 +663,7 @@ tuning:
         );
     }
 
-    /// A single-antenna UM982 is a real install (sakura_bench_hunter_outdoor),
+    /// A single-antenna UM982 is a real install (sakura_um982),
     /// so the receiver model must not imply the antenna count.
     #[test]
     fn unicore_without_dual_antenna_loads() {
@@ -765,11 +761,10 @@ tuning:
     fn build_section_parses_and_validates() {
         let yaml = format!(
             "build:\n  board: sakurah743\n  rc_protocol: crsf\n  outer_loop: mpc\n  \
-             pos_source: gps\n  gps_model: ublox\n  role: chaser\n{MINIMAL}"
+             pos_source: gps\n  gps_model: ublox\n{MINIMAL}"
         );
         let b = load("test", &yaml).unwrap().build.unwrap();
         assert_eq!(b.board.as_deref(), Some("sakurah743"));
-        assert_eq!(b.role.as_deref(), Some("chaser"));
     }
 
     #[test]

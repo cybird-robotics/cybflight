@@ -1,9 +1,3 @@
-[registry]
-global-credential-providers = ["cargo:token"]
-
-[registries]
-utadr = { index = "sparse+https://crates.yifanl.com/api/v1/crates/" }
-
 [target.thumbv7em-none-eabihf]
 rustflags = ["-C", "target-cpu=cortex-m7"]
 runner = "bash tools/build.sh"

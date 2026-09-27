@@ -78,7 +78,7 @@ const MAGIC: u32 = 0x4359_4250; // "CYBP"
 /// (fields added/removed/reordered — i.e. whenever `PARAM_COUNT` or index
 /// order moves). The KV store is name-keyed and insensitive to reshapes;
 /// this stamps the fixed-layout blob header used by tests and host export.
-const VERSION: u32 = 55;
+const VERSION: u32 = 56;
 const HEADER_SIZE: usize = 16; // magic + version + length + crc
 
 /// The `fs_ctrl_timeout_s` schema minimum, mirrored as a `const` so the
@@ -2063,14 +2063,6 @@ pub struct SystemSettings {
     /// it under 2^24 so the `f32` the param plane carries stays exact.
     #[param(key = "blackbox_mute_mask", min = 0.0, max = 131_071.0)]
     pub blackbox_mute_mask: u32,
-    /// Leader→chaser pose downlink over the ESP32 bridge. Off by default:
-    /// it is the heaviest single downlink stream (up to 100 Hz) and
-    /// saturates WiFi airtime, starving telemetry and RTK corrections.
-    /// Live (no reboot). Meaningful only on `role_leader` builds; on
-    /// others the flag is harmlessly ignored (the schema stays
-    /// feature-invariant so flash images port across builds).
-    #[param(key = "peer_pose_en")]
-    pub peer_pose_enable: bool,
 }
 
 /// The firmware's full persisted configuration, grouped by subsystem.
@@ -2193,7 +2185,6 @@ impl FirmwareConfig {
                 blackbox_record_set: 3,
                 blackbox_rate_div: 1,
                 blackbox_mute_mask: 0,
-                peer_pose_enable: false,
             },
         }
     }
@@ -2499,7 +2490,6 @@ pub(crate) mod tests_support {
                 blackbox_record_set: 2, // Mid — non-default so round-trip catches drops
                 blackbox_rate_div: 8,   // non-default so round-trip catches drops
                 blackbox_mute_mask: 0x1_2002, // non-default (incl. a >16-bit id) so round-trip catches drops
-                peer_pose_enable: true, // non-default so round-trip catches drops
             },
         }
     }
@@ -2598,7 +2588,6 @@ mod tests {
             "rpm_notch_lpf_hz",
             "sampler_kind",
             "gps_fuse_vel",
-            "peer_pose_en",
             // v51
             "mpc_drag_x",
             "mpc_bodydrag_z",
@@ -2947,7 +2936,6 @@ mod tests {
                 blackbox_record_set: 0,
                 blackbox_rate_div: 1,
                 blackbox_mute_mask: 0,
-                peer_pose_enable: false,
             },
             ..test_config()
         };

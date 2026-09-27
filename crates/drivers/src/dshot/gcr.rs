@@ -56,7 +56,7 @@ pub fn decode_telemetry_packet(
     count: usize,
     ticks_per_bit: u32,
 ) -> Option<u16> {
-    if count < 2 {
+    if count < 2 || edge_timings.len() < 2 || ticks_per_bit == 0 {
         return None;
     }
 
@@ -71,11 +71,15 @@ pub fn decode_telemetry_packet(
             if bits >= 21 {
                 break;
             }
-            ((diff + half) / ticks_per_bit) as i32
+            (diff.checked_add(half)? / ticks_per_bit) as i32
         } else {
             21 - bits
         };
 
+        // A capture gap must fit the remaining frame before it is used as a shift.
+        if len <= 0 || len > 21 - bits {
+            return None;
+        }
         value <<= len;
         value |= 1 << (len - 1);
         old_value = edge_timings[i.min(edge_timings.len() - 1)];
@@ -206,6 +210,16 @@ mod tests {
         let edges: &[u32] = &[0];
         assert_eq!(decode_telemetry_packet(edges, 1, 16), None);
         assert_eq!(decode_telemetry_packet(&[], 0, 16), None);
+    }
+
+    #[test]
+    fn invalid_capture_bounds_return_none() {
+        assert_eq!(decode_telemetry_packet(&[], 2, 16), None);
+        assert_eq!(decode_telemetry_packet(&[0], 2, 16), None);
+        assert_eq!(decode_telemetry_packet(&[0, 16], 2, 0), None);
+        assert_eq!(decode_telemetry_packet(&[0, 0], 2, 16), None);
+        assert_eq!(decode_telemetry_packet(&[0, u32::MAX], 2, 16), None);
+        assert_eq!(decode_telemetry_packet(&[0, 22 * 16], 2, 16), None);
     }
 
     #[test]

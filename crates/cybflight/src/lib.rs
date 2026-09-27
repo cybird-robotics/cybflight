@@ -17,8 +17,6 @@ pub mod comm;
 pub mod serial_logger;
 pub mod control;
 pub mod estimation;
-#[cfg(feature = "role_chaser")]
-pub mod gimbal;
 pub mod health;
 pub mod motors;
 pub use cybflight_msgs as msgs;
@@ -36,9 +34,7 @@ pub mod usb_serial;
 pub mod vehicle;
 pub mod watchdog;
 
-// Gimbal roles are optional (absence = unchanged firmware) but mutually exclusive.
-#[cfg(all(feature = "role_leader", feature = "role_chaser"))]
-compile_error!("role_leader and role_chaser are mutually exclusive — pick one");
+
 
 /// Firmware version from `Cargo.toml`.
 pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");

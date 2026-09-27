@@ -329,4 +329,3 @@ only records the current baked value (the log has no tombstone).
 | `blackbox_tier` | — | 0 | 4 | live | Blackbox record-set tier: 0=None, 1=Small, 2=Mid, 3=Large, |
 | `blackbox_rate_div` | — | 1 | 64 | live | Blackbox rate divider for `/imu1_raw`: one sample in N is |
 | `blackbox_mute_mask` | — | 0 | 131071 | live | Bitmask of muted blackbox topics, keyed by MCAP channel id |
-| `peer_pose_en` | — | — | — | live | Leader→chaser pose downlink over the ESP32 bridge. Off by default: |

@@ -1,7 +1,9 @@
+# SAKURA u-blox F9 RTK integration example; compile coverage is not flight validation.
+# Measure and tune for your own vehicle before flight; see docs/gps-configuration.md.
 # Vehicle definition: SAKURAH743 bench quad (the values that lived in
 # `vehicle.rs` as QUADROTOR_BODY / QUADROTOR_MOTORS before the YAML bake).
 #
-# Selected at build time via `VEHICLE=sakura_bench` (see `.env` /
+# Selected at build time via `VEHICLE=sakura_ublox_f9` (see `.env` /
 # Justfile). The `airframe` section is REQUIRED — physical identity has no
 # defaults; a missing field fails the build. Everything under `tuning` is
 # optional: keys are registry parameter names (see `param list`), values
@@ -13,8 +15,8 @@
 #   m3 FRONT_LEFT (CW).
 
 # Compile-time build selections — per-vehicle hardware facts. Consumed by
-# tools/vehicle_features.py (feature list) and cross-checked by build.rs.
-# Env vars (BOARD, RC_PROTOCOL, OUTER_LOOP, POS_SOURCE, GPS_MODEL, ROLE,
+# tools/vehicle_features.sh (feature list) and cross-checked by build.rs.
+# Env vars (BOARD, RC_PROTOCOL, OUTER_LOOP, POS_SOURCE, GPS_MODEL,
 # IMU_RATE) still override for dev experiments; the script warns on divergence.
 build:
   board: sakurah743
@@ -23,10 +25,9 @@ build:
                            #   mpc_full: 13-state NMPC -> (T_d, tau_d) -> INDI
                            #   alpha inner loop, no rate gains (docs/mpc_full_indi_plan.md)
   pos_source: gps          # gps | mocap
-  gps_model: ublox         # ublox | unicore (UM982 dual-antenna)
+  gps_model: ublox           # u-blox F9 RTK, legacy CFG-MSG initialization
   gps_dual_antenna: no    # yes | no — is ANT2 fitted? `yes` requires
                           #   gps_model: unicore (build error otherwise)
-  role: leader             # leader | chaser; omit for none
   imu_rate: 8khz           # 8khz | 1khz (ICM low-noise mode, 1 kHz inner loop)
   indi: yes                # yes | no — `no` degrades the inner loop to a plain rate
                            #   controller (under mpc_full: to static inversion — bench only)
@@ -34,11 +35,15 @@ build:
 # Default offline mission (missions/<name>.yaml file stem), applied at
 # boot until `mission set` + `param save` persists another. Name is
 # resolved and env-checked against build.pos_source at bake time.
+
+# Example schedule: review its coordinates before activating mission mode.
 default_mission: outdoor_splits_slow
 
 airframe:
-  name: racer_01
-
+  # Physical-airframe identity: the mocap rigid-body name and the
+  # cybgcs fleet.toml roster key. Same drone => same name => the
+  # airframe block below must match byte-for-byte across environments.
+  name: sakura_01
   # Thrust-to-command model (REQUIRED, hardware identity like mass):
   # bench-measured (thrust, voltage) → command table baked from
   # crates/cybflight/data/thrust_tables/a2rl_0114.csv. Analytic
@@ -51,10 +56,10 @@ airframe:
   inertia_kg_m2: [0.0021, 0.0, 0.0, 0.0, 0.0018, 0.0, 0.0, 0.0, 0.003]
   max_rate_rad_s: [10.0, 10.0, 6.0]
   motors:
-    - { pos_m: [-0.075, -0.1], spin: cw,  max_thrust_n: 12.0, torque_coeff_m: 0.022 }
-    - { pos_m: [ 0.075, -0.1], spin: ccw, max_thrust_n: 12.0, torque_coeff_m: 0.022 }
-    - { pos_m: [-0.075,  0.1], spin: ccw, max_thrust_n: 12.0, torque_coeff_m: 0.022 }
-    - { pos_m: [ 0.075,  0.1], spin: cw,  max_thrust_n: 12.0, torque_coeff_m: 0.022 }
+    - { pos_m: [-0.1, -0.085], spin: cw,  max_thrust_n: 12.0, torque_coeff_m: 0.022 }
+    - { pos_m: [ 0.05, -0.085], spin: ccw, max_thrust_n: 12.0, torque_coeff_m: 0.022 }
+    - { pos_m: [-0.1,  0.085], spin: ccw, max_thrust_n: 12.0, torque_coeff_m: 0.022 }
+    - { pos_m: [ 0.05,  0.085], spin: cw,  max_thrust_n: 12.0, torque_coeff_m: 0.022 }
 
 # Fixed geodetic anchor for the ENU frame (optional).
 #
@@ -195,7 +200,7 @@ tuning:
   # pos_source is gps, so the mocap guard is never constructed here.
   # Stated anyway, for the same reason the cascade gains above are stated
   # under outer_loop: mpc — POS_SOURCE=mocap is a supported dev override
-  # (tools/vehicle_features.py), and such a build must not silently
+  # (tools/vehicle_features.sh), and such a build must not silently
   # inherit invisible schema defaults. Values are the reviewed defaults;
   # re-tune against the actual volume before flying mocap on this frame.
   eskf_mocap_max_jumps: 3
@@ -204,9 +209,6 @@ tuning:
   eskf_mocap_bias_cov_thresh: 0.003
   eskf_mocap_pos_std: 0.01         # install-specific: volume/camera count
   eskf_mocap_att_std: 0.03         # install-specific: marker spread
-  # Disarmed re-anchor radius; without it the jump cascade wedges the
-  # filter permanently. Keep >> eskf_mocap_pos_std and << the jump gate.
-  eskf_mocap_reanchor_m: 0.10
 
   # ══ Pinned schema defaults ═════════════════════════════════════════
   # Written out explicitly so no flight-relevant value is inherited
@@ -471,4 +473,3 @@ tuning:
 
   # ── system — device/UX toggles ──
   blackbox_tier: 3   # record-set tier
-  peer_pose_en: 0   # 0/1

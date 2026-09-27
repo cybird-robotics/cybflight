@@ -185,7 +185,7 @@ bsp-foxeerh743  = { path = "../bsp/foxeerh743",  optional = true }
 In practice you never hand-compose the feature list: the **vehicle YAML's
 `build:` section selects it** (see "The Configuration Plane" below), and
 `just build [<vehicle>]` derives `--features` via
-`tools/vehicle_features.py`. The vehicle is the recipe's optional
+`tools/vehicle_features.sh`. The vehicle is the recipe's optional
 positional argument, defaulting to `VEHICLE=` in `.env`; `just vehicles`
 lists them, and an unknown name is a hard error rather than a fallback.
 
@@ -429,8 +429,7 @@ build:                      # compile-time hardware selections → cargo feature
                             #   inner loop, no rate gains (docs/mpc_full_indi_plan.md);
                             #   cascade | rate = legacy outer loops
   pos_source: gps
-  gps_model: ublox
-  role: chaser
+  gps_model: unicore
   imu_rate: 8khz            #   or 1khz: ICM low-noise mode, 1 kHz inner loop
   indi: yes                 #   or no: inner loop degrades to a rate controller
   plan_online: no           #   or yes: compile the online BFGS planner
@@ -535,7 +534,7 @@ The boundary, decided per knob and recorded here so it doesn't drift:
   and weights, loop rates (`mpc_rate_hz`, `cascade_rate_hz`), sampler
   selection (`sampler_kind`), GPS velocity fusion (`gps_fuse_vel` — a
   *policy*, not a hardware fact: it works with any receiver and a
-  multipath site is reason enough to turn it off), `peer_pose_en`,
+  multipath site is reason enough to turn it off),
   battery facts, RPM-notch config.
 - **Compile-time features, selected by the YAML `build:` section**.
   Two things qualify a knob for this list.
@@ -545,8 +544,7 @@ The boundary, decided per knob and recorded here so it doesn't drift:
   if both compiled + safety-critical arming branches), mission-planning
   schema (`plan_online` — ~110 KiB of solver `.bss` + task-future state
   that a `const bool` cannot remove; see optimization rule 7), position source,
-  GPS driver (monomorphized, no-dyn rule), gimbal role (USART2
-  ownership), IMU rate (`imu_rate: 8khz|1khz` → `imu_1khz` — programs
+  GPS driver (monomorphized, no-dyn rule), IMU rate (`imu_rate: 8khz|1khz` → `imu_1khz` — programs
   hardware registers at init and re-times the IMU path; every
   IMU-rate const derives from `rates::IMU_ODR_HZ` at compile time,
   keeping the default 8 kHz build bit-identical. The *control* rate is
@@ -575,7 +573,7 @@ The boundary, decided per knob and recorded here so it doesn't drift:
   (link-time singletons — cannot be runtime by construction).
 
 Env vars of the `build:` knob names (`BOARD=`, `OUTER_LOOP=`, …) remain
-as deliberate dev overrides; `vehicle_features.py` warns on divergence
+as deliberate dev overrides; `vehicle-features` warns on divergence
 and the build.rs guard downgrades to a warning for overridden knobs —
 except `board`, which never downgrades (flashing one board's pin mapping
 with another vehicle's airframe params is the exact hazard the guard

@@ -124,7 +124,7 @@ Message IDs and struct layouts are defined in the shared `cybflight-msgs` crate.
 
 ## Shared Crate: `cybflight-msgs`
 
-A standalone no_std crate published to the `utadr` registry defines all message
+A standalone no_std crate published to crates.io defines all message
 types used by both STM32 firmware and ESP32 bridge firmware. This is the single
 source of truth for wire format.
 

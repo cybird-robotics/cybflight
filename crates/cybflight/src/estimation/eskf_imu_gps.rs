@@ -264,10 +264,6 @@ pub async fn estimation_task() {
         }
     };
 
-    // Publish the anchored ENU origin for the gimbal / peer-pose pipeline: the
-    // leader re-expresses its ESKF position as absolute LLH, the chaser
-    // reprojects the leader's LLH into this same frame. Once per flight.
-    sensors::GNSS_ORIGIN.signal(origin);
 
     // Seed position: the vehicle's ENU location inside the anchored frame.
     //
@@ -335,7 +331,7 @@ pub async fn estimation_task() {
     // anchor time. `init_with_cov` left the orientation at identity with a large
     // yaw cov (`init_yaw_cov`); one baseline update against that near-flat prior
     // snaps yaw to the measured heading — same model as the runtime fusion, so
-    // the filter (and any heading-dependent control / gimbal) starts on the true
+    // the filter (and any heading-dependent control) starts on the true
     // heading instead of yaw=0. Best-effort: with no usable, fresh heading the
     // identity prior stands and yaw converges later through the loop's updates.
     if fuse_gps_heading {

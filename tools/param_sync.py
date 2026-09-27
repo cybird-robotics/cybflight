@@ -15,7 +15,7 @@ The firmware never writes the YAML; the explicit merge + git commit is
 what makes the vehicle file a *reviewed* tuning record.
 
 Usage:
-  tools/param_sync.py [--port /dev/ttyACM0] [--vehicle sakura_bench] [--dry-run]
+  tools/param_sync.py [--port /dev/ttyACM0] [--vehicle sakura_vicon] [--dry-run]
 
 Requires pyserial (`pip install pyserial`).
 """
@@ -118,7 +118,7 @@ def merge_into_yaml(path: str, overrides: dict[str, str]) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--port", default=None)
-    ap.add_argument("--vehicle", default=os.environ.get("VEHICLE", "sakura_bench"))
+    ap.add_argument("--vehicle", default=os.environ.get("VEHICLE", "sakura_vicon"))
     ap.add_argument("--dry-run", action="store_true", help="print the merge, don't write")
     ap.add_argument(
         "--force-vehicle-mismatch",

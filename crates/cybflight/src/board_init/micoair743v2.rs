@@ -49,7 +49,7 @@ use hal::time::Hertz;
 use hal::timer::low_level::Timer as LLTimer;
 
 // Buffered serial UARTs used as role candidates (SerialRx on USART6, GPS on
-// USART3, gimbal on USART2). board_init dispatches on the bsp::PORT_* constants.
+// USART3). board_init dispatches on the bsp::PORT_* constants.
 hal::bind_interrupts!(struct SerialIrqs {
     USART6 => hal::usart::BufferedInterruptHandler<hal::peripherals::USART6>;
     USART3 => hal::usart::BufferedInterruptHandler<hal::peripherals::USART3>;
@@ -428,40 +428,6 @@ pub async fn init(
             }
         }
         _ => defmt::warn!("ESP bridge: PORT_ESP_BRIDGE is not a supported port on this board"),
-    }
-
-    // --- Gimbal (chaser only): bsp::PORT_GIMBAL selects the UART (USART2). ---
-    #[cfg(feature = "role_chaser")]
-    {
-        match bsp::PORT_GIMBAL {
-            bsp::SerialPortId::Usart2 => {
-                static GIMBAL_TX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-                static GIMBAL_RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
-                let tx_buf = &mut GIMBAL_TX_BUF.init([0u8; 256])[..];
-                let rx_buf = &mut GIMBAL_RX_BUF.init([0u8; 256])[..];
-                let mut uart_config = hal::usart::Config::default();
-                uart_config.baudrate = 921_600;
-                match hal::usart::BufferedUart::new(
-                    board.serial.usart2,
-                    board.serial.usart2_rx,
-                    board.serial.usart2_tx,
-                    tx_buf,
-                    rx_buf,
-                    SerialIrqs,
-                    uart_config,
-                ) {
-                    Ok(uart) => {
-                        let (tx, _rx) = uart.split();
-                        defmt::info!("Gimbal USART2 init OK (BufferedUart @921600)");
-                        spawner
-                            .spawn(crate::gimbal::gimbal_task(tx))
-                            .unwrap_or_else(|e| defmt::error!("Failed to spawn gimbal task: {}", e));
-                    }
-                    Err(e) => defmt::error!("Gimbal USART2 init failed: {}", e),
-                }
-            }
-            _ => defmt::warn!("Gimbal: PORT_GIMBAL is not a supported port on this board"),
-        }
     }
 
     // --- DShot motor output (quad on TIM1, M1–M4) ---

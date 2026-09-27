@@ -15,8 +15,9 @@ use cybflight_sim::{
     runner::MissionRunner,
     scenario::{Scenario, Verdict},
     sensors::{GpsModel, ImuModel, NoisyGps, NoisyImu},
-    viz::RerunLogger,
 };
+#[cfg(feature = "viz")]
+use cybflight_sim::viz::RerunLogger;
 use nalgebra::Vector3;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -112,7 +113,7 @@ struct Args {
     #[arg(long)]
     markdown: bool,
 
-    /// Stream to a running rerun viewer (spawns one if available).
+    /// Stream to a running rerun viewer (requires the `viz` Cargo feature).
     #[arg(long)]
     viz: bool,
 
@@ -139,6 +140,11 @@ struct Args {
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    #[cfg(not(feature = "viz"))]
+    if args.viz {
+        eprintln!("--viz requires the viz Cargo feature; run `VIZ=1 just sim-run`");
+        return ExitCode::from(2);
+    }
 
     let mut scenario = build_scenario(&args.scenario);
     if let Some(imu) = args.noise.build_imu(args.noise_seed) {
@@ -192,6 +198,7 @@ fn main() -> ExitCode {
         let csv = report::write_csv(&dir, &out.history).expect("write csv");
         println!("wrote {}", csv.display());
     }
+    #[cfg(feature = "viz")]
     if args.viz {
         if let Some(logger) = RerunLogger::spawn(&format!("cybflight-sim:{}", scenario.name)) {
             logger.log_scenario(&scenario.name);

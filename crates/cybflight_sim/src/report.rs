@@ -1,6 +1,6 @@
 //! Simulation report artifacts.
 //!
-//! Conservative output set, per user direction:
+//! Report output:
 //!  - `report.json` is the primary, always-written artifact.
 //!  - `report.md` and `timeseries.csv` are minimal stubs, enabled for
 //!    future-proofing when an agent workflow wants either format.

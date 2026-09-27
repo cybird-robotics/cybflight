@@ -208,7 +208,6 @@ fn test_vehicle_params() -> FirmwareConfig {
             blackbox_record_set: 0,
             blackbox_rate_div: 1,
             blackbox_mute_mask: 0,
-            peer_pose_enable: false,
         },
     }
 }

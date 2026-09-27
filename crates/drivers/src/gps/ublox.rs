@@ -1,16 +1,15 @@
 //! u-blox GNSS receiver driver — UBX binary protocol, legacy CFG-* commands.
 //!
-//! Compatible with M8 (incl. SAM-M8Q), M9 / M9P, and ZED-F9P RTK.
-//! NOT compatible with M10, which removed legacy CFG-MSG/CFG-RATE/CFG-PRT
-//! in favour of the CFG-VALSET key-database. If M10 support is needed
-//! later, dispatch on UBX-MON-VER and add a separate init path.
+//! The SAKURA outdoor integration uses F9 RTK receivers. Legacy CFG-MSG
+//! availability must be checked for the exact receiver model and firmware.
+//! There is no CFG-VALSET initialization or MON-VER negotiation path here;
+//! the former M10 configuration notes do not describe this implementation.
 //!
 //! Init sends `CFG-MSG NAV-PVT 1` and waits for the matching ACK-ACK,
-//! retrying up to `MAX_ATTEMPTS` times. Retries cover the F9P cold-boot
-//! window (~1–3 s), during which the receiver silently drops UBX
-//! commands; duplicate CFG-MSGs are harmless because the receiver re-ACKs
-//! each one. NMEA is left enabled — caller is expected to provide enough
-//! UART bandwidth (≥38400 baud) for the receiver's default output.
+//! retrying up to `MAX_ATTEMPTS` times when the frame budget is exhausted.
+//! A scan can block on a silent receiver, so callers must enforce a wall-clock
+//! initialization timeout. Receiver baud/rate settings must be configured
+//! separately; this driver leaves NMEA output enabled.
 
 use embedded_io_async::{Read, Write};
 
@@ -46,7 +45,7 @@ pub struct NavPvt {
     /// Flags byte bit 1: differential corrections were applied.
     pub diff_soln: bool,
     /// Flags byte bits 6-7: RTK carrier-phase solution status.
-    /// 0 = none, 1 = float, 2 = fixed. Always 0 on M8 (no RTK hardware).
+    /// 0 = none, 1 = float, 2 = fixed. Zero on receivers without RTK support.
     pub carr_soln: u8,
     pub num_sv: u8,
     pub lon_1e7: i32,
@@ -127,7 +126,7 @@ fn build_frame(buf: &mut [u8], class: u8, id: u8, payload: &[u8]) -> usize {
 // Driver
 // ---------------------------------------------------------------------------
 
-/// u-blox M8/M9/F9P GNSS driver.
+/// u-blox NAV-PVT driver with legacy CFG-MSG initialization.
 pub struct Ublox<RW> {
     rw: RW,
 }
@@ -147,16 +146,15 @@ where
     /// Initialise the receiver.
     ///
     /// Repeatedly sends `CFG-MSG NAV-PVT 1` and watches for the matching
-    /// ACK-ACK; retrying covers the F9P's variable cold-boot window
-    /// during which the receiver silently drops UBX commands. Returns
+    /// ACK-ACK. Each attempt is bounded by received frame count, not time;
+    /// a silent receiver requires the caller's outer timeout. Returns
     /// `Error::Nak` if the receiver explicitly rejects the request, or
-    /// `Error::Timeout` if no attempt is acknowledged.
+    /// `Error::Timeout` if all frame-budgeted attempts are exhausted.
     pub async fn new(
         rw: RW,
         delay: &mut impl embedded_hal_async::delay::DelayNs,
     ) -> Result<Self, Error<RW::Error>> {
-        // Short prime delay; the bulk of the cold-boot tolerance comes
-        // from the retry loop below, not this delay.
+        // Initial receiver startup delay; the caller bounds total startup time.
         delay.delay_ms(500).await;
 
         let mut driver = Self { rw };
@@ -165,10 +163,9 @@ where
         let mut frame = [0u8; 16];
         let frame_len = build_frame(&mut frame, UBX_CLASS_CFG, UBX_CFG_MSG, &payload);
 
-        // F9P cold-boot can run anywhere from ~1 s to >3 s. Rather than
-        // pick a single delay that covers the worst case, send CFG-MSG
-        // and watch for ACK over a short window; if absent, resend. The
-        // receiver tolerates duplicate CFG-MSG (each one re-ACKs).
+        // Resend CFG-MSG after scanning a fixed number of unrelated frames.
+        // Silence does not exhaust this budget: read_header can remain pending
+        // until the caller's outer timeout cancels initialization.
         const MAX_ATTEMPTS: u8 = 5;
         const FRAMES_PER_ATTEMPT: u8 = 30;
         for attempt in 0..MAX_ATTEMPTS {

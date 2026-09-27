@@ -1,86 +1,36 @@
-# Vehicle definition: SAKURAH743 bench quad (the values that lived in
-# `vehicle.rs` as QUADROTOR_BODY / QUADROTOR_MOTORS before the YAML bake).
-#
-# Selected at build time via `VEHICLE=sakura_bench` (see `.env` /
-# Justfile). The `airframe` section is REQUIRED — physical identity has no
-# defaults; a missing field fails the build. Everything under `tuning` is
-# optional: keys are registry parameter names (see `param list`), values
-# override the schema defaults at bake time. Runtime `param set` + `save`
-# overrides layer on top of everything here (per-key, flash-persisted).
-#
-# Body frame FLU (x fwd, y left, z up); Betaflight QuadX motor order:
-#   m0 REAR_RIGHT (CW), m1 FRONT_RIGHT (CCW), m2 REAR_LEFT (CCW),
-#   m3 FRONT_LEFT (CW).
+# Vehicle definition: FOXEERH743 bench quad. Same airframe placeholder
+# values as sakura_bench; the tuning block restores this board's
+# historical IMU LPF cutoffs (20/150 Hz vs the schema default 80/200).
+# Copy this file into vehicles/ before selecting VEHICLE=foxeer_bench.
 
-# Compile-time build selections — per-vehicle hardware facts. Consumed by
-# tools/vehicle_features.py (feature list) and cross-checked by build.rs.
-# Env vars (BOARD, RC_PROTOCOL, OUTER_LOOP, POS_SOURCE, GPS_MODEL, ROLE,
-# IMU_RATE) still override for dev experiments; the script warns on divergence.
+# Compile-time build selections (see sakura_vicon.yaml for the policy).
+# Matches the cargo default feature set — this vehicle is the bare
+# `cargo check` / rust-analyzer fallback.
 build:
-  board: sakurah743
+  board: foxeerh743
   rc_protocol: crsf
   outer_loop: mpc          # mpc | mpc_full | cascade | rate
-                           #   mpc_full: 13-state NMPC -> (T_d, tau_d) -> INDI
-                           #   alpha inner loop, no rate gains (docs/mpc_full_indi_plan.md)
-  pos_source: mocap          # gps | mocap
-  gps_model: unicore         # ublox | unicore (UM982 dual-antenna)
-  gps_dual_antenna: yes    # yes | no — is ANT2 fitted? `yes` requires
-                          #   gps_model: unicore (build error otherwise)
-  role: chaser             # leader | chaser; omit for none
+  pos_source: mocap
   imu_rate: 8khz           # 8khz | 1khz (ICM low-noise mode, 1 kHz inner loop)
   indi: yes                # yes | no — `no` degrades the inner loop to a plain rate
                            #   controller (under mpc_full: to static inversion — bench only)
 
-# Default offline mission (missions/<name>.yaml file stem), applied at
-# boot until `mission set` + `param save` persists another. Name is
-# resolved and env-checked against build.pos_source at bake time.
+# Default offline mission (see sakura_vicon.yaml for the policy).
 default_mission: indoor_splits_slow
 
 airframe:
-  name: hunter_01
-
-  # Thrust-to-command model (REQUIRED, hardware identity like mass):
-  # bench-measured (thrust, voltage) → command table baked from
-  # crates/cybflight/data/thrust_tables/a2rl_0114.csv. Analytic
-  # alternatives: { type: quadratic, k: … } / { type: sqrt_squared, k: … }
-  # (A2RL 6S map fits: k = 0.518 / 0.458 respectively).
+  # Thrust-to-command model (REQUIRED, hardware identity like mass).
+  # Placeholder: same bench table as sakura_bench — replace with this
+  # airframe's own bench data before flight.
   thrust_model: { type: table, table: a2rl_0114 }
   mass_kg: 0.6
-  # Row-major inertia tensor [Ixx Ixy Ixz Iyx Iyy Iyz Izx Izy Izz], kg·m².
-  # Calibrate from a bifilar pendulum test or CAD model.
   inertia_kg_m2: [0.0021, 0.0, 0.0, 0.0, 0.0018, 0.0, 0.0, 0.0, 0.003]
   max_rate_rad_s: [10.0, 10.0, 6.0]
   motors:
-    # hunter_01 measured geometry — must match the hunter_indoor/outdoor
-    # YAMLs byte-for-byte (airframe.name identifies one physical drone;
-    # enforced by vehicle-yaml's airframe_identity test).
-    - { pos_m: [-0.9, -0.086], spin: cw,  max_thrust_n: 12.0, torque_coeff_m: 0.022 }
-    - { pos_m: [ 0.054, -0.086], spin: ccw, max_thrust_n: 12.0, torque_coeff_m: 0.022 }
-    - { pos_m: [-0.9,  0.086], spin: ccw, max_thrust_n: 12.0, torque_coeff_m: 0.022 }
-    - { pos_m: [ 0.054,  0.086], spin: cw,  max_thrust_n: 12.0, torque_coeff_m: 0.022 }
-
-# Fixed geodetic anchor for the ENU frame (optional).
-#
-# When present, ENU (0,0,0) is this point on every flight, so a mission's
-# waypoints — which are expressed in ENU — always describe the same
-# physical place. When absent (the default, as here), the frame is
-# anchored at the first RTK-fixed PVT instead, which means the same
-# mission flies somewhere slightly different each session.
-#
-# Either way the estimator still waits for an RTK-fixed PVT before it
-# initialises: with a fixed origin that fix seeds *where the vehicle is*
-# inside the frame, and a biased stand-alone seed would start the
-# estimate metres off.
-#
-# lat/lon are f64 (this is deliberately NOT a `tuning:` key — that map is
-# f32, which quantises latitude to ~0.6 m and would throw away the very
-# accuracy the RTK anchor provides). `alt_msl_m` matches the receiver's
-# `alt_msl`, not ellipsoidal height.
-#
-# origin:
-#   lat_deg: 47.3977419
-#   lon_deg: 8.5455938
-#   alt_msl_m: 488.5
+    - { pos_m: [-0.075, -0.1], spin: cw,  max_thrust_n: 12.0, torque_coeff_m: 0.022 }
+    - { pos_m: [ 0.075, -0.1], spin: ccw, max_thrust_n: 12.0, torque_coeff_m: 0.022 }
+    - { pos_m: [-0.075,  0.1], spin: ccw, max_thrust_n: 12.0, torque_coeff_m: 0.022 }
+    - { pos_m: [ 0.075,  0.1], spin: cw,  max_thrust_n: 12.0, torque_coeff_m: 0.022 }
 
 tuning:
   # Keys here are flat registry names, and the heading above each block
@@ -89,18 +39,29 @@ tuning:
   # `tuning:` whatever its group, because the `airframe:` block above carries
   # only the required identity that has no default.
 
-  # ── airframe.install — GPS antenna extrinsics ──
-  # Body/FLU, IMU at origin — per-install facts, previously the
-  # GPS_ANTENNA_EXTRINSICS const in vehicle.rs.
-  gps_ant_x: -0.03
-  gps_ant_y: 0.0
-  gps_ant_z: 0.0
-  gps_base_x: 0.0
-  gps_base_y: -1.0
-  gps_base_z: 0.0
-  # ── cascade — position + attitude gains ──
-  # Previously DEFAULT_CONTROL_GAINS in vehicle.rs; the schema default for
-  # cascade gains is zero.
+  # ── sensors — IMU software LPF cutoffs ──
+  # This board's historical values.
+  imu_accel_lpf_hz: 20.0
+  imu_gyro_lpf_hz: 150.0
+
+  # ── airframe.motors + battery + sensors — hardware-coupled, pin per vehicle (see sakura_vicon.yaml for the policy) ──
+  # Placeholder values copied from sakura_bench — identify on the bench
+  # for this airframe before flight.
+  m0_tau: 0.02
+  m1_tau: 0.02
+  m2_tau: 0.02
+  m3_tau: 0.02
+  m0_omega_max: 4188.79
+  m1_omega_max: 4188.79
+  m2_omega_max: 4188.79
+  m3_omega_max: 4188.79
+  m0_g2_ry: 0.001
+  m1_g2_ry: -0.001
+  m2_g2_ry: -0.001
+  m3_g2_ry: 0.001
+  batt_nominal_v: 23.0
+  batt_min_v: 12.0
+  batt_max_v: 30.0
   pos_kp_x: 4.0
   pos_kp_y: 4.0
   pos_kp_z: 8.0
@@ -111,57 +72,6 @@ tuning:
   att_k_p: 3.0
   att_k_y: 1.0
 
-  # ── airframe.motors + battery + sensors — hardware-coupled, pin per vehicle ──
-  # Pin-what-you-fly policy: these values are physically determined by
-  # THIS airframe's motors/props/battery/install, so they are written out
-  # explicitly even where they equal today's schema defaults — a future
-  # default retune must never silently change a flying vehicle, and a new
-  # airframe copies this checklist instead of inheriting invisible
-  # numbers. The bake warns when any of these keys is left unset.
-  #
-  # Motor dynamics (FOPDT): time constant + max mechanical speed
-  # (4188.79 rad/s = 40 000 RPM). Identify per motor on the bench.
-  m0_tau: 0.02
-  m1_tau: 0.02
-  m2_tau: 0.02
-  m3_tau: 0.02
-  m0_omega_max: 4188.79
-  m1_omega_max: 4188.79
-  m2_omega_max: 4188.79
-  m3_omega_max: 4188.79
-  # G2 yaw effectiveness (reaction torque from motor spin-up). Sign
-  # follows spin direction: CW +, CCW −. Motor order m0 RR(CW),
-  # m1 FR(CCW), m2 RL(CCW), m3 FL(CW).
-  m0_g2_ry: 0.001
-  m1_g2_ry: -0.001
-  m2_g2_ry: -0.001
-  m3_g2_ry: 0.001
-  # Battery (6S): bootstrap voltage for the thrust table before the first
-  # ADC frame, and the ADC plausibility window.
-  batt_nominal_v: 23.0
-  batt_min_v: 12.0
-  batt_max_v: 30.0
-  # IMU software LPF cutoffs (board install / vibration environment).
-  #
-  # This is the one `imu_rate: 1khz` vehicle, so the hardware chain in
-  # front of these biquads is NOT the 8 kHz one: the ICM runs a 258 Hz
-  # gyro AAF plus a 2nd-order 227 Hz digital UI filter (docs/imu_aaf.md),
-  # which alone lands at ENBW 186 Hz / 1.6 ms group delay — near enough
-  # to what an 8 kHz build gets *after* its 200 Hz software filter
-  # (215 Hz / 1.3 ms). Stacking a 200 Hz biquad on top of that bought
-  # 19 % ENBW for 60 % more delay (151 Hz / 2.6 ms) in the one INDI path
-  # that has no other band-limiting — `rate_err = rate_sp − gyro`, gain
-  # `indi_rate_*`, straight to WLS.
-  #
-  # 380 Hz is therefore near-passthrough (183 Hz / 1.9 ms): it leaves the
-  # gyro to the hardware while keeping a software backstop, and sits just
-  # under the 0.4·fs = 400 Hz clamp in `ImuReader` so it is the cutoff
-  # actually applied rather than a clamped one. Accel keeps 80 Hz — its
-  # 4.4 ms is invisible behind the 12 Hz `indi_sync_hz` filter on `spf_fs`
-  # and it is the ESKF that benefits.
-  imu_accel_lpf_hz: 80.0
-  imu_gyro_lpf_hz: 380.0
-
   # ── eskf.filter — process/measurement noise + jump gates ──
   # Full EskfConfig surface — noise model AND the outlier gates. No
   # estimator threshold is a hidden code constant.
@@ -169,64 +79,72 @@ tuning:
   eskf_gyro_noise: 0.0001        # gyro noise density [rad/s/sqrt(Hz)]
   eskf_acc_bias_rw: 0.001        # accel bias random walk
   eskf_gyro_bias_rw: 0.00001     # gyro bias random walk
+  # INACTIVE on this build: the mocap estimation task subscribes only to
+  # IMU_1 and VICON_POSE — no baro or magnetometer fusion. Stated for the
+  # POS_SOURCE=gps dev override, same policy as the GPS-guard block.
   eskf_baro_std: 0.5             # baro 1-sigma [m]
   eskf_mag_std: 0.05             # magnetometer 1-sigma
   eskf_gate_sigma: 10.0          # Mahalanobis gate [sigma/dim]; lower = stricter
-  # Absolute position-jump reject gate. POSITION-SOURCE COUPLED: 3 m for
-  # GPS because the legitimate inter-frame residual at 10 m/s over a
-  # 5-10 Hz NAV-PVT is ~1 m by itself. Still catches RTK ambiguity loss
-  # and multipath, which jump tens of metres.
-  eskf_max_pos_jump_m: 3.0
-  eskf_max_att_jump_rad: 0.7     # inert on GPS-only (no attitude measurement)
+  # Absolute jump reject gates. POSITION-SOURCE COUPLED: 1 m suits mocap
+  # (10 m/s worst-case flight x 100 ms worst-case latency). 0.7 rad
+  # (~40 deg) catches rigid-body re-association flips while sitting above
+  # any plausible inter-frame attitude change.
+  eskf_max_pos_jump_m: 1.0
+  eskf_max_att_jump_rad: 0.7
 
-  # ── eskf.gps_guard — GNSS acceptance + sigma schedule ──
-  # Failsafe cascade limits. These decide when a faulted PVT stream stops
-  # driving the filter — raising them widens the window in which bad
-  # fixes keep steering the estimate. Safety-relevant, not nuisance
-  # suppression.
-  eskf_gps_max_jumps: 5          # consecutive jump-gated PVTs -> disarm/re-init
-  eskf_gps_max_rejects: 15       # consecutive filter-rejected PVTs -> disarm
-  # Timing (receiver-rate coupled; u-blox NAV-PVT at 5-10 Hz).
+  # ── eskf.mocap_guard — mocap acceptance ──
+  # Failsafe cascade limits. Mocap deliberately does NOT re-init on a
+  # jump cascade (unlike GPS): a jump almost always means the volume
+  # re-associated onto a different rigid body, and IMU dead-reckoning is
+  # the more trustworthy source. Raising these widens the window in which
+  # a misidentified pose keeps steering the filter.
+  eskf_mocap_max_jumps: 3        # binary fault (right body vs wrong body)
+  eskf_mocap_max_rejects: 8      # ~25-80 ms at 100-360 Hz
+  # Staleness — COUPLE THIS TO THE STREAM RATE. 0.1 s assumes 100-360 Hz;
+  # a slower Vicon/Optitrack config needs a larger value.
+  eskf_mocap_stale_s: 0.1
+  eskf_mocap_bias_cov_thresh: 0.003   # 3-axis trace (mocap observes all axes)
+  # Pose measurement sigma. INSTALL-SPECIFIC: camera count, volume size
+  # and marker spread all move these. Unlike GPS (sigma per fix from
+  # h_acc), mocap sigma is static — these two numbers are the entire
+  # statement of how much the filter trusts the volume.
+  eskf_mocap_pos_std: 0.01
+  eskf_mocap_att_std: 0.03
+  # Disarmed re-anchor radius. Once the jump cascade has wedged the
+  # filter it cannot heal on its own — every pose stays outside the jump
+  # gate forever — so a disarmed airframe whose pose stream agrees with
+  # itself to within this radius re-seeds the ESKF. Keep it well above
+  # eskf_mocap_pos_std and well below eskf_max_pos_jump_m. Never applies
+  # in flight.
+  eskf_mocap_reanchor_m: 0.10
+
+  # ── eskf.gps_guard — GNSS acceptance + sigma schedule (INACTIVE on this build) ──
+  # pos_source is mocap, so the GPS guard is never constructed here.
+  # Stated anyway, for the same reason the cascade gains are stated under
+  # outer_loop: mpc — POS_SOURCE=gps is a supported dev override
+  # (tools/vehicle_features.sh), and such a build must not silently
+  # inherit invisible schema defaults. Values are the reviewed defaults;
+  # re-tune against the actual receiver and site before flying GPS.
+  # (GPS antenna extrinsics are deliberately NOT stated: this airframe
+  # carries no GPS antenna, so a lever arm here would be a fabricated
+  # fact rather than an unstated one.)
+  eskf_gps_max_jumps: 5
+  eskf_gps_max_rejects: 15
   eskf_gps_stale_s: 2.0
   eskf_gps_rtk_fix_debounce_s: 2.0
   eskf_gps_rtk_loss_debounce_s: 1.0
-  # Convergence gate (arming) and initial yaw covariance. GPS-only cannot
-  # observe yaw, so init_yaw_cov starts deliberately large.
   eskf_gps_bias_cov_thresh: 0.002
   eskf_gps_init_yaw_cov: 10.0
-  # PVT usability gate (site/receiver coupled: open field vs urban canyon).
   eskf_gps_min_sv: 6
   eskf_gps_h_acc_max_m: 50.0
-  # Position/velocity measurement sigma floors by carrier solution
-  # (baseline length to base station, antenna quality, site multipath).
-  eskf_gps_pos_sigma_fix_m: 0.05     # carr_soln=2, RTK-fixed
-  eskf_gps_pos_sigma_float_m: 0.30   # carr_soln=1, RTK-float
-  eskf_gps_pos_sigma_none_m: 2.0     # carr_soln=0, stand-alone
+  eskf_gps_pos_sigma_fix_m: 0.05
+  eskf_gps_pos_sigma_float_m: 0.30
+  eskf_gps_pos_sigma_none_m: 2.0
   eskf_gps_vel_sigma_m_s: 0.10
-  # Minimum carrier solution for a jump-cascade re-init. 2 = RTK-fixed
-  # only. A NON-RTK receiver MUST set this to 0, else the cascade can
-  # never re-init and the guard only ever disarms.
+  # A non-RTK receiver MUST set this to 0, else a jump cascade can never
+  # re-init and the guard only ever disarms.
   eskf_gps_reinit_min_carr_soln: 2
-  # Dual-antenna heading sigma floor (baseline-length coupled). Only read
-  # on gps_unicore builds; inert here (ublox, single antenna).
   eskf_gps_heading_sigma_floor_rad: 0.025
-
-  # ── eskf.mocap_guard — mocap acceptance (INACTIVE on this build) ──
-  # pos_source is gps, so the mocap guard is never constructed here.
-  # Stated anyway, for the same reason the cascade gains above are stated
-  # under outer_loop: mpc — POS_SOURCE=mocap is a supported dev override
-  # (tools/vehicle_features.py), and such a build must not silently
-  # inherit invisible schema defaults. Values are the reviewed defaults;
-  # re-tune against the actual volume before flying mocap on this frame.
-  eskf_mocap_max_jumps: 3
-  eskf_mocap_max_rejects: 8
-  eskf_mocap_stale_s: 0.1          # couple to the mocap stream rate
-  eskf_mocap_bias_cov_thresh: 0.003
-  eskf_mocap_pos_std: 0.01         # install-specific: volume/camera count
-  eskf_mocap_att_std: 0.03         # install-specific: marker spread
-  # Disarmed re-anchor radius; without it the jump cascade wedges the
-  # filter permanently. Keep >> eskf_mocap_pos_std and << the jump gate.
-  eskf_mocap_reanchor_m: 0.10
 
   # ══ Pinned schema defaults ═════════════════════════════════════════
   # Written out explicitly so no flight-relevant value is inherited
@@ -239,22 +157,37 @@ tuning:
   # so literal zeros there would read as measured data. Mission selection
   # is expressed once as `default_mission:` above.
 
-  # ── airframe.install + sensors — install calibration + fusion policy ──
+  # ── airframe.install + sensors — install calibration + fusion policy (INACTIVE on this build) ──
+  # No mag fusion and no GNSS on a mocap build; see the note above.
   mag_hi_x: 0
   mag_hi_y: 0
   mag_hi_z: 0
   gps_fuse_vel: 1   # 0/1
 
   # ── eskf.filter — initial covariance P0 ──
-  eskf_init_pos_var: 1
+  # POSITION-SOURCE COUPLED. Set the position variance to the bootstrap
+  # source's own accuracy squared: the filter is seeded directly from a
+  # mocap pose, so that is eskf_mocap_pos_std^2 = 1e-4, not the 1 m^2
+  # the GPS vehicles carry. Leaving it at 1 tells the filter its own
+  # seed is 100x worse than the measurements that follow, and it snaps
+  # to the first few frames.
+  eskf_init_pos_var: 1e-4
+  # Velocity is NOT directly measured by mocap (it is inferred from the
+  # pose sequence) and init() seeds it at zero, so this stays generous —
+  # it also covers an in-flight re-init, where true velocity is nonzero.
   eskf_init_vel_var: 1
   eskf_init_acc_bias_var: 0.01
   eskf_init_gyro_bias_var: 0.01
   eskf_init_att_var_rp: 0.1
 
   # ── eskf.faults — fault annunciation windows ──
-  eskf_fault_pos_timeout_s: 2
-  eskf_fault_cov_blowup_m2: 25
+  # POSITION-SOURCE COUPLED — these were GPS-scale. A 2 s stale window is
+  # 200-700 dropped frames at 100-360 Hz, i.e. 20x the mocap guard's own
+  # eskf_mocap_stale_s, so POS_STALE would annunciate long after the
+  # guard had already given up. 25 m^2 is a 5 m 1-sigma, larger than the
+  # arena itself.
+  eskf_fault_pos_timeout_s: 0.3
+  eskf_fault_cov_blowup_m2: 1.0
   eskf_fault_nan_hold_s: 3
   eskf_fault_cascade_hold_s: 3
 
@@ -326,8 +259,8 @@ tuning:
   m3_g2_rp: 0
 
   # ── indi.controller — rate gains, sync filter, WLS weights ──
-  indi_rate_r: 160
-  indi_rate_p: 160
+  indi_rate_r: 80
+  indi_rate_p: 80
   indi_rate_y: 80
   indi_sync_hz: 12
   indi_ctrl_div: 4             # 8 kHz IMU / 4 = 2 kHz INDI (reboot)
@@ -455,7 +388,10 @@ tuning:
   mpc_tilt_barrier_delta: 0.05
 
   # ── trajectory.planner — online BFGS planner (inactive: USE_OFFLINE_PLAN) ──
-  plan_max_vel: 100
+  # Arena-scale, not the outdoor vehicles' 100 m/s: this airframe flies
+  # in a ~5 x 7 x 2 m volume. Inert while USE_OFFLINE_PLAN is set, but a
+  # vehicle file should not state a false fact about the airframe.
+  plan_max_vel: 5
   plan_max_tilt: 1.0471976
   plan_w_time: 1
   plan_w_energy: 0.01
@@ -486,4 +422,3 @@ tuning:
 
   # ── system — device/UX toggles ──
   blackbox_tier: 3   # record-set tier
-  peer_pose_en: 0   # 0/1

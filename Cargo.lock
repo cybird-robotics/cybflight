@@ -1116,7 +1116,9 @@ dependencies = [
 
 [[package]]
 name = "cybflight-msgs"
-version = "0.1.22"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4fa1dc1023f3c38b8b8585bc4127f8456c1662fd262bdff110c733f9b5706af"
 dependencies = [
  "defmt 1.0.1",
  "embassy-time",
@@ -5277,7 +5279,8 @@ checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
 [[package]]
 name = "um982"
 version = "0.1.0"
-source = "git+https://github.com/UTADR/um982#45dd127b4d084d9203a67bde499b1f6d96d73267"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3c5b330c4f2f9af125748c4ea19ecc382d8d25f016fbb9ddd96c0b4f1088728"
 dependencies = [
  "embedded-io-async 0.7.0",
  "libm",

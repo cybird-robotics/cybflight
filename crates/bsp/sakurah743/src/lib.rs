@@ -56,7 +56,7 @@ pub const PRIMARY_GYRO_ODR_HZ: f32 = 8000.0;
 //
 // Role        Port    Pins              Notes
 // SerialRx    UART4   PB9 TX / PB8 RX   CRSF/GHST receiver
-// GPS         USART3  PD8 TX / PD9 RX   u-blox (M8/M9/F9P)
+// GPS         USART3  PD8 TX / PD9 RX   UM982 reference receiver
 // ESP bridge  USART1  PA9 TX / PA10 RX  WiFi/companion link, DMA
 // =====================================================================
 
@@ -75,8 +75,6 @@ pub const POWER_CAL: PowerCalibration = PowerCalibration {
 pub const PORT_SERIAL_RX: SerialPortId = SerialPortId::Uart4;
 pub const PORT_GPS: SerialPortId = SerialPortId::Usart3;
 pub const PORT_ESP_BRIDGE: SerialPortId = SerialPortId::Usart1;
-/// Gimbal (Z-1Mini GCU control) — chaser only. PD5 TX / PD6 RX, board "UART2".
-pub const PORT_GIMBAL: SerialPortId = SerialPortId::Usart2;
 
 /// Sensor identities from Betaflight header (no WHOAMI constants here).
 pub mod sensors {

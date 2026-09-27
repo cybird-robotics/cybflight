@@ -37,9 +37,6 @@ use super::{FrameAccumulator, encode_frame};
 pub async fn esp_bridge_rx_task(mut rx: UartRx<'static, crate::hal::mode::Async>) {
     let pose_pub = sensors::VICON_POSE.immediate_publisher();
     let neighbor_tx = sensors::NEIGHBOR_STATES.sender();
-    // Chaser only: republish the leader's pose from the direct PEER_POSE link.
-    #[cfg(feature = "role_chaser")]
-    let leader_tx = sensors::LEADER_POSE.sender();
     let mut acc = FrameAccumulator::new();
     let mut read_buf = [0u8; 128];
 
@@ -91,14 +88,6 @@ pub async fn esp_bridge_rx_task(mut rx: UartRx<'static, crate::hal::mode::Async>
                                     let rx_time = embassy_time::Instant::now();
                                     let states = NeighborStates::from_wire(&fs, rx_time);
                                     neighbor_tx.send(states);
-                                }
-                            }
-                            #[cfg(feature = "role_chaser")]
-                            wire::msg_id::PEER_POSE => {
-                                if let Some(wp) = wire::WirePeerPose::from_bytes(payload) {
-                                    let rx_time = embassy_time::Instant::now();
-                                    let pp = cybflight_msgs::PeerPose::from_wire(&wp, rx_time);
-                                    leader_tx.send(pp);
                                 }
                             }
                             _ => {
@@ -238,39 +227,11 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
     // Free-running tick counter for per-topic decimation (mod by DECIM_*).
     let mut tick: u32 = 0;
 
-    // Leader peer-pose state: ENU origin (held once the GPS ESKF anchors) and
-    // the live 3D-fix flag, for the direct WirePeerPose link to the chaser.
-    // Gated at runtime by the `peer_pose_en` param (live — re-read on
-    // PARAM_VERSION change) so the heavy 100 Hz downlink is off unless the
-    // leader's vehicle explicitly enables it. The role itself stays a
-    // compile-time feature (hardware topology).
-    #[cfg(feature = "role_leader")]
-    let mut peer_origin: Option<cybflight_core::geodetic::LlhOrigin> = None;
-    #[cfg(feature = "role_leader")]
-    let mut peer_fix3d = false;
-    #[cfg(feature = "role_leader")]
-    let mut peer_pose_enabled = crate::params::get().system.peer_pose_enable;
-    #[cfg(feature = "role_leader")]
-    let mut peer_pose_param_ver =
-        crate::params::PARAM_VERSION.load(core::sync::atomic::Ordering::Acquire);
-
     defmt::info!("ESP bridge TX task started (DMA)");
 
     loop {
         Timer::after_millis(TX_PERIOD_MS).await;
         tick = tick.wrapping_add(1);
-
-        // Live param: pick up `param set peer_pose_en` without a reboot.
-        // Cheap (one atomic load per 10 ms tick; the clone only happens on
-        // an actual version change).
-        #[cfg(feature = "role_leader")]
-        {
-            let v = crate::params::PARAM_VERSION.load(core::sync::atomic::Ordering::Acquire);
-            if v != peer_pose_param_ver {
-                peer_pose_param_ver = v;
-                peer_pose_enabled = crate::params::get().system.peer_pose_enable;
-            }
-        }
 
         // Drain each subscriber — only send the latest message per
         // *eligible* tick. Per-topic `DECIM_*` further throttles the
@@ -297,39 +258,12 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
                 pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
             }
         }
-        // Drain odometry once per tick: the GCS odometry downlink is decimated
-        // to 25 Hz, while the leader's direct peer-pose link to the chaser (when
-        // the `peer_pose_en` param is set) reuses the same fresh sample at the
-        // full 100 Hz tick.
         let odom = drain_latest(&mut odom_sub);
         if let Some(ref m) = odom {
             if tick % DECIM_VEHICLE_ODOMETRY == 0 {
                 let mut w = WireVehicleOdometry::from_msg(m);
                 w.timestamp_us = utc_ts(m.timestamp);
                 pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
-            }
-            // Leader → chaser peer pose: re-express our fused ESKF position as
-            // absolute LLH so the chaser can reproject it into its own ENU.
-            // Disabled by default; enable with `param set peer_pose_en 1`.
-            #[cfg(feature = "role_leader")]
-            if peer_pose_enabled {
-                if peer_origin.is_none() {
-                    peer_origin = sensors::GNSS_ORIGIN.try_take();
-                }
-                if let Some(o) = peer_origin {
-                    let (lat_rad, lon_rad, alt_m) = o.enu_to_llh(m.pose.position);
-                    let converged = crate::estimation::ESTIMATOR_READY
-                        .load(core::sync::atomic::Ordering::Acquire);
-                    let w = wire::WirePeerPose::new(
-                        utc_ts(m.timestamp),
-                        lat_rad,
-                        lon_rad,
-                        alt_m,
-                        converged,
-                        peer_fix3d,
-                    );
-                    pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
-                }
             }
         }
         if tick % DECIM_ATTITUDE_CONTROL_SETPOINT == 0 {
@@ -396,13 +330,6 @@ pub async fn esp_bridge_tx_task(mut tx: UartTx<'static, crate::hal::mode::Async>
             let mut w = WireGpsFix::from_msg(&m);
             w.timestamp_us = utc_ts(m.timestamp);
             pos += encode_and_advance(&w, &mut seq, &mut batch[pos..]);
-            // Track 3D-fix liveness for the leader's peer-pose status flag.
-            // Unconditional under role_leader (cheap; keeps the flag warm
-            // for the moment peer_pose_en flips on).
-            #[cfg(feature = "role_leader")]
-            {
-                peer_fix3d = m.fix_type >= 3;
-            }
         }
         if let Some(m) = drain_latest(&mut rc_link_sub) {
             let mut w = WireRcLinkStatus::from_msg(&m);

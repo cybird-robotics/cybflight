@@ -229,8 +229,8 @@ fn solve_scaled(name: &str, head_pos: Vec3, start_yaw: f32, veh: &Vehicle, time_
 
 #[test]
 fn every_mission_yaml_solves_like_the_firmware() {
-    let indoor = vehicle("sakura_bench_leader_1khz");
-    let outdoor = vehicle("sakura_bench_racer_outdoor");
+    let indoor = vehicle("simulation/research_1khz");
+    let outdoor = vehicle("simulation/research_outdoor");
 
     let mut names: Vec<String> = std::fs::read_dir(root().join("missions"))
         .unwrap()
@@ -301,7 +301,7 @@ fn every_mission_yaml_solves_like_the_firmware() {
 /// (entries span 1 … T⁷) from a genuine solver defect.
 #[test]
 fn waypoint_miss_vs_segment_duration() {
-    let outdoor = vehicle("sakura_bench_racer_outdoor");
+    let outdoor = vehicle("simulation/research_outdoor");
     for name in ["outdoor_splits-super_timeopt", "outdoor_splits-super_fast", "indoor_slalom_timeopt"] {
         let m = load_mission(name, &std::fs::read_to_string(root().join(format!("missions/{name}.yaml"))).unwrap()).unwrap();
         let start = Vec3::from(m.start);

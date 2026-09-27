@@ -44,7 +44,7 @@ use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, StandardNormal};
 use vehicle_yaml::mission::{Mission, load_mission};
 
-const VEHICLE_YAML: &str = "sakura_bench_leader_1khz";
+const VEHICLE_YAML: &str = "simulation/research_1khz";
 const INDI_RATE_HZ: f32 = 1000.0;
 const SQP_RATE_HZ: f32 = 100.0;
 const SQP_N: usize = 20;

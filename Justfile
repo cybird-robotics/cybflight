@@ -9,7 +9,7 @@ HOST := `rustc -vV | sed -n 's/^host: //p'`
 # source of truth for per-vehicle compile-time selections: board,
 # rc_protocol, outer_loop (mpc|mpc_full|cascade|rate), pos_source
 # (gps|mocap), gps_model (ublox|unicore), gps_dual_antenna (yes|no),
-# role (leader|chaser), imu_rate (8khz|1khz), indi (yes|no) and
+# imu_rate (8khz|1khz), indi (yes|no) and
 # plan_online (yes|no). Env vars of the same names remain as dev
 # overrides (the script warns on divergence). `just print-features`
 # lists every knob with its resolved value and provenance.
@@ -20,22 +20,21 @@ HOST := `rustc -vV | sed -n 's/^host: //p'`
 #
 # Historical env vars that no longer exist: SAMPLER (`sampler_kind`
 # runtime param), GPS_FUSE_VEL / GPS_FUSE_HEADING (`gps_fuse_*` params),
-# PEER_POSE (`peer_pose_en` param).
 #
 # Feature resolution runs per-recipe rather than as a top-level backtick,
 # so the vehicle can come from a positional argument. That also stops
-# `just test` / `just --list` / tab-completion from forking python at all.
+# `just test` / `just --list` / tab-completion from running the feature helper.
 # The script HARD FAILS when vehicles/<vehicle>.yaml does not exist —
 # `just vehicles` lists the legal names. build.rs stays the feature↔YAML
 # consistency guard.
-DEFAULT_VEHICLE := env_var_or_default("VEHICLE", "sakura_bench")
+DEFAULT_VEHICLE := env_var_or_default("VEHICLE", "sakura_vicon")
 
 # NOTE: this recipe takes an argument, so `just build test` means "build the
 # vehicle named test", not "build, then test" — that fails immediately with
 # the list of available names rather than building anything.
 # Build firmware for a vehicle (default: $VEHICLE from .env; see `just vehicles`).
 build $VEHICLE=DEFAULT_VEHICLE:
-    cargo run --release --no-default-features --features {{ `python3 tools/vehicle_features.py` }}
+    cargo run --release --no-default-features --features {{ `bash tools/vehicle_features.sh` }},postmortem
 
 # Convenience: build the MPC variant without editing the vehicle YAML.
 build-mpc $VEHICLE=DEFAULT_VEHICLE:
@@ -48,7 +47,7 @@ build-cascade $VEHICLE=DEFAULT_VEHICLE:
 # `*` marks the current default; any name listed is a valid `just build` arg.
 # List every vehicle YAML with the build facts that distinguish them.
 vehicles:
-    @python3 tools/vehicle_features.py --list
+    @bash tools/vehicle_features.sh --list
 
 # Takes the same positional vehicle as `just build`, so it is the dry run
 # for a build you are about to do. (`just --dry-run build` does NOT evaluate
@@ -56,7 +55,7 @@ vehicles:
 # Print the resolved feature list + per-knob provenance for a vehicle.
 print-features $VEHICLE=DEFAULT_VEHICLE:
     @echo "VEHICLE={{VEHICLE}}"
-    @echo "FEATURES={{ `python3 tools/vehicle_features.py --explain` }}"
+    @echo "FEATURES={{ `bash tools/vehicle_features.sh --explain` }}"
 
 # Static RAM / flash report for a vehicle's firmware (builds it first):
 # section sizes, the 20 largest .bss/.data symbols, and the headroom
@@ -76,10 +75,14 @@ size $VEHICLE=DEFAULT_VEHICLE: (build VEHICLE)
 test:
     cargo test -p cybflight-core --target {{HOST}} --release
 
-# Core tests, driver tests and the sim regression snapshot in one go —
+# Core, build-tool and driver tests plus the sim regression snapshot —
 # the set worth passing before a commit that touches control or
 # estimation code.
-test-all: test test-drivers sim-check
+test-all: test test-build-tools test-drivers sim-check
+
+# Validate vehicle parsing and build feature selection.
+test-build-tools:
+    cargo test -p vehicle-yaml --target {{HOST}} --release
 
 # Run only the MPC convergence + benchmark tests (faster iteration).
 test-mpc:
@@ -171,7 +174,8 @@ GPS := env_var_or_default("GPS", "none")
 VIZ := env_var_or_default("VIZ", "0")
 
 sim-run:
-    cargo run -p cybflight-sim --target {{HOST}} --profile release-host --bin sim-run -- \
+    cargo run -p cybflight-sim --target {{HOST}} --profile release-host --bin sim-run \
+        {{ if VIZ == "1" { "--features viz" } else { "" } }} -- \
         --scenario {{SCENARIO}} --controller {{CONTROLLER}} --noise {{NOISE}} --gps {{GPS}} \
         {{ if VIZ == "1" { "--viz" } else { "" } }}
 
@@ -221,14 +225,6 @@ check-all:
         --features board_sakurah743,est_pos_mocap,rx_crsf,defmt_uart,outer_mpc_full
     cargo check -p cybflight --no-default-features \
         --features board_sakurah743,est_pos_mocap,rx_crsf,defmt_uart,outer_mpc_full,indi_off
-    # Multi-vehicle roles. Previously uncovered entirely — including the
-    # feature set the repo's own .env vehicle resolves to.
-    cargo check -p cybflight --no-default-features \
-        --features board_sakurah743,est_pos_gps,rx_crsf,defmt_uart,outer_mpc,role_chaser
-    cargo check -p cybflight --no-default-features \
-        --features board_sakurah743,est_pos_mocap,rx_crsf,defmt_uart,outer_mpc,role_chaser
-    cargo check -p cybflight --no-default-features \
-        --features board_sakurah743,est_pos_mocap,rx_crsf,defmt_uart,outer_mpc,role_leader
     # Dual-antenna heading. The `gps_unicore` fusion path had NO coverage
     # here at all, so `update_baseline` and the init yaw-seed were only
     # ever compiled by a real vehicle build.

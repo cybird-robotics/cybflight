@@ -70,10 +70,16 @@ just test-drivers
 If you use Cybflight in your research, please cite:
 
 ```bibtex
-@misc{lin2026cybflight,
-  title  = {Cybflight: An Embedded Rust Autopilot for Aerial Robotics Research},
-  author = {Yifan Lin and Chao Qin and H. S. Helson Go and Hugh H.-T. Liu},
-  year   = {2026},
-  howpublished = {IEEE IROS 2026 Workshop Why Rust for Robotics: A Perspective From Industry}
+@inproceedings{lin2026cybflight,
+  author    = {Yifan Lin and Chao Qin and H. S. Helson Go
+               and Hugh H.-T. Liu},
+  title     = {{Cybflight}: An Embedded {Rust} Autopilot
+               for Aerial Robotics Research},
+  booktitle = {{IEEE IROS} 2026 Workshop
+               ``Why Rust for Robotics: A Perspective From Industry''},
+  intype    = {presented at the},
+  year      = {2026},
+  note      = {{arXiv}:2609.31232},
+  url       = {https://arxiv.org/abs/2609.31232}
 }
 ```
